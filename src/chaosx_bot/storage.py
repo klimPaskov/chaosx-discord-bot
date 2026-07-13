@@ -43,6 +43,28 @@ CREATE TABLE IF NOT EXISTS admin_ask_memory (
 CREATE INDEX IF NOT EXISTS idx_admin_ask_memory_scope
 ON admin_ask_memory(actor_id, guild_id, channel_id, id);
 
+CREATE TABLE IF NOT EXISTS message_ask_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    actor_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    channel_id INTEGER,
+    source_message_id INTEGER,
+    bot_message_id INTEGER NOT NULL UNIQUE,
+    parent_bot_message_id INTEGER,
+    prompt_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    request TEXT NOT NULL,
+    output_excerpt TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_ask_memory_scope
+ON message_ask_memory(guild_id, channel_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_message_ask_memory_bot_message
+ON message_ask_memory(bot_message_id);
+
 CREATE TABLE IF NOT EXISTS github_deliveries (
     delivery_id TEXT PRIMARY KEY,
     event TEXT NOT NULL,
@@ -226,6 +248,128 @@ class Store:
             )
             await db.commit()
             return cur.rowcount
+
+    async def record_message_ask_turn(
+        self,
+        *,
+        mode: str,
+        actor_id: int,
+        guild_id: int | None,
+        channel_id: int | None,
+        source_message_id: int | None,
+        bot_message_id: int,
+        parent_bot_message_id: int | None,
+        prompt_hash: str,
+        status: str,
+        request: str,
+        output_excerpt: str,
+        keep_last: int = 0,
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO message_ask_memory(
+                    created_at, mode, actor_id, guild_id, channel_id, source_message_id,
+                    bot_message_id, parent_bot_message_id, prompt_hash, status, request, output_excerpt
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso(),
+                    mode[:40],
+                    actor_id,
+                    guild_id,
+                    channel_id,
+                    source_message_id,
+                    bot_message_id,
+                    parent_bot_message_id,
+                    prompt_hash,
+                    status,
+                    request[:1200],
+                    output_excerpt[:2500],
+                ),
+            )
+            if keep_last > 0:
+                await db.execute(
+                    """
+                    DELETE FROM message_ask_memory
+                    WHERE guild_id IS ?
+                      AND channel_id IS ?
+                      AND id NOT IN (
+                          SELECT id FROM message_ask_memory
+                          WHERE guild_id IS ?
+                            AND channel_id IS ?
+                          ORDER BY id DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (guild_id, channel_id, guild_id, channel_id, keep_last),
+                )
+            await db.commit()
+
+    async def get_message_ask_turn(self, *, bot_message_id: int | None, guild_id: int | None, channel_id: int | None) -> tuple | None:
+        if not bot_message_id:
+            return None
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT created_at, mode, actor_id, prompt_hash, status, request, output_excerpt, bot_message_id, parent_bot_message_id
+                FROM message_ask_memory
+                WHERE bot_message_id = ?
+                  AND guild_id IS ?
+                  AND channel_id IS ?
+                LIMIT 1
+                """,
+                (bot_message_id, guild_id, channel_id),
+            )
+            row = await cur.fetchone()
+        return tuple(row) if row else None
+
+    async def list_message_ask_chain(self, *, bot_message_id: int | None, guild_id: int | None, channel_id: int | None, limit: int = 6) -> list[tuple]:
+        if not bot_message_id or limit <= 0:
+            return []
+        rows: list[tuple] = []
+        seen: set[int] = set()
+        current = bot_message_id
+        async with aiosqlite.connect(self.db_path) as db:
+            while current and len(rows) < limit and current not in seen:
+                seen.add(current)
+                cur = await db.execute(
+                    """
+                    SELECT created_at, mode, actor_id, prompt_hash, status, request, output_excerpt, bot_message_id, parent_bot_message_id
+                    FROM message_ask_memory
+                    WHERE bot_message_id = ?
+                      AND guild_id IS ?
+                      AND channel_id IS ?
+                    LIMIT 1
+                    """,
+                    (current, guild_id, channel_id),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    break
+                data = tuple(row)
+                rows.append(data)
+                current = data[8]
+        return list(reversed(rows))
+
+    async def list_recent_message_ask_memory(self, *, guild_id: int | None, channel_id: int | None, limit: int = 3) -> list[tuple]:
+        if limit <= 0:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT created_at, mode, actor_id, prompt_hash, status, request, output_excerpt, bot_message_id, parent_bot_message_id
+                FROM message_ask_memory
+                WHERE guild_id IS ?
+                  AND channel_id IS ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, channel_id, limit),
+            )
+            rows = [tuple(row) for row in await cur.fetchall()]
+        return list(reversed(rows))
 
     async def record_github_delivery(self, *, delivery_id: str, event: str, action: str | None, status: str, summary: str) -> bool:
         async with aiosqlite.connect(self.db_path) as db:

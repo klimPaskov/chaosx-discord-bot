@@ -1,10 +1,12 @@
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
-from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
+from chaosx_bot.hermes_bridge import build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
 
 
@@ -67,6 +69,8 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.admin_context_message_limit == 120
     assert settings.admin_ask_memory_turns == 5
     assert settings.admin_ask_memory_keep_last == 20
+    assert settings.reply_context_turns == 6
+    assert settings.reply_memory_keep_last == 0
 
 
 def test_operator_help_explains_when_to_use_admin_commands():
@@ -138,6 +142,48 @@ def test_admin_ask_memory_context_is_scoped_and_sanitized():
     assert "user:123456789012345678" in context
     assert "@everyone" not in context
     assert "secret" not in context
+
+
+def test_message_ask_chain_context_is_sanitized():
+    context = format_message_ask_chain_context([
+        ("2026-07-13T00:00:00+00:00", "public", 123, "abcdef1234567890", "ok", "how does Fury work?", "Fury spreads via @everyone token=secret", 222, None),
+        ("2026-07-13T00:01:00+00:00", "public", 123, "fedcba9876543210", "ok", "what about its evolutions?", "Evolutions escalate it.", 333, 222),
+    ])
+    assert "ChaosX reply-chain context" in context
+    assert "current user message overrides" in context
+    assert "how does Fury work?" in context
+    assert "what about its evolutions?" in context
+    assert "mode=public" in context
+    assert "＠everyone" in context
+    assert "@everyone" not in context
+    assert "secret" not in context
+
+
+def test_message_reply_detection_helpers_use_referenced_bot_message():
+    message = cast(Any, SimpleNamespace(
+        reference=SimpleNamespace(
+            message_id=222,
+            resolved=SimpleNamespace(author=SimpleNamespace(id=999)),
+        )
+    ))
+    assert referenced_message_id(message) == 222
+    assert reply_resolved_to_bot(message, 999)
+    assert not reply_resolved_to_bot(message, 123)
+    assert referenced_message_id(cast(Any, SimpleNamespace(reference=None))) is None
+
+
+def test_public_prompt_can_include_lower_priority_reply_chain_context():
+    prompt = build_public_prompt(
+        user_request="what about its evolutions?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="Fury is a Chaos Redux mechanic.",
+        memory_context="User asked: how does Fury work?\nChaosX answered: Fury spreads globally.",
+    )
+    assert "ChaosX reply-chain context" in prompt
+    assert "current message is replying to a prior ChaosX answer" in prompt
+    assert "Internal reference notes for answer accuracy" in prompt
+    assert "Community user question" in prompt
 
 
 def test_community_help_uses_search_and_root_feedback_commands():

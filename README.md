@@ -17,7 +17,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Bot profile description: `Ask ChaosX questions about Chaos Redux events, scenarios, mechanics, testing, and mod info.`
 - Public limits by default: 10 broad `/ask` or direct mention asks per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
 - Broad ask model override: `CHAOSX_ASK_PROVIDER=openai-codex`, `CHAOSX_ASK_MODEL=gpt-5.6-luna`, `CHAOSX_ASK_REASONING_EFFORT=medium`.
-- Public Hermes-backed commands run with the `safe` toolset and a public prompt boundary: answer only Chaos Redux/mod/server-use questions, refuse dangerous/off-topic requests, do not perform external actions, and include repo/vault/spec/code paths only when explicitly asked. Public `/ask` uses a prebuilt SQLite/FTS index over the Chaos Redux repo plus whitelisted Chaos Redux Vault folders, with `.env`, token notes, `.obsidian`, raw ingest, logs, and private/non-project paths excluded.
+- Public Hermes-backed commands run with the `safe` toolset and a public prompt boundary: answer only Chaos Redux/mod/server-use questions, refuse dangerous/off-topic requests, do not perform external actions, and include repo/vault/spec/code paths only when explicitly asked. Public `/ask` uses a prebuilt SQLite/FTS index over the Chaos Redux repo plus whitelisted Chaos Redux Vault folders, with `.env`, token notes, `.obsidian`, raw ingest, logs, and private/non-project paths excluded. Model-backed bot answers store their bot message ID in local SQLite; when a community member replies to a stored ChaosX answer, only that reply chain is injected as low-priority context. When Hoops mentions ChaosX or replies to one of its messages, the message routes through owner/admin mode automatically.
 - Approved `/event-idea` outputs are quietly captured to the Chaos Redux vault, refresh the vault index/reference notes/log, and auto-create a sanitized forum post in `CHAOSX_COMMUNITY_EVENT_IDEAS_CHANNEL_ID`. Approved `/suggestion` outputs are quietly captured to the vault and refresh indexes/logs.
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=openai-codex`, `CHAOSX_OPERATOR_MODEL=gpt-5.6-luna`, `CHAOSX_OPERATOR_REASONING_EFFORT=xhigh`.
 - Provides:
@@ -46,7 +46,7 @@ If reverting to a narrow setup later, use:
 - Embed Links
 - Attach Files only if needed later
 - Read Message History where `/admin ask` message-analysis workflows need it
-- Message Content Intent in the Developer Portal is needed for direct `@ChaosX <question>` asks and for `/admin ask` to read message bodies. ChaosX only reacts to its own direct mention for public ask; it does not run passive public message monitoring.
+- Message Content Intent in the Developer Portal is needed for direct `@ChaosX <question>` asks, replies to ChaosX answers, and for `/admin ask` to read message bodies. ChaosX reacts only to its own direct mention or replies to its own stored answer messages for public ask; for Hoops, direct mentions/replies route through owner/admin mode automatically. It does not run passive public message monitoring.
 - Create Events only after Hoops explicitly confirms a follow-up action from a playtest draft. `/playtest schedule` itself is draft-only and does not create Discord Scheduled Events.
 
 `/admin ask` remains runtime-gated to the configured owner ID before any protected operation runs. Do not expose separate public moderation/member-management commands unless explicitly requested.

@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     admin_ask_timeout_seconds: int = Field(default=0, ge=0, le=86400, description="Max seconds for /admin ask Hermes runs; 0 disables the subprocess timeout")
     admin_ask_memory_turns: int = Field(default=5, ge=0, le=20, description="Previous /admin ask turns to inject for owner follow-up context; 0 disables follow-up memory")
     admin_ask_memory_keep_last: int = Field(default=20, ge=1, le=100, description="Stored /admin ask turns to retain per owner/channel/thread")
+    reply_context_turns: int = Field(default=6, ge=0, le=20, description="Previous model-backed ChaosX reply-chain turns to inject when a user replies to a stored bot answer; 0 disables reply-chain context")
+    reply_memory_keep_last: int = Field(default=0, ge=0, le=10000, description="Stored model-backed message asks to retain per guild/channel; 0 keeps all stored asks")
     ask_model: str = Field(default="gpt-5.6-luna", description="Model override for broad ask commands")
     ask_provider: str = Field(default="openai-codex", description="Provider override for broad ask commands")
     ask_reasoning_effort: str = Field(default="medium", description="Reasoning effort for broad ask commands")

@@ -118,6 +118,55 @@ def public_ask_wants_sources(request: str) -> bool:
     return any(term in text for term in PUBLIC_ASK_SOURCE_REQUEST_TERMS)
 
 
+def referenced_message_id(message: discord.Message) -> int | None:
+    reference = getattr(message, "reference", None)
+    if not reference:
+        return None
+    value = getattr(reference, "message_id", None)
+    return int(value) if value else None
+
+
+def reply_resolved_to_bot(message: discord.Message, bot_user_id: int | None) -> bool:
+    if bot_user_id is None:
+        return False
+    reference = getattr(message, "reference", None)
+    resolved = getattr(reference, "resolved", None) if reference else None
+    author = getattr(resolved, "author", None)
+    return bool(author and getattr(author, "id", None) == bot_user_id)
+
+
+def format_message_ask_chain_context(rows: list[tuple]) -> str:
+    if not rows:
+        return ""
+    lines = [
+        "## ChaosX reply-chain context",
+        "Prior model-backed ChaosX turns from the Discord message chain this user replied to. Use only to resolve this reply; the current user message overrides the chain.",
+    ]
+    for index, (created_at, mode, actor_id, prompt_hash_value, status, request, output_excerpt, bot_message_id, parent_bot_message_id) in enumerate(rows, start=1):
+        safe_mode = sanitize_admin_context_text(str(mode), limit=40)
+        safe_request = sanitize_admin_context_text(str(request), limit=700)
+        safe_output = sanitize_admin_context_text(str(output_excerpt), limit=1000)
+        safe_status = sanitize_admin_context_text(str(status), limit=40)
+        lines.append(
+            f"### Chain turn {index} — {created_at} mode={safe_mode} status={safe_status}\n"
+            f"User asked: {safe_request}\n"
+            f"ChaosX answered: {safe_output}"
+        )
+    return "\n".join(lines)
+
+
+async def fetch_message_ask_chain_context(bot: ChaosXBot, *, bot_message_id: int | None, guild_id: int | None, channel_id: int | None) -> str:
+    if bot.settings.reply_context_turns <= 0 or not bot_message_id:
+        return ""
+    rows = await bot.store.list_message_ask_chain(
+        bot_message_id=bot_message_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        limit=bot.settings.reply_context_turns,
+    )
+    return format_message_ask_chain_context(rows)
+
+
 def extract_mention_ask_request(content: str, bot_user_id: int | None) -> str | None:
     """Return the public-ask text from a direct ChaosX mention, or None if not mentioned."""
 
@@ -455,7 +504,7 @@ class ChaosXBot(discord.Client):
             await guild.leave()
 
     async def on_message(self, message: discord.Message) -> None:
-        await handle_mention_ask(self, message)
+        await handle_message_ask(self, message)
 
     async def leave_unauthorized_guilds(self) -> None:
         allowed = self.settings.allowed_guild_id or self.settings.command_guild_id
@@ -511,36 +560,161 @@ async def public_gate(interaction: discord.Interaction, settings: Settings) -> b
     return True
 
 
-async def handle_mention_ask(bot: ChaosXBot, message: discord.Message) -> None:
+async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> None:
     if not bot.settings.mention_ask_enabled or bot.user is None:
         return
     if message.author.bot or getattr(message, "webhook_id", None):
         return
-    if not any(user.id == bot.user.id for user in getattr(message, "mentions", []) or []):
-        return
-    request = extract_mention_ask_request(message.content or "", bot.user.id)
-    if request is None:
-        return
-    guild_id = message.guild.id if message.guild else None
-    if public_deny_reason(guild_id, bot.settings.allowed_guild_id):
-        return
-    if not request:
-        await message.reply(
-            "Ask me a Chaos Redux question after the mention, like `@ChaosX how does Zombie Outbreak work?`",
-            mention_author=False,
-            allowed_mentions=safe_allowed_mentions(),
-        )
-        return
-    await run_public_ask_message(bot, message, request)
 
-
-async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, request: str) -> None:
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
-    command_name = "mention ask"
+    if public_deny_reason(guild_id, bot.settings.allowed_guild_id):
+        return
+
+    mentioned = any(user.id == bot.user.id for user in getattr(message, "mentions", []) or [])
+    parent_bot_message_id = referenced_message_id(message)
+    known_parent_turn = await bot.store.get_message_ask_turn(
+        bot_message_id=parent_bot_message_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+    )
+    replies_to_known_chain = known_parent_turn is not None
+    replies_to_bot = replies_to_known_chain or reply_resolved_to_bot(message, bot.user.id)
+    if not mentioned and not replies_to_bot:
+        return
+
+    if mentioned:
+        request = extract_mention_ask_request(message.content or "", bot.user.id) or ""
+    else:
+        request = " ".join((message.content or "").split())
+
+    if not request:
+        if message.author.id == bot.settings.owner_id:
+            guidance = "Send an admin request after the mention, or reply to a ChaosX answer with the admin request."
+        else:
+            guidance = "Ask me a Chaos Redux question after the mention or in your reply, like `@ChaosX how does Zombie Outbreak work?`"
+        await message.reply(guidance, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        return
+
+    if message.author.id == bot.settings.owner_id:
+        await run_admin_ask_message(
+            bot,
+            message,
+            request,
+            parent_bot_message_id=parent_bot_message_id if replies_to_bot else None,
+        )
+        return
+
+    if not mentioned and not replies_to_known_chain:
+        return
+    await run_public_ask_message(
+        bot,
+        message,
+        request,
+        parent_bot_message_id=parent_bot_message_id if replies_to_known_chain else None,
+    )
+
+
+async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, request: str, *, parent_bot_message_id: int | None = None) -> None:
+    guild_id = message.guild.id if message.guild else None
+    channel_id = getattr(message.channel, "id", None)
+    reason = owner_deny_reason(message.author.id, bot.settings.owner_id, guild_id, bot.settings.allowed_guild_id)
+    if reason:
+        return
+    if admin_ask_memory_reset_requested(request):
+        deleted = await bot.store.clear_admin_ask_memory(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id)
+        await message.reply(f"Cleared `{deleted}` saved `/admin ask` turn(s) for this channel/thread.", mention_author=False, allowed_mentions=safe_allowed_mentions())
+        return
+
+    guild_name = message.guild.name if message.guild else None
+    channel_name = getattr(message.channel, "name", None)
+    admin_rows = await bot.store.list_admin_ask_memory(
+        actor_id=message.author.id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        limit=bot.settings.admin_ask_memory_turns,
+    )
+    owner_context = format_admin_ask_memory_context(admin_rows)
+    chain_context = await fetch_message_ask_chain_context(bot, bot_message_id=parent_bot_message_id, guild_id=guild_id, channel_id=channel_id)
+    if chain_context:
+        owner_context += "\n\n" + chain_context
+    owner_request = request + owner_context
+    prompt = build_owner_prompt(owner_request=owner_request, guild_name=guild_name, channel_name=channel_name)
+    hermes_timeout = bot.settings.admin_ask_timeout_seconds
+    async with message.channel.typing():
+        result = await run_hermes(
+            hermes_bin=bot.settings.hermes_bin,
+            profile=bot.settings.hermes_profile,
+            repo=bot.settings.chaos_redux_repo,
+            prompt=prompt,
+            timeout_seconds=hermes_timeout,
+            model=bot.settings.operator_model,
+            provider=bot.settings.operator_provider,
+            reasoning_effort=bot.settings.operator_reasoning_effort,
+            toolsets=None,
+            ignore_rules=False,
+        )
+    output = result.stdout.strip() or result.stderr.strip() or "No output."
+    if result.timed_out:
+        output = (
+            f"Hermes run timed out after {hermes_timeout}s. "
+            "For very broad server actions, ask for a preview/scope first, then confirm execution."
+        )
+    status = "ok" if result.ok else "failed"
+    await bot.store.record_hermes_run(
+        actor_id=message.author.id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        prompt_hash=result.prompt_hash,
+        status=status,
+        output_excerpt=output,
+    )
+    if result.ok:
+        await bot.store.record_admin_ask_turn(
+            actor_id=message.author.id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            prompt_hash=result.prompt_hash,
+            status=status,
+            request=sanitize_admin_context_text(request, limit=2000),
+            output_excerpt=sanitize_admin_context_text(output, limit=4000),
+            keep_last=bot.settings.admin_ask_memory_keep_last,
+        )
+    await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="admin mention ask", summary=request)
+
+    first_sent: discord.Message | None = None
+    for i, part in enumerate(_chunk(output)):
+        content = ("ChaosX admin answer\n" if i == 0 else "") + part
+        if i == 0:
+            first_sent = await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        else:
+            await message.channel.send(content, allowed_mentions=safe_allowed_mentions())
+    if first_sent and result.ok:
+        await bot.store.record_message_ask_turn(
+            mode="admin",
+            actor_id=message.author.id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            source_message_id=message.id,
+            bot_message_id=first_sent.id,
+            parent_bot_message_id=parent_bot_message_id,
+            prompt_hash=result.prompt_hash,
+            status=status,
+            request=sanitize_admin_context_text(request, limit=1200),
+            output_excerpt=sanitize_admin_context_text(output, limit=2500),
+            keep_last=bot.settings.reply_memory_keep_last,
+        )
+
+
+async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, request: str, *, parent_bot_message_id: int | None = None) -> None:
+    guild_id = message.guild.id if message.guild else None
+    channel_id = getattr(message.channel, "id", None)
+    command_name = "reply ask" if parent_bot_message_id else "mention ask"
     source_paths_allowed = public_ask_wants_sources(request)
     reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
-    rejection = public_ask_rejection_reason(request, reference_context=reference_context)
+    memory_context = await fetch_message_ask_chain_context(bot, bot_message_id=parent_bot_message_id, guild_id=guild_id, channel_id=channel_id)
+    domain_context = reference_context or memory_context
+    rejection = public_ask_rejection_reason(request, reference_context=domain_context)
     if rejection:
         await message.reply(rejection, mention_author=False, allowed_mentions=safe_allowed_mentions())
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command=command_name, summary="public ask rejected")
@@ -575,6 +749,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         channel_name=channel_name,
         reference_context=reference_context,
         source_paths_allowed=source_paths_allowed,
+        memory_context=memory_context,
     )
     async with message.channel.typing():
         result = await run_hermes(
@@ -593,6 +768,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     if result.timed_out:
         output = f"Hermes run timed out after {bot.settings.hermes_timeout_seconds}s. Try a narrower Chaos Redux question."
     output = sanitize_public_ask_output(output)
+    memory_output = output
     output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
@@ -604,12 +780,28 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         output_excerpt=output,
     )
     await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command=command_name, summary=request)
+    first_sent: discord.Message | None = None
     for i, part in enumerate(_chunk(output)):
         content = ("ChaosX answer\n" if i == 0 else "") + part
         if i == 0:
-            await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
+            first_sent = await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
         else:
             await message.channel.send(content, allowed_mentions=safe_allowed_mentions())
+    if first_sent and result.ok and memory_output != PUBLIC_ASK_REDIRECT:
+        await bot.store.record_message_ask_turn(
+            mode="public",
+            actor_id=message.author.id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            source_message_id=message.id,
+            bot_message_id=first_sent.id,
+            parent_bot_message_id=parent_bot_message_id,
+            prompt_hash=result.prompt_hash,
+            status=status,
+            request=sanitize_admin_context_text(request, limit=1200),
+            output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
+            keep_last=bot.settings.reply_memory_keep_last,
+        )
 
 
 async def send_scripted_response(
@@ -895,6 +1087,7 @@ async def run_hermes_command(
     rate = None
     source_paths_allowed = False
     reference_context = ""
+    memory_context = ""
     if owner_only:
         if not await owner_gate(interaction, bot.settings):
             return
@@ -953,6 +1146,7 @@ async def run_hermes_command(
             channel_name=channel_name,
             reference_context=reference_context if rate_bucket == "ask" else "",
             source_paths_allowed=source_paths_allowed,
+            memory_context=memory_context if rate_bucket == "ask" else "",
         )
     )
     model = provider = reasoning_effort = toolsets = None
@@ -988,8 +1182,11 @@ async def run_hermes_command(
         )
     if not owner_only and rate_bucket == "ask":
         output = sanitize_public_ask_output(output)
+        memory_output = output
         if rate:
             output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
+    else:
+        memory_output = ""
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
         actor_id=interaction.user.id,
@@ -1010,6 +1207,9 @@ async def run_hermes_command(
             output_excerpt=sanitize_admin_context_text(output, limit=4000),
             keep_last=bot.settings.admin_ask_memory_keep_last,
         )
+    should_record_reply_memory = bool(
+        not owner_only and rate_bucket == "ask" and public and result.ok and memory_output and memory_output != PUBLIC_ASK_REDIRECT
+    )
     await bot.store.audit(
         actor_id=interaction.user.id,
         guild_id=interaction.guild_id,
@@ -1018,11 +1218,35 @@ async def run_hermes_command(
         summary=request,
     )
     header = "ChaosX answer" if public else f"ChaosX `{status}` hash `{result.prompt_hash[:12]}`"
+    first_sent = None
     for i, part in enumerate(_chunk(output)):
-        await interaction.followup.send(
+        send_kwargs = {
+            "ephemeral": not public,
+            "allowed_mentions": safe_allowed_mentions(),
+        }
+        if i == 0 and should_record_reply_memory:
+            send_kwargs["wait"] = True
+        sent = await interaction.followup.send(
             (header + "\n" if i == 0 else "") + part,
-            ephemeral=not public,
-            allowed_mentions=safe_allowed_mentions(),
+            **send_kwargs,
+        )
+        if i == 0:
+            first_sent = sent
+    first_sent_id = getattr(first_sent, "id", None)
+    if should_record_reply_memory and first_sent_id is not None:
+        await bot.store.record_message_ask_turn(
+            mode="public",
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            source_message_id=None,
+            bot_message_id=first_sent_id,
+            parent_bot_message_id=None,
+            prompt_hash=result.prompt_hash,
+            status=status,
+            request=sanitize_admin_context_text(request, limit=1200),
+            output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
+            keep_last=bot.settings.reply_memory_keep_last,
         )
     return result, output
 
