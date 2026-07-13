@@ -61,6 +61,48 @@ def _stable_id(prefix: str, *parts: object) -> str:
     return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
 
 
+def community_help_text() -> str:
+    return """## ChaosX community commands
+`/chaosx ask` — broad rate-limited Chaos Redux question.
+`/chaosx event` — event lookup by ID/name.
+`/chaosx scenario` — scenario lookup.
+`/chaosx cluster` — cluster lookup.
+`/chaosx mechanic` — mechanic/source search.
+`/chaosx search` — indexed repo/docs search.
+`/chaosx source` — source-of-truth map.
+`/chaosx compare` — compare entities/sources.
+`/chaosx status` — repo/index or entity status.
+`/chaosx testing` — testing queue search.
+`/chaosx help` — this guide.
+`/repo status`, `/repo search`, `/repo file`, `/repo diff`, `/repo history` — read-only repo tools.
+`/work suggestion`, `/work event-idea` — draft/check ideas without creating GitHub issues.
+`/playtest queue`, `/playtest report`, `/playtest summary` — playtest info/reporting.
+
+Public broad ask is rate-limited; scripted lookups should be preferred."""
+
+
+def operator_help_text(settings: Settings) -> str:
+    return f"""## ChaosX protected operator commands
+Models:
+- Public broad ask: `{settings.ask_provider}` / `{settings.ask_model}`
+- Autonomous server ops: `{settings.operator_provider}` / `{settings.operator_model}`
+
+Root protected:
+`/health`, `/inventory`, `/ask`, `/say`
+
+Protected server/admin:
+`/server ask` — autonomous server-management request using the smarter operator model.
+`/server role-audit`, `/server scan-behaviour`, `/server member-info`, `/server add-role`, `/server remove-role`, `/server timeout`
+`/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin config`, `/admin permissions-audit`, `/admin jobs`, `/admin rollback`
+
+Protected project ops:
+`/work issue-draft`, `/work handoff`, `/work changelog`, `/work release-draft`
+`/playtest schedule`, `/playtest cancel`
+`/hermes route`, `/hermes task`, `/hermes status`, `/hermes cancel`, `/hermes audit`, `/hermes review-pr`
+
+Important: `/server ask` can reason autonomously, but Discord/GitHub side effects still depend on bot permissions, role hierarchy, configured secrets, and approval gates."""
+
+
 class ChaosXBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
@@ -170,6 +212,7 @@ async def run_hermes_command(
     owner_only: bool = False,
     rate_bucket: str = "scripted",
     use_ask_model: bool = False,
+    use_operator_model: bool = False,
 ) -> None:
     if owner_only:
         if not await owner_gate(interaction, bot.settings):
@@ -206,14 +249,19 @@ async def run_hermes_command(
     await interaction.response.defer(ephemeral=not public, thinking=True)
     guild_name, channel_name = _guild_channel(interaction)
     prompt = build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
+    model = provider = None
+    if use_operator_model:
+        model, provider = bot.settings.operator_model, bot.settings.operator_provider
+    elif use_ask_model:
+        model, provider = bot.settings.ask_model, bot.settings.ask_provider
     result = await run_hermes(
         hermes_bin=bot.settings.hermes_bin,
         profile=bot.settings.hermes_profile,
         repo=bot.settings.chaos_redux_repo,
         prompt=prompt,
         timeout_seconds=bot.settings.hermes_timeout_seconds,
-        model=bot.settings.ask_model if use_ask_model else None,
-        provider=bot.settings.ask_provider if use_ask_model else None,
+        model=model,
+        provider=provider,
     )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     status = "ok" if result.ok else "failed"
@@ -249,12 +297,26 @@ async def run_owner_hermes(
     command_name: str,
     public: bool = False,
     use_ask_model: bool = False,
+    use_operator_model: bool = False,
 ) -> None:
-    await run_hermes_command(bot, interaction, request, command_name=command_name, public=public, owner_only=True, use_ask_model=use_ask_model)
+    await run_hermes_command(bot, interaction, request, command_name=command_name, public=public, owner_only=True, use_ask_model=use_ask_model, use_operator_model=use_operator_model)
 
 
 def register_commands(bot: ChaosXBot) -> None:
     settings = bot.settings
+
+    @bot.tree.command(name="help", description="Show all public ChaosX community commands.")
+    async def root_help(interaction: discord.Interaction) -> None:
+        if not await public_gate(interaction, settings):
+            return
+        await interaction.response.send_message(community_help_text(), ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @bot.tree.command(name="operator-help", description="Show protected ChaosX operator commands.")
+    @app_commands.default_permissions(administrator=True)
+    async def operator_help(interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        await interaction.response.send_message(operator_help_text(settings), ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @bot.tree.command(name="health", description="Protected ChaosX runtime health check.")
     @app_commands.default_permissions(administrator=True)
@@ -372,7 +434,7 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @chaosx.command(name="help", description="Show ChaosX command help.")
     async def chaosx_help(interaction: discord.Interaction, topic: str = "all") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx help", summary=topic, render=lambda: bot.knowledge.help(topic))
+        await send_scripted_response(bot, interaction, command_name="chaosx help", summary=topic, render=community_help_text)
 
     @repo.command(name="status", description="Show repository/index status.")
     async def repo_status(interaction: discord.Interaction) -> None:
@@ -538,6 +600,16 @@ def register_commands(bot: ChaosXBot) -> None:
     @admin.command(name="rollback", description="Prepare rollback instructions for a deployment.")
     async def admin_rollback(interaction: discord.Interaction, deployment: str) -> None:
         await run_owner_hermes(bot, interaction, f"/admin rollback deployment={deployment!r}. Do not perform destructive rollback without explicit approval.", command_name="admin rollback")
+
+    @server.command(name="ask", description="Autonomously handle a protected server-management request.")
+    async def server_ask(interaction: discord.Interaction, request: str) -> None:
+        prompt = (
+            "Protected autonomous Discord server-management request. Use available ChaosX/Discord capabilities where safe. "
+            "Perform read-only inspection or safe bounded actions directly when permissions allow. For destructive, broad, irreversible, secret-requiring, or permission-expanding actions, stop and report the exact approval/blocker. "
+            "Do not use mass pings. Keep an audit-minded summary.\n\n"
+            f"Request: {request}"
+        )
+        await run_owner_hermes(bot, interaction, prompt, command_name="server ask", use_operator_model=True)
 
     @server.command(name="role-audit", description="Scan roles for elevated permissions and hierarchy risks.")
     async def server_role_audit(interaction: discord.Interaction) -> None:

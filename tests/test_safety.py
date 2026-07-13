@@ -46,6 +46,8 @@ def test_ask_model_defaults_to_luna_medium():
     settings = Settings(_env_file=None, discord_token="dummy")
     assert settings.ask_model == "luna-medium"
     assert settings.ask_provider == "nous"
+    assert settings.operator_model == "luna-xhigh"
+    assert settings.operator_provider == "nous"
 
 
 def test_fixed_window_rate_limiter_blocks_after_limit():
