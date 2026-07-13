@@ -1,5 +1,5 @@
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_context_requested, community_help_text, extract_requested_channel_id, extract_requested_user_id, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_context_requested, community_help_text, extract_member_search_queries, extract_requested_channel_id, extract_requested_user_id, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -88,6 +88,8 @@ def test_admin_context_helpers_extract_targets_and_sanitize_text():
     assert "abc123" not in text
     assert "user:123456789012345678" in text
     assert "channel:234567890123456789" in text
+    assert extract_member_search_queries("timeout @Holly after preview") == ["Holly"]
+    assert extract_member_search_queries("resolve member named Holly") == ["Holly"]
 
 
 def test_community_help_uses_search_and_root_feedback_commands():

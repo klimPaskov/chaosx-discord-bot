@@ -498,6 +498,7 @@ async def send_scripted_response(
 SECRETISH_PATTERN = re.compile(r"(?i)(token|password|secret|api[_-]?key|authorization|cookie)\s*[:=]\s*\S+")
 USER_MENTION_PATTERN = re.compile(r"<@!?(\d{15,25})>")
 CHANNEL_MENTION_PATTERN = re.compile(r"<#(\d{15,25})>")
+PLAIN_USER_REF_PATTERN = re.compile(r"(?<!<)@([A-Za-z0-9_.-]{2,32})")
 
 
 def sanitize_admin_context_text(text: str, *, limit: int = 700) -> str:
@@ -541,6 +542,80 @@ def extract_requested_channel_id(request: str) -> int | None:
             if match:
                 return int(match.group(0))
     return None
+
+
+def extract_member_search_queries(request: str) -> list[str]:
+    """Extract plain-text member names that Discord did not turn into <@id> mentions."""
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for match in PLAIN_USER_REF_PATTERN.finditer(request):
+        value = match.group(1).strip(".,:;!?()[]{}'\"")
+        if value and value.casefold() not in seen:
+            queries.append(value)
+            seen.add(value.casefold())
+    lowered = request.casefold()
+    for marker in ("user named", "member named", "resolve user named", "resolve member named", "resolve user", "resolve member"):
+        idx = lowered.find(marker)
+        if idx < 0:
+            continue
+        tail = request[idx + len(marker): idx + len(marker) + 80].strip(" :#@")
+        match = re.match(r"[A-Za-z0-9_.-]{2,32}", tail)
+        if match:
+            value = match.group(0)
+            if value.casefold() in {"named", "user", "member"}:
+                continue
+            if value.casefold() not in seen:
+                queries.append(value)
+                seen.add(value.casefold())
+    return queries[:5]
+
+
+async def fetch_admin_member_context(bot: ChaosXBot, interaction: discord.Interaction, request: str) -> str:
+    """Resolve plain-text member references for owner/admin server actions."""
+
+    if not interaction.guild_id:
+        return ""
+    if extract_requested_user_id(request):
+        return ""
+    queries = extract_member_search_queries(request)
+    if not queries:
+        return ""
+
+    lines: list[str] = ["\n\n## Discord member resolution context"]
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {bot.settings.discord_token}"}) as session:
+            for query in queries:
+                async with session.get(
+                    f"https://discord.com/api/v10/guilds/{int(interaction.guild_id)}/members/search",
+                    params={"query": query, "limit": 10},
+                ) as resp:
+                    payload = await resp.json()
+                    safe_query = sanitize_admin_context_text(query, limit=80)
+                    if resp.status == 403:
+                        lines.append(f"- `{safe_query}`: member search returned HTTP 403 Missing Access. Check Administrator permission and Server Members Intent if this repeats.")
+                        continue
+                    if resp.status >= 400 or not isinstance(payload, list):
+                        lines.append(f"- `{safe_query}`: member search failed with Discord HTTP {resp.status}.")
+                        continue
+                    if not payload:
+                        lines.append(f"- `{safe_query}`: no members found.")
+                        continue
+                    lines.append(f"- `{safe_query}` candidates:")
+                    for member in payload[:10]:
+                        user = member.get("user") or {}
+                        user_id = user.get("id") or "unknown"
+                        username = sanitize_admin_context_text(str(user.get("username") or ""), limit=80)
+                        global_name = sanitize_admin_context_text(str(user.get("global_name") or ""), limit=80)
+                        nick = sanitize_admin_context_text(str(member.get("nick") or ""), limit=80)
+                        roles = member.get("roles") or []
+                        joined = sanitize_admin_context_text(str(member.get("joined_at") or ""), limit=80)
+                        lines.append(f"  - user_id={user_id} username={username!r} global_name={global_name!r} nick={nick!r} roles={roles[:8]} joined_at={joined}")
+    except Exception as exc:
+        return f"\n\n## Discord member resolution context\nCould not search members: {type(exc).__name__}."
+
+    lines.append("Use these IDs for owner-requested member/server actions; if multiple plausible candidates exist, ask for confirmation before mutating anything.")
+    return "\n".join(lines)
 
 
 async def fetch_admin_message_context(bot: ChaosXBot, interaction: discord.Interaction, request: str) -> str:
@@ -653,7 +728,10 @@ async def run_hermes_command(
 
     await interaction.response.defer(ephemeral=not public, thinking=True)
     guild_name, channel_name = _guild_channel(interaction)
-    owner_context = await fetch_admin_message_context(bot, interaction, request) if owner_only else ""
+    owner_context = ""
+    if owner_only:
+        owner_context = await fetch_admin_member_context(bot, interaction, request)
+        owner_context += await fetch_admin_message_context(bot, interaction, request)
     owner_request = request + owner_context
     source_paths_allowed = public_ask_wants_sources(request) if not owner_only and rate_bucket == "ask" else False
     prompt = (
