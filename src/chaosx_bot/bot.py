@@ -30,6 +30,14 @@ PUBLIC_ASK_BLOCK_TERMS = {
     "credential", "delete server", "nuke", "hack", "malware", "phishing", "exploit", "bypass", "mass ping",
     "@everyone", "@here", "ban everyone", "delete channel", "delete role", "manage server", "moderation",
 }
+PUBLIC_ASK_OFFTOPIC_TERMS = {
+    "recipe", "ingredients", "measurements", "exact measurements", "baking steps", "cooking steps",
+    "chocolate cake", "pancake", "capital of", "haiku", "cats", "unrelated test phrase",
+}
+PUBLIC_OUTPUT_FORBIDDEN_TERMS = {
+    "safe server moderation", "channel organization", "reporting abuse", "chocolate cake recipe",
+    "ingredients:", "method:", "baking steps", "cooking steps",
+}
 
 
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
@@ -56,9 +64,18 @@ def public_ask_rejection_reason(request: str) -> str | None:
     text = request.casefold()
     if any(term in text for term in PUBLIC_ASK_BLOCK_TERMS):
         return PUBLIC_ASK_REDIRECT
+    if any(term in text for term in PUBLIC_ASK_OFFTOPIC_TERMS):
+        return PUBLIC_ASK_REDIRECT
     if not any(term in text for term in PUBLIC_ASK_DOMAIN_TERMS):
         return PUBLIC_ASK_REDIRECT
     return None
+
+
+def sanitize_public_ask_output(output: str) -> str:
+    text = output.casefold()
+    if any(term in text for term in PUBLIC_OUTPUT_FORBIDDEN_TERMS):
+        return PUBLIC_ASK_REDIRECT
+    return output
 
 
 def _can_manage_role(guild: discord.Guild, actor: discord.Member, bot_member: discord.Member, role: discord.Role) -> tuple[bool, str]:
@@ -336,6 +353,8 @@ async def run_hermes_command(
         ignore_rules=ignore_rules,
     )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
+    if not owner_only and rate_bucket == "ask":
+        output = sanitize_public_ask_output(output)
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
         actor_id=interaction.user.id,
