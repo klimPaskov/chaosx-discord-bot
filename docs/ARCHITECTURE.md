@@ -14,7 +14,7 @@
 - ChaosX is its own Discord bot identity and runtime, not an automation of a normal user account.
 - Community knowledge/tester commands are public inside the configured guild, but source/spec/repo-file views are not public because implementation specs are for Klim and coding agents.
 - Owner/operator work should mostly go through `/admin ask`; avoid exposing tiny one-off admin/server commands unless Hoops explicitly asks for them.
-- `/admin ask` may pre-resolve plain-text member references such as `@Holly`/`member named Holly`, and may fetch recent messages from the current or explicitly mentioned channel for owner-requested analysis, optionally filtered to a mentioned/user-id target. This is active/on-demand, not passive monitoring.
+- `/admin ask` injects recent owner-only follow-up memory scoped to the same owner + guild + Discord channel/thread, may pre-resolve plain-text member references such as `@Holly`/`member named Holly`, and may fetch recent messages from the current or explicitly mentioned channel for owner-requested analysis, optionally filtered to a mentioned/user-id target. This is active/on-demand, not passive monitoring. Previous turns are context only, never authorization for server mutation.
 - Repository/project reasoning is delegated to local Hermes profile `chaos_redux` through a bounded prompt.
 - Reminder/digest-style automation output defaults to the configured automation reminder channel.
 - Weekly content-dump automation targets the content-dump channel and must stay silent unless it has enough fresh visual assets to make an image-led post.
@@ -24,6 +24,7 @@
 
 - Do not add Message Content intent unless explicitly approved.
 - Hoops wants ChaosX to have maximum server control on the Discord side, but execution must remain owner-only through `/admin ask`; do not expose public or cluttery moderation/member-management commands.
+- `/admin ask` follow-up memory must remain private, owner-scoped, channel/thread-scoped, and resettable with `reset context`.
 - Do not create/delete/rename/reorder channels or roles from generic public `/ask` output.
 - Do not create announcements, scheduled events, or PRs without a preview + owner confirmation flow.
 - Public `/issue` may create GitHub issues only through its validated AI-reviewed report form.

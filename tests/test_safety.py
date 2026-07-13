@@ -1,5 +1,5 @@
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_context_requested, community_help_text, extract_member_search_queries, extract_requested_channel_id, extract_requested_user_id, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, community_help_text, extract_member_search_queries, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -61,6 +61,8 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.automation_reminder_channel_id == 1395464062367698977
     assert settings.content_dump_channel_id == 1516054706286235768
     assert settings.admin_context_message_limit == 120
+    assert settings.admin_ask_memory_turns == 5
+    assert settings.admin_ask_memory_keep_last == 20
 
 
 def test_operator_help_explains_when_to_use_admin_commands():
@@ -69,6 +71,7 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale" in help_text
     assert "/admin ask request:<text>" in help_text
     assert "analyze recent channel/user messages" in help_text
+    assert "reset context" in help_text
     assert "/server ask" not in help_text
     assert "/hermes" not in help_text
     assert "/admin config" not in help_text
@@ -90,6 +93,20 @@ def test_admin_context_helpers_extract_targets_and_sanitize_text():
     assert "channel:234567890123456789" in text
     assert extract_member_search_queries("timeout @Holly after preview") == ["Holly"]
     assert extract_member_search_queries("resolve member named Holly") == ["Holly"]
+
+
+def test_admin_ask_memory_context_is_scoped_and_sanitized():
+    assert admin_ask_memory_reset_requested("reset context")
+    assert admin_ask_memory_reset_requested("clear admin ask context please")
+    assert not admin_ask_memory_reset_requested("reset the event catalog")
+    context = format_admin_ask_memory_context([
+        ("2026-07-13T00:00:00+00:00", "abcdef1234567890", "ok", "check <@123456789012345678>", "found @everyone token=secret"),
+    ])
+    assert "Previous /admin ask context" in context
+    assert "current owner request overrides" in context
+    assert "user:123456789012345678" in context
+    assert "@everyone" not in context
+    assert "secret" not in context
 
 
 def test_community_help_uses_search_and_root_feedback_commands():

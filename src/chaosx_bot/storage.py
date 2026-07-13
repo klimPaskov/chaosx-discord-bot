@@ -28,6 +28,21 @@ CREATE TABLE IF NOT EXISTS hermes_runs (
     output_excerpt TEXT
 );
 
+CREATE TABLE IF NOT EXISTS admin_ask_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    actor_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    channel_id INTEGER,
+    prompt_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    request TEXT NOT NULL,
+    output_excerpt TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_ask_memory_scope
+ON admin_ask_memory(actor_id, guild_id, channel_id, id);
+
 CREATE TABLE IF NOT EXISTS github_deliveries (
     delivery_id TEXT PRIMARY KEY,
     event TEXT NOT NULL,
@@ -148,6 +163,79 @@ class Store:
                 (now_iso(), actor_id, guild_id, channel_id, prompt_hash, status, output_excerpt[:4000]),
             )
             await db.commit()
+
+    async def record_admin_ask_turn(
+        self,
+        *,
+        actor_id: int,
+        guild_id: int | None,
+        channel_id: int | None,
+        prompt_hash: str,
+        status: str,
+        request: str,
+        output_excerpt: str,
+        keep_last: int = 20,
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO admin_ask_memory(created_at, actor_id, guild_id, channel_id, prompt_hash, status, request, output_excerpt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now_iso(), actor_id, guild_id, channel_id, prompt_hash, status, request[:2000], output_excerpt[:4000]),
+            )
+            if keep_last > 0:
+                await db.execute(
+                    """
+                    DELETE FROM admin_ask_memory
+                    WHERE actor_id = ?
+                      AND guild_id IS ?
+                      AND channel_id IS ?
+                      AND id NOT IN (
+                          SELECT id FROM admin_ask_memory
+                          WHERE actor_id = ?
+                            AND guild_id IS ?
+                            AND channel_id IS ?
+                          ORDER BY id DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (actor_id, guild_id, channel_id, actor_id, guild_id, channel_id, keep_last),
+                )
+            await db.commit()
+
+    async def list_admin_ask_memory(self, *, actor_id: int, guild_id: int | None, channel_id: int | None, limit: int = 5) -> list[tuple]:
+        if limit <= 0:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT created_at, prompt_hash, status, request, output_excerpt
+                FROM admin_ask_memory
+                WHERE actor_id = ?
+                  AND guild_id IS ?
+                  AND channel_id IS ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (actor_id, guild_id, channel_id, limit),
+            )
+            rows = [tuple(row) for row in await cur.fetchall()]
+        return list(reversed(rows))
+
+    async def clear_admin_ask_memory(self, *, actor_id: int, guild_id: int | None, channel_id: int | None) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                DELETE FROM admin_ask_memory
+                WHERE actor_id = ?
+                  AND guild_id IS ?
+                  AND channel_id IS ?
+                """,
+                (actor_id, guild_id, channel_id),
+            )
+            await db.commit()
+            return cur.rowcount
 
     async def record_github_delivery(self, *, delivery_id: str, event: str, action: str | None, status: str, summary: str) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
