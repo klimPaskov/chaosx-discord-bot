@@ -55,6 +55,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Known' not in status
     assert 'Indexed commit' not in status
     assert 'source docs' not in status
+    testing = knowledge.testing_queue()
+    assert '## Testing queue' in testing
+    assert 'Use this before playtesting' in testing
+    assert 'Event ' in testing
 
 
 def test_knowledge_auto_refreshes_stale_index(tmp_path: Path):

@@ -22,11 +22,11 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Provides:
   - `/help` — public community command guide.
   - `/ask`, `/suggestion`, `/event-idea` — public AI-backed Chaos Redux question/drafting commands.
-  - `/event`, `/scenario`, `/cluster`, `/search`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/cluster` names member events, `/search` replaces the older duplicate `/mechanic`, and `/scenario` reads triggerable SCN scenario docs, not event IDs.
+  - `/event`, `/scenario`, `/cluster`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/cluster` names member events, `/testing` shows events marked as needing playtesting, and `/scenario` reads triggerable SCN scenario docs, not event IDs.
   - `/event-idea` formats a rough event idea with name, ID placeholder, type, baseline description, evolutions, world-end/scenario hooks, testing notes, and overlap/gap notes.
   - `/issue` — validates bug/crash/enhancement/balance/content/general reports and creates a GitHub issue in `CHAOSX_GITHUB_REPO`; bugs/crashes require relevant `error.log` lines.
   - `/work ...` — protected issue-style drafts, handoffs, changelog, and release draft command family.
-  - `/playtest ...` — queue/schedule/report/summary/cancel command family.
+  - `/playtest queue` shows the same testing queue, `/playtest report event_id:<id> observation:<text>` records tester feedback, and `/playtest summary` recaps reports. Scheduling/cancel helpers are protected.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
   - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family. `/admin help` explains what each admin-only command is for and when to use it.
   - `/server ...` — protected autonomous ask, role audit, behaviour scan, member info, role assignment/removal, and timeout commands.
@@ -99,5 +99,5 @@ The second command should exit with a missing-token error unless `.env` has `CHA
 1. Add the real Chaos Redux guild ID to `.env`.
 2. Start the bot and run `/health` privately.
 3. Run `/inventory` in the target server and save the baseline output.
-4. Add command groups incrementally: playtest scheduling, issue drafts, repo search, GitHub webhook receiver.
+4. Add command groups incrementally: playtest scheduling, issue drafts, GitHub webhook receiver.
 5. Keep write-capable features behind explicit owner confirmation.

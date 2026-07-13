@@ -76,6 +76,35 @@ class Knowledge:
             f"- Scenario list: {scenario_text}\n"
         )
 
+    def testing_queue(self, limit: int = 10) -> str:
+        """Return a simple tester-facing list of events that need playtesting."""
+        self.ensure_index()
+        conn = connect(self.db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT event_id, name, type, cluster_id, member_severity, details
+                FROM catalog_events
+                WHERE status LIKE '%Needs Testing%'
+                ORDER BY CAST(event_id AS INTEGER)
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return "## Testing queue\nNo events are currently marked `Needs Testing` in the catalog."
+        lines = [
+            "## Testing queue",
+            "Use this before playtesting to pick an event that needs feedback. After testing, use `/playtest report` with the event ID and what happened.",
+            "",
+        ]
+        for event_id, name, type_, cluster_id, severity, details in rows:
+            summary = _clean_snippet(details)[:220] if details else "No details available."
+            lines.append(f"- `Event {int(event_id):03d}` **{name}** — {type_ or 'unknown'}; cluster `{cluster_id or 'none'}`; severity `{severity or 'none'}`. {summary}")
+        return "\n".join(lines)
+
     def search(self, query: str, scope: str = "all", limit: int = 5, show_evidence: bool = False) -> str:
         self.ensure_index()
         safe_query = _fts_query(query)
@@ -283,7 +312,7 @@ class Knowledge:
     def help(self, topic: str = "all") -> str:
         return (
             "## ChaosX help\n"
-            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/search`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest queue`.\n"
+            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest queue`.\n"
             "Commands that use AI say so in `/help`; lookup commands are usually faster for exact event, scenario, cluster, and testing info."
         )
 

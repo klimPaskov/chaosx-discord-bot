@@ -183,20 +183,27 @@ def _stable_id(prefix: str, *parts: object) -> str:
     return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
 
 
+def _event_label(event_id: str) -> str:
+    value = event_id.strip()
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if digits:
+        return f"event id `{int(digits)}`"
+    return f"event `{value or 'unknown'}`"
+
+
 def community_help_text() -> str:
     return """## ChaosX community help
-Use ChaosX for Chaos Redux event info, scenario info, project search, issue reports, testing notes, and cleaner idea/report drafts.
+Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing notes, and cleaner idea/report drafts.
 
-### Ask or search
-- `/ask question:<text>` — uses AI to answer broader Chaos Redux questions.
-- `/search query:<text>` — search events, mechanics, docs, specs, and testing info when you do not know the exact command.
+### Ask
+- `/ask question:<text>` — uses AI to answer any Chaos Redux question.
 
 ### Look things up
 - `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, and evolutions.
 - `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry.
 - `/cluster cluster:<id or name>` — event cluster summary with member event names.
 - `/status` — project catalog totals and event breakdowns.
-- `/testing query:<text>` — find testing notes or queues matching a topic.
+- `/testing` — show events currently marked as needing testing.
 
 ### Report or draft feedback
 - `/issue` — create a formatted GitHub issue after ChaosX validates the report fields. Bugs/crashes require relevant `error.log` lines.
@@ -205,10 +212,10 @@ Use ChaosX for Chaos Redux event info, scenario info, project search, issue repo
 
 ### Playtest notes
 - `/playtest queue` — use before testing to see what needs attention.
-- `/playtest report` — use after testing something to record what happened, what broke, or what felt off.
-- `/playtest summary` — use after multiple reports to recap the current findings.
+- `/playtest report event_id:<id> observation:<text>` — use after testing an event to record what happened, what broke, or what felt off.
+- `/playtest summary` — use after several reports to recap recorded findings.
 
-Tip: use `/search` for mechanics, event systems, and general project lookup."""
+Tip: use `/ask` when you need a flexible explanation; use exact lookup commands for events, scenarios, clusters, status, and testing."""
 
 
 def operator_help_text(settings: Settings) -> str:
@@ -241,7 +248,8 @@ Use this when you want private controls. Regular users should mostly use `/help`
 - `/work handoff` — make a protected Codex/Hermes handoff prompt.
 - `/work changelog` — draft player-facing changelog text.
 - `/work release-draft` — draft announcement/release notes; does not publish.
-- `/playtest schedule` / `/playtest cancel` — manage playtest records.
+- `/playtest queue` — public tester queue; `/playtest report` records event feedback; `/playtest summary` recaps reports.
+- `/playtest schedule` / `/playtest cancel` — protected/owner scheduling helpers.
 
 ### Hermes tools
 - `/hermes route` — choose the right agent/skill route for a task.
@@ -559,17 +567,13 @@ def register_commands(bot: ChaosXBot) -> None:
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster), owner_render=lambda: bot.knowledge.cluster(cluster, show_evidence=True))
 
-    @bot.tree.command(name="search", description="Search public-facing Chaos Redux info.")
-    async def chaosx_search(interaction: discord.Interaction, query: str, scope: str = "all") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx search", summary=query, render=lambda: bot.knowledge.search(query, scope=scope, limit=8), owner_render=lambda: bot.knowledge.search(query, scope=scope, limit=8, show_evidence=True))
-
     @bot.tree.command(name="status", description="Show Chaos Redux catalog totals and breakdowns.")
     async def chaosx_status(interaction: discord.Interaction, entity: str = "global", surface: str = "all") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx status", summary=entity, render=bot.knowledge.status, owner_render=bot.knowledge.status)
 
-    @bot.tree.command(name="testing", description="Show prioritized testing queue.")
-    async def chaosx_testing(interaction: discord.Interaction, kind: str = "all", limit: int = 10) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary=kind, render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit), owner_render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit, show_evidence=True))
+    @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
+    async def chaosx_testing(interaction: discord.Interaction) -> None:
+        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary="queue", render=bot.knowledge.testing_queue, owner_render=bot.knowledge.testing_queue)
 
 
     @bot.tree.command(name="suggestion", description="Clean up a Chaos Redux suggestion and note likely overlap.")
@@ -680,9 +684,9 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
     async def work_release_draft(interaction: discord.Interaction, tag: str) -> None:
         await run_owner_hermes(bot, interaction, f"/work release-draft tag={tag!r}. Draft only; do not publish or announce.", command_name="work release-draft")
 
-    @playtest.command(name="queue", description="Show playtest queue.")
-    async def playtest_queue(interaction: discord.Interaction, kind: str = "all") -> None:
-        await run_hermes_command(bot, interaction, f"/playtest queue kind={kind!r}. Keep it concise and community-facing.", command_name="playtest queue")
+    @playtest.command(name="queue", description="Show events that need playtesting.")
+    async def playtest_queue(interaction: discord.Interaction) -> None:
+        await send_scripted_response(bot, interaction, command_name="playtest queue", summary="queue", render=bot.knowledge.testing_queue, owner_render=bot.knowledge.testing_queue)
 
     @playtest.command(name="schedule", description="Prepare a playtest Scheduled Event plan.")
     async def playtest_schedule(interaction: discord.Interaction, target: str, start: str, duration: int, voice: str = "none", build: str = "") -> None:
@@ -694,13 +698,16 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="playtest schedule", summary=playtest_id)
         await interaction.response.send_message(preview, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    @playtest.command(name="report", description="Draft a structured playtest report.")
-    async def playtest_report(interaction: discord.Interaction, event: str, observation: str) -> None:
-        report = {"event": event, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
-        await bot.store.add_playtest_report(playtest_id=event, report=report)
-        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event, render=lambda: f"Recorded playtest observation for `{event}` if that draft exists.\n```text\n{observation[:1500]}\n```")
+    @playtest.command(name="report", description="Record what happened while testing one event.")
+    async def playtest_report(interaction: discord.Interaction, event_id: str, observation: str) -> None:
+        label = _event_label(event_id)
+        playtest_id = _stable_id("playtest", interaction.user.id, interaction.created_at.isoformat(), event_id, observation)
+        report = {"event_id": event_id, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
+        await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=label.replace('`', ''), start_time="", duration_minutes=0, voice="", build="")
+        await bot.store.add_playtest_report(playtest_id=playtest_id, report=report)
+        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id, render=lambda: f"Recorded playtest observation for {label}.\n```text\n{observation[:1500]}\n```")
 
-    @playtest.command(name="summary", description="Summarize a playtest.")
+    @playtest.command(name="summary", description="Summarize recorded playtest reports.")
     async def playtest_summary(interaction: discord.Interaction, event: str = "latest") -> None:
         rows = await bot.store.list_playtests(limit=10)
         lines = ["## Playtest records"]
