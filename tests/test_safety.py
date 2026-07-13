@@ -1,4 +1,5 @@
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner
+from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 
 
@@ -25,3 +26,9 @@ def test_prompt_boundary_contains_untrusted_content_warning():
 def test_prompt_hash_is_stable():
     assert prompt_hash("abc") == prompt_hash("abc")
     assert prompt_hash("abc") != prompt_hash("abcd")
+
+
+def test_blank_optional_guild_ids_are_allowed():
+    settings = Settings(CHAOSX_DISCORD_TOKEN="dummy", CHAOSX_ALLOWED_GUILD_ID="", CHAOSX_COMMAND_GUILD_ID="")
+    assert settings.allowed_guild_id is None
+    assert settings.command_guild_id is None

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     owner_id: int = Field(default=789502982122373150, description="Only this Discord user ID may use ChaosX")
     allowed_guild_id: Optional[int] = Field(default=None)
     command_guild_id: Optional[int] = Field(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def blank_optional_ints_to_none(cls, data):
+        if isinstance(data, dict):
+            for key in ("allowed_guild_id", "command_guild_id"):
+                if data.get(key) == "":
+                    data[key] = None
+        return data
 
     chaos_redux_repo: Path = Field(default=Path("/home/klim/projects/chaos_redux"))
     hermes_bin: Path = Field(default=Path("/home/klim/.local/bin/hermes"))
