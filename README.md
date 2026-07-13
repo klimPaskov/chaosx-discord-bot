@@ -1,6 +1,6 @@
 # ChaosX Discord Bot
 
-Community-facing Discord knowledge bot plus protected operations agent for the Chaos Redux server.
+Community-facing Discord knowledge bot for the Chaos Redux server, with separate admin tools for operators.
 
 ChaosX is intended for the Chaos Redux community to ask bounded project questions while keeping operational/admin actions restricted to the configured owner Discord user ID. Public token-consuming commands are rate-limited and length-limited.
 
@@ -12,7 +12,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Optional guild lock with `CHAOSX_ALLOWED_GUILD_ID`.
 - Uses no Message Content privileged intent by default.
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
-- Bot presence/description: `Community Chaos Redux knowledge bot with protected operations` / watching `Chaos Redux ops`.
+- Bot presence/description: `Chaos Redux community knowledge bot` / watching `Chaos Redux ops`.
 - Public limits by default: 3 broad `/ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
 - Broad ask model override: `CHAOSX_ASK_PROVIDER=openai-codex`, `CHAOSX_ASK_MODEL=gpt-5.6-luna`, `CHAOSX_ASK_REASONING_EFFORT=medium`.
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=openai-codex`, `CHAOSX_OPERATOR_MODEL=gpt-5.6-luna`, `CHAOSX_OPERATOR_REASONING_EFFORT=xhigh`.

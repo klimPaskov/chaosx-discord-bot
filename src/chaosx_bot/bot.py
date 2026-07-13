@@ -14,7 +14,7 @@ from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
 from .webhook_server import GitHubWebhookServer
 
-BOT_DESCRIPTION = "Community Chaos Redux knowledge bot with protected operations"
+BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
 
 
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
@@ -78,7 +78,7 @@ def community_help_text() -> str:
 `/work suggestion`, `/work event-idea` — draft/check ideas without creating GitHub issues.
 `/playtest queue`, `/playtest report`, `/playtest summary` — playtest info/reporting.
 
-Public broad ask is rate-limited; scripted lookups should be preferred. Admin/operator commands are under `/admin`, `/server`, and `/hermes`."""
+General questions are rate-limited; lookups are usually faster and more reliable for event, scenario, mechanic, and testing info."""
 
 
 def operator_help_text(settings: Settings) -> str:

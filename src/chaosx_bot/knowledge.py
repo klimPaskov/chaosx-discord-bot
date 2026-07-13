@@ -172,7 +172,7 @@ class Knowledge:
         return (
             "## ChaosX help\n"
             "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/source`, `/status`, `/testing`, `/repo search`, `/repo file`, `/work suggestion`, `/work event-idea`, `/playtest queue`.\n"
-            "Admin/automation commands are restricted. Public broad ask is rate-limited."
+            "General questions are rate-limited; lookup commands are usually faster for event, scenario, mechanic, and testing info."
         )
 
     def _find_event(self, event: str):
