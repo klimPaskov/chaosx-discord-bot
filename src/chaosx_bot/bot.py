@@ -182,7 +182,7 @@ async def send_scripted_response(
     command_name: str,
     summary: str,
     render,
-    public: bool = False,
+    public: bool = True,
 ) -> None:
     if not await public_gate(interaction, bot.settings):
         return
@@ -208,7 +208,7 @@ async def run_hermes_command(
     request: str,
     *,
     command_name: str,
-    public: bool = False,
+    public: bool = True,
     owner_only: bool = False,
     rate_bucket: str = "scripted",
     use_ask_model: bool = False,
@@ -280,7 +280,7 @@ async def run_hermes_command(
         command=command_name,
         summary=request,
     )
-    header = f"ChaosX `{status}` hash `{result.prompt_hash[:12]}`"
+    header = "ChaosX answer" if public else f"ChaosX `{status}` hash `{result.prompt_hash[:12]}`"
     for i, part in enumerate(_chunk(output)):
         await interaction.followup.send(
             (header + "\n" if i == 0 else "") + part,
@@ -309,7 +309,7 @@ def register_commands(bot: ChaosXBot) -> None:
     async def root_help(interaction: discord.Interaction) -> None:
         if not await public_gate(interaction, settings):
             return
-        await interaction.response.send_message(community_help_text(), ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        await interaction.response.send_message(community_help_text(), ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
     @bot.tree.command(name="operator-help", description="Show protected ChaosX operator commands.")
     @app_commands.default_permissions(administrator=True)
@@ -392,9 +392,9 @@ def register_commands(bot: ChaosXBot) -> None:
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
     server = app_commands.Group(name="server", description="Protected Discord server administration", default_permissions=discord.Permissions(administrator=True))
 
-    @chaosx.command(name="ask", description="Answer a Chaos Redux question with evidence.")
-    async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "private") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx ask question={question!r} visibility={visibility!r}. Answer with evidence footer.", command_name="chaosx ask", public=visibility == "public", rate_bucket="ask", use_ask_model=True)
+    @chaosx.command(name="ask", description="Answer a Chaos Redux question.")
+    async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "public") -> None:
+        await run_hermes_command(bot, interaction, f"/chaosx ask question={question!r} visibility={visibility!r}. Answer concisely for the community; do not include internal source/debug metadata unless asked.", command_name="chaosx ask", public=visibility != "private", rate_bucket="ask", use_ask_model=True)
 
     @chaosx.command(name="event", description="Look up an event by ID or name.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
@@ -493,7 +493,7 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @playtest.command(name="queue", description="Show playtest queue.")
     async def playtest_queue(interaction: discord.Interaction, kind: str = "all") -> None:
-        await run_hermes_command(bot, interaction, f"/playtest queue kind={kind!r}. Include evidence for ordering.", command_name="playtest queue")
+        await run_hermes_command(bot, interaction, f"/playtest queue kind={kind!r}. Keep it concise and community-facing.", command_name="playtest queue")
 
     @playtest.command(name="schedule", description="Prepare a playtest Scheduled Event plan.")
     async def playtest_schedule(interaction: discord.Interaction, target: str, start: str, duration: int, voice: str = "none", build: str = "") -> None:

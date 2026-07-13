@@ -16,6 +16,9 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     knowledge = Knowledge(repo, db)
     event = knowledge.event('2')
     assert 'Zombie Outbreak' in event
-    assert 'Evidence:' in event
+    assert 'Evidence:' not in event
+    assert 'docs/spreadsheets' not in event
+    search = knowledge.search('Zombie Outbreak')
+    assert 'Evidence:' not in search
     search = knowledge.search('Zombie Outbreak', limit=2)
     assert 'Search results' in search

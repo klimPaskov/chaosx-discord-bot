@@ -46,8 +46,8 @@ class Knowledge:
             f"- Indexed commit: `{meta.get('commit_sha', 'unknown')}`\n"
             f"- Last sync: `{indexed_at}`\n"
             f"- Indexed source docs: `{docs}`\n"
-            f"- Catalog events: `{events}`\n"
-            f"- Catalog clusters: `{clusters}`\n"
+            f"- Known events: `{events}`\n"
+            f"- Known clusters: `{clusters}`\n"
             f"- Dirty state: `{('yes' if dirty else 'no')}`\n"
             + (f"\n```text\n{dirty[:1200]}\n```" if dirty else "")
         )
@@ -81,26 +81,25 @@ class Knowledge:
             return f"No indexed results for `{query}`."
         lines = [f"## Search results for `{query}`"]
         for i, (path, source_class, commit, indexed_at, snip, _rank) in enumerate(rows, 1):
-            lines.append(f"{i}. `{path}` — {source_class}\n   {snip}\n   Evidence: `{commit[:12]}` · synced `{_fmt_ts(indexed_at)}`")
+            lines.append(f"{i}. `{path}`\n   {snip}")
         return "\n".join(lines)
 
     def event(self, event: str, view: str = "overview") -> str:
         self.ensure_index()
         row = self._find_event(event)
         if not row:
-            return self.search(event, scope="all", limit=5) + "\n\nNo exact event catalog match; showing search results instead."
+            return self.search(event, scope="all", limit=5) + "\n\nNo exact event match; showing search results instead."
         keys = ["row_key", "event_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
         data = dict(zip(keys, row))
         event_label = f"Event {data['event_id']}: {data['name']}" if data["event_id"] else f"Unassigned event idea: {data['name']}"
-        paths = self._entity_paths(data["event_id"], data["name"])
         lines = [
             f"## {event_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
-            f"- Catalog status: `{data['status'] or 'unknown'}`",
+            f"- Status: `{data['status'] or 'unknown'}`",
             f"- Cluster: `{data['cluster_id'] or 'none'}`",
             f"- Member severity: `{data['member_severity'] or 'none'}`",
             "",
-            data["details"][:MAX_EXCERPT_CHARS] or "No details in catalog.",
+            data["details"][:MAX_EXCERPT_CHARS] or "No details available.",
         ]
         evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
         shown_evos = [f"- **{label}:** {text[:400]}" for label, text in evos if text]
@@ -108,9 +107,6 @@ class Knowledge:
             lines += ["", "### Evolution tracks", *shown_evos]
         if data["world_end"]:
             lines += ["", "### World-end relationship", data["world_end"][:700]]
-        if paths:
-            lines += ["", "### Source paths", *[f"- `{p}` — {sc}" for p, sc in paths[:12]]]
-        lines += ["", self._footer("catalog", "docs/spreadsheets/chaos_redux_events_catalog.csv")]
         return "\n".join(lines)
 
     def cluster(self, cluster: str) -> str:
@@ -124,7 +120,7 @@ class Knowledge:
         finally:
             conn.close()
         if not row:
-            return f"No registered cluster match for `{cluster}`. Planned clusters without IDs must remain unassigned."
+            return f"No registered cluster match for `{cluster}`. Planned clusters without IDs remain unassigned."
         row_key, cluster_id, name, details, members, type_, chaos_level, status, indexed_at = row
         label = f"Cluster {cluster_id}: {name}" if cluster_id else f"Planned cluster idea: {name}"
         return (
@@ -133,8 +129,7 @@ class Knowledge:
             f"- Chaos level: `{chaos_level or 'unknown'}`\n"
             f"- Members: `{members or 'none'}`\n"
             f"- Status: `{status or 'unknown'}`\n\n"
-            f"{details or 'No details in catalog.'}\n\n"
-            f"{self._footer('catalog', 'docs/spreadsheets/chaos_redux_clusters_catalog.csv')}"
+            f"{details or 'No details available.'}"
         )
 
     def source(self, query: str) -> str:
@@ -145,7 +140,6 @@ class Knowledge:
         lines = [f"## Source map for `{query}`"]
         for path, source_class in paths[:20]:
             lines.append(f"- `{path}` — {source_class}")
-        lines.append("\nPrecedence: accepted specs for intended design; implementation files for current behavior; localisation for player-facing text; catalogs for status/overview; plans as queued/dispositioned work.")
         return "\n".join(lines)
 
     def file_excerpt(self, rel_path: str, lines: str = "") -> str:
@@ -165,7 +159,7 @@ class Knowledge:
         return (
             "## ChaosX help\n"
             "Community commands: `/chaosx ask`, `/chaosx event`, `/chaosx scenario`, `/chaosx cluster`, `/chaosx mechanic`, `/chaosx search`, `/chaosx source`, `/chaosx status`, `/chaosx testing`, `/repo search`, `/repo file`, `/work suggestion`, `/work event-idea`, `/playtest queue`.\n"
-            "Admin/automation commands are restricted. Public broad ask is rate-limited. Evidence footers show source class, paths, commit, sync time, and confidence when available."
+            "Admin/automation commands are restricted. Public broad ask is rate-limited."
         )
 
     def _find_event(self, event: str):
@@ -200,15 +194,6 @@ class Knowledge:
             return found
         finally:
             conn.close()
-
-    def _footer(self, source_class: str, path: str) -> str:
-        conn = connect(self.db_path)
-        try:
-            meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
-        finally:
-            conn.close()
-        return f"Evidence: {source_class} · `{path}` · commit `{meta.get('commit_sha', 'unknown')[:12]}` · synced `{_fmt_ts(meta.get('indexed_at'))}` · confidence high"
-
 
 def _git(repo: Path, args: list[str]) -> str:
     try:
