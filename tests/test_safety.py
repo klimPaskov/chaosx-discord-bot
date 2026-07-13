@@ -29,6 +29,11 @@ def test_prompt_hash_is_stable():
 
 
 def test_blank_optional_guild_ids_are_allowed():
-    settings = Settings(CHAOSX_DISCORD_TOKEN="dummy", CHAOSX_ALLOWED_GUILD_ID="", CHAOSX_COMMAND_GUILD_ID="")
+    settings = Settings(
+        _env_file=None,
+        allowed_guild_id="",
+        command_guild_id="",
+        discord_token="dummy",
+    )
     assert settings.allowed_guild_id is None
     assert settings.command_guild_id is None

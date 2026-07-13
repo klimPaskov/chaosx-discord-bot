@@ -45,6 +45,11 @@ class ChaosXBot(discord.Client):
             guild = discord.Object(id=self.settings.command_guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
+            # Avoid duplicate slash commands: during initial setup we briefly
+            # synced globals, so clear global commands once guild-scoped commands
+            # are registered. ChaosX is intended to live only in the configured guild.
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync(guild=None)
         else:
             await self.tree.sync()
 

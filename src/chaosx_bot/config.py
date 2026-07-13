@@ -17,7 +17,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    discord_token: str = Field(default="", description="Discord bot token")
+    discord_token: str = Field(default="", description="Discord bot token", repr=False)
     owner_id: int = Field(default=789502982122373150, description="Only this Discord user ID may use ChaosX")
     allowed_guild_id: Optional[int] = Field(default=None)
     command_guild_id: Optional[int] = Field(default=None)
