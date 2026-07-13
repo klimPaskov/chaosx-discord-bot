@@ -1,0 +1,28 @@
+# secrets
+.env
+*.env
+config.local.toml
+
+# runtime
+*.db
+*.db-shm
+*.db-wal
+logs/
+run/
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.dist/
+dist/
+build/
+*.egg-info/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
