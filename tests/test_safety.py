@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -53,6 +53,7 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.command_guild_id == 1395459671598436533
     assert settings.github_repo == "klimPaskov/Chaos-Redux"
     assert settings.public_ask_limit_per_hour == 10
+    assert settings.mention_ask_enabled is True
     assert settings.hermes_timeout_seconds == 900
     assert settings.admin_ask_timeout_seconds == 0
     assert settings.ask_model == "gpt-5.6-luna"
@@ -144,6 +145,7 @@ def test_community_help_uses_search_and_root_feedback_commands():
     assert "/search" not in help_text
     assert "/mechanic" not in help_text
     assert "uses AI to answer any Chaos Redux question" in help_text
+    assert "@ChaosX <question>" in help_text
     assert "world-end scenario notes" in help_text
     assert "uses AI to review a report form" in help_text
     assert "It shows your remaining asks" not in help_text
@@ -223,6 +225,15 @@ def test_public_ask_detects_explicit_source_requests():
     assert public_ask_wants_sources("Where is Zombie Outbreak stored in the repo?")
     assert public_ask_wants_sources("Which files implement the zombie event?")
     assert not public_ask_wants_sources("How does the Zombie Outbreak event work?")
+
+
+def test_mention_ask_extracts_only_direct_bot_mentions():
+    bot_id = 123456789012345678
+    assert extract_mention_ask_request(f"<@{bot_id}> how does Zombie Outbreak work?", bot_id) == "how does Zombie Outbreak work?"
+    assert extract_mention_ask_request(f"hey <@!{bot_id}>, explain Fury", bot_id) == "hey, explain Fury"
+    assert extract_mention_ask_request("how does Zombie Outbreak work?", bot_id) is None
+    assert extract_mention_ask_request("<@999999999999999999> how does Zombie Outbreak work?", bot_id) is None
+    assert extract_mention_ask_request(f"<@{bot_id}>", bot_id) == ""
 
 
 def test_public_ask_output_sanitizer_blocks_leaky_or_offtopic_output():

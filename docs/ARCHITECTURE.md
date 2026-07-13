@@ -2,8 +2,8 @@
 
 ## Current architecture
 
-- `discord.py` interaction-only bot.
-- No Message Content intent.
+- `discord.py` bot with slash commands plus a direct-mention public ask listener.
+- Message Content intent enabled only so `@ChaosX <question>` can reuse `/ask`; no passive public message monitoring.
 - Public community-knowledge command gate plus a small protected admin/automation gate.
 - Single-guild lock for the Chaos Redux server.
 - Local SQLite audit log and automation/job records.
@@ -12,7 +12,7 @@
 ## Design choices
 
 - ChaosX is its own Discord bot identity and runtime, not an automation of a normal user account.
-- Community knowledge/tester commands are public inside the configured guild. Public `/ask` uses a fast prebuilt SQLite/FTS index over the Chaos Redux repo plus whitelisted Chaos Redux Vault folders, but it only retrieves small snippets and still has no filesystem, Discord-management, issue-creation, or command-execution ability. Raw source/spec/repo-file views stay out of the public command surface because implementation specs are for Klim and coding agents.
+- Community knowledge/tester commands are public inside the configured guild. Public `/ask` and direct `@ChaosX <question>` mentions use a fast prebuilt SQLite/FTS index over the Chaos Redux repo plus whitelisted Chaos Redux Vault folders, but only retrieve small snippets and still have no filesystem, Discord-management, issue-creation, or command-execution ability. Raw source/spec/repo-file views stay out of the public command surface because implementation specs are for Klim and coding agents.
 - Owner/operator work should mostly go through `/admin ask`; avoid exposing tiny one-off admin/server commands unless Hoops explicitly asks for them.
 - `/admin ask` injects recent owner-only follow-up memory scoped to the same owner + guild + Discord channel/thread, may pre-resolve plain-text member references such as `@Holly`/`member named Holly`, and may fetch recent messages from the current or explicitly mentioned channel for owner-requested analysis, optionally filtered to a mentioned/user-id target. This is active/on-demand, not passive monitoring. Previous turns are context only, never authorization for server mutation.
 - Public `/event-idea` and `/suggestion` can quietly write approved notes into the Chaos Redux vault. New vault notes refresh `index.md`, `Events/Events Index.md`, `Planning/Community Suggestions/Community Suggestions Index.md`, and `log.md` so references do not go stale. New approved `/event-idea` notes also create a sanitized forum post in the configured event-ideas channel.
@@ -23,7 +23,7 @@
 
 ## Approval gates to preserve
 
-- Do not add Message Content intent unless explicitly approved.
+- Do not broaden Message Content use beyond explicitly mentioned asks and owner-requested `/admin ask` message analysis; no passive public monitoring.
 - Hoops wants ChaosX to have maximum server control on the Discord side, but execution must remain owner-only through `/admin ask`; do not expose public or cluttery moderation/member-management commands.
 - `/admin ask` follow-up memory must remain private, owner-scoped, channel/thread-scoped, and resettable with `reset context`.
 - Do not create/delete/rename/reorder channels or roles from generic public `/ask` output.
@@ -32,7 +32,7 @@
 
 ## Current command shape
 
-- Public: `/help`, `/ask`, `/event`, `/scenario`, `/cluster`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest report`, `/playtest summary`.
+- Public: `/help`, `/ask`, direct `@ChaosX <question>` mentions, `/event`, `/scenario`, `/cluster`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest report`, `/playtest summary`.
 - Protected owner shortcuts: `/admin ask`, `/admin help`, `/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin jobs`, `/admin permissions-audit`, protected `/playtest schedule request:<plain English>` and `/playtest cancel`.
 - Removed from the user command surface: `/server`, `/hermes`, `/work`, `/admin config`, `/admin rollback`, `/search`, `/mechanic`, and tiny role-management commands.
 

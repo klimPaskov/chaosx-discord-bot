@@ -118,6 +118,21 @@ def public_ask_wants_sources(request: str) -> bool:
     return any(term in text for term in PUBLIC_ASK_SOURCE_REQUEST_TERMS)
 
 
+def extract_mention_ask_request(content: str, bot_user_id: int | None) -> str | None:
+    """Return the public-ask text from a direct ChaosX mention, or None if not mentioned."""
+
+    if bot_user_id is None:
+        return None
+    pattern = re.compile(rf"<@!?{re.escape(str(bot_user_id))}>")
+    if not pattern.search(content or ""):
+        return None
+    request = pattern.sub(" ", content or "")
+    request = re.sub(r"\s+([,.;:!?])", r"\1", request)
+    request = re.sub(r"^[\s,;:!\-—–]+", "", request)
+    request = re.sub(r"\s+", " ", request).strip()
+    return request
+
+
 def validate_issue_report(*, issue_type: str, title: str, description: str, steps: str = "", expected: str = "", actual: str = "", error_log_lines: str = "") -> str | None:
     kind = issue_type.casefold().strip()
     if kind not in ISSUE_TYPES:
@@ -325,6 +340,7 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 
 ### Ask
 - `/ask question:<text>` — uses AI to answer any Chaos Redux question.
+- `@ChaosX <question>` — same as `/ask` when you want to ping the bot directly.
 
 ### Look things up
 - `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, evolutions, and world-end scenario notes.
@@ -376,9 +392,11 @@ Removed from your command surface: config dumps, rollback drafts, separate Herme
 class ChaosXBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
-        # Public commands are interaction-first. Admin message analysis fetches
-        # explicit channel history through Discord REST on demand, so the bot can
-        # still start even if Message Content is not toggled in the portal yet.
+        # Mention-triggered public ask needs message content, but stays passive:
+        # ChaosX only responds when its own bot mention is present and still
+        # applies the normal public /ask guild lock, rate limit, prompt cap, and
+        # safe/no-action Hermes toolset.
+        intents.message_content = settings.mention_ask_enabled
         super().__init__(intents=intents, allowed_mentions=safe_allowed_mentions())
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
@@ -436,6 +454,9 @@ class ChaosXBot(discord.Client):
             print(f"ChaosX leaving unauthorized guild {guild.id} ({guild.name})")
             await guild.leave()
 
+    async def on_message(self, message: discord.Message) -> None:
+        await handle_mention_ask(self, message)
+
     async def leave_unauthorized_guilds(self) -> None:
         allowed = self.settings.allowed_guild_id or self.settings.command_guild_id
         if not allowed:
@@ -488,6 +509,106 @@ async def public_gate(interaction: discord.Interaction, settings: Settings) -> b
             await interaction.response.send_message(reason, ephemeral=True, allowed_mentions=safe_allowed_mentions())
         return False
     return True
+
+
+async def handle_mention_ask(bot: ChaosXBot, message: discord.Message) -> None:
+    if not bot.settings.mention_ask_enabled or bot.user is None:
+        return
+    if message.author.bot or getattr(message, "webhook_id", None):
+        return
+    if not any(user.id == bot.user.id for user in getattr(message, "mentions", []) or []):
+        return
+    request = extract_mention_ask_request(message.content or "", bot.user.id)
+    if request is None:
+        return
+    guild_id = message.guild.id if message.guild else None
+    if public_deny_reason(guild_id, bot.settings.allowed_guild_id):
+        return
+    if not request:
+        await message.reply(
+            "Ask me a Chaos Redux question after the mention, like `@ChaosX how does Zombie Outbreak work?`",
+            mention_author=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    await run_public_ask_message(bot, message, request)
+
+
+async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, request: str) -> None:
+    guild_id = message.guild.id if message.guild else None
+    channel_id = getattr(message.channel, "id", None)
+    command_name = "mention ask"
+    rejection = public_ask_rejection_reason(request)
+    if rejection:
+        await message.reply(rejection, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command=command_name, summary="public ask rejected")
+        return
+    max_chars = bot.settings.public_prompt_max_chars
+    if len(request) > max_chars:
+        await message.reply(
+            f"Request is too long for public ChaosX asks. Limit: {max_chars} characters.",
+            mention_author=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    limit = bot.settings.public_ask_limit_per_hour
+    if limit <= 0:
+        await message.reply("Public ChaosX asks are currently disabled.", mention_author=False, allowed_mentions=safe_allowed_mentions())
+        return
+    rate = bot.rate_limiter.check(bucket="ask", user_id=message.author.id, limit=limit, window_seconds=3600)
+    if not rate.allowed:
+        minutes = max(1, rate.retry_after_seconds // 60)
+        await message.reply(
+            f"Rate limit hit for ChaosX `ask` commands. Try again in about {minutes} minute(s).",
+            mention_author=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+
+    guild_name = message.guild.name if message.guild else None
+    channel_name = getattr(message.channel, "name", None)
+    source_paths_allowed = public_ask_wants_sources(request)
+    prompt = build_public_prompt(
+        user_request=request,
+        guild_name=guild_name,
+        channel_name=channel_name,
+        reference_context=bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed),
+        source_paths_allowed=source_paths_allowed,
+    )
+    async with message.channel.typing():
+        result = await run_hermes(
+            hermes_bin=bot.settings.hermes_bin,
+            profile=bot.settings.hermes_profile,
+            repo=bot.settings.chaos_redux_repo,
+            prompt=prompt,
+            timeout_seconds=bot.settings.hermes_timeout_seconds,
+            model=bot.settings.ask_model,
+            provider=bot.settings.ask_provider,
+            reasoning_effort=bot.settings.ask_reasoning_effort,
+            toolsets="safe",
+            ignore_rules=True,
+        )
+    output = result.stdout.strip() or result.stderr.strip() or "No output."
+    if result.timed_out:
+        output = f"Hermes run timed out after {bot.settings.hermes_timeout_seconds}s. Try a narrower Chaos Redux question."
+    output = sanitize_public_ask_output(output)
+    output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
+    status = "ok" if result.ok else "failed"
+    await bot.store.record_hermes_run(
+        actor_id=message.author.id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        prompt_hash=result.prompt_hash,
+        status=status,
+        output_excerpt=output,
+    )
+    await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command=command_name, summary=request)
+    for i, part in enumerate(_chunk(output)):
+        content = ("ChaosX answer\n" if i == 0 else "") + part
+        if i == 0:
+            await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        else:
+            await message.channel.send(content, allowed_mentions=safe_allowed_mentions())
 
 
 async def send_scripted_response(
