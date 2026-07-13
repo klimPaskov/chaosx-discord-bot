@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -323,7 +324,7 @@ def operator_help_text(settings: Settings) -> str:
 Use this only for private owner tools. If you are unsure, use `/admin ask` and write the request normally.
 
 ### Main command
-- `/admin ask request:<text>` — the command you will usually use. Ask it to check Chaos Redux, explain bot/server state, summarize tester reports, draft Codex handoffs, or decide what should be done next. It uses the stronger private model path.
+- `/admin ask request:<text>` — the command you will usually use. Ask it to check Chaos Redux, explain bot/server state, fetch and analyze recent channel/user messages, summarize tester reports, draft Codex handoffs, or decide what should be done next. It uses the stronger private model path.
 
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
@@ -342,7 +343,9 @@ Removed from your command surface: config dumps, rollback drafts, separate Herme
 class ChaosXBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
-        # No Message Content intent by default; ChaosX is interaction-first.
+        # Public commands are interaction-first. Admin message analysis fetches
+        # explicit channel history through Discord REST on demand, so the bot can
+        # still start even if Message Content is not toggled in the portal yet.
         super().__init__(intents=intents, allowed_mentions=safe_allowed_mentions())
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
@@ -492,6 +495,110 @@ async def send_scripted_response(
                 await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
 
+SECRETISH_PATTERN = re.compile(r"(?i)(token|password|secret|api[_-]?key|authorization|cookie)\s*[:=]\s*\S+")
+USER_MENTION_PATTERN = re.compile(r"<@!?(\d{15,25})>")
+CHANNEL_MENTION_PATTERN = re.compile(r"<#(\d{15,25})>")
+
+
+def sanitize_admin_context_text(text: str, *, limit: int = 700) -> str:
+    """Keep fetched Discord context useful while avoiding mentions/secrets."""
+
+    text = SECRETISH_PATTERN.sub(r"\1=[REDACTED]", text or "")
+    text = text.replace("@everyone", "＠everyone").replace("@here", "＠here")
+    text = USER_MENTION_PATTERN.sub(r"user:\1", text)
+    text = CHANNEL_MENTION_PATTERN.sub(r"channel:\1", text)
+    return " ".join(text.split())[:limit]
+
+
+def admin_context_requested(request: str) -> bool:
+    text = request.casefold()
+    return any(term in text for term in ("analyze", "analyse", "summarize", "summarise", "messages", "message history", "recent chat", "what did", "user said"))
+
+
+def extract_requested_user_id(request: str) -> int | None:
+    match = USER_MENTION_PATTERN.search(request)
+    if match:
+        return int(match.group(1))
+    lowered = request.casefold()
+    for marker in ("user id", "userid", "member id"):
+        idx = lowered.find(marker)
+        if idx >= 0:
+            match = re.search(r"\d{15,25}", request[idx: idx + 80])
+            if match:
+                return int(match.group(0))
+    return None
+
+
+def extract_requested_channel_id(request: str) -> int | None:
+    match = CHANNEL_MENTION_PATTERN.search(request)
+    if match:
+        return int(match.group(1))
+    lowered = request.casefold()
+    for marker in ("channel id", "channelid"):
+        idx = lowered.find(marker)
+        if idx >= 0:
+            match = re.search(r"\d{15,25}", request[idx: idx + 80])
+            if match:
+                return int(match.group(0))
+    return None
+
+
+async def fetch_admin_message_context(bot: ChaosXBot, interaction: discord.Interaction, request: str) -> str:
+    """Fetch recent Discord messages for explicit owner/admin analysis requests."""
+
+    if not admin_context_requested(request) or not interaction.guild_id:
+        return ""
+    target_channel_id = extract_requested_channel_id(request) or interaction.channel_id
+    target_user_id = extract_requested_user_id(request)
+    if not target_channel_id:
+        return ""
+
+    limit = bot.settings.admin_context_message_limit
+    fetched: list[dict] | dict
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {bot.settings.discord_token}"}) as session:
+            async with session.get(
+                f"https://discord.com/api/v10/channels/{int(target_channel_id)}/messages",
+                params={"limit": min(limit, 100)},
+            ) as resp:
+                fetched = await resp.json()
+                if resp.status == 403:
+                    return "\n\n## Discord message context\nCould not fetch messages: missing channel access / Read Message History permission."
+                if resp.status >= 400:
+                    return f"\n\n## Discord message context\nCould not fetch messages: Discord HTTP {resp.status}: {fetched}"
+    except Exception as exc:
+        return f"\n\n## Discord message context\nCould not fetch messages: {type(exc).__name__}."
+
+    if not isinstance(fetched, list):
+        return "\n\n## Discord message context\nCould not fetch messages: unexpected Discord response."
+
+    kept: list[str] = []
+    for message in fetched:
+        author = message.get("author") or {}
+        author_id = int(author.get("id") or 0)
+        if target_user_id and author_id != target_user_id:
+            continue
+        content = sanitize_admin_context_text(str(message.get("content") or ""))
+        attachments = message.get("attachments") or []
+        attachment_names = [sanitize_admin_context_text(str(a.get("filename") or "attachment"), limit=120) for a in attachments[:4] if isinstance(a, dict)]
+        if not content and not attachment_names:
+            continue
+        timestamp = str(message.get("timestamp") or "unknown")
+        author_name = sanitize_admin_context_text(str(author.get("username") or author_id), limit=120)
+        suffix = f" attachments={attachment_names}" if attachment_names else ""
+        kept.append(f"- {timestamp} message_id={message.get('id')} author={author_name} author_id={author_id}: {content}{suffix}")
+
+    kept.reverse()
+    if not kept:
+        target = f" from user `{target_user_id}`" if target_user_id else ""
+        return f"\n\n## Discord message context\nFetched {len(fetched)} recent messages in channel `{target_channel_id}` but found no readable text{target}. If messages exist but bodies are empty, enable Message Content Intent for ChaosX in the Discord Developer Portal."
+    header = f"\n\n## Discord message context\nFetched {len(kept)} matching recent messages from channel `{target_channel_id}`"
+    if target_user_id:
+        header += f" for user `{target_user_id}`"
+    header += ". Use this context only for the owner-requested analysis; do not ping users or expose secrets."
+    return header + "\n" + "\n".join(kept[-80:])
+
+
 async def run_hermes_command(
     bot: ChaosXBot,
     interaction: discord.Interaction,
@@ -546,9 +653,11 @@ async def run_hermes_command(
 
     await interaction.response.defer(ephemeral=not public, thinking=True)
     guild_name, channel_name = _guild_channel(interaction)
+    owner_context = await fetch_admin_message_context(bot, interaction, request) if owner_only else ""
+    owner_request = request + owner_context
     source_paths_allowed = public_ask_wants_sources(request) if not owner_only and rate_bucket == "ask" else False
     prompt = (
-        build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
+        build_owner_prompt(owner_request=owner_request, guild_name=guild_name, channel_name=channel_name)
         if owner_only
         else build_public_prompt(
             user_request=request,

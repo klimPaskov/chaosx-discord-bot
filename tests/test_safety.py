@@ -1,5 +1,5 @@
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, community_help_text, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_context_requested, community_help_text, extract_requested_channel_id, extract_requested_user_id, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -57,6 +57,7 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.operator_reasoning_effort == "xhigh"
     assert settings.automation_reminder_channel_id == 1395464062367698977
     assert settings.content_dump_channel_id == 1516054706286235768
+    assert settings.admin_context_message_limit == 120
 
 
 def test_operator_help_explains_when_to_use_admin_commands():
@@ -64,6 +65,7 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/admin health" in help_text
     assert "Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale" in help_text
     assert "/admin ask request:<text>" in help_text
+    assert "analyze recent channel/user messages" in help_text
     assert "/server ask" not in help_text
     assert "/hermes" not in help_text
     assert "/admin config" not in help_text
@@ -71,6 +73,18 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/work" not in help_text
     assert "/issue" not in help_text
     assert "1395464062367698977" in help_text
+
+
+def test_admin_context_helpers_extract_targets_and_sanitize_text():
+    request = "analyze messages from <@123456789012345678> in <#234567890123456789>"
+    assert admin_context_requested(request)
+    assert extract_requested_user_id(request) == 123456789012345678
+    assert extract_requested_channel_id(request) == 234567890123456789
+    text = sanitize_admin_context_text("@everyone token=abc123 <@123456789012345678> <#234567890123456789>")
+    assert "@everyone" not in text
+    assert "abc123" not in text
+    assert "user:123456789012345678" in text
+    assert "channel:234567890123456789" in text
 
 
 def test_community_help_uses_search_and_root_feedback_commands():
