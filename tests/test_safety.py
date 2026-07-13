@@ -60,9 +60,10 @@ def test_ask_model_defaults_to_openai_luna():
 def test_operator_help_explains_when_to_use_admin_commands():
     help_text = operator_help_text(Settings(_env_file=None, discord_token="dummy"))
     assert "/admin health" in help_text
-    assert "Use if lookups look stale or broken" in help_text
-    assert "/server ask request:<text>" in help_text
-    assert "No file/Discord actions" in help_text
+    assert "Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` shows old spreadsheet/docs data" in help_text
+    assert "/admin ask request:<text>" in help_text
+    assert "/server ask" not in help_text
+    assert "Most of the time, use `/admin ask`" in help_text
     assert "/work handoff" in help_text
 
 
@@ -71,6 +72,8 @@ def test_community_help_uses_search_and_root_feedback_commands():
     assert "/search" not in help_text
     assert "/mechanic" not in help_text
     assert "uses AI to answer any Chaos Redux question" in help_text
+    assert "world-end scenario notes" in help_text
+    assert "uses AI to review a report form" in help_text
     assert "It shows your remaining asks" not in help_text
     assert "e.g." not in help_text
     assert "/testing`" in help_text

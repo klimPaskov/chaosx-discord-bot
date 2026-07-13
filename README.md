@@ -23,13 +23,12 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
   - `/help` — public community command guide.
   - `/ask`, `/suggestion`, `/event-idea` — public AI-backed Chaos Redux question/drafting commands.
   - `/event`, `/scenario`, `/cluster`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/cluster` names member events, `/testing` shows events marked as needing playtesting, and `/scenario` reads triggerable SCN scenario docs, not event IDs.
-  - `/event-idea` formats a rough event idea with name, ID placeholder, optional type/cluster/evolutions/world-end/scenario fields, baseline description, testing notes, and overlap/gap notes.
-  - `/issue` — opens a report form, validates bug/crash/enhancement/balance/cosmetic/general reports, and creates a GitHub issue in `CHAOSX_GITHUB_REPO`; bug/crash forms require relevant `error.log` lines, while other report types use expected/desired-result fields instead.
+  - `/event-idea` formats a rough event idea with name, ID placeholder, optional type/cluster/evolutions/world-end/scenario/easter-egg fields, baseline description, testing notes, and overlap/gap notes.
+  - `/issue` — opens a report form, uses AI to review it, then formats approved bug/crash/enhancement/balance/cosmetic/general reports into GitHub issues in `CHAOSX_GITHUB_REPO`; bug/crash forms require relevant `error.log` lines, while other report types use expected/desired-result fields instead.
   - `/work ...` — protected issue-style drafts, handoffs, changelog, and release draft command family.
   - `/testing` shows the tester queue. `/playtest report observation:<text> [event_id:<id>]` records informal tester observations that are not ready for GitHub; `/playtest summary` recaps reports. Scheduling/cancel helpers are protected.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
-  - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family. `/admin help` explains what each admin-only command is for and when to use it.
-  - `/server ...` — protected autonomous ask, role audit, behaviour scan, member info, role assignment/removal, and timeout commands.
+  - `/admin ...` — private owner/operator help, ask, health/sync/reindex/config/permissions/jobs/rollback command family. `/admin ask` is the main private catch-all for server and project operations; `/admin help` explains when to use the smaller shortcuts.
 - Stores a local SQLite audit log in `CHAOSX_DB_PATH`.
 
 ## Security model

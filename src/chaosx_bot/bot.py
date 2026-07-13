@@ -171,6 +171,18 @@ async def submit_validated_issue(
     )
     if validation_error:
         return False, validation_error, None
+    ai_ok, ai_reason = await ai_review_issue_report(
+        bot,
+        issue_type=issue_type,
+        title=title,
+        description=description,
+        steps=steps,
+        expected=expected,
+        actual=actual,
+        error_log_lines=error_log_lines,
+    )
+    if not ai_ok:
+        return False, f"AI review did not approve this report yet: {ai_reason}", None
     body = format_github_issue_body(
         issue_type=issue_type,
         title=title,
@@ -186,6 +198,50 @@ async def submit_validated_issue(
     ok, result = await create_github_issue(bot.settings.github_repo, title=issue_title, body=body)
     await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="issue", summary=issue_title)
     return ok, result, issue_title
+
+
+async def ai_review_issue_report(
+    bot: "ChaosXBot",
+    *,
+    issue_type: str,
+    title: str,
+    description: str,
+    steps: str = "",
+    expected: str = "",
+    actual: str = "",
+    error_log_lines: str = "",
+) -> tuple[bool, str]:
+    prompt = (
+        "Review this Chaos Redux Discord issue report before it is sent to GitHub. "
+        "Approve only if it is about Chaos Redux and has enough concrete information for the selected type. "
+        "Reply with exactly one line starting with APPROVED: or REJECTED:.\n\n"
+        f"Type: {issue_type}\nTitle: {title}\nDescription: {description}\nSteps: {steps}\nExpected: {expected}\nActual: {actual}\nerror.log: {error_log_lines[:2500]}"
+    )
+    result = await run_hermes(
+        hermes_bin=bot.settings.hermes_bin,
+        profile=bot.settings.hermes_profile,
+        repo=bot.settings.chaos_redux_repo,
+        prompt=build_public_prompt(
+            user_request=prompt,
+            guild_name="Chaos Redux",
+            channel_name="issue-review",
+            reference_context="",
+            source_paths_allowed=False,
+        ),
+        timeout_seconds=bot.settings.hermes_timeout_seconds,
+        model=bot.settings.ask_model,
+        provider=bot.settings.ask_provider,
+        reasoning_effort=bot.settings.ask_reasoning_effort,
+        toolsets="safe",
+        ignore_rules=True,
+    )
+    text = (result.stdout or result.stderr).strip().splitlines()[0:1]
+    line = text[0].strip() if text else ""
+    if result.ok and line.upper().startswith("APPROVED"):
+        return True, line
+    if line.upper().startswith("REJECTED"):
+        return False, line
+    return False, line or "AI review failed or returned an unclear result."
 
 
 async def create_github_issue(repo: str, *, title: str, body: str) -> tuple[bool, str]:
@@ -242,14 +298,14 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/ask question:<text>` — uses AI to answer any Chaos Redux question.
 
 ### Look things up
-- `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, and evolutions.
+- `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, evolutions, and world-end scenario notes.
 - `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry.
 - `/cluster cluster:<id or name>` — event cluster summary with member event names.
 - `/status` — project catalog totals and event breakdowns.
 - `/testing` — show events currently marked as needing testing.
 
 ### Report or draft feedback
-- `/issue` — create a formatted GitHub issue through a report form. Bug/crash forms ask for relevant `error.log` lines.
+- `/issue` — uses AI to review a report form; if approved, ChaosX formats it and sends it to GitHub Issues. Bug/crash forms ask for relevant `error.log` lines.
 - `/suggestion suggestion:<idea>` — uses AI to turn a rough suggestion into a clearer review note.
 - `/event-idea idea:<idea>` — uses AI to format an event idea with a name, ID placeholder, type, baseline description, evolutions, and scenario hooks.
 
@@ -262,49 +318,41 @@ Tip: use `/ask` when you need a flexible explanation; use exact lookup commands 
 
 def operator_help_text(settings: Settings) -> str:
     return f"""## ChaosX admin help
-Use this when you want private controls. Regular users should mostly use `/help`, `/ask`, and lookup commands.
+Use this when you want private owner-only controls. If you are unsure, use `/admin ask` and write the task normally.
 
-### Start here
-- `/admin health` — is the bot online, which repo/profile is it using, and what guilds can it see.
-- `/admin config` — show safe config: model, rate limits, guild IDs, webhook on/off. Secrets are not printed.
-- `/admin sync` — light index sync/maintenance request. Use after docs/catalogs changed.
-- `/admin reindex` — rebuild local Chaos Redux search/catalog index. Use if lookups look stale or broken.
-- `/admin permissions-audit` — ask for a permissions/security check. Use after role/bot permission changes.
+### Main command
+- `/admin ask request:<text>` — your catch-all private AI helper for Chaos Redux and Discord-server operations. Use it for things like “summarize recent tester issues,” “check whether commands look stale,” “draft a Codex handoff for zombie bugs,” or “look at the server roles and tell me if anything is risky.” It can inspect and reason more broadly than public `/ask`, but should stop before destructive or broad actions unless you clearly approve them.
 
-### Ask models
-- Public `/ask`: `{settings.ask_provider}` / `{settings.ask_model}` reasoning `{settings.ask_reasoning_effort or 'default'}`. No file/Discord actions.
-- `/admin ask request:<text>` — private project/operator ask. Use for repo/project operations questions, not public chat.
-- `/server ask request:<text>` — smarter server-management ask: `{settings.operator_provider}` / `{settings.operator_model}` reasoning `{settings.operator_reasoning_effort or 'default'}`. Use for Discord-server tasks. It should stop before destructive/broad actions unless explicitly approved.
+### Health / setup
+- `/admin help` — this guide.
+- `/admin health` — quick “is ChaosX alive?” check. Use when commands seem missing, stale, or the bot just restarted.
+- `/admin config` — shows runtime config: model, limits, guild IDs, repo path, DB path, webhook on/off. Use when checking whether the bot is pointed at the right repo/server.
+- `/admin sync` — light maintenance/sync nudge. Use after command/help text changed or when Discord command choices look stale.
+- `/admin reindex` — rebuilds the local Chaos Redux catalog/search DB. Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` shows old spreadsheet/docs data.
 
-### Server tools
-- `/server role-audit` — list elevated roles and hierarchy risks.
-- `/server scan-behaviour` — scan recent visible messages for obvious abuse/spam signals.
-- `/server member-info user:<user>` — private moderation context for one member.
-- `/server add-role` / `/server remove-role` — role changes if Discord permissions and hierarchy allow it.
-- `/server timeout` — timeout a member if permissions allow it.
+### Audits / recovery
+- `/admin permissions-audit` — asks ChaosX to review bot/server/GitHub permissions and explain risks. Use after invite/role/permission changes.
+- `/admin jobs` — checks tracked background jobs or retries a failed one. Use when webhooks/automation were expected to run.
+- `/admin automation action:list` — lists named automation toggles. Use when you want to check whether a bot-side automation is enabled. `enable`/`disable` toggles a named automation if it exists.
+- `/admin rollback deployment:<name>` — drafts rollback steps for a bad deployment. It does not roll back by itself.
 
-### Project/work tools
-- Public `/issue` — validates a report and creates a GitHub issue in `{settings.github_repo}`. Bugs/crashes require relevant `error.log` lines.
+### Project utilities
+- Public `/issue` — AI-reviews a report form; if approved, formats it and creates a GitHub issue in `{settings.github_repo}`.
 - Public `/suggestion` / `/event-idea` — AI-assisted community suggestion cleanup and structured event-idea formatting.
-- `/work issue-draft` — private draft only; no GitHub issue is filed.
-- `/work handoff` — make a protected Codex/Hermes handoff prompt.
-- `/work changelog` — draft player-facing changelog text.
-- `/work release-draft` — draft announcement/release notes; does not publish.
-- `/testing` — public tester queue. `/playtest report` records informal observations; `/playtest summary` recaps reports. Use `/issue` instead when something is a concrete bug/crash/request that should go to GitHub.
-- `/playtest schedule` / `/playtest cancel` — protected/owner scheduling helpers.
+- `/work issue-draft` — private issue-style draft only; no GitHub issue is filed.
+- `/work handoff` — drafts a Codex/Hermes handoff prompt.
+- `/work changelog` — drafts player-facing changelog text.
+- `/work release-draft` — drafts announcement/release notes; does not publish.
+- `/testing` — public tester queue. `/playtest report` records informal observations; `/playtest summary` recaps reports. Use `/issue` for concrete bug/crash/request reports that should go to GitHub.
 
-### Hermes tools
-- `/hermes route` — choose the right agent/skill route for a task.
-- `/hermes task` — create an agent-task preview.
+### Advanced Hermes utilities
+- `/hermes route` — asks which agent/skill route fits a task. Example: “which route should handle a balance audit?”
+- `/hermes task` — creates an agent-task preview. Use when you want to queue work but review the task first.
 - `/hermes status` / `/hermes cancel` — inspect or cancel agent work.
-- `/hermes audit` — route a review/audit.
+- `/hermes audit` — route a focused audit/review.
 - `/hermes review-pr` — review a PR; cannot approve or merge.
 
-### Automation
-- `/admin automation action:list` — list automations.
-- `/admin automation action:enable name:<name>` or `disable` — toggle a named automation.
-- `/admin jobs` — list/retry tracked jobs.
-- `/admin rollback` — prepare rollback instructions; does not perform destructive rollback by itself.
+Most of the time, use `/admin ask`; the smaller commands are shortcuts for repeated maintenance tasks.
 """
 
 
@@ -457,6 +505,7 @@ async def run_hermes_command(
     rate_bucket: str = "scripted",
     use_ask_model: bool = False,
     use_operator_model: bool = False,
+    max_chars_override: int | None = None,
 ) -> None:
     rate = None
     if owner_only:
@@ -472,7 +521,7 @@ async def run_hermes_command(
                 await interaction.response.send_message(rejection, ephemeral=not public, allowed_mentions=safe_allowed_mentions())
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary="public ask rejected")
                 return
-        max_chars = bot.settings.public_prompt_max_chars
+        max_chars = max_chars_override or bot.settings.public_prompt_max_chars
         if len(request) > max_chars:
             await interaction.response.send_message(
                 f"Request is too long for public ChaosX commands. Limit: {max_chars} characters.",
@@ -652,8 +701,8 @@ def register_commands(bot: ChaosXBot) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster), owner_render=lambda: bot.knowledge.cluster(cluster, show_evidence=True))
 
     @bot.tree.command(name="status", description="Show Chaos Redux catalog totals and breakdowns.")
-    async def chaosx_status(interaction: discord.Interaction, entity: str = "global", surface: str = "all") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx status", summary=entity, render=bot.knowledge.status, owner_render=bot.knowledge.status)
+    async def chaosx_status(interaction: discord.Interaction) -> None:
+        await send_scripted_response(bot, interaction, command_name="chaosx status", summary="global", render=bot.knowledge.status, owner_render=bot.knowledge.status)
 
     @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
     async def chaosx_testing(interaction: discord.Interaction) -> None:
@@ -677,6 +726,7 @@ def register_commands(bot: ChaosXBot) -> None:
         evo_v: str = "",
         world_end: str = "",
         triggerable_scenario: str = "",
+        easter_egg: str = "",
     ) -> None:
         extra = {
             "event_type": event_type,
@@ -688,16 +738,18 @@ def register_commands(bot: ChaosXBot) -> None:
             "evo_v": evo_v,
             "world_end": world_end,
             "triggerable_scenario": triggerable_scenario,
+            "easter_egg": easter_egg,
         }
+        request = f"/event-idea idea={idea!r} fields={extra!r}. Format a Chaos Redux event idea draft with name, TBD ID, type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use placeholders for missing parts. Do not assign a real ID or claim acceptance."
         await run_hermes_command(
             bot,
             interaction,
-            f"""/event-idea idea={idea!r} optional_fields={extra!r}. Use AI to format this as a Chaos Redux event idea review draft, not just a duplicate check.
-Include: proposed event name, ID placeholder like TBD-###, event type, baseline description, trigger/conditions if inferable, immediate effects, evolution ideas, world-end relationship if supplied/relevant, triggerable/manual scenario hooks if supplied/relevant, likely cluster/tags, testing notes, and a short overlap/gap note if relevant. Preserve supplied optional fields and leave missing fields as placeholders/questions. Do not allocate a real ID or claim acceptance.""",
+            request,
             command_name="event-idea",
+            max_chars_override=2200,
         )
 
-    @bot.tree.command(name="issue", description="Create a formatted GitHub issue after ChaosX validates the report.")
+    @bot.tree.command(name="issue", description="AI-review a report form, then create a GitHub issue if approved.")
     @app_commands.choices(issue_type=[
         app_commands.Choice(name="Bug", value="bug"),
         app_commands.Choice(name="Crash", value="crash"),
@@ -818,7 +870,7 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
 
     @admin.command(name="ask", description="Protected project/server request through Hermes.")
     async def admin_ask(interaction: discord.Interaction, request: str) -> None:
-        await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_ask_model=True)
+        await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_operator_model=True)
 
     @admin.command(name="health", description="Check ChaosX runtime health.")
     async def admin_health(interaction: discord.Interaction) -> None:
@@ -1034,5 +1086,5 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server timeout", summary=f"{member.id} {minutes}m")
         await interaction.response.send_message(f"Timed out `{member}` for `{minutes}` minute(s).", ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    for group in (work, playtest, hermes, admin, server):
+    for group in (work, playtest, hermes, admin):
         bot.tree.add_command(group)

@@ -312,7 +312,7 @@ def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> 
         scenario_id = str(int(match.group(1)))
         name = match.group(2).strip()
         details = text[start:end].strip()
-        status = "Reserved" if "reserved" in details.casefold() or "placeholder" in details.casefold() else "Implemented"
+        status = "Reserved" if "reserved" in details.casefold() or "placeholder" in details.casefold() else "Fully Functional"
         conn.execute(
             """
             INSERT OR REPLACE INTO catalog_scenarios(row_key, scenario_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
