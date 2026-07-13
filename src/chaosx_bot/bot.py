@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import discord
 import hashlib
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+
+import aiohttp
+import discord
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
 from .config import Settings
-from .hermes_bridge import build_owner_prompt, run_hermes
+from .hermes_bridge import build_owner_prompt, build_public_prompt, run_hermes
 from .knowledge import Knowledge
 from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
@@ -127,6 +129,7 @@ class ChaosXBot(discord.Client):
     async def setup_hook(self) -> None:
         await self.store.init()
         await self.webhook_server.start()
+        await self.update_application_description()
         register_commands(self)
         if self.settings.command_guild_id:
             guild = discord.Object(id=self.settings.command_guild_id)
@@ -150,6 +153,20 @@ class ChaosXBot(discord.Client):
     async def close(self) -> None:
         await self.webhook_server.stop()
         await super().close()
+
+    async def update_application_description(self) -> None:
+        description = self.settings.application_description.strip()
+        if not description:
+            return
+        headers = {"Authorization": f"Bot {self.settings.discord_token}", "Content-Type": "application/json"}
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.patch("https://discord.com/api/v10/applications/@me", json={"description": description}) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        print(f"ChaosX application description update failed: HTTP {response.status} {body[:200]}")
+        except Exception as exc:
+            print(f"ChaosX application description update failed: {type(exc).__name__}: {exc}")
 
 
 async def owner_gate(interaction: discord.Interaction, settings: Settings) -> bool:
@@ -261,14 +278,20 @@ async def run_hermes_command(
 
     await interaction.response.defer(ephemeral=not public, thinking=True)
     guild_name, channel_name = _guild_channel(interaction)
-    prompt = build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
-    model = provider = reasoning_effort = None
+    prompt = (
+        build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
+        if owner_only
+        else build_public_prompt(user_request=request, guild_name=guild_name, channel_name=channel_name)
+    )
+    model = provider = reasoning_effort = toolsets = None
     if use_operator_model:
         model, provider = bot.settings.operator_model, bot.settings.operator_provider
         reasoning_effort = bot.settings.operator_reasoning_effort
     elif use_ask_model:
         model, provider = bot.settings.ask_model, bot.settings.ask_provider
         reasoning_effort = bot.settings.ask_reasoning_effort
+    if not owner_only:
+        toolsets = "safe"
     result = await run_hermes(
         hermes_bin=bot.settings.hermes_bin,
         profile=bot.settings.hermes_profile,
@@ -278,6 +301,7 @@ async def run_hermes_command(
         model=model,
         provider=provider,
         reasoning_effort=reasoning_effort,
+        toolsets=toolsets,
     )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     status = "ok" if result.ok else "failed"

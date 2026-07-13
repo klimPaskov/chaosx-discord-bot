@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     )
 
     discord_token: str = Field(default="", description="Discord bot token", repr=False)
+    application_description: str = Field(default="Ask ChaosX questions about Chaos Redux events, scenarios, mechanics, testing, and mod info.")
     owner_id: int = Field(default=789502982122373150, description="Discord user ID with admin/automation access")
     allowed_guild_id: Optional[int] = Field(default=None)
     command_guild_id: Optional[int] = Field(default=None)
