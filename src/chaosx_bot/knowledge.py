@@ -103,12 +103,12 @@ class Knowledge:
             lines.append(item)
         return "\n".join(lines)
 
-    def public_ask_context(self, query: str, limit: int = 6) -> str:
-        """Return internal retrieval snippets for public /ask without paths/metadata.
+    def public_ask_context(self, query: str, limit: int = 6, include_sources: bool = False) -> str:
+        """Return internal retrieval snippets for public /ask.
 
         Broad ask may use specs and planning docs for accuracy, but user-facing
-        answers must not expose source paths/classes/commits or mention hidden
-        spec documents.
+        answers should not expose source paths/classes/commits by default. When
+        the user explicitly asks for files/sources, include repo-relative paths.
         """
         self.ensure_index()
         safe_query = _fts_query(query)
@@ -116,7 +116,8 @@ class Knowledge:
         try:
             rows = conn.execute(
                 """
-                SELECT snippet(source_docs_fts, 2, '', '', ' … ', 35) AS snip,
+                SELECT d.path, d.source_class,
+                       snippet(source_docs_fts, 2, '', '', ' … ', 35) AS snip,
                        bm25(source_docs_fts) AS rank
                 FROM source_docs_fts
                 JOIN source_docs d ON d.id = source_docs_fts.rowid
@@ -130,11 +131,13 @@ class Knowledge:
             conn.close()
         snippets: list[str] = []
         total = 0
-        for i, (snip, _rank) in enumerate(rows, 1):
+        for i, (path, source_class, snip, _rank) in enumerate(rows, 1):
             clean = _clean_snippet(snip)
             if not clean:
                 continue
             item = f"{i}. {clean}"
+            if include_sources:
+                item = f"{item}\n   Source: {path} ({source_class})"
             if total + len(item) > MAX_CONTEXT_CHARS:
                 break
             snippets.append(item)

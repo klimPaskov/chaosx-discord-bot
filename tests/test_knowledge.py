@@ -39,6 +39,9 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert ask_context
     assert 'docs/' not in ask_context
     assert 'accepted_source_specification' not in ask_context
+    ask_context_with_sources = knowledge.public_ask_context('Zombie Outbreak source path', include_sources=True)
+    assert 'Source:' in ask_context_with_sources
+    assert 'docs/' in ask_context_with_sources or 'events/' in ask_context_with_sources or 'common/' in ask_context_with_sources
     status = knowledge.status()
     assert 'Known scenarios' in status
     assert 'Indexed commit' not in status

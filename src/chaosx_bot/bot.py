@@ -44,6 +44,10 @@ PUBLIC_OUTPUT_FORBIDDEN_TERMS = {
     "safe server moderation", "channel organization", "reporting abuse",
     "ingredients:", "method:", "recipe", "baking steps", "cooking steps",
 }
+PUBLIC_ASK_SOURCE_REQUEST_TERMS = {
+    "path", "paths", "file", "files", "source", "sources", "repo", "repository", "code", "implementation",
+    "where is", "where are", "stored", "located", "spec", "specs", "documentation", "docs",
+}
 
 
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
@@ -84,6 +88,11 @@ def sanitize_public_ask_output(output: str) -> str:
     if any(term in text for term in PUBLIC_OUTPUT_FORBIDDEN_TERMS):
         return PUBLIC_ASK_REDIRECT
     return output
+
+
+def public_ask_wants_sources(request: str) -> bool:
+    text = request.casefold()
+    return any(term in text for term in PUBLIC_ASK_SOURCE_REQUEST_TERMS)
 
 
 def _can_manage_role(guild: discord.Guild, actor: discord.Member, bot_member: discord.Member, role: discord.Role) -> tuple[bool, str]:
@@ -346,6 +355,7 @@ async def run_hermes_command(
 
     await interaction.response.defer(ephemeral=not public, thinking=True)
     guild_name, channel_name = _guild_channel(interaction)
+    source_paths_allowed = public_ask_wants_sources(request) if not owner_only and rate_bucket == "ask" else False
     prompt = (
         build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
         if owner_only
@@ -353,7 +363,8 @@ async def run_hermes_command(
             user_request=request,
             guild_name=guild_name,
             channel_name=channel_name,
-            reference_context=bot.knowledge.public_ask_context(request) if rate_bucket == "ask" else "",
+            reference_context=bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed) if rate_bucket == "ask" else "",
+            source_paths_allowed=source_paths_allowed,
         )
     )
     model = provider = reasoning_effort = toolsets = None
