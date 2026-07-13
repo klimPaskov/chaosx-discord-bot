@@ -31,7 +31,13 @@ class Settings(BaseSettings):
     @classmethod
     def blank_optional_ints_to_none(cls, data):
         if isinstance(data, dict):
-            for key in ("allowed_guild_id", "command_guild_id", "automation_reminder_channel_id", "content_dump_channel_id"):
+            for key in (
+                "allowed_guild_id",
+                "command_guild_id",
+                "automation_reminder_channel_id",
+                "content_dump_channel_id",
+                "community_event_ideas_channel_id",
+            ):
                 if data.get(key) == "":
                     data[key] = None
         return data
@@ -59,6 +65,7 @@ class Settings(BaseSettings):
     community_notes_enabled: bool = Field(default=True, description="Write approved public suggestions/event ideas to the Chaos Redux vault")
     community_event_specs_folder: str = Field(default="Events/Event Specs", description="Vault-relative folder for approved community event idea specs")
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")
+    community_event_ideas_channel_id: Optional[int] = Field(default=1395464994639839356, description="Discord forum/text channel for approved /event-idea posts; blank disables auto-posting")
     automation_reminder_channel_id: Optional[int] = Field(default=1395464062367698977, description="Discord channel for automation reminders/digests")
     content_dump_channel_id: Optional[int] = Field(default=1516054706286235768, description="Discord channel for weekly image-led content dumps")
 

@@ -83,6 +83,34 @@ def fenced(text: str, *, limit: int = 4000) -> str:
     return f"```text\n{text}\n```"
 
 
+def discord_quote(text: object, *, limit: int = 700) -> str:
+    quoted = sanitize_text(text, limit=limit)
+    if not quoted:
+        return "> Not supplied."
+    return "\n".join(f"> {line}" if line else ">" for line in quoted.splitlines())
+
+
+def format_event_idea_post_title(*, raw_idea: str, draft: str) -> str:
+    title = extract_title(draft, raw_idea, fallback_prefix="Community Event Idea")
+    title = re.sub(r"\s+", " ", sanitize_text(title, limit=120)).strip(" `*_#")
+    return (title or "Community Event Idea")[:95]
+
+
+def format_event_idea_post_body(*, raw_idea: str, draft: str, actor_id: int | None = None) -> str:
+    submitter = f"user:{actor_id}" if actor_id else "unknown Discord user"
+    return f"""**New approved Chaos Redux event idea**
+Submitted through `/event-idea` by {submitter}.
+
+**Original idea**
+{discord_quote(raw_idea, limit=900)}
+
+**Formatted draft**
+{sanitize_text(draft, limit=7000)}
+
+_Review note: this is an approved community idea for discussion/review, not a release promise._
+""".strip()
+
+
 def write_unique_note(vault_path: Path, relative_folder: str, filename: str, content: str) -> NoteWriteResult:
     root = vault_path.expanduser().resolve()
     folder = (root / relative_folder).resolve()

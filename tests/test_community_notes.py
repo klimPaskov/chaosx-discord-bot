@@ -1,4 +1,6 @@
 from chaosx_bot.community_notes import (
+    format_event_idea_post_body,
+    format_event_idea_post_title,
     should_write_approved_note,
     write_event_idea_note,
     write_suggestion_note,
@@ -12,6 +14,29 @@ def test_community_note_settings_defaults():
     assert settings.community_notes_enabled is True
     assert settings.community_event_specs_folder == "Events/Event Specs"
     assert settings.community_suggestions_folder == "Planning/Community Suggestions"
+    assert settings.community_event_ideas_channel_id == 1395464994639839356
+
+
+def test_event_idea_channel_post_format_is_safe_and_readable():
+    draft = "# Comet Capital Swap\n\nA token=abc123 comet causes @everyone to swap capitals."
+    title = format_event_idea_post_title(
+        raw_idea="A strange comet causes countries to swap capitals.",
+        draft=draft,
+    )
+    body = format_event_idea_post_body(
+        raw_idea="A strange comet causes countries to swap capitals and pings @here.",
+        draft=draft,
+        actor_id=123,
+    )
+    assert title == "Comet Capital Swap"
+    assert "**New approved Chaos Redux event idea**" in body
+    assert "user:123" in body
+    assert "> A strange comet" in body
+    assert "＠everyone" in body
+    assert "＠here" in body
+    assert "abc123" not in body
+    assert "[REDACTED]" in body
+    assert "vault" not in body.casefold()
 
 
 def test_write_event_idea_note_uses_spec_structure(tmp_path):

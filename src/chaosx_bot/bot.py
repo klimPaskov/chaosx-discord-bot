@@ -12,7 +12,12 @@ import discord
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
-from .community_notes import write_event_idea_note, write_suggestion_note
+from .community_notes import (
+    format_event_idea_post_body,
+    format_event_idea_post_title,
+    write_event_idea_note,
+    write_suggestion_note,
+)
 from .config import Settings
 from .vault_index import refresh_vault_indexes
 from .hermes_bridge import HermesResult, build_owner_prompt, build_public_prompt, run_hermes
@@ -910,6 +915,72 @@ async def run_owner_hermes(
     await run_hermes_command(bot, interaction, request, command_name=command_name, public=public, owner_only=True, use_ask_model=use_ask_model, use_operator_model=use_operator_model)
 
 
+def event_idea_forum_tags(channel: discord.ForumChannel, *, event_type: str = "", cluster: str = "", world_end: str = "") -> list[discord.ForumTag]:
+    available = list(getattr(channel, "available_tags", []) or [])
+    if not available:
+        return []
+    text = f"{event_type} {cluster} {world_end}".casefold()
+    wanted: list[str] = []
+    if "world" in text and "end" in text:
+        wanted.append("world end scenario")
+    if "evolution" in text or "evo" in text:
+        wanted.append("evolution")
+    if "cluster" in text:
+        wanted.append("event cluster")
+    if "minor" in text and "repeat" in text:
+        wanted.append("minor repeatable")
+    if "minor" in text and ("fire" in text or "once" in text):
+        wanted.append("minor fire-once")
+    if "major" in text:
+        wanted.append("major")
+    wanted.append("other")
+    by_name = {tag.name.casefold(): tag for tag in available}
+    for name in wanted:
+        tag = by_name.get(name)
+        if tag:
+            return [tag]
+    return [available[0]]
+
+
+async def post_approved_event_idea(
+    bot: ChaosXBot,
+    *,
+    actor_id: int,
+    raw_idea: str,
+    draft: str,
+    event_type: str = "",
+    cluster: str = "",
+    world_end: str = "",
+) -> str | None:
+    channel_id = bot.settings.community_event_ideas_channel_id
+    if not channel_id:
+        return None
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+    title = format_event_idea_post_title(raw_idea=raw_idea, draft=draft)
+    body = format_event_idea_post_body(raw_idea=raw_idea, draft=draft, actor_id=actor_id)
+    chunks = _chunk(body, limit=1850)
+    if isinstance(channel, discord.ForumChannel):
+        created = await channel.create_thread(
+            name=title,
+            content=chunks[0],
+            applied_tags=event_idea_forum_tags(channel, event_type=event_type, cluster=cluster, world_end=world_end),
+            allowed_mentions=safe_allowed_mentions(),
+            reason="ChaosX approved /event-idea auto-post",
+        )
+        thread = created.thread
+        for part in chunks[1:]:
+            await thread.send(part, allowed_mentions=safe_allowed_mentions())
+        return created.message.jump_url
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        message = await channel.send(chunks[0], allowed_mentions=safe_allowed_mentions())
+        for part in chunks[1:]:
+            await channel.send(part, allowed_mentions=safe_allowed_mentions())
+        return message.jump_url
+    raise TypeError(f"Unsupported event idea channel type: {type(channel).__name__}")
+
+
 class IssueReportModal(discord.ui.Modal):
     def __init__(self, bot: ChaosXBot, issue_type: str):
         super().__init__(title=f"{issue_type.title()} issue report")
@@ -1081,6 +1152,20 @@ def register_commands(bot: ChaosXBot) -> None:
                             reason="ChaosX approved community event idea captured.",
                             changed_path=note.path,
                         )
+                        try:
+                            post_url = await post_approved_event_idea(
+                                bot,
+                                actor_id=interaction.user.id,
+                                raw_idea=idea,
+                                draft=result[1],
+                                event_type=event_type,
+                                cluster=cluster,
+                                world_end=world_end,
+                            )
+                            if post_url:
+                                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post", summary=post_url)
+                        except Exception as exc:
+                            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post error", summary=type(exc).__name__)
                     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
             except Exception as exc:
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)
