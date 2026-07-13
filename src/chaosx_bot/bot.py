@@ -317,42 +317,24 @@ Tip: use `/ask` when you need a flexible explanation; use exact lookup commands 
 
 
 def operator_help_text(settings: Settings) -> str:
+    reminder_channel = settings.automation_reminder_channel_id or "unset"
     return f"""## ChaosX admin help
-Use this when you want private owner-only controls. If you are unsure, use `/admin ask` and write the task normally.
+Use this only for private owner tools. If you are unsure, use `/admin ask` and write the request normally.
 
 ### Main command
-- `/admin ask request:<text>` — your catch-all private AI helper for Chaos Redux and Discord-server operations. Use it for things like “summarize recent tester issues,” “check whether commands look stale,” “draft a Codex handoff for zombie bugs,” or “look at the server roles and tell me if anything is risky.” It can inspect and reason more broadly than public `/ask`, but should stop before destructive or broad actions unless you clearly approve them.
+- `/admin ask request:<text>` — the command you will usually use. Ask it to check Chaos Redux, explain bot/server state, summarize tester reports, draft Codex handoffs, or decide what should be done next. It uses the stronger private model path.
 
-### Health / setup
-- `/admin help` — this guide.
-- `/admin health` — quick “is ChaosX alive?” check. Use when commands seem missing, stale, or the bot just restarted.
-- `/admin config` — shows runtime config: model, limits, guild IDs, repo path, DB path, webhook on/off. Use when checking whether the bot is pointed at the right repo/server.
-- `/admin sync` — light maintenance/sync nudge. Use after command/help text changed or when Discord command choices look stale.
-- `/admin reindex` — rebuilds the local Chaos Redux catalog/search DB. Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` shows old spreadsheet/docs data.
+### Useful shortcuts
+- `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
+- `/admin reindex` — refresh ChaosX's local Chaos Redux catalog/search database. Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale after spreadsheet/docs changes.
+- `/admin sync` — resync slash commands with Discord. Use after I change command names/options and Discord still shows the old version.
 
-### Audits / recovery
-- `/admin permissions-audit` — asks ChaosX to review bot/server/GitHub permissions and explain risks. Use after invite/role/permission changes.
-- `/admin jobs` — checks tracked background jobs or retries a failed one. Use when webhooks/automation were expected to run.
-- `/admin automation action:list` — lists named automation toggles. Use when you want to check whether a bot-side automation is enabled. `enable`/`disable` toggles a named automation if it exists.
-- `/admin rollback deployment:<name>` — drafts rollback steps for a bad deployment. It does not roll back by itself.
+### Automation / diagnostics
+- `/admin automation action:list` — shows which reminder/digest automations are enabled and where they will post. Reminder-style automation output goes to channel `{reminder_channel}`.
+- `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
+- `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
 
-### Project utilities
-- Public `/issue` — AI-reviews a report form; if approved, formats it and creates a GitHub issue in `{settings.github_repo}`.
-- Public `/suggestion` / `/event-idea` — AI-assisted community suggestion cleanup and structured event-idea formatting.
-- `/work issue-draft` — private issue-style draft only; no GitHub issue is filed.
-- `/work handoff` — drafts a Codex/Hermes handoff prompt.
-- `/work changelog` — drafts player-facing changelog text.
-- `/work release-draft` — drafts announcement/release notes; does not publish.
-- `/testing` — public tester queue. `/playtest report` records informal observations; `/playtest summary` recaps reports. Use `/issue` for concrete bug/crash/request reports that should go to GitHub.
-
-### Advanced Hermes utilities
-- `/hermes route` — asks which agent/skill route fits a task. Example: “which route should handle a balance audit?”
-- `/hermes task` — creates an agent-task preview. Use when you want to queue work but review the task first.
-- `/hermes status` / `/hermes cancel` — inspect or cancel agent work.
-- `/hermes audit` — route a focused audit/review.
-- `/hermes review-pr` — review a PR; cannot approve or merge.
-
-Most of the time, use `/admin ask`; the smaller commands are shortcuts for repeated maintenance tasks.
+Removed from your command surface: config dumps, rollback drafts, separate Hermes routing, separate server groups, and tiny role-management commands. Use `/admin ask` instead if you ever need that kind of inspection.
 """
 
 
@@ -375,6 +357,16 @@ class ChaosXBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await self.store.init()
+        if self.settings.automation_reminder_channel_id:
+            await self.store.set_automation_destination(
+                [
+                    "playtest_reminders",
+                    "post_playtest_result_request",
+                    "weekly_project_digest",
+                    "stale_blocker_reminder",
+                ],
+                str(self.settings.automation_reminder_channel_id),
+            )
         await self.webhook_server.start()
         await self.update_application_description()
         register_commands(self)
@@ -680,9 +672,7 @@ def register_commands(bot: ChaosXBot) -> None:
 
     work = app_commands.Group(name="work", description="Protected Chaos Redux work drafts", default_permissions=discord.Permissions(administrator=True))
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
-    hermes = app_commands.Group(name="hermes", description="Hermes agent routing/task commands", default_permissions=discord.Permissions(administrator=True))
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
-    server = app_commands.Group(name="server", description="Protected Discord server administration", default_permissions=discord.Permissions(administrator=True))
 
     @bot.tree.command(name="ask", description="Answer a Chaos Redux question.")
     async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "public") -> None:
@@ -836,30 +826,6 @@ def register_commands(bot: ChaosXBot) -> None:
     async def playtest_cancel(interaction: discord.Interaction, event: str) -> None:
         await run_owner_hermes(bot, interaction, f"/playtest cancel event={event!r}. Preserve audit record; cancel only if explicit approval and permissions exist.", command_name="playtest cancel")
 
-    @hermes.command(name="route", description="Recommend project skill/subagent route.")
-    async def hermes_route(interaction: discord.Interaction, goal: str, event: str = "", surface: str = "") -> None:
-        await run_owner_hermes(bot, interaction, f"/hermes route goal={goal!r} event={event!r} surface={surface!r}. Recommendation only; do not start work.", command_name="hermes route")
-
-    @hermes.command(name="task", description="Create an agent task preview.")
-    async def hermes_task(interaction: discord.Interaction, goal: str, mode: str = "analysis", event: str = "", visibility: str = "private") -> None:
-        await run_owner_hermes(bot, interaction, f"/hermes task goal={goal!r} event={event!r} mode={mode!r} visibility={visibility!r}. Preview and approval gates; no draft PR unless enabled.", command_name="hermes task", public=visibility == "channel")
-
-    @hermes.command(name="status", description="Show Hermes task status.")
-    async def hermes_status(interaction: discord.Interaction, task: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/hermes status task={task!r}. Use completed-with-evidence wording where appropriate.", command_name="hermes status")
-
-    @hermes.command(name="cancel", description="Cancel a queued/running task if safe.")
-    async def hermes_cancel(interaction: discord.Interaction, task: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/hermes cancel task={task!r}. Cancel only if safe; preserve evidence.", command_name="hermes cancel")
-
-    @hermes.command(name="audit", description="Route an audit.")
-    async def hermes_audit(interaction: discord.Interaction, target: str, surface: str = "completion") -> None:
-        await run_owner_hermes(bot, interaction, f"/hermes audit target={target!r} surface={surface!r}. Show proposed route/write scope before starting.", command_name="hermes audit")
-
-    @hermes.command(name="review-pr", description="Review a pull request against project evidence.")
-    async def hermes_review_pr(interaction: discord.Interaction, number: int) -> None:
-        await run_owner_hermes(bot, interaction, f"/hermes review-pr number={number}. Cannot approve or merge.", command_name="hermes review-pr")
-
     @admin.command(name="help", description="Show protected operator command help.")
     async def admin_help(interaction: discord.Interaction) -> None:
         if not await owner_gate(interaction, settings):
@@ -910,23 +876,6 @@ def register_commands(bot: ChaosXBot) -> None:
         text = "## ChaosX automations\n" + "\n".join(f"- `{n}` enabled=`{bool(e)}` destination=`{d or 'unset'}`" for n, e, d in rows)
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    @admin.command(name="config", description="Show/validate config with secrets redacted.")
-    async def admin_config(interaction: discord.Interaction, action: str = "show") -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        text = (
-            "## ChaosX config\n"
-            f"- allowed_guild_id: `{settings.allowed_guild_id}`\n"
-            f"- command_guild_id: `{settings.command_guild_id}`\n"
-            f"- broad ask provider/model: `{settings.ask_provider}` / `{settings.ask_model}` reasoning=`{settings.ask_reasoning_effort or 'default'}`\n"
-            f"- public ask limit/hour: `{settings.public_ask_limit_per_hour}`\n"
-            f"- scripted limit/hour: `{settings.public_scripted_limit_per_hour}`\n"
-            f"- webhook listener: `{settings.webhook_host}:{settings.webhook_port}` enabled=`{bool(settings.github_webhook_secret)}`\n"
-            f"- repo: `{settings.chaos_redux_repo}`\n"
-            f"- db: `{settings.db_path}`\n"
-        )
-        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
     @admin.command(name="permissions-audit", description="Audit Discord/GitHub permissions.")
     async def admin_permissions_audit(interaction: discord.Interaction) -> None:
         await run_owner_hermes(bot, interaction, "/admin permissions audit. Identify excessive permissions and drift.", command_name="admin permissions-audit")
@@ -935,156 +884,5 @@ def register_commands(bot: ChaosXBot) -> None:
     async def admin_jobs(interaction: discord.Interaction, action: str = "list", job: str = "") -> None:
         await run_owner_hermes(bot, interaction, f"/admin jobs action={action!r} job={job!r}.", command_name="admin jobs")
 
-    @admin.command(name="rollback", description="Prepare rollback instructions for a deployment.")
-    async def admin_rollback(interaction: discord.Interaction, deployment: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/admin rollback deployment={deployment!r}. Do not perform destructive rollback without explicit approval.", command_name="admin rollback")
-
-    @server.command(name="ask", description="Autonomously handle a protected server-management request.")
-    async def server_ask(interaction: discord.Interaction, request: str) -> None:
-        prompt = (
-            "Protected autonomous Discord server-management request. Use available ChaosX/Discord capabilities where safe. "
-            "Perform read-only inspection or safe bounded actions directly when permissions allow. For destructive, broad, irreversible, secret-requiring, or permission-expanding actions, stop and report the exact approval/blocker. "
-            "Do not use mass pings. Keep an audit-minded summary.\n\n"
-            f"Request: {request}"
-        )
-        await run_owner_hermes(bot, interaction, prompt, command_name="server ask", use_operator_model=True)
-
-    @server.command(name="role-audit", description="Scan roles for elevated permissions and hierarchy risks.")
-    async def server_role_audit(interaction: discord.Interaction) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        if not interaction.guild:
-            await interaction.response.send_message("Run this inside the server.", ephemeral=True)
-            return
-        guild = interaction.guild
-        bot_member = guild.me
-        lines = [f"## Role audit for {guild.name}", f"Bot top role: `{bot_member.top_role.name if bot_member else 'unknown'}`", ""]
-        risky = []
-        for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
-            flags = _dangerous_role_flags(role)
-            if flags:
-                risky.append(f"- `{role.name}` `{role.id}` position={role.position} flags={', '.join(flags)} members={len(role.members)}")
-        lines += risky or ["No elevated permission roles found in cache."]
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=guild.id, channel_id=interaction.channel_id, command="server role-audit", summary="role audit")
-        await interaction.response.send_message("Role audit generated privately.", ephemeral=True)
-        for part in _chunk("\n".join(lines)):
-            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @server.command(name="scan-behaviour", description="Scan recent visible channel messages for obvious abuse signals.")
-    async def server_scan_behaviour(interaction: discord.Interaction, limit: int = 200) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        if not interaction.guild:
-            await interaction.response.send_message("Run this inside the server.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        limit = max(20, min(limit, 1000))
-        channel_count = message_count = mass_mentions = attachments = 0
-        author_counts: Counter[int] = Counter()
-        suspicious: list[str] = []
-        for channel in interaction.guild.text_channels:
-            perms = channel.permissions_for(interaction.guild.me)  # type: ignore[arg-type]
-            if not (perms.view_channel and perms.read_message_history):
-                continue
-            channel_count += 1
-            try:
-                async for msg in channel.history(limit=max(1, limit // max(1, len(interaction.guild.text_channels)))):
-                    if msg.author.bot:
-                        continue
-                    message_count += 1
-                    author_counts[msg.author.id] += 1
-                    if msg.mention_everyone:
-                        mass_mentions += 1
-                        suspicious.append(f"- Mass mention by `{msg.author}` in #{channel.name} at {msg.created_at.isoformat()}")
-                    if len(msg.mentions) + len(msg.role_mentions) >= 8:
-                        suspicious.append(f"- Mention burst by `{msg.author}` in #{channel.name}: {len(msg.mentions)} users, {len(msg.role_mentions)} roles")
-                    if msg.attachments:
-                        attachments += len(msg.attachments)
-            except discord.Forbidden:
-                continue
-            except discord.HTTPException as exc:
-                suspicious.append(f"- Could not scan #{channel.name}: {exc.status}")
-        top = [f"- <@{uid}>: {count} visible messages" for uid, count in author_counts.most_common(10)]
-        lines = [
-            f"## Behaviour scan for {interaction.guild.name}",
-            f"Scanned channels: `{channel_count}`",
-            f"Visible non-bot messages checked: `{message_count}`",
-            f"Mass-mention messages: `{mass_mentions}`",
-            f"Attachments observed: `{attachments}`",
-            "",
-            "### Top visible posters",
-            *(top or ["No messages visible."]),
-            "",
-            "### Signals",
-            *(suspicious[:30] or ["No obvious abuse signals found in visible recent history."]),
-            "",
-            "Note: without Message Content intent, this scan does not inspect message text semantics.",
-        ]
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server scan-behaviour", summary=f"limit={limit}")
-        for part in _chunk("\n".join(lines)):
-            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @server.command(name="member-info", description="Show protected member moderation context.")
-    async def server_member_info(interaction: discord.Interaction, member: discord.Member) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        roles = [r.name for r in sorted(member.roles, key=lambda r: r.position, reverse=True) if not r.is_default()]
-        text = (
-            f"## Member info: `{member}`\n"
-            f"- ID: `{member.id}`\n"
-            f"- Bot: `{member.bot}`\n"
-            f"- Joined: `{member.joined_at.isoformat() if member.joined_at else 'unknown'}`\n"
-            f"- Created: `{member.created_at.isoformat()}`\n"
-            f"- Top role: `{member.top_role.name}`\n"
-            f"- Roles: {', '.join(roles[:30]) or 'none'}"
-        )
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server member-info", summary=str(member.id))
-        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @server.command(name="add-role", description="Add a role to a member if Discord permissions allow it.")
-    async def server_add_role(interaction: discord.Interaction, member: discord.Member, role: discord.Role, reason: str = "ChaosX operator action") -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        assert interaction.guild is not None
-        ok, why = _can_manage_role(interaction.guild, interaction.user, interaction.guild.me, role)  # type: ignore[arg-type]
-        if not ok:
-            await interaction.response.send_message(f"Blocked: {why}", ephemeral=True)
-            return
-        try:
-            await member.add_roles(role, reason=reason)
-            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server add-role", summary=f"{member.id}->{role.id}")
-            await interaction.response.send_message(f"Added `{role.name}` to `{member}`.", ephemeral=True, allowed_mentions=safe_allowed_mentions())
-        except discord.Forbidden:
-            await interaction.response.send_message("Blocked by Discord permissions. Reinvite/role hierarchy may need Manage Roles and a higher bot role.", ephemeral=True)
-
-    @server.command(name="remove-role", description="Remove a role from a member if Discord permissions allow it.")
-    async def server_remove_role(interaction: discord.Interaction, member: discord.Member, role: discord.Role, reason: str = "ChaosX operator action") -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        assert interaction.guild is not None
-        ok, why = _can_manage_role(interaction.guild, interaction.user, interaction.guild.me, role)  # type: ignore[arg-type]
-        if not ok:
-            await interaction.response.send_message(f"Blocked: {why}", ephemeral=True)
-            return
-        try:
-            await member.remove_roles(role, reason=reason)
-            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server remove-role", summary=f"{member.id}->{role.id}")
-            await interaction.response.send_message(f"Removed `{role.name}` from `{member}`.", ephemeral=True, allowed_mentions=safe_allowed_mentions())
-        except discord.Forbidden:
-            await interaction.response.send_message("Blocked by Discord permissions. Reinvite/role hierarchy may need Manage Roles and a higher bot role.", ephemeral=True)
-
-    @server.command(name="timeout", description="Timeout a member if Discord permissions allow it.")
-    async def server_timeout(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "ChaosX operator timeout") -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        minutes = max(1, min(minutes, 40320))
-        try:
-            await member.timeout(datetime.now(timezone.utc) + timedelta(minutes=minutes), reason=reason)
-        except discord.Forbidden:
-            await interaction.response.send_message("Blocked by Discord permissions. ChaosX needs Moderate Members and correct role hierarchy.", ephemeral=True)
-            return
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server timeout", summary=f"{member.id} {minutes}m")
-        await interaction.response.send_message(f"Timed out `{member}` for `{minutes}` minute(s).", ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    for group in (work, playtest, hermes, admin):
+    for group in (work, playtest, admin):
         bot.tree.add_command(group)

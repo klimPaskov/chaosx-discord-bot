@@ -200,3 +200,14 @@ class Store:
             cur = await db.execute("UPDATE automation_config SET enabled = ?, updated_at = ? WHERE name = ?", (1 if enabled else 0, now_iso(), name))
             await db.commit()
             return cur.rowcount > 0
+
+    async def set_automation_destination(self, names: list[str], destination: str) -> None:
+        if not names:
+            return
+        placeholders = ",".join("?" for _ in names)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                f"UPDATE automation_config SET destination = ?, updated_at = ? WHERE name IN ({placeholders})",
+                (destination, now_iso(), *names),
+            )
+            await db.commit()

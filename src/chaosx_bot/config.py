@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     @classmethod
     def blank_optional_ints_to_none(cls, data):
         if isinstance(data, dict):
-            for key in ("allowed_guild_id", "command_guild_id"):
+            for key in ("allowed_guild_id", "command_guild_id", "automation_reminder_channel_id"):
                 if data.get(key) == "":
                     data[key] = None
         return data
@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     webhook_public_base_url: str = Field(default="")
     db_path: Path = Field(default=Path("./chaosx.db"))
     github_repo: str = Field(default="klimPaskov/Chaos-Redux", description="GitHub repo for public /issue creation")
+    automation_reminder_channel_id: Optional[int] = Field(default=1395464062367698977, description="Discord channel for automation reminders/digests")
 
     @model_validator(mode="after")
     def default_allowed_guild_to_command_guild(self):

@@ -55,16 +55,21 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.operator_model == "gpt-5.6-luna"
     assert settings.operator_provider == "openai-codex"
     assert settings.operator_reasoning_effort == "xhigh"
+    assert settings.automation_reminder_channel_id == 1395464062367698977
 
 
 def test_operator_help_explains_when_to_use_admin_commands():
     help_text = operator_help_text(Settings(_env_file=None, discord_token="dummy"))
     assert "/admin health" in help_text
-    assert "Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` shows old spreadsheet/docs data" in help_text
+    assert "Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale" in help_text
     assert "/admin ask request:<text>" in help_text
     assert "/server ask" not in help_text
-    assert "Most of the time, use `/admin ask`" in help_text
-    assert "/work handoff" in help_text
+    assert "/hermes" not in help_text
+    assert "/admin config" not in help_text
+    assert "/admin rollback" not in help_text
+    assert "/work" not in help_text
+    assert "/issue" not in help_text
+    assert "1395464062367698977" in help_text
 
 
 def test_community_help_uses_search_and_root_feedback_commands():

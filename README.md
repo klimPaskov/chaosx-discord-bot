@@ -27,8 +27,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
   - `/issue` — opens a report form, uses AI to review it, then formats approved bug/crash/enhancement/balance/cosmetic/general reports into GitHub issues in `CHAOSX_GITHUB_REPO`; bug/crash forms require relevant `error.log` lines, while other report types use expected/desired-result fields instead.
   - `/work ...` — protected issue-style drafts, handoffs, changelog, and release draft command family.
   - `/testing` shows the tester queue. `/playtest report observation:<text> [event_id:<id>]` records informal tester observations that are not ready for GitHub; `/playtest summary` recaps reports. Scheduling/cancel helpers are protected.
-  - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
-  - `/admin ...` — private owner/operator help, ask, health/sync/reindex/config/permissions/jobs/rollback command family. `/admin ask` is the main private catch-all for server and project operations; `/admin help` explains when to use the smaller shortcuts.
+  - `/admin ...` — private owner/operator ask, health, sync, reindex, automation, jobs, and permissions-audit command family. `/admin ask` is the main private catch-all for server and project operations; `/admin help` shows only owner/admin tools.
 - Stores a local SQLite audit log in `CHAOSX_DB_PATH`.
 
 ## Security model
@@ -74,7 +73,7 @@ CHAOSX_ALLOWED_GUILD_ID=<Chaos Redux guild id>
 
 ## Protected Hermes bridge
 
-`/ask` is the public/community broad question command. Protected owner/operator asks live under `/admin ask` and `/server ask`.
+`/ask` is the public/community broad question command. Protected owner/operator asks live under `/admin ask` only.
 
 Protected Hermes-backed commands execute:
 
