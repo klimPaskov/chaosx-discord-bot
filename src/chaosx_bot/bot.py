@@ -135,9 +135,6 @@ Models:
 - Autonomous server ops: `{settings.operator_provider}` / `{settings.operator_model}`
 - Autonomous server reasoning: `{settings.operator_reasoning_effort or 'default'}`
 
-Root protected:
-`/health`, `/inventory`, `/say`
-
 Protected server/admin:
 `/admin help` — this private operator guide.
 `/admin ask` — protected project/server request through the configured ask model.
@@ -411,66 +408,6 @@ def register_commands(bot: ChaosXBot) -> None:
             return
         await interaction.response.send_message(community_help_text(), ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
-    @bot.tree.command(name="health", description="Protected ChaosX runtime health check.")
-    @app_commands.default_permissions(administrator=True)
-    async def health(interaction: discord.Interaction) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        guilds = ", ".join(f"{g.name}({g.id})" for g in bot.guilds) or "none"
-        text = (
-            "ChaosX online.\n"
-            f"Description: `{BOT_DESCRIPTION}`\n"
-            f"Owner: `{settings.owner_id}`\n"
-            f"Allowed guild: `{settings.allowed_guild_id or 'not locked'}`\n"
-            f"Hermes profile: `{settings.hermes_profile}`\n"
-            f"Repo: `{settings.chaos_redux_repo}`\n"
-            f"Visible guilds: {guilds}"
-        )
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="health", summary="health check")
-        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @bot.tree.command(name="inventory", description="Read-only inventory of the current guild.")
-    @app_commands.default_permissions(administrator=True)
-    async def inventory(interaction: discord.Interaction) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        if not interaction.guild:
-            await interaction.response.send_message("Run this inside a guild.", ephemeral=True)
-            return
-        guild = interaction.guild
-        lines = [
-            f"Guild: {guild.name} (`{guild.id}`)",
-            f"Owner ID: `{guild.owner_id}`",
-            f"Channels: `{len(guild.channels)}`",
-            f"Roles: `{len(guild.roles)}`",
-            "",
-            "Channels:",
-        ]
-        for ch in sorted(guild.channels, key=lambda c: (str(c.type), c.position, c.id)):
-            lines.append(f"- {ch.name} `{ch.id}` type={ch.type} position={ch.position}")
-        lines.append("\nRoles:")
-        for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
-            perms = role.permissions
-            flags = []
-            for attr in ("administrator", "manage_guild", "manage_channels", "manage_roles", "manage_webhooks"):
-                if getattr(perms, attr):
-                    flags.append(attr)
-            lines.append(f"- {role.name} `{role.id}` position={role.position}" + (f" perms={','.join(flags)}" if flags else ""))
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=guild.id, channel_id=interaction.channel_id, command="inventory", summary="read-only guild inventory")
-        await interaction.response.send_message("Inventory generated privately.", ephemeral=True)
-        for part in _chunk("\n".join(lines)):
-            await interaction.followup.send(f"```text\n{part}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @bot.tree.command(name="say", description="Protected: post an exact message to the current channel without mention parsing.")
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(message="Message to post. Mentions are not parsed.")
-    async def say(interaction: discord.Interaction, message: str) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="say", summary=message)
-        await interaction.response.send_message("Posting message with mentions disabled.", ephemeral=True)
-        await interaction.channel.send(message, allowed_mentions=safe_allowed_mentions())  # type: ignore[union-attr]
-
     work = app_commands.Group(name="work", description="Chaos Redux work-item drafting commands")
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
     hermes = app_commands.Group(name="hermes", description="Hermes agent routing/task commands", default_permissions=discord.Permissions(administrator=True))
@@ -611,9 +548,22 @@ def register_commands(bot: ChaosXBot) -> None:
     async def admin_ask(interaction: discord.Interaction, request: str) -> None:
         await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_ask_model=True)
 
-    @admin.command(name="health", description="Admin health check.")
+    @admin.command(name="health", description="Check ChaosX runtime health.")
     async def admin_health(interaction: discord.Interaction) -> None:
-        await health(interaction)
+        if not await owner_gate(interaction, settings):
+            return
+        guilds = ", ".join(f"{g.name}({g.id})" for g in bot.guilds) or "none"
+        text = (
+            "ChaosX online.\n"
+            f"Description: `{BOT_DESCRIPTION}`\n"
+            f"Owner: `{settings.owner_id}`\n"
+            f"Allowed guild: `{settings.allowed_guild_id or 'not locked'}`\n"
+            f"Hermes profile: `{settings.hermes_profile}`\n"
+            f"Repo: `{settings.chaos_redux_repo}`\n"
+            f"Visible guilds: {guilds}"
+        )
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin health", summary="health check")
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="sync", description="Run/plan index sync.")
     async def admin_sync(interaction: discord.Interaction, mode: str = "incremental") -> None:
