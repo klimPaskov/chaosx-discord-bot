@@ -40,6 +40,14 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert "weekly_content_dump" in by_name
     assert by_name["weekly_content_dump"][0] == 1
     assert "fresh visuals" in by_name["weekly_content_dump"][2]
+    for deleted_name in {
+        "stale_blocker_reminder",
+        "trusted_role_direct_issue_creation",
+        "weekly_project_digest",
+        "selected_channel_content_watcher",
+        "pull_request_ready_summary",
+    }:
+        assert deleted_name not in by_name
 
 
 async def test_admin_ask_memory_is_scoped_pruned_and_clearable(tmp_path):

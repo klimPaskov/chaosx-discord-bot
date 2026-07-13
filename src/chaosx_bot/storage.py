@@ -98,33 +98,23 @@ CREATE TABLE IF NOT EXISTS automation_config (
 
 DEFAULT_AUTOMATIONS = {
     "repository_index_refresh": 1,
-    "pull_request_ready_summary": 1,
     "ci_failure_first_recovery": 1,
     "skill_subagent_change_summary": 1,
     "playtest_reminders": 1,
     "post_playtest_result_request": 1,
-    "weekly_project_digest": 0,
     "weekly_content_dump": 1,
-    "stale_blocker_reminder": 0,
     "release_announcement_posting": 0,
-    "selected_channel_content_watcher": 0,
-    "trusted_role_direct_issue_creation": 0,
     "agent_draft_pr_mode": 0,
 }
 
 AUTOMATION_DESCRIPTIONS = {
     "repository_index_refresh": "Refreshes ChaosX's local event/scenario/cluster/search index from the Chaos Redux repo.",
-    "pull_request_ready_summary": "Would summarize PRs that look ready for review/merge.",
     "ci_failure_first_recovery": "Would summarize CI failures and the first likely recovery step.",
     "skill_subagent_change_summary": "Would summarize changes made by agent/skill-driven work.",
     "playtest_reminders": "Sends playtest reminder messages when a playtest is scheduled.",
     "post_playtest_result_request": "Asks testers for results/observations after a playtest window.",
-    "weekly_project_digest": "Text-style weekly project digest; usually keep this off if using content dumps.",
     "weekly_content_dump": "Image-led weekly content-dump post. Posts only when enough fresh visuals/assets exist.",
-    "stale_blocker_reminder": "Reminds about old blockers that have not moved.",
     "release_announcement_posting": "Reserved for release announcement posting; should stay off until explicitly used.",
-    "selected_channel_content_watcher": "Reserved watcher for chosen Discord channels; not active by default.",
-    "trusted_role_direct_issue_creation": "Reserved mode for trusted-role issue creation; public /issue is the normal path.",
     "agent_draft_pr_mode": "Reserved mode for agent-created draft PRs; currently not a normal ChaosX workflow.",
 }
 
