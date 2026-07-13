@@ -73,7 +73,7 @@ CHAOSX_ALLOWED_GUILD_ID=<Chaos Redux guild id>
 
 `/ask` is the public/community broad question command. Protected owner/operator asks live under `/admin ask` only.
 
-Protected Hermes-backed commands execute with a 15-minute timeout:
+`/admin ask` has no ChaosX subprocess timeout; other protected Hermes-backed commands use the configured timeout:
 
 ```bash
 hermes --profile chaos_redux chat -q '<bounded prompt>' --quiet

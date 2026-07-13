@@ -679,12 +679,13 @@ async def run_hermes_command(
         ignore_rules = True
     else:
         ignore_rules = False
+    hermes_timeout = bot.settings.admin_ask_timeout_seconds if command_name == "admin ask" else bot.settings.hermes_timeout_seconds
     result = await run_hermes(
         hermes_bin=bot.settings.hermes_bin,
         profile=bot.settings.hermes_profile,
         repo=bot.settings.chaos_redux_repo,
         prompt=prompt,
-        timeout_seconds=bot.settings.hermes_timeout_seconds,
+        timeout_seconds=hermes_timeout,
         model=model,
         provider=provider,
         reasoning_effort=reasoning_effort,
@@ -694,8 +695,7 @@ async def run_hermes_command(
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
         output = (
-            f"Hermes run timed out after {bot.settings.hermes_timeout_seconds}s. "
-            "I increased the ChaosX timeout for future runs; retry the same `/admin ask`. "
+            f"Hermes run timed out after {hermes_timeout}s. "
             "For very broad server actions, ask for a preview/scope first, then confirm execution."
         )
     if not owner_only and rate_bucket == "ask":

@@ -51,6 +51,7 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.github_repo == "klimPaskov/Chaos-Redux"
     assert settings.public_ask_limit_per_hour == 10
     assert settings.hermes_timeout_seconds == 900
+    assert settings.admin_ask_timeout_seconds == 0
     assert settings.ask_model == "gpt-5.6-luna"
     assert settings.ask_provider == "openai-codex"
     assert settings.ask_reasoning_effort == "medium"

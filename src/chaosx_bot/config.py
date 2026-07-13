@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     hermes_bin: Path = Field(default=Path("/home/klim/.local/bin/hermes"))
     hermes_profile: str = Field(default="chaos_redux")
     hermes_timeout_seconds: int = Field(default=900, ge=30, le=1800)
+    admin_ask_timeout_seconds: int = Field(default=0, ge=0, le=86400, description="Max seconds for /admin ask Hermes runs; 0 disables the subprocess timeout")
     ask_model: str = Field(default="gpt-5.6-luna", description="Model override for broad ask commands")
     ask_provider: str = Field(default="openai-codex", description="Provider override for broad ask commands")
     ask_reasoning_effort: str = Field(default="medium", description="Reasoning effort for broad ask commands")

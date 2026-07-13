@@ -101,7 +101,7 @@ async def run_hermes(
     profile: str,
     repo: Path,
     prompt: str,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     model: str | None = None,
     provider: str | None = None,
     reasoning_effort: str | None = None,
@@ -127,7 +127,10 @@ async def run_hermes(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+            if timeout_seconds is None or timeout_seconds <= 0:
+                stdout_b, stderr_b = await proc.communicate()
+            else:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except asyncio.TimeoutError:
         try:
             proc.kill()  # type: ignore[possibly-undefined]
