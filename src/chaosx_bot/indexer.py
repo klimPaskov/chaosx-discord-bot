@@ -6,9 +6,11 @@ import os
 import re
 import sqlite3
 import subprocess
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
+from zipfile import ZipFile
 
 TEXT_EXTENSIONS = {
     ".md", ".txt", ".csv", ".yml", ".yaml", ".json", ".toml", ".mod",
@@ -223,8 +225,77 @@ def rebuild_index(repo: Path, db_path: Path) -> IndexStats:
     return IndexStats(docs=docs, events=events, scenarios=scenarios, clusters=clusters, commit_sha=commit)
 
 
+def _catalog_rows(repo: Path, *, csv_name: str, sheet_index: int) -> list[dict[str, str]]:
+    csv_path = repo / "docs/spreadsheets" / csv_name
+    if csv_path.exists():
+        with csv_path.open(newline="", encoding="utf-8-sig") as fp:
+            return [dict(row) for row in csv.DictReader(fp)]
+    xlsx_path = repo / "docs/spreadsheets/chaos_redux_events_catalog.xlsx"
+    return _xlsx_sheet_rows(xlsx_path, sheet_index=sheet_index)
+
+
+def _xlsx_sheet_rows(path: Path, *, sheet_index: int) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with ZipFile(path) as zf:
+        shared = _xlsx_shared_strings(zf)
+        sheet_xml = zf.read(f"xl/worksheets/sheet{sheet_index}.xml")
+    root = ET.fromstring(sheet_xml)
+    ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    table: list[list[str]] = []
+    for row in root.findall(".//a:sheetData/a:row", ns):
+        values: dict[int, str] = {}
+        for cell in row.findall("a:c", ns):
+            ref = cell.attrib.get("r", "A1")
+            col = _xlsx_col_index(ref)
+            values[col] = _xlsx_cell_value(cell, shared, ns)
+        if values:
+            width = max(values) + 1
+            table.append([values.get(i, "") for i in range(width)])
+    if not table:
+        return []
+    headers = [h.strip() for h in table[0]]
+    rows: list[dict[str, str]] = []
+    for raw in table[1:]:
+        if not any(str(v).strip() for v in raw):
+            continue
+        rows.append({headers[i]: (raw[i].strip() if i < len(raw) else "") for i in range(len(headers)) if headers[i]})
+    return rows
+
+
+def _xlsx_shared_strings(zf: ZipFile) -> list[str]:
+    try:
+        root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    except KeyError:
+        return []
+    ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    strings: list[str] = []
+    for si in root.findall("a:si", ns):
+        strings.append("".join(t.text or "" for t in si.findall(".//a:t", ns)))
+    return strings
+
+
+def _xlsx_cell_value(cell: ET.Element, shared: list[str], ns: dict[str, str]) -> str:
+    if cell.attrib.get("t") == "s":
+        v = cell.find("a:v", ns)
+        if v is not None and v.text and v.text.isdigit():
+            idx = int(v.text)
+            return shared[idx] if idx < len(shared) else ""
+    if cell.attrib.get("t") == "inlineStr":
+        return "".join(t.text or "" for t in cell.findall(".//a:t", ns))
+    v = cell.find("a:v", ns)
+    return v.text if v is not None and v.text is not None else ""
+
+
+def _xlsx_col_index(ref: str) -> int:
+    letters = "".join(ch for ch in ref if ch.isalpha())
+    value = 0
+    for ch in letters:
+        value = value * 26 + (ord(ch.upper()) - ord("A") + 1)
+    return max(0, value - 1)
+
+
 def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int:
-    path = repo / "docs/spreadsheets/chaos_redux_events_catalog.csv"
     conn.execute("DROP TABLE IF EXISTS catalog_events")
     conn.execute("""
     CREATE TABLE catalog_events (
@@ -245,30 +316,26 @@ def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int
         indexed_at REAL NOT NULL
     )
     """)
-    if not path.exists():
-        return 0
     count = 0
-    with path.open(newline="", encoding="utf-8-sig") as fp:
-        reader = csv.DictReader(fp)
-        for row_number, row in enumerate(reader, 1):
-            event_id = (row.get("ID") or "").strip()
-            name = (row.get("Event Name") or "").strip()
-            if not event_id and not name:
-                continue
-            row_key = event_id if event_id else f"unassigned:{row_number}:{name}"
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO catalog_events(row_key, event_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row_key, event_id, name, row.get("Details") or "", row.get("Evo I") or "", row.get("Evo II") or "",
-                    row.get("Evo III") or "", row.get("Evo IV") or "", row.get("Evo V") or "",
-                    row.get("World-End Scenario") or "", row.get("Type") or "", row.get("Cluster ID") or "",
-                    row.get("Member Severity") or "", row.get("Status") or "", indexed_at,
-                ),
-            )
-            count += 1
+    for row_number, row in enumerate(_catalog_rows(repo, csv_name="chaos_redux_events_catalog.csv", sheet_index=1), 1):
+        event_id = (row.get("ID") or "").strip()
+        name = (row.get("Event Name") or "").strip()
+        if not event_id and not name:
+            continue
+        row_key = event_id if event_id else f"unassigned:{row_number}:{name}"
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO catalog_events(row_key, event_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row_key, event_id, name, row.get("Details") or "", row.get("Evo I") or "", row.get("Evo II") or "",
+                row.get("Evo III") or "", row.get("Evo IV") or "", row.get("Evo V") or "",
+                row.get("World-End Scenario") or "", row.get("Type") or "", row.get("Cluster ID") or "",
+                row.get("Member Severity") or "", row.get("Status") or "", indexed_at,
+            ),
+        )
+        count += 1
     return count
 
 
@@ -328,7 +395,6 @@ def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> 
 
 
 def _load_clusters(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int:
-    path = repo / "docs/spreadsheets/chaos_redux_clusters_catalog.csv"
     conn.execute("DROP TABLE IF EXISTS catalog_clusters")
     conn.execute("""
     CREATE TABLE catalog_clusters (
@@ -343,23 +409,19 @@ def _load_clusters(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> i
         indexed_at REAL NOT NULL
     )
     """)
-    if not path.exists():
-        return 0
     count = 0
-    with path.open(newline="", encoding="utf-8-sig") as fp:
-        reader = csv.DictReader(fp)
-        for row_number, row in enumerate(reader, 1):
-            cluster_id = (row.get("Cluster ID") or "").strip()
-            name = (row.get("Cluster Name") or "").strip()
-            if not cluster_id and not name:
-                continue
-            row_key = cluster_id if cluster_id else f"planned:{row_number}:{name}"
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO catalog_clusters(row_key, cluster_id, name, details, members, type, chaos_level, status, indexed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (row_key, cluster_id, name, row.get("Details") or "", row.get("Members (ID)") or "", row.get("Type") or "", row.get("Chaos level") or "", row.get("Status") or "", indexed_at),
-            )
-            count += 1
+    for row_number, row in enumerate(_catalog_rows(repo, csv_name="chaos_redux_clusters_catalog.csv", sheet_index=2), 1):
+        cluster_id = (row.get("Cluster ID") or "").strip()
+        name = (row.get("Cluster Name") or "").strip()
+        if not cluster_id and not name:
+            continue
+        row_key = cluster_id if cluster_id else f"planned:{row_number}:{name}"
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO catalog_clusters(row_key, cluster_id, name, details, members, type, chaos_level, status, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (row_key, cluster_id, name, row.get("Details") or "", row.get("Members (ID)") or "", row.get("Type") or "", row.get("Chaos level") or "", row.get("Status") or "", indexed_at),
+        )
+        count += 1
     return count

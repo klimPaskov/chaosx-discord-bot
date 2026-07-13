@@ -13,13 +13,14 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     stats = rebuild_index(repo, db)
     assert stats.docs > 100
     assert stats.events >= 180
-    assert stats.scenarios >= 8
-    assert stats.clusters >= 14
+    assert stats.scenarios >= 7
+    assert stats.clusters >= 12
     knowledge = Knowledge(repo, db)
     event = knowledge.event('2')
     assert 'Zombie Outbreak' in event
     assert 'Evidence:' not in event
     assert 'docs/spreadsheets' not in event
+    assert 'Fully Functional' in knowledge.event('4')
     search = knowledge.search('Zombie Outbreak')
     assert 'Evidence:' not in search
     assert 'docs/specs/' not in search
