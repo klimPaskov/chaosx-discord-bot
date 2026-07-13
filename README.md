@@ -26,7 +26,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
   - `/event`, `/scenario`, `/cluster`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/cluster` names member events, `/testing` shows events marked as needing playtesting, and `/scenario` reads triggerable SCN scenario docs, not event IDs.
   - `/event-idea` formats a rough event idea with name, ID placeholder, optional type/cluster/evolutions/world-end/scenario/easter-egg fields, baseline description, testing notes, and overlap/gap notes.
   - `/issue` — opens a report form, uses AI to review it, then formats approved bug/crash/enhancement/balance/cosmetic/general reports into GitHub issues in `CHAOSX_GITHUB_REPO`; bug/crash forms require relevant `error.log` lines, while other report types use expected/desired-result fields instead.
-  - `/testing` shows the tester queue. `/playtest report observation:<text> [event_id:<id>]` records informal tester observations that are not ready for GitHub; `/playtest summary` shows recent reported playtests. Scheduling/cancel helpers are protected.
+  - `/testing` shows the tester queue. `/playtest report observation:<text> [event_id:<id>]` records informal tester observations that are not ready for GitHub; `/playtest summary` shows recent reported playtests. `/playtest schedule request:<plain English>` is protected and AI-powered: it stores a local draft and returns a private plan/ready-to-post message, but does not create a Discord Scheduled Event or public post unless Hoops confirms a follow-up action.
   - `/admin ...` — private owner/operator ask, health, sync, reindex, automation, jobs, and permissions-audit command family. `/admin automation` explains what each automation does and where it posts. `/admin ask` is the main private catch-all for server and project operations, including scoped follow-up memory, plain-text member resolution, and explicit recent channel/user message analysis; `/admin help` shows only owner/admin tools.
   - Weekly content-dump automation posts to `CHAOSX_CONTENT_DUMP_CHANNEL_ID` only when enough fresh images/assets exist; it stays silent rather than posting a text-only dump.
 - Stores a local SQLite audit log in `CHAOSX_DB_PATH`.
@@ -47,7 +47,7 @@ If reverting to a narrow setup later, use:
 - Attach Files only if needed later
 - Read Message History where `/admin ask` message-analysis workflows need it
 - Message Content Intent in the Developer Portal is needed for `/admin ask` to read message bodies; without it, Discord may return empty content even though history fetch succeeds. ChaosX does not run passive public message monitoring.
-- Create Events only when playtest scheduling is implemented
+- Create Events only after Hoops explicitly confirms a follow-up action from a playtest draft. `/playtest schedule` itself is draft-only and does not create Discord Scheduled Events.
 
 `/admin ask` remains runtime-gated to the configured owner ID before any protected operation runs. Do not expose separate public moderation/member-management commands unless explicitly requested.
 

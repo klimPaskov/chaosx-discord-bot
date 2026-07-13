@@ -1,5 +1,8 @@
+import ast
+from pathlib import Path
+
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, community_help_text, extract_member_search_queries, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -72,6 +75,10 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/admin ask request:<text>" in help_text
     assert "analyze recent channel/user messages" in help_text
     assert "reset context" in help_text
+    assert "/playtest schedule request:<plain English>" in help_text
+    assert "AI-powered playtest planner" in help_text
+    assert "Test Fury tomorrow 8pm" in help_text
+    assert "does **not** create a Discord Scheduled Event" in help_text
     assert "/server ask" not in help_text
     assert "/hermes" not in help_text
     assert "/admin config" not in help_text
@@ -79,6 +86,29 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/work" not in help_text
     assert "/issue" not in help_text
     assert "1395464062367698977" in help_text
+
+
+def test_playtest_schedule_prompt_is_one_field_ai_draft_only():
+    prompt = build_playtest_schedule_prompt(
+        request="Test Fury tomorrow 8pm for 90 minutes in voice, latest Steam build",
+        playtest_id="playtest-abc123",
+    )
+    assert "natural_request=" in prompt
+    assert "playtest-abc123" in prompt
+    assert "Hoops' local time (UTC+3)" in prompt
+    assert "Message to post" in prompt
+    assert "did not create a Discord Scheduled Event or public post" in prompt
+    assert "Do not actually create Discord Scheduled Events" in prompt
+
+
+def test_playtest_schedule_slash_signature_has_only_request_field():
+    bot_source = Path(__file__).resolve().parents[1] / "src" / "chaosx_bot" / "bot.py"
+    tree = ast.parse(bot_source.read_text(encoding="utf-8"))
+    schedule_funcs = [node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "playtest_schedule"]
+    assert len(schedule_funcs) == 1
+    arg_names = [arg.arg for arg in schedule_funcs[0].args.args]
+    assert arg_names == ["interaction", "request"]
+    assert {"target", "start", "duration", "voice", "build"}.isdisjoint(arg_names)
 
 
 def test_admin_context_helpers_extract_targets_and_sanitize_text():

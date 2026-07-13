@@ -33,7 +33,7 @@
 ## Current command shape
 
 - Public: `/help`, `/ask`, `/event`, `/scenario`, `/cluster`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest report`, `/playtest summary`.
-- Protected owner shortcuts: `/admin ask`, `/admin help`, `/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin jobs`, `/admin permissions-audit`, protected `/playtest schedule`/`cancel`.
+- Protected owner shortcuts: `/admin ask`, `/admin help`, `/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin jobs`, `/admin permissions-audit`, protected `/playtest schedule request:<plain English>` and `/playtest cancel`.
 - Removed from the user command surface: `/server`, `/hermes`, `/work`, `/admin config`, `/admin rollback`, `/search`, `/mechanic`, and tiny role-management commands.
 
 Keep the owner gate centralized and covered by tests whenever adding commands.

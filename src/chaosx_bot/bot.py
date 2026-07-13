@@ -286,6 +286,26 @@ def _stable_id(prefix: str, *parts: object) -> str:
     return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
 
 
+def build_playtest_schedule_prompt(*, request: str, playtest_id: str) -> str:
+    return f"""/playtest schedule natural_request={request!r}
+Draft ID: {playtest_id}
+
+You are helping Hoops plan a Chaos Redux playtest from one natural-language request.
+Use Hoops' local time (UTC+3) when the request gives relative or local timing unless the request states another timezone.
+Use Chaos Redux context if useful: event IDs/names, likely testing targets, builds, tester instructions, and result-reporting flow.
+
+Return a concise private owner-facing playtest draft with exactly these sections:
+1. Playtest draft — include the draft ID.
+2. Parsed plan — target, suggested start time/timezone, duration, voice/channel, build/version, tester count if inferable.
+3. What to test — 3-6 concrete checks or goals.
+4. Message to post — a ready-to-send Discord announcement/reminder, casual and short.
+5. Missing info / assumptions — only important unknowns.
+6. Next step — say that this command stored a local draft only and did not create a Discord Scheduled Event or public post. If Hoops wants a public Scheduled Event/post/reminders, tell him to confirm the exact action.
+
+Do not actually create Discord Scheduled Events, public posts, GitHub issues, files, or reminders from this command. Draft only.
+"""
+
+
 def _event_label(event_id: str) -> str:
     value = event_id.strip()
     digits = "".join(ch for ch in value if ch.isdigit())
@@ -333,6 +353,12 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 - `/admin reindex` — refresh ChaosX's local Chaos Redux catalog/search database. Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale after spreadsheet/docs changes.
 - `/admin sync` — resync slash commands with Discord. Use after I change command names/options and Discord still shows the old version.
 
+### Playtest scheduling
+- `/playtest schedule request:<plain English>` — owner-only, AI-powered playtest planner. Type one normal sentence; ChaosX will infer target/time/duration/build/voice when possible, store a local draft, and return a private playtest plan plus a ready-to-post Discord message. It does **not** create a Discord Scheduled Event, public post, reminder, or GitHub issue by itself.
+  - Example: `/playtest schedule request:Test Fury tomorrow 8pm for 90 minutes in voice, latest Steam build`
+  - Example: `/playtest schedule request:Plan a weekend multiplayer test for zombie outbreak and Soviet collapse, ask testers to report crashes and balance issues`
+  - If you like the draft, confirm the exact action through `/admin ask`, e.g. `create the Discord Scheduled Event from this playtest draft and post the reminder in <channel>`.
+
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
@@ -368,8 +394,6 @@ class ChaosXBot(discord.Client):
                 [
                     "playtest_reminders",
                     "post_playtest_result_request",
-                    "weekly_project_digest",
-                    "stale_blocker_reminder",
                 ],
                 str(self.settings.automation_reminder_channel_id),
             )
@@ -1088,15 +1112,32 @@ def register_commands(bot: ChaosXBot) -> None:
         await interaction.response.send_modal(IssueReportModal(bot, kind))
 
 
-    @playtest.command(name="schedule", description="Prepare a playtest Scheduled Event plan.")
-    async def playtest_schedule(interaction: discord.Interaction, target: str, start: str, duration: int, voice: str = "none", build: str = "") -> None:
+    @playtest.command(name="schedule", description="AI-draft a playtest plan from one plain-English request.")
+    @app_commands.describe(request="Example: Test Fury tomorrow 8pm for 90 minutes in voice, latest build")
+    async def playtest_schedule(interaction: discord.Interaction, request: str) -> None:
         if not await owner_gate(interaction, settings):
             return
-        playtest_id = _stable_id("playtest", target, start, duration, voice, build)
-        await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=target, start_time=start, duration_minutes=duration, voice=voice, build=build)
-        preview = f"Playtest draft `{playtest_id}`\nTarget: `{target}`\nStart: `{start}`\nDuration: `{duration}` minutes\nVoice: `{voice}`\nBuild: `{build or 'unspecified'}`\nNo Discord Scheduled Event was created by this draft command."
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="playtest schedule", summary=playtest_id)
-        await interaction.response.send_message(preview, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        playtest_id = _stable_id("playtest", interaction.user.id, interaction.created_at.isoformat(), request)
+        await bot.store.create_playtest(
+            playtest_id=playtest_id,
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            target=request[:500],
+            start_time="AI draft",
+            duration_minutes=0,
+            voice="AI draft",
+            build="",
+        )
+        await run_hermes_command(
+            bot,
+            interaction,
+            build_playtest_schedule_prompt(request=request, playtest_id=playtest_id),
+            command_name="playtest schedule",
+            public=False,
+            owner_only=True,
+            use_operator_model=True,
+        )
 
     @playtest.command(name="report", description="Record informal playtest observations.")
     async def playtest_report(interaction: discord.Interaction, observation: str, event_id: str = "") -> None:
