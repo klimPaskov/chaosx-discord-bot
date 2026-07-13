@@ -16,6 +16,7 @@
 - Owner/operator work should mostly go through `/admin ask`; avoid exposing tiny one-off admin/server commands unless Hoops explicitly asks for them.
 - Repository/project reasoning is delegated to local Hermes profile `chaos_redux` through a bounded prompt.
 - Reminder/digest-style automation output defaults to the configured automation reminder channel.
+- Weekly content-dump automation targets the content-dump channel and must stay silent unless it has enough fresh visual assets to make an image-led post.
 
 ## Approval gates to preserve
 
@@ -28,7 +29,7 @@
 ## Current command shape
 
 - Public: `/help`, `/ask`, `/event`, `/scenario`, `/cluster`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest report`, `/playtest summary`.
-- Protected owner shortcuts: `/admin ask`, `/admin help`, `/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin jobs`, `/admin permissions-audit`, `/work ...`, protected `/playtest schedule`/`cancel`.
-- Removed from the user command surface: `/server`, `/hermes`, `/admin config`, `/admin rollback`, `/search`, `/mechanic`, and tiny role-management commands.
+- Protected owner shortcuts: `/admin ask`, `/admin help`, `/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin jobs`, `/admin permissions-audit`, protected `/playtest schedule`/`cancel`.
+- Removed from the user command surface: `/server`, `/hermes`, `/work`, `/admin config`, `/admin rollback`, `/search`, `/mechanic`, and tiny role-management commands.
 
 Keep the owner gate centralized and covered by tests whenever adding commands.

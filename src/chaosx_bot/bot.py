@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -311,7 +312,7 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 
 ### Playtest notes
 - `/playtest report observation:<text>` — record testing observations, quick notes, balance feel, weird behavior, or unclear feedback that is not ready to become a GitHub issue. Add `event_id` if the note is about one event.
-- `/playtest summary` — recap recorded observations after a testing session.
+- `/playtest summary` — show recent recorded playtest observations.
 
 Tip: use `/ask` when you need a flexible explanation; use exact lookup commands for events, scenarios, clusters, status, and testing."""
 
@@ -330,7 +331,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 - `/admin sync` — resync slash commands with Discord. Use after I change command names/options and Discord still shows the old version.
 
 ### Automation / diagnostics
-- `/admin automation action:list` — shows which reminder/digest automations are enabled and where they will post. Reminder-style automation output goes to channel `{reminder_channel}`.
+- `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
 
@@ -366,6 +367,11 @@ class ChaosXBot(discord.Client):
                     "stale_blocker_reminder",
                 ],
                 str(self.settings.automation_reminder_channel_id),
+            )
+        if self.settings.content_dump_channel_id:
+            await self.store.set_automation_destination(
+                ["weekly_content_dump"],
+                str(self.settings.content_dump_channel_id),
             )
         await self.webhook_server.start()
         await self.update_application_description()
@@ -670,7 +676,6 @@ def register_commands(bot: ChaosXBot) -> None:
             return
         await interaction.response.send_message(community_help_text(), ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
-    work = app_commands.Group(name="work", description="Protected Chaos Redux work drafts", default_permissions=discord.Permissions(administrator=True))
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
 
@@ -766,33 +771,6 @@ def register_commands(bot: ChaosXBot) -> None:
         await interaction.response.send_modal(IssueReportModal(bot, kind))
 
 
-    @work.command(name="issue-draft", description="Turn a report into a private issue-style draft for Hoops review.")
-    async def work_issue_draft(interaction: discord.Interaction, summary: str, event: str = "", surface: str = "") -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        draft_id = _stable_id("issue", interaction.user.id, interaction.created_at.isoformat(), summary)
-        body = (
-            f"Summary: {summary}\n"
-            f"Event/entity: {event or 'unknown'}\n"
-            f"Surface: {surface or 'unknown'}\n\n"
-            "Expected behavior:\n- TBD\n\nActual behavior:\n- TBD\n\nReproduction steps:\n1. TBD\n\nEvidence:\n- Discord draft created by ChaosX; no GitHub issue created yet."
-        )
-        await bot.store.create_issue_draft(draft_id=draft_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, summary=summary, body=body)
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="work issue-draft", summary=draft_id)
-        await interaction.response.send_message(f"Created issue draft `{draft_id}`. No GitHub issue was created.\n```text\n{body[:1600]}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @work.command(name="handoff", description="Create a clear implementation/review handoff draft.")
-    async def work_handoff(interaction: discord.Interaction, task: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/work handoff task={task!r}. Include files, identifiers, validation, blockers, next owner.", command_name="work handoff")
-
-    @work.command(name="changelog", description="Draft player-facing changelog.")
-    async def work_changelog(interaction: discord.Interaction, ref_a: str, ref_b: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/work changelog ref_a={ref_a!r} ref_b={ref_b!r}. Draft only; avoid unsupported completion claims.", command_name="work changelog")
-
-    @work.command(name="release-draft", description="Draft release notes/announcement preview.")
-    async def work_release_draft(interaction: discord.Interaction, tag: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/work release-draft tag={tag!r}. Draft only; do not publish or announce.", command_name="work release-draft")
-
     @playtest.command(name="schedule", description="Prepare a playtest Scheduled Event plan.")
     async def playtest_schedule(interaction: discord.Interaction, target: str, start: str, duration: int, voice: str = "none", build: str = "") -> None:
         if not await owner_gate(interaction, settings):
@@ -814,13 +792,29 @@ def register_commands(bot: ChaosXBot) -> None:
         heading = f"Recorded playtest observation for {label}." if event_id.strip() else "Recorded general playtest observation."
         await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id or "general", render=lambda: f"{heading}\nUse `/issue` instead if this should become a tracked GitHub bug/crash/request.\n```text\n{observation[:1500]}\n```")
 
-    @playtest.command(name="summary", description="Summarize recorded playtest reports.")
-    async def playtest_summary(interaction: discord.Interaction, event: str = "latest") -> None:
-        rows = await bot.store.list_playtests(limit=10)
-        lines = ["## Playtest records"]
-        for playtest_id, target, start_time, duration_minutes, voice, build, status in rows:
-            lines.append(f"- `{playtest_id}` target=`{target}` start=`{start_time}` duration=`{duration_minutes}` voice=`{voice}` build=`{build}` status=`{status}`")
-        await send_scripted_response(bot, interaction, command_name="playtest summary", summary=event, render=lambda: "\n".join(lines))
+    @playtest.command(name="summary", description="Show recent recorded playtest observations.")
+    async def playtest_summary(interaction: discord.Interaction, limit: int = 10) -> None:
+        limit = max(1, min(limit, 25))
+        rows = await bot.store.list_playtest_reports(limit=limit)
+        lines = ["## Reported playtests"]
+        if not rows:
+            lines.append("No playtest observations recorded yet.")
+        for playtest_id, created_at, target, status, report_json in rows:
+            try:
+                report = json.loads(report_json or "{}")
+            except json.JSONDecodeError:
+                report = {}
+            event_id = report.get("event_id")
+            label = f"event id `{event_id}`" if event_id else "general"
+            observation = str(report.get("observation") or "").strip() or "No observation text stored."
+            reporter_id = report.get("reporter_id")
+            created = str(report.get("created_at") or created_at or "unknown")
+            lines.append(
+                f"- `{playtest_id}` — {label} — status `{status}` — {created}"
+                + (f" — reporter `{reporter_id}`" if reporter_id else "")
+                + f"\n  - {observation[:500]}"
+            )
+        await send_scripted_response(bot, interaction, command_name="playtest summary", summary=str(limit), render=lambda: "\n".join(lines))
 
     @playtest.command(name="cancel", description="Prepare/cancel playtest reminders/event if approved.")
     async def playtest_cancel(interaction: discord.Interaction, event: str) -> None:
@@ -873,7 +867,10 @@ def register_commands(bot: ChaosXBot) -> None:
             await interaction.response.send_message((f"Automation `{name}` set to `{action}`." if ok else f"Unknown automation `{name}`."), ephemeral=True)
             return
         rows = await bot.store.list_automations()
-        text = "## ChaosX automations\n" + "\n".join(f"- `{n}` enabled=`{bool(e)}` destination=`{d or 'unset'}`" for n, e, d in rows)
+        lines = ["## ChaosX automations"]
+        for name, enabled, destination, description in rows:
+            lines.append(f"- `{name}` — enabled=`{bool(enabled)}` — destination=`{destination or 'unset'}`\n  - {description}")
+        text = "\n".join(lines)
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="permissions-audit", description="Audit Discord/GitHub permissions.")
@@ -884,5 +881,5 @@ def register_commands(bot: ChaosXBot) -> None:
     async def admin_jobs(interaction: discord.Interaction, action: str = "list", job: str = "") -> None:
         await run_owner_hermes(bot, interaction, f"/admin jobs action={action!r} job={job!r}.", command_name="admin jobs")
 
-    for group in (work, playtest, admin):
+    for group in (playtest, admin):
         bot.tree.add_command(group)

@@ -56,6 +56,7 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.operator_provider == "openai-codex"
     assert settings.operator_reasoning_effort == "xhigh"
     assert settings.automation_reminder_channel_id == 1395464062367698977
+    assert settings.content_dump_channel_id == 1516054706286235768
 
 
 def test_operator_help_explains_when_to_use_admin_commands():

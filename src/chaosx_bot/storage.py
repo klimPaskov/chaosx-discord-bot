@@ -89,11 +89,28 @@ DEFAULT_AUTOMATIONS = {
     "playtest_reminders": 1,
     "post_playtest_result_request": 1,
     "weekly_project_digest": 0,
+    "weekly_content_dump": 1,
     "stale_blocker_reminder": 0,
     "release_announcement_posting": 0,
     "selected_channel_content_watcher": 0,
     "trusted_role_direct_issue_creation": 0,
     "agent_draft_pr_mode": 0,
+}
+
+AUTOMATION_DESCRIPTIONS = {
+    "repository_index_refresh": "Refreshes ChaosX's local event/scenario/cluster/search index from the Chaos Redux repo.",
+    "pull_request_ready_summary": "Would summarize PRs that look ready for review/merge.",
+    "ci_failure_first_recovery": "Would summarize CI failures and the first likely recovery step.",
+    "skill_subagent_change_summary": "Would summarize changes made by agent/skill-driven work.",
+    "playtest_reminders": "Sends playtest reminder messages when a playtest is scheduled.",
+    "post_playtest_result_request": "Asks testers for results/observations after a playtest window.",
+    "weekly_project_digest": "Text-style weekly project digest; usually keep this off if using content dumps.",
+    "weekly_content_dump": "Image-led weekly content-dump post. Posts only when enough fresh visuals/assets exist.",
+    "stale_blocker_reminder": "Reminds about old blockers that have not moved.",
+    "release_announcement_posting": "Reserved for release announcement posting; should stay off until explicitly used.",
+    "selected_channel_content_watcher": "Reserved watcher for chosen Discord channels; not active by default.",
+    "trusted_role_direct_issue_creation": "Reserved mode for trusted-role issue creation; public /issue is the normal path.",
+    "agent_draft_pr_mode": "Reserved mode for agent-created draft PRs; currently not a normal ChaosX workflow.",
 }
 
 
@@ -167,7 +184,7 @@ class Store:
     async def list_issue_drafts(self, limit: int = 10) -> list[tuple]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("SELECT draft_id, created_at, summary, status FROM issue_drafts ORDER BY created_at DESC LIMIT ?", (limit,))
-            return await cur.fetchall()
+            return [tuple(row) for row in await cur.fetchall()]
 
     async def create_playtest(self, *, playtest_id: str, actor_id: int, guild_id: int | None, channel_id: int | None, target: str, start_time: str, duration_minutes: int, voice: str, build: str) -> None:
         async with aiosqlite.connect(self.db_path) as db:
@@ -188,12 +205,26 @@ class Store:
     async def list_playtests(self, limit: int = 10) -> list[tuple]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("SELECT playtest_id, target, start_time, duration_minutes, voice, build, status FROM playtest_records ORDER BY created_at DESC LIMIT ?", (limit,))
-            return await cur.fetchall()
+            return [tuple(row) for row in await cur.fetchall()]
 
-    async def list_automations(self) -> list[tuple[str, int, str]]:
+    async def list_playtest_reports(self, limit: int = 10) -> list[tuple]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT playtest_id, created_at, target, status, report_json
+                FROM playtest_records
+                WHERE status = 'reported'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [tuple(row) for row in await cur.fetchall()]
+
+    async def list_automations(self) -> list[tuple[str, int, str, str]]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("SELECT name, enabled, destination FROM automation_config ORDER BY name")
-            return await cur.fetchall()
+            return [(*tuple(row), AUTOMATION_DESCRIPTIONS.get(str(row[0]), "No description yet.")) for row in await cur.fetchall()]
 
     async def set_automation(self, name: str, enabled: bool) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
