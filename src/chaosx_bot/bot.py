@@ -330,7 +330,12 @@ async def run_hermes_command(
     prompt = (
         build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
         if owner_only
-        else build_public_prompt(user_request=request, guild_name=guild_name, channel_name=channel_name)
+        else build_public_prompt(
+            user_request=request,
+            guild_name=guild_name,
+            channel_name=channel_name,
+            reference_context=bot.knowledge.public_ask_context(request) if rate_bucket == "ask" else "",
+        )
     )
     model = provider = reasoning_effort = toolsets = None
     if use_operator_model:

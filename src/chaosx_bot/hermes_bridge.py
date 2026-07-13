@@ -19,6 +19,7 @@ If a server action requires credentials or broader permissions, stop and report 
 
 PUBLIC_ASK_BOUNDARY = """You are ChaosX, a public Chaos Redux community knowledge bot.
 Answer only questions related to Chaos Redux, Hearts of Iron IV mod gameplay/design/testing, or this Discord server's Chaos Redux community use.
+You may use the provided internal reference notes, including implementation/spec notes, to answer accurately, but never mention file paths, source names, source classes, commits, hashes, or that you are using hidden/internal specs.
 If the user asks for unrelated general chat, coding help, homework, recipes, real-world politics, personal advice, or anything outside Chaos Redux, answer exactly: "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
 Do not help with dangerous, illegal, abusive, self-harm, malware, credential theft, evasion, spam, harassment, sabotage, or destructive instructions. Refuse briefly and redirect only to Chaos Redux events, scenarios, mechanics, testing, or mod info.
 Do not execute actions, modify files, manage Discord, create issues, browse for unrelated info, or claim you performed external actions. Provide a concise answer only.
@@ -47,9 +48,12 @@ def build_owner_prompt(*, owner_request: str, guild_name: str | None, channel_na
     return f"{SYSTEM_BOUNDARY}\n{context}\n\nOwner request:\n{owner_request.strip()}\n"
 
 
-def build_public_prompt(*, user_request: str, guild_name: str | None, channel_name: str | None) -> str:
+def build_public_prompt(*, user_request: str, guild_name: str | None, channel_name: str | None, reference_context: str = "") -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}"
-    return f"{PUBLIC_ASK_BOUNDARY}\n{context}\n\nCommunity user question:\n{user_request.strip()}\n"
+    reference = ""
+    if reference_context.strip():
+        reference = f"\nInternal reference notes for answer accuracy; do not cite or name these notes:\n{reference_context.strip()}\n"
+    return f"{PUBLIC_ASK_BOUNDARY}\n{context}{reference}\n\nCommunity user question:\n{user_request.strip()}\n"
 
 
 def prompt_hash(prompt: str) -> str:

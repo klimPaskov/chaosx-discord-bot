@@ -11,6 +11,7 @@ from .indexer import connect, rebuild_index
 
 MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
+MAX_CONTEXT_CHARS = 2400
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,44 @@ class Knowledge:
                 item += f"\n   Evidence: `{source_class}` · commit `{commit[:12]}` · synced `{_fmt_ts(indexed_at)}`"
             lines.append(item)
         return "\n".join(lines)
+
+    def public_ask_context(self, query: str, limit: int = 6) -> str:
+        """Return internal retrieval snippets for public /ask without paths/metadata.
+
+        Broad ask may use specs and planning docs for accuracy, but user-facing
+        answers must not expose source paths/classes/commits or mention hidden
+        spec documents.
+        """
+        self.ensure_index()
+        safe_query = _fts_query(query)
+        conn = connect(self.db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT snippet(source_docs_fts, 2, '', '', ' … ', 35) AS snip,
+                       bm25(source_docs_fts) AS rank
+                FROM source_docs_fts
+                JOIN source_docs d ON d.id = source_docs_fts.rowid
+                WHERE source_docs_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (safe_query, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        snippets: list[str] = []
+        total = 0
+        for i, (snip, _rank) in enumerate(rows, 1):
+            clean = _clean_snippet(snip)
+            if not clean:
+                continue
+            item = f"{i}. {clean}"
+            if total + len(item) > MAX_CONTEXT_CHARS:
+                break
+            snippets.append(item)
+            total += len(item)
+        return "\n".join(snippets)
 
     def event(self, event: str, view: str = "overview", show_evidence: bool = False) -> str:
         self.ensure_index()
@@ -234,6 +273,14 @@ def _extract_number(value: str) -> str | None:
 def _fts_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-z0-9_\-]+", query)
     return " OR ".join(tokens[:8]) or '""'
+
+
+def _clean_snippet(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip()
+    value = re.sub(r"(?i)docs/[A-Za-z0-9_./-]+", "", value)
+    value = re.sub(r"(?i)[A-Za-z]:[/\\][^\s`]+", "", value)
+    value = re.sub(r"`[^`]*(?:docs/|/mnt/|/home/)[^`]*`", "", value)
+    return value[:500].strip(" -—:;,.`")
 
 
 def _parse_lines(lines: str, total: int) -> tuple[int, int]:

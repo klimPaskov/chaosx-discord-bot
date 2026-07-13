@@ -27,6 +27,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Evidence:' in owner_search
     search = knowledge.search('Zombie Outbreak', limit=2)
     assert 'Search results' in search
+    ask_context = knowledge.public_ask_context('Zombie Outbreak')
+    assert ask_context
+    assert 'docs/' not in ask_context
+    assert 'accepted_source_specification' not in ask_context
     status = knowledge.status()
     assert 'Indexed commit' not in status
     assert 'source docs' not in status
