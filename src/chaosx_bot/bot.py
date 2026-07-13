@@ -128,26 +128,48 @@ General questions are rate-limited; lookups are usually faster and more reliable
 
 
 def operator_help_text(settings: Settings) -> str:
-    return f"""## ChaosX protected operator commands
-Models:
-- Public broad ask: `{settings.ask_provider}` / `{settings.ask_model}`
-- Public broad ask reasoning: `{settings.ask_reasoning_effort or 'default'}`
-- Autonomous server ops: `{settings.operator_provider}` / `{settings.operator_model}`
-- Autonomous server reasoning: `{settings.operator_reasoning_effort or 'default'}`
+    return f"""## ChaosX admin help
+Use this when you want private controls. Regular users should mostly use `/help`, `/ask`, and lookup commands.
 
-Protected server/admin:
-`/admin help` — this private operator guide.
-`/admin ask` — protected project/server request through the configured ask model.
-`/server ask` — autonomous server-management request using the smarter operator model.
-`/server role-audit`, `/server scan-behaviour`, `/server member-info`, `/server add-role`, `/server remove-role`, `/server timeout`
-`/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin config`, `/admin permissions-audit`, `/admin jobs`, `/admin rollback`
+### Start here
+- `/admin health` — is the bot online, which repo/profile is it using, and what guilds can it see.
+- `/admin config` — show safe config: model, rate limits, guild IDs, webhook on/off. Secrets are not printed.
+- `/admin sync` — light index sync/maintenance request. Use after docs/catalogs changed.
+- `/admin reindex` — rebuild local Chaos Redux search/catalog index. Use if lookups look stale or broken.
+- `/admin permissions-audit` — ask for a permissions/security check. Use after role/bot permission changes.
 
-Protected project ops:
-`/work issue-draft`, `/work handoff`, `/work changelog`, `/work release-draft`
-`/playtest schedule`, `/playtest cancel`
-`/hermes route`, `/hermes task`, `/hermes status`, `/hermes cancel`, `/hermes audit`, `/hermes review-pr`
+### Ask models
+- Public `/ask`: `{settings.ask_provider}` / `{settings.ask_model}` reasoning `{settings.ask_reasoning_effort or 'default'}`. No file/Discord actions.
+- `/admin ask request:<text>` — private project/operator ask. Use for repo/project operations questions, not public chat.
+- `/server ask request:<text>` — smarter server-management ask: `{settings.operator_provider}` / `{settings.operator_model}` reasoning `{settings.operator_reasoning_effort or 'default'}`. Use for Discord-server tasks. It should stop before destructive/broad actions unless explicitly approved.
 
-Important: `/server ask` can reason autonomously, but Discord/GitHub side effects still depend on bot permissions, role hierarchy, configured secrets, and approval gates."""
+### Server tools
+- `/server role-audit` — list elevated roles and hierarchy risks.
+- `/server scan-behaviour` — scan recent visible messages for obvious abuse/spam signals.
+- `/server member-info user:<user>` — private moderation context for one member.
+- `/server add-role` / `/server remove-role` — role changes if Discord permissions and hierarchy allow it.
+- `/server timeout` — timeout a member if permissions allow it.
+
+### Project/work tools
+- `/work issue-draft` — create a private draft only; no GitHub issue is filed.
+- `/work handoff` — make a Codex/Hermes handoff prompt.
+- `/work changelog` — draft player-facing changelog text.
+- `/work release-draft` — draft announcement/release notes; does not publish.
+- `/playtest schedule` / `/playtest cancel` — manage playtest records.
+
+### Hermes tools
+- `/hermes route` — choose the right agent/skill route for a task.
+- `/hermes task` — create an agent-task preview.
+- `/hermes status` / `/hermes cancel` — inspect or cancel agent work.
+- `/hermes audit` — route a review/audit.
+- `/hermes review-pr` — review a PR; cannot approve or merge.
+
+### Automation
+- `/admin automation action:list` — list automations.
+- `/admin automation action:enable name:<name>` or `disable` — toggle a named automation.
+- `/admin jobs` — list/retry tracked jobs.
+- `/admin rollback` — prepare rollback instructions; does not perform destructive rollback by itself.
+"""
 
 
 class ChaosXBot(discord.Client):
@@ -424,7 +446,7 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @bot.tree.command(name="scenario", description="Look up a scenario by ID or name.")
     async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.event(scenario, view), owner_render=lambda: bot.knowledge.event(scenario, view, show_evidence=True))
+        await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.scenario(scenario, view), owner_render=lambda: bot.knowledge.scenario(scenario, view, show_evidence=True))
 
     @bot.tree.command(name="cluster", description="Look up an event cluster.")
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
@@ -542,7 +564,9 @@ def register_commands(bot: ChaosXBot) -> None:
     async def admin_help(interaction: discord.Interaction) -> None:
         if not await owner_gate(interaction, settings):
             return
-        await interaction.response.send_message(operator_help_text(settings), ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        for part in _chunk(operator_help_text(settings)):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="ask", description="Protected project/server request through Hermes.")
     async def admin_ask(interaction: discord.Interaction, request: str) -> None:

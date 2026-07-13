@@ -19,16 +19,12 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Public Hermes-backed commands run with the `safe` toolset and a public prompt boundary: answer only Chaos Redux/mod/server-use questions, refuse dangerous/off-topic requests, and do not perform external actions.
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=openai-codex`, `CHAOSX_OPERATOR_MODEL=gpt-5.6-luna`, `CHAOSX_OPERATOR_REASONING_EFFORT=xhigh`.
 - Provides:
-  - `/health` — private runtime/status check.
-  - `/inventory` — private read-only guild/channel/role inventory.
   - `/help` — public community command guide.
-  - `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands.
-  - `/say` — operator-only exact post to the current channel with mentions disabled.
-
+  - `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands. `/scenario` reads the scenario catalog, not the event catalog.
   - `/work ...` — issue draft/suggestion/event idea/handoff/changelog/release draft command family.
   - `/playtest ...` — queue/schedule/report/summary/cancel command family.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
-  - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family.
+  - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family. `/admin help` explains what each admin-only command is for and when to use it.
   - `/server ...` — protected autonomous ask, role audit, behaviour scan, member info, role assignment/removal, and timeout commands.
 - Stores a local SQLite audit log in `CHAOSX_DB_PATH`.
 

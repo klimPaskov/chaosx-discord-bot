@@ -75,6 +75,24 @@ CREATE TABLE IF NOT EXISTS catalog_events (
     indexed_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS catalog_scenarios (
+    row_key TEXT PRIMARY KEY,
+    scenario_id TEXT,
+    name TEXT NOT NULL,
+    details TEXT NOT NULL,
+    evo_i TEXT,
+    evo_ii TEXT,
+    evo_iii TEXT,
+    evo_iv TEXT,
+    evo_v TEXT,
+    world_end TEXT,
+    type TEXT,
+    cluster_id TEXT,
+    member_severity TEXT,
+    status TEXT,
+    indexed_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS catalog_clusters (
     row_key TEXT PRIMARY KEY,
     cluster_id TEXT,
@@ -93,6 +111,7 @@ CREATE TABLE IF NOT EXISTS catalog_clusters (
 class IndexStats:
     docs: int
     events: int
+    scenarios: int
     clusters: int
     commit_sha: str
 
@@ -194,12 +213,13 @@ def rebuild_index(repo: Path, db_path: Path) -> IndexStats:
             )
             docs += 1
         events = _load_events(conn, repo, indexed_at)
+        scenarios = _load_scenarios(conn, repo, indexed_at)
         clusters = _load_clusters(conn, repo, indexed_at)
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('commit_sha', ?)", (commit,))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('indexed_at', ?)", (str(indexed_at),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('doc_count', ?)", (str(docs),))
     conn.close()
-    return IndexStats(docs=docs, events=events, clusters=clusters, commit_sha=commit)
+    return IndexStats(docs=docs, events=events, scenarios=scenarios, clusters=clusters, commit_sha=commit)
 
 
 def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int:
@@ -242,6 +262,55 @@ def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int
                 """,
                 (
                     row_key, event_id, name, row.get("Details") or "", row.get("Evo I") or "", row.get("Evo II") or "",
+                    row.get("Evo III") or "", row.get("Evo IV") or "", row.get("Evo V") or "",
+                    row.get("World-End Scenario") or "", row.get("Type") or "", row.get("Cluster ID") or "",
+                    row.get("Member Severity") or "", row.get("Status") or "", indexed_at,
+                ),
+            )
+            count += 1
+    return count
+
+
+def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int:
+    path = repo / "docs/spreadsheets/chaos_redux_scenarios_catalog.csv"
+    conn.execute("DROP TABLE IF EXISTS catalog_scenarios")
+    conn.execute("""
+    CREATE TABLE catalog_scenarios (
+        row_key TEXT PRIMARY KEY,
+        scenario_id TEXT,
+        name TEXT NOT NULL,
+        details TEXT NOT NULL,
+        evo_i TEXT,
+        evo_ii TEXT,
+        evo_iii TEXT,
+        evo_iv TEXT,
+        evo_v TEXT,
+        world_end TEXT,
+        type TEXT,
+        cluster_id TEXT,
+        member_severity TEXT,
+        status TEXT,
+        indexed_at REAL NOT NULL
+    )
+    """)
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open(newline="", encoding="utf-8-sig") as fp:
+        reader = csv.DictReader(fp)
+        for row_number, row in enumerate(reader, 1):
+            scenario_id = (row.get("ID") or "").strip()
+            name = (row.get("Event Name") or row.get("Scenario Name") or "").strip()
+            if not scenario_id and not name:
+                continue
+            row_key = scenario_id if scenario_id else f"unassigned:{row_number}:{name}"
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO catalog_scenarios(row_key, scenario_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_key, scenario_id, name, row.get("Details") or "", row.get("Evo I") or "", row.get("Evo II") or "",
                     row.get("Evo III") or "", row.get("Evo IV") or "", row.get("Evo V") or "",
                     row.get("World-End Scenario") or "", row.get("Type") or "", row.get("Cluster ID") or "",
                     row.get("Member Severity") or "", row.get("Status") or "", indexed_at,

@@ -23,9 +23,10 @@ class Knowledge:
         conn = connect(self.db_path)
         try:
             count = conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0]
+            scenarios = conn.execute("SELECT COUNT(*) FROM catalog_scenarios").fetchone()[0]
         finally:
             conn.close()
-        if count == 0:
+        if count == 0 or scenarios == 0:
             rebuild_index(self.repo, self.db_path)
 
     def status(self) -> str:
@@ -35,12 +36,14 @@ class Knowledge:
             meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
             docs = conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0]
             events = conn.execute("SELECT COUNT(*) FROM catalog_events").fetchone()[0]
+            scenarios = conn.execute("SELECT COUNT(*) FROM catalog_scenarios").fetchone()[0]
             clusters = conn.execute("SELECT COUNT(*) FROM catalog_clusters").fetchone()[0]
         finally:
             conn.close()
         return (
             "## ChaosX status\n"
             f"- Known events: `{events}`\n"
+            f"- Known scenarios: `{scenarios}`\n"
             f"- Known clusters: `{clusters}`\n"
             f"- Index health: `ready`\n"
         )
@@ -151,6 +154,33 @@ class Knowledge:
             lines += ["", self._footer("catalog", "docs/spreadsheets/chaos_redux_events_catalog.csv")]
         return "\n".join(lines)
 
+    def scenario(self, scenario: str, view: str = "overview", show_evidence: bool = False) -> str:
+        self.ensure_index()
+        row = self._find_scenario(scenario)
+        if not row:
+            return self.search(scenario, scope="all", limit=5, show_evidence=show_evidence) + "\n\nNo exact scenario match; showing public search results instead."
+        keys = ["row_key", "scenario_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
+        data = dict(zip(keys, row))
+        scenario_label = f"Scenario {data['scenario_id']}: {data['name']}" if data["scenario_id"] else f"Unassigned scenario idea: {data['name']}"
+        lines = [
+            f"## {scenario_label}",
+            f"- Type: `{data['type'] or 'unknown'}`",
+            f"- Status: `{data['status'] or 'unknown'}`",
+            f"- Cluster: `{data['cluster_id'] or 'none'}`",
+            f"- Member severity: `{data['member_severity'] or 'none'}`",
+            "",
+            data["details"][:MAX_EXCERPT_CHARS] or "No details available.",
+        ]
+        evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
+        shown_evos = [f"- **{label}:** {text[:400]}" for label, text in evos if text]
+        if shown_evos and view in {"overview", "design", "history"}:
+            lines += ["", "### Evolution tracks", *shown_evos]
+        if data["world_end"]:
+            lines += ["", "### World-end relationship", data["world_end"][:700]]
+        if show_evidence:
+            lines += ["", self._footer("catalog", "docs/spreadsheets/chaos_redux_scenarios_catalog.csv")]
+        return "\n".join(lines)
+
     def cluster(self, cluster: str, show_evidence: bool = False) -> str:
         self.ensure_index()
         conn = connect(self.db_path)
@@ -219,6 +249,19 @@ class Knowledge:
                 if row:
                     return row
             return conn.execute("SELECT * FROM catalog_events WHERE lower(name) LIKE ? ORDER BY CAST(event_id AS INTEGER) LIMIT 1", (f"%{value.lower()}%",)).fetchone()
+        finally:
+            conn.close()
+
+    def _find_scenario(self, scenario: str):
+        value = scenario.strip()
+        conn = connect(self.db_path)
+        try:
+            number = _extract_number(value)
+            if number:
+                row = conn.execute("SELECT * FROM catalog_scenarios WHERE scenario_id = ?", (str(int(number)),)).fetchone()
+                if row:
+                    return row
+            return conn.execute("SELECT * FROM catalog_scenarios WHERE lower(name) LIKE ? ORDER BY CAST(scenario_id AS INTEGER) LIMIT 1", (f"%{value.lower()}%",)).fetchone()
         finally:
             conn.close()
 

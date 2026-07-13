@@ -1,5 +1,5 @@
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import PUBLIC_ASK_REDIRECT, public_ask_rejection_reason, sanitize_public_ask_output
+from chaosx_bot.bot import PUBLIC_ASK_REDIRECT, operator_help_text, public_ask_rejection_reason, sanitize_public_ask_output
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -52,6 +52,15 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.operator_model == "gpt-5.6-luna"
     assert settings.operator_provider == "openai-codex"
     assert settings.operator_reasoning_effort == "xhigh"
+
+
+def test_operator_help_explains_when_to_use_admin_commands():
+    help_text = operator_help_text(Settings(_env_file=None, discord_token="dummy"))
+    assert "/admin health" in help_text
+    assert "Use if lookups look stale or broken" in help_text
+    assert "/server ask request:<text>" in help_text
+    assert "No file/Discord actions" in help_text
+    assert "/work handoff" in help_text
 
 
 def test_fixed_window_rate_limiter_blocks_after_limit():
