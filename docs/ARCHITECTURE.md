@@ -15,6 +15,7 @@
 - Community knowledge/tester commands are public inside the configured guild, but source/spec/repo-file views are not public because implementation specs are for Klim and coding agents.
 - Owner/operator work should mostly go through `/admin ask`; avoid exposing tiny one-off admin/server commands unless Hoops explicitly asks for them.
 - `/admin ask` injects recent owner-only follow-up memory scoped to the same owner + guild + Discord channel/thread, may pre-resolve plain-text member references such as `@Holly`/`member named Holly`, and may fetch recent messages from the current or explicitly mentioned channel for owner-requested analysis, optionally filtered to a mentioned/user-id target. This is active/on-demand, not passive monitoring. Previous turns are context only, never authorization for server mutation.
+- Public `/event-idea` and `/suggestion` can quietly write approved notes into the Chaos Redux vault. New vault notes refresh `index.md`, `Events/Events Index.md`, `Planning/Community Suggestions/Community Suggestions Index.md`, and `log.md` so references do not go stale.
 - Repository/project reasoning is delegated to local Hermes profile `chaos_redux` through a bounded prompt.
 - Reminder/digest-style automation output defaults to the configured automation reminder channel.
 - Weekly content-dump automation targets the content-dump channel and must stay silent unless it has enough fresh visual assets to make an image-led post.

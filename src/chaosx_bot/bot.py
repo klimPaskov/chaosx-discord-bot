@@ -14,6 +14,7 @@ from discord import app_commands
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
 from .community_notes import write_event_idea_note, write_suggestion_note
 from .config import Settings
+from .vault_index import refresh_vault_indexes
 from .hermes_bridge import HermesResult, build_owner_prompt, build_public_prompt, run_hermes
 from .knowledge import Knowledge
 from .rate_limit import FixedWindowRateLimiter
@@ -979,6 +980,14 @@ def register_commands(bot: ChaosXBot) -> None:
                     channel_id=interaction.channel_id,
                 )
                 if note:
+                    if note.created:
+                        refresh_vault_indexes(
+                            vault_path=settings.obsidian_vault_path,
+                            event_specs_folder=settings.community_event_specs_folder,
+                            suggestions_folder=settings.community_suggestions_folder,
+                            reason="ChaosX approved community suggestion captured.",
+                            changed_path=note.path,
+                        )
                     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion", summary=str(note.path))
             except Exception as exc:
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion error", summary=type(exc).__name__)
@@ -1040,6 +1049,14 @@ def register_commands(bot: ChaosXBot) -> None:
                     easter_egg=easter_egg,
                 )
                 if note:
+                    if note.created:
+                        refresh_vault_indexes(
+                            vault_path=settings.obsidian_vault_path,
+                            event_specs_folder=settings.community_event_specs_folder,
+                            suggestions_folder=settings.community_suggestions_folder,
+                            reason="ChaosX approved community event idea captured.",
+                            changed_path=note.path,
+                        )
                     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
             except Exception as exc:
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)

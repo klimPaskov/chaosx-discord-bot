@@ -18,6 +18,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Public limits by default: 10 broad `/ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
 - Broad ask model override: `CHAOSX_ASK_PROVIDER=openai-codex`, `CHAOSX_ASK_MODEL=gpt-5.6-luna`, `CHAOSX_ASK_REASONING_EFFORT=medium`.
 - Public Hermes-backed commands run with the `safe` toolset and a public prompt boundary: answer only Chaos Redux/mod/server-use questions, refuse dangerous/off-topic requests, do not perform external actions, and include repo/spec/code paths only when explicitly asked.
+- Approved `/event-idea` and `/suggestion` outputs are quietly captured to the Chaos Redux vault; each new captured note refreshes the vault index/reference notes and appends the vault log.
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=openai-codex`, `CHAOSX_OPERATOR_MODEL=gpt-5.6-luna`, `CHAOSX_OPERATOR_REASONING_EFFORT=xhigh`.
 - Provides:
   - `/help` — public community command guide.
