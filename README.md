@@ -1,17 +1,19 @@
 # ChaosX Discord Bot
 
-Owner-only Discord command agent for Chaos Redux server operations.
+Community-facing Discord knowledge bot plus owner-only operations agent for the Chaos Redux server.
 
-This is intentionally **not** a public community chatbot. It is a private control surface: only the configured owner Discord user ID can invoke commands. Other users receive an ephemeral denial.
+ChaosX is intended for the Chaos Redux community to ask bounded project questions while keeping operational/admin actions restricted to the configured owner Discord user ID. Public token-consuming commands are rate-limited and length-limited.
 
 ## What it does now
 
 - Registers slash commands with Discord.
-- Refuses every command unless `interaction.user.id == CHAOSX_OWNER_ID`.
+- Community read-only/project-question commands are available in the configured guild.
+- Admin/automation/server-write commands refuse every user unless `interaction.user.id == CHAOSX_OWNER_ID`.
 - Optional guild lock with `CHAOSX_ALLOWED_GUILD_ID`.
 - Uses no Message Content privileged intent by default.
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
-- Bot presence/description: `Owner-only Chaos Redux Discord operations agent` / watching `Chaos Redux ops`.
+- Bot presence/description: `Community Chaos Redux knowledge bot with owner-only operations` / watching `Chaos Redux ops`.
+- Public limits by default: 3 broad `/chaosx ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
 - Provides:
   - `/health` — private runtime/status check.
   - `/inventory` — private read-only guild/channel/role inventory.

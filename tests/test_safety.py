@@ -1,6 +1,7 @@
-from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner
+from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
+from chaosx_bot.rate_limit import FixedWindowRateLimiter
 
 
 def test_owner_only_gate():
@@ -14,6 +15,8 @@ def test_guild_lock():
     assert is_allowed_guild(1, 1)
     assert not is_allowed_guild(2, 1)
     assert "different guild" in deny_reason(123, 123, 2, 1)
+    assert public_deny_reason(1, 1) is None
+    assert "different guild" in public_deny_reason(2, 1)
 
 
 def test_prompt_boundary_contains_untrusted_content_warning():
@@ -37,3 +40,13 @@ def test_blank_optional_guild_ids_are_allowed():
     )
     assert settings.allowed_guild_id is None
     assert settings.command_guild_id is None
+
+
+def test_fixed_window_rate_limiter_blocks_after_limit():
+    limiter = FixedWindowRateLimiter()
+    assert limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600).allowed
+    assert limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600).allowed
+    blocked = limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600)
+    assert not blocked.allowed
+    assert blocked.retry_after_seconds > 0
+    assert limiter.check(bucket="ask", user_id=2, limit=2, window_seconds=3600).allowed

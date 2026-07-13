@@ -3,12 +3,13 @@ from __future__ import annotations
 import discord
 from discord import app_commands
 
-from .auth import deny_reason, safe_allowed_mentions
+from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
 from .config import Settings
 from .hermes_bridge import build_owner_prompt, run_hermes
+from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
 
-BOT_DESCRIPTION = "Owner-only Chaos Redux Discord operations agent"
+BOT_DESCRIPTION = "Community Chaos Redux knowledge bot with owner-only operations"
 
 
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
@@ -39,6 +40,7 @@ class ChaosXBot(discord.Client):
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
         self.store = Store(settings.db_path)
+        self.rate_limiter = FixedWindowRateLimiter()
 
     async def setup_hook(self) -> None:
         await self.store.init()
@@ -64,7 +66,7 @@ class ChaosXBot(discord.Client):
 
 
 async def owner_gate(interaction: discord.Interaction, settings: Settings) -> bool:
-    reason = deny_reason(
+    reason = owner_deny_reason(
         interaction.user.id,
         settings.owner_id,
         interaction.guild_id,
@@ -79,16 +81,59 @@ async def owner_gate(interaction: discord.Interaction, settings: Settings) -> bo
     return True
 
 
-async def run_owner_hermes(
+async def public_gate(interaction: discord.Interaction, settings: Settings) -> bool:
+    reason = public_deny_reason(interaction.guild_id, settings.allowed_guild_id)
+    if reason:
+        if interaction.response.is_done():
+            await interaction.followup.send(reason, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        else:
+            await interaction.response.send_message(reason, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        return False
+    return True
+
+
+async def run_hermes_command(
     bot: ChaosXBot,
     interaction: discord.Interaction,
     request: str,
     *,
     command_name: str,
     public: bool = False,
+    owner_only: bool = False,
+    rate_bucket: str = "scripted",
 ) -> None:
-    if not await owner_gate(interaction, bot.settings):
+    if owner_only:
+        if not await owner_gate(interaction, bot.settings):
+            return
+    elif not await public_gate(interaction, bot.settings):
         return
+
+    if not owner_only:
+        max_chars = bot.settings.public_prompt_max_chars
+        if len(request) > max_chars:
+            await interaction.response.send_message(
+                f"Request is too long for public ChaosX commands. Limit: {max_chars} characters.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        if rate_bucket == "ask":
+            limit = bot.settings.public_ask_limit_per_hour
+        else:
+            limit = bot.settings.public_scripted_limit_per_hour
+        if limit <= 0:
+            await interaction.response.send_message("This public command is currently disabled.", ephemeral=True)
+            return
+        rate = bot.rate_limiter.check(bucket=rate_bucket, user_id=interaction.user.id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            minutes = max(1, rate.retry_after_seconds // 60)
+            await interaction.response.send_message(
+                f"Rate limit hit for ChaosX `{rate_bucket}` commands. Try again in about {minutes} minute(s).",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+
     await interaction.response.defer(ephemeral=not public, thinking=True)
     guild_name, channel_name = _guild_channel(interaction)
     prompt = build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
@@ -116,13 +161,24 @@ async def run_owner_hermes(
         command=command_name,
         summary=request,
     )
-    header = f"Hermes run `{status}` hash `{result.prompt_hash[:12]}` returncode `{result.returncode}`"
+    header = f"ChaosX `{status}` hash `{result.prompt_hash[:12]}`"
     for i, part in enumerate(_chunk(output)):
         await interaction.followup.send(
             (header + "\n" if i == 0 else "") + part,
             ephemeral=not public,
             allowed_mentions=safe_allowed_mentions(),
         )
+
+
+async def run_owner_hermes(
+    bot: ChaosXBot,
+    interaction: discord.Interaction,
+    request: str,
+    *,
+    command_name: str,
+    public: bool = False,
+) -> None:
+    await run_hermes_command(bot, interaction, request, command_name=command_name, public=public, owner_only=True)
 
 
 def register_commands(bot: ChaosXBot) -> None:
@@ -199,67 +255,67 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @chaosx.command(name="ask", description="Answer a Chaos Redux question with evidence.")
     async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "private") -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx ask question={question!r} visibility={visibility!r}. Answer with evidence footer.", command_name="chaosx ask", public=visibility == "public")
+        await run_hermes_command(bot, interaction, f"/chaosx ask question={question!r} visibility={visibility!r}. Answer with evidence footer.", command_name="chaosx ask", public=visibility == "public", rate_bucket="ask")
 
     @chaosx.command(name="event", description="Look up an event by ID or name.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx event event={event!r} view={view!r}. Include catalog, specs, implementation evidence, testing state.", command_name="chaosx event")
+        await run_hermes_command(bot, interaction, f"/chaosx event event={event!r} view={view!r}. Include catalog, specs, implementation evidence, testing state.", command_name="chaosx event")
 
     @chaosx.command(name="scenario", description="Look up a scenario by ID or name.")
     async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx scenario scenario={scenario!r} view={view!r}. Include evidence and testing status.", command_name="chaosx scenario")
+        await run_hermes_command(bot, interaction, f"/chaosx scenario scenario={scenario!r} view={view!r}. Include evidence and testing status.", command_name="chaosx scenario")
 
     @chaosx.command(name="cluster", description="Look up an event cluster.")
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx cluster cluster={cluster!r}. Never invent IDs for planned clusters.", command_name="chaosx cluster")
+        await run_hermes_command(bot, interaction, f"/chaosx cluster cluster={cluster!r}. Never invent IDs for planned clusters.", command_name="chaosx cluster")
 
     @chaosx.command(name="mechanic", description="Explain a Chaos Redux mechanic.")
     async def chaosx_mechanic(interaction: discord.Interaction, mechanic: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx mechanic mechanic={mechanic!r}. Distinguish design docs from implementation evidence.", command_name="chaosx mechanic")
+        await run_hermes_command(bot, interaction, f"/chaosx mechanic mechanic={mechanic!r}. Distinguish design docs from implementation evidence.", command_name="chaosx mechanic")
 
     @chaosx.command(name="search", description="Search indexed/project sources.")
     async def chaosx_search(interaction: discord.Interaction, query: str, scope: str = "all") -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx search query={query!r} scope={scope!r}. Return ranked source snippets and evidence metadata.", command_name="chaosx search")
+        await run_hermes_command(bot, interaction, f"/chaosx search query={query!r} scope={scope!r}. Return ranked source snippets and evidence metadata.", command_name="chaosx search")
 
     @chaosx.command(name="source", description="Show source-of-truth map for an entity/path.")
     async def chaosx_source(interaction: discord.Interaction, query: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx source query={query!r}. Explain intended design/current behavior/player wording/plans.", command_name="chaosx source")
+        await run_hermes_command(bot, interaction, f"/chaosx source query={query!r}. Explain intended design/current behavior/player wording/plans.", command_name="chaosx source")
 
     @chaosx.command(name="compare", description="Compare two sources/entities.")
     async def chaosx_compare(interaction: discord.Interaction, left: str, right: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx compare left={left!r} right={right!r}. Highlight conflicts, missing surfaces, stale docs. Do not apply changes.", command_name="chaosx compare")
+        await run_hermes_command(bot, interaction, f"/chaosx compare left={left!r} right={right!r}. Highlight conflicts, missing surfaces, stale docs. Do not apply changes.", command_name="chaosx compare")
 
     @chaosx.command(name="status", description="Show completion/status matrix.")
     async def chaosx_status(interaction: discord.Interaction, entity: str = "global", surface: str = "all") -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx status entity={entity!r} surface={surface!r}. Separate finished/partial/blocked/unknown evidence.", command_name="chaosx status")
+        await run_hermes_command(bot, interaction, f"/chaosx status entity={entity!r} surface={surface!r}. Separate finished/partial/blocked/unknown evidence.", command_name="chaosx status")
 
     @chaosx.command(name="testing", description="Show prioritized testing queue.")
     async def chaosx_testing(interaction: discord.Interaction, kind: str = "all", limit: int = 10) -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx testing kind={kind!r} limit={limit}. Prioritize Needs Testing, recent changes, issues, missing playtest evidence.", command_name="chaosx testing")
+        await run_hermes_command(bot, interaction, f"/chaosx testing kind={kind!r} limit={limit}. Prioritize Needs Testing, recent changes, issues, missing playtest evidence.", command_name="chaosx testing")
 
     @chaosx.command(name="help", description="Show ChaosX command help.")
     async def chaosx_help(interaction: discord.Interaction, topic: str = "all") -> None:
-        await run_owner_hermes(bot, interaction, f"/chaosx help topic={topic!r}. Keep compact.", command_name="chaosx help")
+        await run_hermes_command(bot, interaction, f"/chaosx help topic={topic!r}. Keep compact.", command_name="chaosx help")
 
     @repo.command(name="status", description="Show repository/index status.")
     async def repo_status(interaction: discord.Interaction) -> None:
-        await run_owner_hermes(bot, interaction, "/repo status. Include branch, commit, dirty state, index health if available.", command_name="repo status")
+        await run_hermes_command(bot, interaction, "/repo status. Include branch, commit, dirty state, index health if available.", command_name="repo status")
 
     @repo.command(name="search", description="Search repo content/symbols.")
     async def repo_search(interaction: discord.Interaction, query: str, path: str = "") -> None:
-        await run_owner_hermes(bot, interaction, f"/repo search query={query!r} path={path!r}. Use exact/symbol search first.", command_name="repo search")
+        await run_hermes_command(bot, interaction, f"/repo search query={query!r} path={path!r}. Use exact/symbol search first.", command_name="repo search")
 
     @repo.command(name="file", description="Show safe excerpt from a repo file.")
     async def repo_file(interaction: discord.Interaction, path: str, lines: str = "") -> None:
-        await run_owner_hermes(bot, interaction, f"/repo file path={path!r} lines={lines!r}. Enforce size limits and redact secret-like values.", command_name="repo file")
+        await run_hermes_command(bot, interaction, f"/repo file path={path!r} lines={lines!r}. Enforce size limits and redact secret-like values.", command_name="repo file")
 
     @repo.command(name="diff", description="Summarize a git diff.")
     async def repo_diff(interaction: discord.Interaction, ref_a: str, ref_b: str, path: str = "") -> None:
-        await run_owner_hermes(bot, interaction, f"/repo diff ref_a={ref_a!r} ref_b={ref_b!r} path={path!r}. Do not claim semantic correctness from diff alone.", command_name="repo diff")
+        await run_hermes_command(bot, interaction, f"/repo diff ref_a={ref_a!r} ref_b={ref_b!r} path={path!r}. Do not claim semantic correctness from diff alone.", command_name="repo diff")
 
     @repo.command(name="history", description="Show relevant history for an entity/path.")
     async def repo_history(interaction: discord.Interaction, entity: str, limit: int = 10) -> None:
-        await run_owner_hermes(bot, interaction, f"/repo history entity={entity!r} limit={limit}.", command_name="repo history")
+        await run_hermes_command(bot, interaction, f"/repo history entity={entity!r} limit={limit}.", command_name="repo history")
 
     @work.command(name="issue-draft", description="Draft a GitHub issue from text/message context.")
     async def work_issue_draft(interaction: discord.Interaction, summary: str, event: str = "", surface: str = "") -> None:
@@ -267,11 +323,11 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @work.command(name="suggestion", description="Structure a suggestion and check duplicates.")
     async def work_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/work suggestion suggestion={suggestion!r}. Structure and duplicate-check; do not promote to accepted design.", command_name="work suggestion")
+        await run_hermes_command(bot, interaction, f"/work suggestion suggestion={suggestion!r}. Structure and duplicate-check; do not promote to accepted design.", command_name="work suggestion")
 
     @work.command(name="event-idea", description="Check an event idea against assigned/unassigned catalogs.")
     async def work_event_idea(interaction: discord.Interaction, idea: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/work event-idea idea={idea!r}. Search assigned events and unassigned ideas; never allocate ID.", command_name="work event-idea")
+        await run_hermes_command(bot, interaction, f"/work event-idea idea={idea!r}. Search assigned events and unassigned ideas; never allocate ID.", command_name="work event-idea")
 
     @work.command(name="handoff", description="Create a Codex/Hermes handoff summary.")
     async def work_handoff(interaction: discord.Interaction, task: str) -> None:
@@ -287,7 +343,7 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @playtest.command(name="queue", description="Show playtest queue.")
     async def playtest_queue(interaction: discord.Interaction, kind: str = "all") -> None:
-        await run_owner_hermes(bot, interaction, f"/playtest queue kind={kind!r}. Include evidence for ordering.", command_name="playtest queue")
+        await run_hermes_command(bot, interaction, f"/playtest queue kind={kind!r}. Include evidence for ordering.", command_name="playtest queue")
 
     @playtest.command(name="schedule", description="Prepare a playtest Scheduled Event plan.")
     async def playtest_schedule(interaction: discord.Interaction, target: str, start: str, duration: int, voice: str = "none", build: str = "") -> None:
@@ -295,11 +351,11 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @playtest.command(name="report", description="Draft a structured playtest report.")
     async def playtest_report(interaction: discord.Interaction, event: str, observation: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/playtest report event={event!r} observation={observation!r}. Structure result and optional issue draft.", command_name="playtest report")
+        await run_hermes_command(bot, interaction, f"/playtest report event={event!r} observation={observation!r}. Structure result and optional issue draft.", command_name="playtest report")
 
     @playtest.command(name="summary", description="Summarize a playtest.")
     async def playtest_summary(interaction: discord.Interaction, event: str) -> None:
-        await run_owner_hermes(bot, interaction, f"/playtest summary event={event!r}. Distinguish observations from reproduced defects.", command_name="playtest summary")
+        await run_hermes_command(bot, interaction, f"/playtest summary event={event!r}. Distinguish observations from reproduced defects.", command_name="playtest summary")
 
     @playtest.command(name="cancel", description="Prepare/cancel playtest reminders/event if approved.")
     async def playtest_cancel(interaction: discord.Interaction, event: str) -> None:

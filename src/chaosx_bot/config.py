@@ -18,9 +18,12 @@ class Settings(BaseSettings):
     )
 
     discord_token: str = Field(default="", description="Discord bot token", repr=False)
-    owner_id: int = Field(default=789502982122373150, description="Only this Discord user ID may use ChaosX")
+    owner_id: int = Field(default=789502982122373150, description="Discord user ID with admin/automation access")
     allowed_guild_id: Optional[int] = Field(default=None)
     command_guild_id: Optional[int] = Field(default=None)
+    public_ask_limit_per_hour: int = Field(default=3, ge=0, le=100)
+    public_scripted_limit_per_hour: int = Field(default=20, ge=0, le=500)
+    public_prompt_max_chars: int = Field(default=600, ge=100, le=4000)
 
     @model_validator(mode="before")
     @classmethod

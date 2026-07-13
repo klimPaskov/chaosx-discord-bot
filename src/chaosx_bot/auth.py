@@ -19,9 +19,20 @@ def safe_allowed_mentions() -> discord.AllowedMentions:
     return discord.AllowedMentions(everyone=False, users=False, roles=False, replied_user=False)
 
 
-def deny_reason(user_id: int, owner_id: int, guild_id: int | None, allowed_guild_id: int | None) -> str | None:
-    if not is_owner(user_id, owner_id):
-        return "ChaosX is owner-only. This command is not available to other users."
+def public_deny_reason(guild_id: int | None, allowed_guild_id: int | None) -> str | None:
     if not is_allowed_guild(guild_id, allowed_guild_id):
         return "ChaosX is locked to a different guild."
     return None
+
+
+def owner_deny_reason(user_id: int, owner_id: int, guild_id: int | None, allowed_guild_id: int | None) -> str | None:
+    if not is_owner(user_id, owner_id):
+        return "This ChaosX command is owner-only."
+    if not is_allowed_guild(guild_id, allowed_guild_id):
+        return "ChaosX is locked to a different guild."
+    return None
+
+
+# Backward-compatible alias used by older tests/imports.
+def deny_reason(user_id: int, owner_id: int, guild_id: int | None, allowed_guild_id: int | None) -> str | None:
+    return owner_deny_reason(user_id, owner_id, guild_id, allowed_guild_id)
