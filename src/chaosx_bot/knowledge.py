@@ -52,7 +52,7 @@ class Knowledge:
             + (f"\n```text\n{dirty[:1200]}\n```" if dirty else "")
         )
 
-    def search(self, query: str, scope: str = "all", limit: int = 5) -> str:
+    def search(self, query: str, scope: str = "all", limit: int = 5, show_evidence: bool = False) -> str:
         self.ensure_index()
         safe_query = _fts_query(query)
         conn = connect(self.db_path)
@@ -81,14 +81,17 @@ class Knowledge:
             return f"No indexed results for `{query}`."
         lines = [f"## Search results for `{query}`"]
         for i, (path, source_class, commit, indexed_at, snip, _rank) in enumerate(rows, 1):
-            lines.append(f"{i}. `{path}`\n   {snip}")
+            item = f"{i}. `{path}`\n   {snip}"
+            if show_evidence:
+                item += f"\n   Evidence: `{source_class}` · commit `{commit[:12]}` · synced `{_fmt_ts(indexed_at)}`"
+            lines.append(item)
         return "\n".join(lines)
 
-    def event(self, event: str, view: str = "overview") -> str:
+    def event(self, event: str, view: str = "overview", show_evidence: bool = False) -> str:
         self.ensure_index()
         row = self._find_event(event)
         if not row:
-            return self.search(event, scope="all", limit=5) + "\n\nNo exact event match; showing search results instead."
+            return self.search(event, scope="all", limit=5, show_evidence=show_evidence) + "\n\nNo exact event match; showing search results instead."
         keys = ["row_key", "event_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
         data = dict(zip(keys, row))
         event_label = f"Event {data['event_id']}: {data['name']}" if data["event_id"] else f"Unassigned event idea: {data['name']}"
@@ -107,9 +110,14 @@ class Knowledge:
             lines += ["", "### Evolution tracks", *shown_evos]
         if data["world_end"]:
             lines += ["", "### World-end relationship", data["world_end"][:700]]
+        if show_evidence:
+            paths = self._entity_paths(data["event_id"], data["name"])
+            if paths:
+                lines += ["", "### Private source paths", *[f"- `{p}` — {sc}" for p, sc in paths[:12]]]
+            lines += ["", self._footer("catalog", "docs/spreadsheets/chaos_redux_events_catalog.csv")]
         return "\n".join(lines)
 
-    def cluster(self, cluster: str) -> str:
+    def cluster(self, cluster: str, show_evidence: bool = False) -> str:
         self.ensure_index()
         conn = connect(self.db_path)
         try:
@@ -123,7 +131,7 @@ class Knowledge:
             return f"No registered cluster match for `{cluster}`. Planned clusters without IDs remain unassigned."
         row_key, cluster_id, name, details, members, type_, chaos_level, status, indexed_at = row
         label = f"Cluster {cluster_id}: {name}" if cluster_id else f"Planned cluster idea: {name}"
-        return (
+        text = (
             f"## {label}\n"
             f"- Type: `{type_ or 'unknown'}`\n"
             f"- Chaos level: `{chaos_level or 'unknown'}`\n"
@@ -131,15 +139,20 @@ class Knowledge:
             f"- Status: `{status or 'unknown'}`\n\n"
             f"{details or 'No details available.'}"
         )
+        if show_evidence:
+            text += f"\n\n{self._footer('catalog', 'docs/spreadsheets/chaos_redux_clusters_catalog.csv')}"
+        return text
 
-    def source(self, query: str) -> str:
+    def source(self, query: str, show_evidence: bool = False) -> str:
         self.ensure_index()
         paths = self._entity_paths(_extract_number(query) or query, query)
         if not paths:
-            return self.search(query, limit=5)
+            return self.search(query, limit=5, show_evidence=show_evidence)
         lines = [f"## Source map for `{query}`"]
         for path, source_class in paths[:20]:
             lines.append(f"- `{path}` — {source_class}")
+        if show_evidence:
+            lines.append("\nPrivate source precedence: accepted specs for intended design; implementation files for current behavior; localisation for player-facing text; catalogs for status/overview; plans as queued/dispositioned work.")
         return "\n".join(lines)
 
     def file_excerpt(self, rel_path: str, lines: str = "") -> str:
@@ -194,6 +207,15 @@ class Knowledge:
             return found
         finally:
             conn.close()
+
+    def _footer(self, source_class: str, path: str) -> str:
+        conn = connect(self.db_path)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
+        finally:
+            conn.close()
+        return f"Private source detail: {source_class} · `{path}` · commit `{meta.get('commit_sha', 'unknown')[:12]}` · synced `{_fmt_ts(meta.get('indexed_at'))}` · confidence high"
+
 
 def _git(repo: Path, args: list[str]) -> str:
     try:

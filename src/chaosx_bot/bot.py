@@ -182,6 +182,7 @@ async def send_scripted_response(
     command_name: str,
     summary: str,
     render,
+    owner_render=None,
     public: bool = True,
 ) -> None:
     if not await public_gate(interaction, bot.settings):
@@ -200,6 +201,14 @@ async def send_scripted_response(
     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)
     for part in _chunk(output):
         await interaction.followup.send(part, ephemeral=not public, allowed_mentions=safe_allowed_mentions())
+    if owner_render and public and interaction.user.id == bot.settings.owner_id:
+        try:
+            owner_output = owner_render()
+        except Exception as exc:
+            owner_output = f"Private details failed: `{type(exc).__name__}: {exc}`"
+        if owner_output and owner_output != output:
+            for part in _chunk("## Private details\n" + owner_output):
+                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
 
 async def run_hermes_command(
@@ -398,27 +407,27 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @chaosx.command(name="event", description="Look up an event by ID or name.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx event", summary=event, render=lambda: bot.knowledge.event(event, view))
+        await send_scripted_response(bot, interaction, command_name="chaosx event", summary=event, render=lambda: bot.knowledge.event(event, view), owner_render=lambda: bot.knowledge.event(event, view, show_evidence=True))
 
     @chaosx.command(name="scenario", description="Look up a scenario by ID or name.")
     async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.event(scenario, view))
+        await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.event(scenario, view), owner_render=lambda: bot.knowledge.event(scenario, view, show_evidence=True))
 
     @chaosx.command(name="cluster", description="Look up an event cluster.")
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster))
+        await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster), owner_render=lambda: bot.knowledge.cluster(cluster, show_evidence=True))
 
     @chaosx.command(name="mechanic", description="Explain a Chaos Redux mechanic.")
     async def chaosx_mechanic(interaction: discord.Interaction, mechanic: str) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx mechanic", summary=mechanic, render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6))
+        await send_scripted_response(bot, interaction, command_name="chaosx mechanic", summary=mechanic, render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6), owner_render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6, show_evidence=True))
 
     @chaosx.command(name="search", description="Search indexed/project sources.")
     async def chaosx_search(interaction: discord.Interaction, query: str, scope: str = "all") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx search", summary=query, render=lambda: bot.knowledge.search(query, scope=scope, limit=8))
+        await send_scripted_response(bot, interaction, command_name="chaosx search", summary=query, render=lambda: bot.knowledge.search(query, scope=scope, limit=8), owner_render=lambda: bot.knowledge.search(query, scope=scope, limit=8, show_evidence=True))
 
     @chaosx.command(name="source", description="Show source-of-truth map for an entity/path.")
     async def chaosx_source(interaction: discord.Interaction, query: str) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx source", summary=query, render=lambda: bot.knowledge.source(query))
+        await send_scripted_response(bot, interaction, command_name="chaosx source", summary=query, render=lambda: bot.knowledge.source(query), owner_render=lambda: bot.knowledge.source(query, show_evidence=True))
 
     @chaosx.command(name="compare", description="Compare two sources/entities.")
     async def chaosx_compare(interaction: discord.Interaction, left: str, right: str) -> None:
@@ -426,11 +435,11 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @chaosx.command(name="status", description="Show completion/status matrix.")
     async def chaosx_status(interaction: discord.Interaction, entity: str = "global", surface: str = "all") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx status", summary=entity, render=lambda: bot.knowledge.status() if entity == "global" else bot.knowledge.source(entity))
+        await send_scripted_response(bot, interaction, command_name="chaosx status", summary=entity, render=lambda: bot.knowledge.status() if entity == "global" else bot.knowledge.source(entity), owner_render=lambda: bot.knowledge.status() if entity == "global" else bot.knowledge.source(entity, show_evidence=True))
 
     @chaosx.command(name="testing", description="Show prioritized testing queue.")
     async def chaosx_testing(interaction: discord.Interaction, kind: str = "all", limit: int = 10) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary=kind, render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit))
+        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary=kind, render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit), owner_render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit, show_evidence=True))
 
     @chaosx.command(name="help", description="Show ChaosX command help.")
     async def chaosx_help(interaction: discord.Interaction, topic: str = "all") -> None:
@@ -442,7 +451,7 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @repo.command(name="search", description="Search repo content/symbols.")
     async def repo_search(interaction: discord.Interaction, query: str, path: str = "") -> None:
-        await send_scripted_response(bot, interaction, command_name="repo search", summary=query, render=lambda: bot.knowledge.search(f'{path} {query}' if path else query, limit=8))
+        await send_scripted_response(bot, interaction, command_name="repo search", summary=query, render=lambda: bot.knowledge.search(f'{path} {query}' if path else query, limit=8), owner_render=lambda: bot.knowledge.search(f'{path} {query}' if path else query, limit=8, show_evidence=True))
 
     @repo.command(name="file", description="Show safe excerpt from a repo file.")
     async def repo_file(interaction: discord.Interaction, path: str, lines: str = "") -> None:
