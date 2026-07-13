@@ -15,14 +15,15 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
 - Bot presence/description: `Chaos Redux community knowledge bot` / watching `Chaos Redux ops`.
 - Bot profile description: `Ask ChaosX questions about Chaos Redux events, scenarios, mechanics, testing, and mod info.`
-- Public limits by default: 10 broad `/ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap. `/ask` answers show remaining asks and time until reset.
+- Public limits by default: 10 broad `/ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
 - Broad ask model override: `CHAOSX_ASK_PROVIDER=openai-codex`, `CHAOSX_ASK_MODEL=gpt-5.6-luna`, `CHAOSX_ASK_REASONING_EFFORT=medium`.
 - Public Hermes-backed commands run with the `safe` toolset and a public prompt boundary: answer only Chaos Redux/mod/server-use questions, refuse dangerous/off-topic requests, do not perform external actions, and include repo/spec/code paths only when explicitly asked.
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=openai-codex`, `CHAOSX_OPERATOR_MODEL=gpt-5.6-luna`, `CHAOSX_OPERATOR_REASONING_EFFORT=xhigh`.
 - Provides:
   - `/help` — public community command guide.
-  - `/ask`, `/event`, `/scenario`, `/cluster`, `/search`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands. `/search` replaces the older duplicate `/mechanic`; `/scenario` reads triggerable SCN scenario docs, not event IDs.
-  - `/suggestion`, `/event-idea` — public suggestion/event idea cleanup and overlap checks.
+  - `/ask`, `/suggestion`, `/event-idea` — public AI-backed Chaos Redux question/drafting commands.
+  - `/event`, `/scenario`, `/cluster`, `/search`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/cluster` names member events, `/search` replaces the older duplicate `/mechanic`, and `/scenario` reads triggerable SCN scenario docs, not event IDs.
+  - `/event-idea` formats a rough event idea with name, ID placeholder, type, baseline description, evolutions, world-end/scenario hooks, testing notes, and overlap/gap notes.
   - `/issue` — validates bug/crash/enhancement/balance/content/general reports and creates a GitHub issue in `CHAOSX_GITHUB_REPO`; bugs/crashes require relevant `error.log` lines.
   - `/work ...` — protected issue-style drafts, handoffs, changelog, and release draft command family.
   - `/playtest ...` — queue/schedule/report/summary/cancel command family.

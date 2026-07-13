@@ -188,22 +188,25 @@ def community_help_text() -> str:
 Use ChaosX for Chaos Redux event info, scenario info, project search, issue reports, testing notes, and cleaner idea/report drafts.
 
 ### Ask or search
-- `/ask question:<text>` — ask a broader Chaos Redux question. It shows your remaining asks at the end.
+- `/ask question:<text>` — uses AI to answer broader Chaos Redux questions.
 - `/search query:<text>` — search events, mechanics, docs, specs, and testing info when you do not know the exact command.
 
 ### Look things up
 - `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, and evolutions.
-- `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry, e.g. `5` = SCN-005 The World in Fury.
-- `/cluster cluster:<id or name>` — event cluster summary and members.
+- `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry.
+- `/cluster cluster:<id or name>` — event cluster summary with member event names.
 - `/status` — project catalog totals and event breakdowns.
 - `/testing query:<text>` — find testing notes or queues matching a topic.
 
 ### Report or draft feedback
 - `/issue` — create a formatted GitHub issue after ChaosX validates the report fields. Bugs/crashes require relevant `error.log` lines.
-- `/suggestion suggestion:<idea>` — turn a rough suggestion into a clearer review note.
-- `/event-idea idea:<idea>` — check whether an event idea overlaps existing catalog entries.
-- `/playtest report report:<text>` — format a playtest finding into a useful report.
-- `/playtest queue` and `/playtest summary` — see or summarize playtest work.
+- `/suggestion suggestion:<idea>` — uses AI to turn a rough suggestion into a clearer review note.
+- `/event-idea idea:<idea>` — uses AI to format an event idea with a name, ID placeholder, type, baseline description, evolutions, and scenario hooks.
+
+### Playtest notes
+- `/playtest queue` — use before testing to see what needs attention.
+- `/playtest report` — use after testing something to record what happened, what broke, or what felt off.
+- `/playtest summary` — use after multiple reports to recap the current findings.
 
 Tip: use `/search` for mechanics, event systems, and general project lookup."""
 
@@ -233,7 +236,7 @@ Use this when you want private controls. Regular users should mostly use `/help`
 
 ### Project/work tools
 - Public `/issue` — validates a report and creates a GitHub issue in `{settings.github_repo}`. Bugs/crashes require relevant `error.log` lines.
-- Public `/suggestion` / `/event-idea` — community suggestion cleanup and event-idea overlap checks.
+- Public `/suggestion` / `/event-idea` — AI-assisted community suggestion cleanup and structured event-idea formatting.
 - `/work issue-draft` — private draft only; no GitHub issue is filed.
 - `/work handoff` — make a protected Codex/Hermes handoff prompt.
 - `/work changelog` — draft player-facing changelog text.
@@ -573,9 +576,15 @@ def register_commands(bot: ChaosXBot) -> None:
     async def chaosx_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
         await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
 
-    @bot.tree.command(name="event-idea", description="Check whether a Chaos Redux event idea already exists or fits a catalog gap.")
+    @bot.tree.command(name="event-idea", description="Format a Chaos Redux event idea into a structured review draft.")
     async def chaosx_event_idea(interaction: discord.Interaction, idea: str) -> None:
-        await run_hermes_command(bot, interaction, f"/event-idea idea={idea!r}. Search assigned events and unassigned ideas; summarize overlap/gap; never allocate an ID.", command_name="event-idea")
+        await run_hermes_command(
+            bot,
+            interaction,
+            f"""/event-idea idea={idea!r}. Use AI to format this as a Chaos Redux event idea review draft, not just a duplicate check.
+Include: proposed event name, ID placeholder like TBD-###, event type, baseline description, trigger/conditions if inferable, immediate effects, evolution ideas, possible world-end relationship, possible triggerable/manual scenario hooks, likely cluster/tags, testing notes, and a short overlap/gap note if relevant. Do not allocate a real ID or claim acceptance.""",
+            command_name="event-idea",
+        )
 
     @bot.tree.command(name="issue", description="Create a formatted GitHub issue after ChaosX validates the report.")
     @app_commands.choices(issue_type=[

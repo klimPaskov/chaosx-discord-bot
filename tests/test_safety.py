@@ -70,8 +70,13 @@ def test_community_help_uses_search_and_root_feedback_commands():
     help_text = community_help_text()
     assert "/search query:<text>" in help_text
     assert "/mechanic" not in help_text
+    assert "uses AI to answer broader Chaos Redux questions" in help_text
+    assert "It shows your remaining asks" not in help_text
+    assert "e.g." not in help_text
     assert "/suggestion suggestion:<idea>" in help_text
     assert "/event-idea idea:<idea>" in help_text
+    assert "baseline description" in help_text
+    assert "Playtest notes" in help_text
     assert "/work suggestion" not in help_text
     assert "/issue" in help_text
 

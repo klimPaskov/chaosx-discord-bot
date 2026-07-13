@@ -36,6 +36,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Evidence:' in owner_search
     search = knowledge.search('Zombie Outbreak', limit=2)
     assert 'Search results' in search
+    cluster = knowledge.cluster('1')
+    assert 'Cluster 1: Wars' in cluster
+    assert '004` Random War' in cluster
+    assert '007` Fury' in cluster
     ask_context = knowledge.public_ask_context('Zombie Outbreak')
     assert ask_context
     assert 'docs/' not in ask_context

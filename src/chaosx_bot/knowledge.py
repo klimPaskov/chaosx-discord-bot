@@ -224,17 +224,36 @@ class Knowledge:
             return f"No registered cluster match for `{cluster}`. Planned clusters without IDs remain unassigned."
         row_key, cluster_id, name, details, members, type_, chaos_level, status, indexed_at = row
         label = f"Cluster {cluster_id}: {name}" if cluster_id else f"Planned cluster idea: {name}"
+        member_lines = self._cluster_member_lines(members)
+        member_text = "\n".join(member_lines) if member_lines else (members or "none")
         text = (
             f"## {label}\n"
             f"- Type: `{type_ or 'unknown'}`\n"
             f"- Chaos level: `{chaos_level or 'unknown'}`\n"
-            f"- Members: `{members or 'none'}`\n"
+            f"- Members:\n{member_text}\n"
             f"- Status: `{status or 'unknown'}`\n\n"
             f"{details or 'No details available.'}"
         )
         if show_evidence:
             text += f"\n\n{self._footer('catalog', 'docs/spreadsheets/chaos_redux_clusters_catalog.csv')}"
         return text
+
+    def _cluster_member_lines(self, members: str) -> list[str]:
+        ids = re.findall(r"\d+", members or "")
+        if not ids:
+            return []
+        conn = connect(self.db_path)
+        try:
+            lines: list[str] = []
+            for event_id in ids[:20]:
+                row = conn.execute("SELECT event_id, name FROM catalog_events WHERE event_id = ?", (str(int(event_id)),)).fetchone()
+                if row:
+                    lines.append(f"  - `{int(row[0]):03d}` {row[1]}")
+                else:
+                    lines.append(f"  - `{int(event_id):03d}`")
+            return lines
+        finally:
+            conn.close()
 
     def source(self, query: str, show_evidence: bool = False) -> str:
         self.ensure_index()
@@ -264,8 +283,8 @@ class Knowledge:
     def help(self, topic: str = "all") -> str:
         return (
             "## ChaosX help\n"
-            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/status`, `/testing`, `/work suggestion`, `/work event-idea`, `/playtest queue`.\n"
-            "General questions are rate-limited; lookup commands are usually faster for event, scenario, mechanic, and testing info."
+            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/search`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest queue`.\n"
+            "Commands that use AI say so in `/help`; lookup commands are usually faster for exact event, scenario, cluster, and testing info."
         )
 
     def _find_event(self, event: str):
