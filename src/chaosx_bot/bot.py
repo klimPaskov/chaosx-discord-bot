@@ -85,7 +85,9 @@ def operator_help_text(settings: Settings) -> str:
     return f"""## ChaosX protected operator commands
 Models:
 - Public broad ask: `{settings.ask_provider}` / `{settings.ask_model}`
+- Public broad ask reasoning: `{settings.ask_reasoning_effort or 'default'}`
 - Autonomous server ops: `{settings.operator_provider}` / `{settings.operator_model}`
+- Autonomous server reasoning: `{settings.operator_reasoning_effort or 'default'}`
 
 Root protected:
 `/health`, `/inventory`, `/say`
@@ -260,11 +262,13 @@ async def run_hermes_command(
     await interaction.response.defer(ephemeral=not public, thinking=True)
     guild_name, channel_name = _guild_channel(interaction)
     prompt = build_owner_prompt(owner_request=request, guild_name=guild_name, channel_name=channel_name)
-    model = provider = None
+    model = provider = reasoning_effort = None
     if use_operator_model:
         model, provider = bot.settings.operator_model, bot.settings.operator_provider
+        reasoning_effort = bot.settings.operator_reasoning_effort
     elif use_ask_model:
         model, provider = bot.settings.ask_model, bot.settings.ask_provider
+        reasoning_effort = bot.settings.ask_reasoning_effort
     result = await run_hermes(
         hermes_bin=bot.settings.hermes_bin,
         profile=bot.settings.hermes_profile,
@@ -273,6 +277,7 @@ async def run_hermes_command(
         timeout_seconds=bot.settings.hermes_timeout_seconds,
         model=model,
         provider=provider,
+        reasoning_effort=reasoning_effort,
     )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     status = "ok" if result.ok else "failed"
@@ -583,7 +588,7 @@ def register_commands(bot: ChaosXBot) -> None:
             "## ChaosX config\n"
             f"- allowed_guild_id: `{settings.allowed_guild_id}`\n"
             f"- command_guild_id: `{settings.command_guild_id}`\n"
-            f"- broad ask provider/model: `{settings.ask_provider}` / `{settings.ask_model}`\n"
+            f"- broad ask provider/model: `{settings.ask_provider}` / `{settings.ask_model}` reasoning=`{settings.ask_reasoning_effort or 'default'}`\n"
             f"- public ask limit/hour: `{settings.public_ask_limit_per_hour}`\n"
             f"- scripted limit/hour: `{settings.public_scripted_limit_per_hour}`\n"
             f"- webhook listener: `{settings.webhook_host}:{settings.webhook_port}` enabled=`{bool(settings.github_webhook_secret)}`\n"

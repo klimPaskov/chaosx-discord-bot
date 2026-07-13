@@ -38,10 +38,12 @@ class Settings(BaseSettings):
     hermes_bin: Path = Field(default=Path("/home/klim/.local/bin/hermes"))
     hermes_profile: str = Field(default="chaos_redux")
     hermes_timeout_seconds: int = Field(default=300, ge=30, le=1800)
-    ask_model: str = Field(default="luna-medium", description="Model override for broad ask commands")
-    ask_provider: str = Field(default="nous", description="Provider override for broad ask commands")
-    operator_model: str = Field(default="luna-xhigh", description="Model override for protected autonomous server operations")
-    operator_provider: str = Field(default="nous", description="Provider override for protected autonomous server operations")
+    ask_model: str = Field(default="gpt-5.6-luna", description="Model override for broad ask commands")
+    ask_provider: str = Field(default="openai-codex", description="Provider override for broad ask commands")
+    ask_reasoning_effort: str = Field(default="medium", description="Reasoning effort for broad ask commands")
+    operator_model: str = Field(default="gpt-5.6-luna", description="Model override for protected autonomous server operations")
+    operator_provider: str = Field(default="openai-codex", description="Provider override for protected autonomous server operations")
+    operator_reasoning_effort: str = Field(default="xhigh", description="Reasoning effort for protected autonomous server operations")
     webhook_host: str = Field(default="127.0.0.1")
     webhook_port: int = Field(default=8787, ge=1, le=65535)
     github_webhook_secret: str = Field(default="", repr=False)
@@ -61,6 +63,15 @@ class Settings(BaseSettings):
         value = value.strip()
         if not value.replace("_", "").replace("-", "").isalnum():
             raise ValueError("Hermes profile may contain only letters, numbers, dash, underscore")
+        return value
+
+    @field_validator("ask_reasoning_effort", "operator_reasoning_effort")
+    @classmethod
+    def reasoning_effort_is_supported(cls, value: str) -> str:
+        value = value.strip().lower()
+        allowed = {"", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+        if value not in allowed:
+            raise ValueError(f"reasoning effort must be one of {sorted(allowed)}")
         return value
 
 

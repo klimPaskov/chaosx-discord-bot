@@ -42,12 +42,14 @@ def test_blank_optional_guild_ids_are_allowed():
     assert settings.command_guild_id is None
 
 
-def test_ask_model_defaults_to_luna_medium():
+def test_ask_model_defaults_to_openai_luna():
     settings = Settings(_env_file=None, discord_token="dummy")
-    assert settings.ask_model == "luna-medium"
-    assert settings.ask_provider == "nous"
-    assert settings.operator_model == "luna-xhigh"
-    assert settings.operator_provider == "nous"
+    assert settings.ask_model == "gpt-5.6-luna"
+    assert settings.ask_provider == "openai-codex"
+    assert settings.ask_reasoning_effort == "medium"
+    assert settings.operator_model == "gpt-5.6-luna"
+    assert settings.operator_provider == "openai-codex"
+    assert settings.operator_reasoning_effort == "xhigh"
 
 
 def test_fixed_window_rate_limiter_blocks_after_limit():
