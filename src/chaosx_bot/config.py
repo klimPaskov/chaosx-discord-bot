@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     hermes_bin: Path = Field(default=Path("/home/klim/.local/bin/hermes"))
     hermes_profile: str = Field(default="chaos_redux")
     hermes_timeout_seconds: int = Field(default=300, ge=30, le=1800)
+    ask_model: str = Field(default="luna-medium", description="Model override for broad ask commands")
+    ask_provider: str = Field(default="nous", description="Provider override for broad ask commands")
     db_path: Path = Field(default=Path("./chaosx.db"))
 
     @field_validator("discord_token")

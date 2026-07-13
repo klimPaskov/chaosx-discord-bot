@@ -43,9 +43,15 @@ async def run_hermes(
     repo: Path,
     prompt: str,
     timeout_seconds: int,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> HermesResult:
     digest = prompt_hash(prompt)
     cmd = [str(hermes_bin), "--profile", profile, "chat", "-q", prompt, "--quiet"]
+    if model:
+        cmd.extend(["--model", model])
+    if provider:
+        cmd.extend(["--provider", provider])
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,

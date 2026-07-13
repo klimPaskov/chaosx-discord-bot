@@ -14,6 +14,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
 - Bot presence/description: `Community Chaos Redux knowledge bot with protected operations` / watching `Chaos Redux ops`.
 - Public limits by default: 3 broad `/chaosx ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
+- Broad ask model override: `CHAOSX_ASK_PROVIDER=nous`, `CHAOSX_ASK_MODEL=luna-medium`; requires `hermes auth add nous` / working Nous Portal auth on the host.
 - Provides:
   - `/health` — private runtime/status check.
   - `/inventory` — private read-only guild/channel/role inventory.
@@ -25,6 +26,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
   - `/playtest ...` — queue/schedule/report/summary/cancel command family.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
   - `/admin ...` — health/sync/reindex/automation/config/permissions/jobs/rollback command family.
+  - `/server ...` — protected role audit, behaviour scan, member info, role assignment/removal, and timeout commands.
 - Stores a local SQLite audit log in `CHAOSX_DB_PATH`.
 
 ## Security model

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import discord
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
@@ -31,6 +33,25 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
         chunks.append(text[:cut])
         text = text[cut:].lstrip()
     return chunks
+
+
+def _can_manage_role(guild: discord.Guild, actor: discord.Member, bot_member: discord.Member, role: discord.Role) -> tuple[bool, str]:
+    if role.is_default():
+        return False, "Cannot manage the @everyone role."
+    if role >= bot_member.top_role:
+        return False, "ChaosX bot role is not above the target role."
+    if guild.owner_id != actor.id and role >= actor.top_role:
+        return False, "Your top role is not above the target role."
+    return True, "ok"
+
+
+def _dangerous_role_flags(role: discord.Role) -> list[str]:
+    perms = role.permissions
+    flags = []
+    for attr in ("administrator", "manage_guild", "manage_channels", "manage_roles", "manage_webhooks", "ban_members", "kick_members", "moderate_members", "mention_everyone"):
+        if getattr(perms, attr):
+            flags.append(attr)
+    return flags
 
 
 class ChaosXBot(discord.Client):
@@ -130,6 +151,7 @@ async def run_hermes_command(
     public: bool = False,
     owner_only: bool = False,
     rate_bucket: str = "scripted",
+    use_ask_model: bool = False,
 ) -> None:
     if owner_only:
         if not await owner_gate(interaction, bot.settings):
@@ -172,6 +194,8 @@ async def run_hermes_command(
         repo=bot.settings.chaos_redux_repo,
         prompt=prompt,
         timeout_seconds=bot.settings.hermes_timeout_seconds,
+        model=bot.settings.ask_model if use_ask_model else None,
+        provider=bot.settings.ask_provider if use_ask_model else None,
     )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     status = "ok" if result.ok else "failed"
@@ -206,14 +230,16 @@ async def run_owner_hermes(
     *,
     command_name: str,
     public: bool = False,
+    use_ask_model: bool = False,
 ) -> None:
-    await run_hermes_command(bot, interaction, request, command_name=command_name, public=public, owner_only=True)
+    await run_hermes_command(bot, interaction, request, command_name=command_name, public=public, owner_only=True, use_ask_model=use_ask_model)
 
 
 def register_commands(bot: ChaosXBot) -> None:
     settings = bot.settings
 
     @bot.tree.command(name="health", description="Protected ChaosX runtime health check.")
+    @app_commands.default_permissions(administrator=True)
     async def health(interaction: discord.Interaction) -> None:
         if not await owner_gate(interaction, settings):
             return
@@ -231,6 +257,7 @@ def register_commands(bot: ChaosXBot) -> None:
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @bot.tree.command(name="inventory", description="Read-only inventory of the current guild.")
+    @app_commands.default_permissions(administrator=True)
     async def inventory(interaction: discord.Interaction) -> None:
         if not await owner_gate(interaction, settings):
             return
@@ -262,11 +289,13 @@ def register_commands(bot: ChaosXBot) -> None:
             await interaction.followup.send(f"```text\n{part}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @bot.tree.command(name="ask", description="Ask the local Chaos Redux Hermes profile to reason about a server/project task.")
-    @app_commands.describe(request="Owner instruction. ChaosX will run local Hermes with Discord safety boundaries.")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(request="Operator instruction. ChaosX will run local Hermes with Discord safety boundaries.")
     async def ask(interaction: discord.Interaction, request: str) -> None:
-        await run_owner_hermes(bot, interaction, request, command_name="ask")
+        await run_owner_hermes(bot, interaction, request, command_name="ask", use_ask_model=True)
 
     @bot.tree.command(name="say", description="Protected: post an exact message to the current channel without mention parsing.")
+    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(message="Message to post. Mentions are not parsed.")
     async def say(interaction: discord.Interaction, message: str) -> None:
         if not await owner_gate(interaction, settings):
@@ -279,12 +308,13 @@ def register_commands(bot: ChaosXBot) -> None:
     repo = app_commands.Group(name="repo", description="Chaos Redux repository commands")
     work = app_commands.Group(name="work", description="Chaos Redux work-item drafting commands")
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
-    hermes = app_commands.Group(name="hermes", description="Hermes agent routing/task commands")
-    admin = app_commands.Group(name="admin", description="ChaosX admin commands")
+    hermes = app_commands.Group(name="hermes", description="Hermes agent routing/task commands", default_permissions=discord.Permissions(administrator=True))
+    admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
+    server = app_commands.Group(name="server", description="Protected Discord server administration", default_permissions=discord.Permissions(administrator=True))
 
     @chaosx.command(name="ask", description="Answer a Chaos Redux question with evidence.")
     async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "private") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx ask question={question!r} visibility={visibility!r}. Answer with evidence footer.", command_name="chaosx ask", public=visibility == "public", rate_bucket="ask")
+        await run_hermes_command(bot, interaction, f"/chaosx ask question={question!r} visibility={visibility!r}. Answer with evidence footer.", command_name="chaosx ask", public=visibility == "public", rate_bucket="ask", use_ask_model=True)
 
     @chaosx.command(name="event", description="Look up an event by ID or name.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
@@ -446,5 +476,142 @@ def register_commands(bot: ChaosXBot) -> None:
     async def admin_rollback(interaction: discord.Interaction, deployment: str) -> None:
         await run_owner_hermes(bot, interaction, f"/admin rollback deployment={deployment!r}. Do not perform destructive rollback without explicit approval.", command_name="admin rollback")
 
-    for group in (chaosx, repo, work, playtest, hermes, admin):
+    @server.command(name="role-audit", description="Scan roles for elevated permissions and hierarchy risks.")
+    async def server_role_audit(interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("Run this inside the server.", ephemeral=True)
+            return
+        guild = interaction.guild
+        bot_member = guild.me
+        lines = [f"## Role audit for {guild.name}", f"Bot top role: `{bot_member.top_role.name if bot_member else 'unknown'}`", ""]
+        risky = []
+        for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
+            flags = _dangerous_role_flags(role)
+            if flags:
+                risky.append(f"- `{role.name}` `{role.id}` position={role.position} flags={', '.join(flags)} members={len(role.members)}")
+        lines += risky or ["No elevated permission roles found in cache."]
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=guild.id, channel_id=interaction.channel_id, command="server role-audit", summary="role audit")
+        await interaction.response.send_message("Role audit generated privately.", ephemeral=True)
+        for part in _chunk("\n".join(lines)):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @server.command(name="scan-behaviour", description="Scan recent visible channel messages for obvious abuse signals.")
+    async def server_scan_behaviour(interaction: discord.Interaction, limit: int = 200) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("Run this inside the server.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        limit = max(20, min(limit, 1000))
+        channel_count = message_count = mass_mentions = attachments = 0
+        author_counts: Counter[int] = Counter()
+        suspicious: list[str] = []
+        for channel in interaction.guild.text_channels:
+            perms = channel.permissions_for(interaction.guild.me)  # type: ignore[arg-type]
+            if not (perms.view_channel and perms.read_message_history):
+                continue
+            channel_count += 1
+            try:
+                async for msg in channel.history(limit=max(1, limit // max(1, len(interaction.guild.text_channels)))):
+                    if msg.author.bot:
+                        continue
+                    message_count += 1
+                    author_counts[msg.author.id] += 1
+                    if msg.mention_everyone:
+                        mass_mentions += 1
+                        suspicious.append(f"- Mass mention by `{msg.author}` in #{channel.name} at {msg.created_at.isoformat()}")
+                    if len(msg.mentions) + len(msg.role_mentions) >= 8:
+                        suspicious.append(f"- Mention burst by `{msg.author}` in #{channel.name}: {len(msg.mentions)} users, {len(msg.role_mentions)} roles")
+                    if msg.attachments:
+                        attachments += len(msg.attachments)
+            except discord.Forbidden:
+                continue
+            except discord.HTTPException as exc:
+                suspicious.append(f"- Could not scan #{channel.name}: {exc.status}")
+        top = [f"- <@{uid}>: {count} visible messages" for uid, count in author_counts.most_common(10)]
+        lines = [
+            f"## Behaviour scan for {interaction.guild.name}",
+            f"Scanned channels: `{channel_count}`",
+            f"Visible non-bot messages checked: `{message_count}`",
+            f"Mass-mention messages: `{mass_mentions}`",
+            f"Attachments observed: `{attachments}`",
+            "",
+            "### Top visible posters",
+            *(top or ["No messages visible."]),
+            "",
+            "### Signals",
+            *(suspicious[:30] or ["No obvious abuse signals found in visible recent history."]),
+            "",
+            "Note: without Message Content intent, this scan does not inspect message text semantics.",
+        ]
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server scan-behaviour", summary=f"limit={limit}")
+        for part in _chunk("\n".join(lines)):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @server.command(name="member-info", description="Show protected member moderation context.")
+    async def server_member_info(interaction: discord.Interaction, member: discord.Member) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        roles = [r.name for r in sorted(member.roles, key=lambda r: r.position, reverse=True) if not r.is_default()]
+        text = (
+            f"## Member info: `{member}`\n"
+            f"- ID: `{member.id}`\n"
+            f"- Bot: `{member.bot}`\n"
+            f"- Joined: `{member.joined_at.isoformat() if member.joined_at else 'unknown'}`\n"
+            f"- Created: `{member.created_at.isoformat()}`\n"
+            f"- Top role: `{member.top_role.name}`\n"
+            f"- Roles: {', '.join(roles[:30]) or 'none'}"
+        )
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server member-info", summary=str(member.id))
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @server.command(name="add-role", description="Add a role to a member if Discord permissions allow it.")
+    async def server_add_role(interaction: discord.Interaction, member: discord.Member, role: discord.Role, reason: str = "ChaosX operator action") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        assert interaction.guild is not None
+        ok, why = _can_manage_role(interaction.guild, interaction.user, interaction.guild.me, role)  # type: ignore[arg-type]
+        if not ok:
+            await interaction.response.send_message(f"Blocked: {why}", ephemeral=True)
+            return
+        try:
+            await member.add_roles(role, reason=reason)
+            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server add-role", summary=f"{member.id}->{role.id}")
+            await interaction.response.send_message(f"Added `{role.name}` to `{member}`.", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        except discord.Forbidden:
+            await interaction.response.send_message("Blocked by Discord permissions. Reinvite/role hierarchy may need Manage Roles and a higher bot role.", ephemeral=True)
+
+    @server.command(name="remove-role", description="Remove a role from a member if Discord permissions allow it.")
+    async def server_remove_role(interaction: discord.Interaction, member: discord.Member, role: discord.Role, reason: str = "ChaosX operator action") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        assert interaction.guild is not None
+        ok, why = _can_manage_role(interaction.guild, interaction.user, interaction.guild.me, role)  # type: ignore[arg-type]
+        if not ok:
+            await interaction.response.send_message(f"Blocked: {why}", ephemeral=True)
+            return
+        try:
+            await member.remove_roles(role, reason=reason)
+            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server remove-role", summary=f"{member.id}->{role.id}")
+            await interaction.response.send_message(f"Removed `{role.name}` from `{member}`.", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        except discord.Forbidden:
+            await interaction.response.send_message("Blocked by Discord permissions. Reinvite/role hierarchy may need Manage Roles and a higher bot role.", ephemeral=True)
+
+    @server.command(name="timeout", description="Timeout a member if Discord permissions allow it.")
+    async def server_timeout(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "ChaosX operator timeout") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        minutes = max(1, min(minutes, 40320))
+        try:
+            await member.timeout(datetime.now(timezone.utc) + timedelta(minutes=minutes), reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message("Blocked by Discord permissions. ChaosX needs Moderate Members and correct role hierarchy.", ephemeral=True)
+            return
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server timeout", summary=f"{member.id} {minutes}m")
+        await interaction.response.send_message(f"Timed out `{member}` for `{minutes}` minute(s).", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    for group in (chaosx, repo, work, playtest, hermes, admin, server):
         bot.tree.add_command(group)

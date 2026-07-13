@@ -42,6 +42,12 @@ def test_blank_optional_guild_ids_are_allowed():
     assert settings.command_guild_id is None
 
 
+def test_ask_model_defaults_to_luna_medium():
+    settings = Settings(_env_file=None, discord_token="dummy")
+    assert settings.ask_model == "luna-medium"
+    assert settings.ask_provider == "nous"
+
+
 def test_fixed_window_rate_limiter_blocks_after_limit():
     limiter = FixedWindowRateLimiter()
     assert limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600).allowed
