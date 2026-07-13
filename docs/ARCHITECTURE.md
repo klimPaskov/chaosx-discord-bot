@@ -22,7 +22,7 @@
 ## Approval gates to preserve
 
 - Do not add Message Content intent unless explicitly approved.
-- Do not add `Administrator`, `Manage Roles`, `Manage Channels`, `Manage Guild`, or `Manage Webhooks` permissions unless a specific approved feature needs them.
+- Hoops wants ChaosX to have maximum server control on the Discord side, but execution must remain owner-only through `/admin ask`; do not expose public or cluttery moderation/member-management commands.
 - Do not create/delete/rename/reorder channels or roles from generic public `/ask` output.
 - Do not create announcements, scheduled events, or PRs without a preview + owner confirmation flow.
 - Public `/issue` may create GitHub issues only through its validated AI-reviewed report form.

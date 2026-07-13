@@ -34,7 +34,11 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 
 ChaosX is a bot account, not a self-bot. Do not use a normal Discord user token.
 
-Baseline Discord permissions should stay narrow:
+Hoops currently wants ChaosX to have maximum server control, while keeping execution owner-only under `/admin ask`:
+
+- Administrator
+
+If reverting to a narrow setup later, use:
 
 - View Channels
 - Send Messages
@@ -44,14 +48,7 @@ Baseline Discord permissions should stay narrow:
 - Message Content Intent in the Developer Portal is needed for `/admin ask` to read message bodies; without it, Discord may return empty content even though history fetch succeeds. ChaosX does not run passive public message monitoring.
 - Create Events only when playtest scheduling is implemented
 
-Do **not** grant:
-
-- Administrator
-- Manage Roles
-- Manage Channels
-- Manage Guild
-- Manage Webhooks
-- moderation permissions
+`/admin ask` remains runtime-gated to the configured owner ID before any protected operation runs. Do not expose separate public moderation/member-management commands unless explicitly requested.
 
 ## Setup
 
@@ -63,7 +60,7 @@ cp .env.example .env
 uv run chaosx-bot
 ```
 
-Create the Discord app/bot in the Discord Developer Portal, copy the bot token into `.env`, and invite the bot to the Chaos Redux server with only the minimal permissions above plus `applications.commands`.
+Create the Discord app/bot in the Discord Developer Portal, copy the bot token into `.env`, and invite the bot to the Chaos Redux server with `applications.commands` plus the chosen bot permission set. Current maximum-control invite uses permission integer `8`.
 
 For fast command registration during staging, set:
 

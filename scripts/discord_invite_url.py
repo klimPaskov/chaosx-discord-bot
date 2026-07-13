@@ -4,10 +4,10 @@ from __future__ import annotations
 import argparse
 from urllib.parse import urlencode
 
-# Minimal baseline permissions for the current scaffold:
-# View Channels, Send Messages, Embed Links, Read Message History.
-# Add Attach Files later only when exports are implemented.
+# Permission helper. Current Hoops-approved maximum-control setup uses
+# Administrator while keeping execution owner-gated in `/admin ask`.
 PERMISSIONS = {
+    "administrator": 1 << 3,
     "view_channels": 1 << 10,
     "send_messages": 1 << 11,
     "embed_links": 1 << 14,
@@ -20,6 +20,7 @@ PERMISSIONS = {
 BASELINE = ["view_channels", "send_messages", "embed_links", "read_message_history"]
 PLAYTEST = BASELINE + ["create_events"]
 EXPORTS = BASELINE + ["attach_files"]
+ADMIN = ["administrator"]
 
 
 def permission_value(names: list[str]) -> int:
@@ -44,13 +45,13 @@ def main() -> None:
     parser.add_argument("--guild-id", help="Optional Chaos Redux guild/server ID")
     parser.add_argument(
         "--profile",
-        choices=["baseline", "exports", "playtest"],
-        default="baseline",
+        choices=["baseline", "exports", "playtest", "admin"],
+        default="admin",
         help="Permission bundle to request",
     )
     args = parser.parse_args()
 
-    names = {"baseline": BASELINE, "exports": EXPORTS, "playtest": PLAYTEST}[args.profile]
+    names = {"baseline": BASELINE, "exports": EXPORTS, "playtest": PLAYTEST, "admin": ADMIN}[args.profile]
     permissions = permission_value(names)
     print("permissions=" + str(permissions))
     print("permissions_named=" + ",".join(names))
