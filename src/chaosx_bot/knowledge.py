@@ -3,31 +3,47 @@ from __future__ import annotations
 import re
 import sqlite3
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .indexer import connect, rebuild_index
+from .indexer import connect, iter_indexable_files, rebuild_index, repo_commit
 
 MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
 MAX_CONTEXT_CHARS = 2400
+INDEX_FRESHNESS_CHECK_SECONDS = 0.0
 
 
 @dataclass(frozen=True)
 class Knowledge:
     repo: Path
     db_path: Path
+    _last_freshness_check: float = field(default=0.0, init=False, repr=False, compare=False)
 
     def ensure_index(self) -> None:
+        now = datetime.now(tz=timezone.utc).timestamp()
+        if now - self._last_freshness_check < INDEX_FRESHNESS_CHECK_SECONDS:
+            return
         conn = connect(self.db_path)
         try:
+            meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
             count = conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0]
             scenarios = conn.execute("SELECT COUNT(*) FROM catalog_scenarios").fetchone()[0]
         finally:
             conn.close()
-        if count == 0 or scenarios == 0:
+        indexed_at = _float_meta(meta.get("indexed_at"))
+        current_commit = repo_commit(self.repo)
+        latest_source_mtime = _latest_indexable_mtime(self.repo)
+        needs_rebuild = (
+            count == 0
+            or scenarios == 0
+            or meta.get("commit_sha") != current_commit
+            or latest_source_mtime > indexed_at
+        )
+        if needs_rebuild:
             rebuild_index(self.repo, self.db_path)
+        object.__setattr__(self, "_last_freshness_check", now)
 
     def status(self) -> str:
         self.ensure_index()
@@ -46,6 +62,7 @@ class Knowledge:
             f"- Known scenarios: `{scenarios}`\n"
             f"- Known clusters: `{clusters}`\n"
             f"- Index health: `ready`\n"
+            f"- Refresh mode: `auto when repo/catalog files change`\n"
         )
 
     def search(self, query: str, scope: str = "all", limit: int = 5, show_evidence: bool = False) -> str:
@@ -306,6 +323,23 @@ def _fmt_ts(value) -> str:
         return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat(timespec="seconds")
     except Exception:
         return "unknown"
+
+
+def _float_meta(value) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _latest_indexable_mtime(repo: Path) -> float:
+    latest = 0.0
+    for path in iter_indexable_files(repo):
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
 
 
 def _extract_number(value: str) -> str | None:

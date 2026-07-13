@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 
 from chaosx_bot.indexer import rebuild_index
 from chaosx_bot.knowledge import Knowledge
@@ -42,3 +43,26 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Known scenarios' in status
     assert 'Indexed commit' not in status
     assert 'source docs' not in status
+
+
+def test_knowledge_auto_refreshes_stale_index(tmp_path: Path):
+    repo = Path('/home/klim/projects/chaos_redux')
+    if not repo.exists():
+        return
+    db = tmp_path / 'chaosx-stale-test.db'
+    rebuild_index(repo, db)
+    conn = sqlite3.connect(db)
+    try:
+        with conn:
+            conn.execute("UPDATE index_meta SET value = '0' WHERE key = 'indexed_at'")
+        before = float(dict(conn.execute("SELECT key, value FROM index_meta"))["indexed_at"])
+    finally:
+        conn.close()
+    assert before == 0
+    Knowledge(repo, db).status()
+    conn = sqlite3.connect(db)
+    try:
+        after = float(dict(conn.execute("SELECT key, value FROM index_meta"))["indexed_at"])
+    finally:
+        conn.close()
+    assert after > before

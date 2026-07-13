@@ -7,7 +7,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 ## What it does now
 
 - Registers slash commands with Discord.
-- Community read-only/project-question commands are available in the configured guild.
+- Community read-only/project-question commands are available in the configured guild and auto-refresh the local index when repo/catalog files change.
 - Admin/automation/server-write commands refuse every user unless `interaction.user.id == CHAOSX_OWNER_ID`.
 - Optional guild lock with `CHAOSX_ALLOWED_GUILD_ID`.
 - Uses no Message Content privileged intent by default.
