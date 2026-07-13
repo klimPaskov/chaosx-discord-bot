@@ -353,7 +353,7 @@ class ChaosXBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.store = Store(settings.db_path)
         self.rate_limiter = FixedWindowRateLimiter()
-        self.knowledge = Knowledge(settings.chaos_redux_repo, settings.db_path)
+        self.knowledge = Knowledge(settings.chaos_redux_repo, settings.db_path, settings.obsidian_vault_path)
         self.webhook_server = GitHubWebhookServer(
             store=self.store,
             secret=settings.github_webhook_secret,

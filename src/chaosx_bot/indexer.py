@@ -21,7 +21,20 @@ TEXT_ROOTS = {
     "localisation", "music", "sound", "paradox_wiki",
 }
 SKIP_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "tmp"}
+VAULT_TEXT_EXTENSIONS = {".md", ".txt"}
+VAULT_ALLOWED_ROOTS = {
+    "Assets",
+    "Events",
+    "Reference",
+    "Systems",
+    "concepts",
+}
+VAULT_ALLOWED_PLANNING_SUBROOTS = {"Community Suggestions"}
+VAULT_SKIP_DIRS = {".git", ".obsidian", ".trash", "Archive", "Scratch", "raw", "__pycache__"}
+VAULT_SKIP_FILES = {"important tokens.md", "index.md", "log.md", "SCHEMA.md", "Temp.md"}
 MAX_FILE_BYTES = 750_000
+SECRET_ASSIGNMENT_RE = re.compile(r"(?i)\b(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*[^\s`'\"]+")
+DISCORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS index_meta (
@@ -126,6 +139,13 @@ def repo_commit(repo: Path) -> str:
         return "unknown"
 
 
+def index_commit(repo: Path, vault_path: Path | None = None) -> str:
+    parts = [f"repo:{repo_commit(repo)}"]
+    if vault_path and vault_path.exists():
+        parts.append(f"vault:{repo_commit(vault_path)}")
+    return "|".join(parts)
+
+
 def source_class_for(path: str) -> str:
     if path.startswith("docs/specs/"):
         return "accepted_source_specification"
@@ -146,6 +166,28 @@ def source_class_for(path: str) -> str:
     return "repository_document"
 
 
+def vault_source_class_for(path: str) -> str:
+    if path.startswith("Events/Event Specs/Community Idea -"):
+        return "vault_community_event_idea_unreviewed"
+    if path.startswith("Events/Event Specs/"):
+        return "vault_event_spec"
+    if path.startswith("Events/"):
+        return "vault_event_map"
+    if path.startswith("concepts/"):
+        return "vault_curated_concept"
+    if path.startswith("Systems/"):
+        return "vault_system_note"
+    if path.startswith("Reference/Repo Docs Curated/"):
+        return "vault_curated_reference"
+    if path.startswith("Reference/"):
+        return "vault_reference_note"
+    if path.startswith("Planning/Community Suggestions/"):
+        return "vault_community_suggestion_unreviewed"
+    if path.startswith("Assets/"):
+        return "vault_asset_note"
+    return "vault_project_note"
+
+
 def is_indexable(repo: Path, path: Path) -> bool:
     rel = path.relative_to(repo)
     parts = set(rel.parts)
@@ -162,6 +204,27 @@ def is_indexable(repo: Path, path: Path) -> bool:
     return path.suffix.lower() in TEXT_EXTENSIONS
 
 
+def is_vault_indexable(vault: Path, path: Path) -> bool:
+    rel = path.relative_to(vault)
+    if set(rel.parts) & VAULT_SKIP_DIRS:
+        return False
+    if path.is_dir():
+        return False
+    if path.name in VAULT_SKIP_FILES:
+        return False
+    if path.stat().st_size > MAX_FILE_BYTES:
+        return False
+    if path.suffix.lower() not in VAULT_TEXT_EXTENSIONS:
+        return False
+    if not rel.parts:
+        return False
+    if rel.parts[0] in VAULT_ALLOWED_ROOTS:
+        return True
+    if rel.parts[0] == "Planning" and len(rel.parts) > 1 and rel.parts[1] in VAULT_ALLOWED_PLANNING_SUBROOTS:
+        return True
+    return False
+
+
 def iter_indexable_files(repo: Path):
     for root, dirs, files in os.walk(repo):
         root_path = Path(root)
@@ -175,11 +238,32 @@ def iter_indexable_files(repo: Path):
                 continue
 
 
+def iter_vault_indexable_files(vault: Path):
+    if not vault.exists():
+        return
+    for root, dirs, files in os.walk(vault):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in VAULT_SKIP_DIRS]
+        for name in files:
+            path = root_path / name
+            try:
+                if is_vault_indexable(vault, path):
+                    yield path
+            except OSError:
+                continue
+
+
 def read_text(path: Path) -> str | None:
     try:
-        return path.read_text(encoding="utf-8-sig", errors="replace")
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except Exception:
         return None
+    return sanitize_index_text(text)
+
+
+def sanitize_index_text(text: str) -> str:
+    text = DISCORD_TOKEN_RE.sub("[REDACTED_DISCORD_TOKEN]", text)
+    return SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
 
 
 def hash_text(text: str) -> str:
@@ -194,14 +278,17 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def rebuild_index(repo: Path, db_path: Path) -> IndexStats:
+def rebuild_index(repo: Path, db_path: Path, vault_path: Path | None = None) -> IndexStats:
     repo = repo.resolve()
-    commit = repo_commit(repo)
+    vault = vault_path.resolve() if vault_path and vault_path.exists() else None
+    commit = index_commit(repo, vault)
     indexed_at = time()
     conn = connect(db_path)
     with conn:
         conn.execute("DELETE FROM source_docs")
         docs = 0
+        repo_docs = 0
+        vault_docs = 0
         for path in iter_indexable_files(repo):
             text = read_text(path)
             if not text:
@@ -215,12 +302,31 @@ def rebuild_index(repo: Path, db_path: Path) -> IndexStats:
                 (rel, source_class_for(rel), path.suffix.lower().lstrip("."), commit, path.stat().st_mtime, hash_text(text), indexed_at, text),
             )
             docs += 1
+            repo_docs += 1
+        if vault:
+            for path in iter_vault_indexable_files(vault):
+                text = read_text(path)
+                if not text:
+                    continue
+                rel = path.relative_to(vault).as_posix()
+                public_path = f"vault/{rel}"
+                conn.execute(
+                    """
+                    INSERT INTO source_docs(path, source_class, file_type, commit_sha, mtime, content_hash, indexed_at, content)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (public_path, vault_source_class_for(rel), path.suffix.lower().lstrip("."), commit, path.stat().st_mtime, hash_text(text), indexed_at, text),
+                )
+                docs += 1
+                vault_docs += 1
         events = _load_events(conn, repo, indexed_at)
         scenarios = _load_scenarios(conn, repo, indexed_at)
         clusters = _load_clusters(conn, repo, indexed_at)
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('commit_sha', ?)", (commit,))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('indexed_at', ?)", (str(indexed_at),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('doc_count', ?)", (str(docs),))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('repo_doc_count', ?)", (str(repo_docs),))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('vault_doc_count', ?)", (str(vault_docs),))
     conn.close()
     return IndexStats(docs=docs, events=events, scenarios=scenarios, clusters=clusters, commit_sha=commit)
 

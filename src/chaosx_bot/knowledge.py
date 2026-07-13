@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .indexer import connect, iter_indexable_files, rebuild_index, repo_commit
+from .indexer import connect, index_commit, iter_indexable_files, iter_vault_indexable_files, rebuild_index
 
 MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
-MAX_CONTEXT_CHARS = 2400
+PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES = {"agent_skill_or_contract"}
+MAX_CONTEXT_CHARS = 3200
 INDEX_FRESHNESS_CHECK_SECONDS = 0.0
 
 
@@ -19,6 +20,7 @@ INDEX_FRESHNESS_CHECK_SECONDS = 0.0
 class Knowledge:
     repo: Path
     db_path: Path
+    vault_path: Path | None = None
     _last_freshness_check: float = field(default=0.0, init=False, repr=False, compare=False)
 
     def ensure_index(self) -> None:
@@ -33,8 +35,11 @@ class Knowledge:
         finally:
             conn.close()
         indexed_at = _float_meta(meta.get("indexed_at"))
-        current_commit = repo_commit(self.repo)
-        latest_source_mtime = _latest_indexable_mtime(self.repo)
+        current_commit = index_commit(self.repo, self.vault_path)
+        latest_source_mtime = max(
+            _latest_indexable_mtime(self.repo),
+            _latest_vault_indexable_mtime(self.vault_path),
+        )
         needs_rebuild = (
             count == 0
             or scenarios == 0
@@ -42,7 +47,7 @@ class Knowledge:
             or latest_source_mtime > indexed_at
         )
         if needs_rebuild:
-            rebuild_index(self.repo, self.db_path)
+            rebuild_index(self.repo, self.db_path, self.vault_path)
         object.__setattr__(self, "_last_freshness_check", now)
 
     def status(self) -> str:
@@ -162,10 +167,11 @@ class Knowledge:
                 FROM source_docs_fts
                 JOIN source_docs d ON d.id = source_docs_fts.rowid
                 WHERE source_docs_fts MATCH ?
+                  AND d.source_class NOT IN ({})
                 ORDER BY rank
                 LIMIT ?
-                """,
-                (safe_query, limit),
+                """.format(",".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)),
+                (safe_query, *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES), limit),
             ).fetchall()
         finally:
             conn.close()
@@ -395,6 +401,18 @@ def _float_meta(value) -> float:
 def _latest_indexable_mtime(repo: Path) -> float:
     latest = 0.0
     for path in iter_indexable_files(repo):
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
+
+
+def _latest_vault_indexable_mtime(vault_path: Path | None) -> float:
+    if not vault_path or not vault_path.exists():
+        return 0.0
+    latest = 0.0
+    for path in iter_vault_indexable_files(vault_path):
         try:
             latest = max(latest, path.stat().st_mtime)
         except OSError:

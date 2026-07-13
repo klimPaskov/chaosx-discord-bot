@@ -12,7 +12,7 @@
 ## Design choices
 
 - ChaosX is its own Discord bot identity and runtime, not an automation of a normal user account.
-- Community knowledge/tester commands are public inside the configured guild, but source/spec/repo-file views are not public because implementation specs are for Klim and coding agents.
+- Community knowledge/tester commands are public inside the configured guild. Public `/ask` uses a fast prebuilt SQLite/FTS index over the Chaos Redux repo plus whitelisted Chaos Redux Vault folders, but it only retrieves small snippets and still has no filesystem, Discord-management, issue-creation, or command-execution ability. Raw source/spec/repo-file views stay out of the public command surface because implementation specs are for Klim and coding agents.
 - Owner/operator work should mostly go through `/admin ask`; avoid exposing tiny one-off admin/server commands unless Hoops explicitly asks for them.
 - `/admin ask` injects recent owner-only follow-up memory scoped to the same owner + guild + Discord channel/thread, may pre-resolve plain-text member references such as `@Holly`/`member named Holly`, and may fetch recent messages from the current or explicitly mentioned channel for owner-requested analysis, optionally filtered to a mentioned/user-id target. This is active/on-demand, not passive monitoring. Previous turns are context only, never authorization for server mutation.
 - Public `/event-idea` and `/suggestion` can quietly write approved notes into the Chaos Redux vault. New vault notes refresh `index.md`, `Events/Events Index.md`, `Planning/Community Suggestions/Community Suggestions Index.md`, and `log.md` so references do not go stale.
