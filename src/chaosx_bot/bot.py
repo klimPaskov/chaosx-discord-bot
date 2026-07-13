@@ -93,7 +93,7 @@ def _format_duration(seconds: int) -> str:
     return f"{sec}s"
 
 
-def public_ask_rejection_reason(request: str) -> str | None:
+def public_ask_rejection_reason(request: str, *, reference_context: str = "") -> str | None:
     text = request.casefold()
     if any(term in text for term in PUBLIC_ASK_BLOCK_TERMS):
         return PUBLIC_ASK_REDIRECT
@@ -101,7 +101,7 @@ def public_ask_rejection_reason(request: str) -> str | None:
         return PUBLIC_ASK_REDIRECT
     if any(term in text for term in PUBLIC_ASK_INJECTION_PATTERNS):
         return PUBLIC_ASK_REDIRECT
-    if not any(term in text for term in PUBLIC_ASK_DOMAIN_TERMS):
+    if not any(term in text for term in PUBLIC_ASK_DOMAIN_TERMS) and not reference_context.strip():
         return PUBLIC_ASK_REDIRECT
     return None
 
@@ -538,7 +538,9 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
     command_name = "mention ask"
-    rejection = public_ask_rejection_reason(request)
+    source_paths_allowed = public_ask_wants_sources(request)
+    reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+    rejection = public_ask_rejection_reason(request, reference_context=reference_context)
     if rejection:
         await message.reply(rejection, mention_author=False, allowed_mentions=safe_allowed_mentions())
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command=command_name, summary="public ask rejected")
@@ -567,12 +569,11 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
 
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
-    source_paths_allowed = public_ask_wants_sources(request)
     prompt = build_public_prompt(
         user_request=request,
         guild_name=guild_name,
         channel_name=channel_name,
-        reference_context=bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed),
+        reference_context=reference_context,
         source_paths_allowed=source_paths_allowed,
     )
     async with message.channel.typing():
@@ -892,6 +893,8 @@ async def run_hermes_command(
     max_chars_override: int | None = None,
 ) -> tuple[HermesResult, str] | None:
     rate = None
+    source_paths_allowed = False
+    reference_context = ""
     if owner_only:
         if not await owner_gate(interaction, bot.settings):
             return
@@ -900,7 +903,9 @@ async def run_hermes_command(
 
     if not owner_only:
         if rate_bucket == "ask":
-            rejection = public_ask_rejection_reason(request)
+            source_paths_allowed = public_ask_wants_sources(request)
+            reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+            rejection = public_ask_rejection_reason(request, reference_context=reference_context)
             if rejection:
                 await interaction.response.send_message(rejection, ephemeral=not public, allowed_mentions=safe_allowed_mentions())
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary="public ask rejected")
@@ -939,7 +944,6 @@ async def run_hermes_command(
         owner_context += await fetch_admin_member_context(bot, interaction, request)
         owner_context += await fetch_admin_message_context(bot, interaction, request)
     owner_request = request + owner_context
-    source_paths_allowed = public_ask_wants_sources(request) if not owner_only and rate_bucket == "ask" else False
     prompt = (
         build_owner_prompt(owner_request=owner_request, guild_name=guild_name, channel_name=channel_name)
         if owner_only
@@ -947,7 +951,7 @@ async def run_hermes_command(
             user_request=request,
             guild_name=guild_name,
             channel_name=channel_name,
-            reference_context=bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed) if rate_bucket == "ask" else "",
+            reference_context=reference_context if rate_bucket == "ask" else "",
             source_paths_allowed=source_paths_allowed,
         )
     )
