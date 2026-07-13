@@ -312,7 +312,7 @@ class Knowledge:
     def help(self, topic: str = "all") -> str:
         return (
             "## ChaosX help\n"
-            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest queue`.\n"
+            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/status`, `/testing`, `/suggestion`, `/event-idea`, `/issue`, `/playtest report`.\n"
             "Commands that use AI say so in `/help`; lookup commands are usually faster for exact event, scenario, cluster, and testing info."
         )
 

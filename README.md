@@ -26,7 +26,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
   - `/event-idea` formats a rough event idea with name, ID placeholder, optional type/cluster/evolutions/world-end/scenario fields, baseline description, testing notes, and overlap/gap notes.
   - `/issue` — opens a report form, validates bug/crash/enhancement/balance/cosmetic/general reports, and creates a GitHub issue in `CHAOSX_GITHUB_REPO`; bug/crash forms require relevant `error.log` lines, while other report types use expected/desired-result fields instead.
   - `/work ...` — protected issue-style drafts, handoffs, changelog, and release draft command family.
-  - `/playtest queue` shows the same testing queue, `/playtest report event_id:<id> observation:<text>` records tester feedback, and `/playtest summary` recaps reports. Scheduling/cancel helpers are protected.
+  - `/testing` shows the tester queue. `/playtest report observation:<text> [event_id:<id>]` records informal tester observations that are not ready for GitHub; `/playtest summary` recaps reports. Scheduling/cancel helpers are protected.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
   - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family. `/admin help` explains what each admin-only command is for and when to use it.
   - `/server ...` — protected autonomous ask, role audit, behaviour scan, member info, role assignment/removal, and timeout commands.

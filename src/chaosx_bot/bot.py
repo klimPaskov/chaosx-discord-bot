@@ -254,9 +254,8 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/event-idea idea:<idea>` — uses AI to format an event idea with a name, ID placeholder, type, baseline description, evolutions, and scenario hooks.
 
 ### Playtest notes
-- `/playtest queue` — use before testing to see what needs attention.
-- `/playtest report event_id:<id> observation:<text>` — use after testing an event to record what happened, what broke, or what felt off.
-- `/playtest summary` — use after several reports to recap recorded findings.
+- `/playtest report observation:<text>` — record testing observations, quick notes, balance feel, weird behavior, or unclear feedback that is not ready to become a GitHub issue. Add `event_id` if the note is about one event.
+- `/playtest summary` — recap recorded observations after a testing session.
 
 Tip: use `/ask` when you need a flexible explanation; use exact lookup commands for events, scenarios, clusters, status, and testing."""
 
@@ -291,7 +290,7 @@ Use this when you want private controls. Regular users should mostly use `/help`
 - `/work handoff` — make a protected Codex/Hermes handoff prompt.
 - `/work changelog` — draft player-facing changelog text.
 - `/work release-draft` — draft announcement/release notes; does not publish.
-- `/playtest queue` — public tester queue; `/playtest report` records event feedback; `/playtest summary` recaps reports.
+- `/testing` — public tester queue. `/playtest report` records informal observations; `/playtest summary` recaps reports. Use `/issue` instead when something is a concrete bug/crash/request that should go to GitHub.
 - `/playtest schedule` / `/playtest cancel` — protected/owner scheduling helpers.
 
 ### Hermes tools
@@ -752,10 +751,6 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
     async def work_release_draft(interaction: discord.Interaction, tag: str) -> None:
         await run_owner_hermes(bot, interaction, f"/work release-draft tag={tag!r}. Draft only; do not publish or announce.", command_name="work release-draft")
 
-    @playtest.command(name="queue", description="Show events that need playtesting.")
-    async def playtest_queue(interaction: discord.Interaction) -> None:
-        await send_scripted_response(bot, interaction, command_name="playtest queue", summary="queue", render=bot.knowledge.testing_queue, owner_render=bot.knowledge.testing_queue)
-
     @playtest.command(name="schedule", description="Prepare a playtest Scheduled Event plan.")
     async def playtest_schedule(interaction: discord.Interaction, target: str, start: str, duration: int, voice: str = "none", build: str = "") -> None:
         if not await owner_gate(interaction, settings):
@@ -766,14 +761,16 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="playtest schedule", summary=playtest_id)
         await interaction.response.send_message(preview, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    @playtest.command(name="report", description="Record what happened while testing one event.")
-    async def playtest_report(interaction: discord.Interaction, event_id: str, observation: str) -> None:
+    @playtest.command(name="report", description="Record informal playtest observations.")
+    async def playtest_report(interaction: discord.Interaction, observation: str, event_id: str = "") -> None:
         label = _event_label(event_id)
-        playtest_id = _stable_id("playtest", interaction.user.id, interaction.created_at.isoformat(), event_id, observation)
-        report = {"event_id": event_id, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
-        await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=label.replace('`', ''), start_time="", duration_minutes=0, voice="", build="")
+        target = label.replace('`', '') if event_id.strip() else "general playtest observation"
+        playtest_id = _stable_id("playtest", interaction.user.id, interaction.created_at.isoformat(), event_id or "general", observation)
+        report = {"event_id": event_id.strip() or None, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
+        await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=target, start_time="", duration_minutes=0, voice="", build="")
         await bot.store.add_playtest_report(playtest_id=playtest_id, report=report)
-        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id, render=lambda: f"Recorded playtest observation for {label}.\n```text\n{observation[:1500]}\n```")
+        heading = f"Recorded playtest observation for {label}." if event_id.strip() else "Recorded general playtest observation."
+        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id or "general", render=lambda: f"{heading}\nUse `/issue` instead if this should become a tracked GitHub bug/crash/request.\n```text\n{observation[:1500]}\n```")
 
     @playtest.command(name="summary", description="Summarize recorded playtest reports.")
     async def playtest_summary(interaction: discord.Interaction, event: str = "latest") -> None:

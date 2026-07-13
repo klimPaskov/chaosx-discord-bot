@@ -80,8 +80,17 @@ def test_community_help_uses_search_and_root_feedback_commands():
     assert "/event-idea idea:<idea>" in help_text
     assert "baseline description" in help_text
     assert "Playtest notes" in help_text
+    assert "/playtest queue" not in help_text
+    assert "Add `event_id` if the note is about one event" in help_text
     assert "/work suggestion" not in help_text
     assert "/issue" in help_text
+
+
+def test_event_label_supports_general_playtest_observations():
+    from chaosx_bot.bot import _event_label
+
+    assert _event_label("1") == "event id `1`"
+    assert _event_label("") == "event `unknown`"
 
 
 def test_issue_validation_requires_logs_for_bugs_and_formats_body():
