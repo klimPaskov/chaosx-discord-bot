@@ -17,6 +17,19 @@ from .storage import Store
 from .webhook_server import GitHubWebhookServer
 
 BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
+PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
+PUBLIC_ASK_DOMAIN_TERMS = {
+    "chaos redux", "chaosx", "hoi4", "hearts of iron", "mod", "event", "scenario", "cluster", "mechanic",
+    "testing", "playtest", "bug", "balance", "focus", "country", "lore", "zombie", "infection", "outbreak",
+    "biowarfare", "chemical", "nuclear", "super event", "evolution", "catalog", "redux",
+}
+PUBLIC_ASK_BLOCK_TERMS = {
+    "ignore previous", "ignore all previous", "system prompt", "developer message", "hidden instruction",
+    "original instruction", "internal instruction", "jailbreak", "godmode", "dan mode", "you are now", "act as",
+    "sudo", "admin mode", "reveal prompt", "print prompt", "show prompt", "secret", "token", "password",
+    "credential", "delete server", "nuke", "hack", "malware", "phishing", "exploit", "bypass", "mass ping",
+    "@everyone", "@here", "ban everyone", "delete channel", "delete role", "manage server", "moderation",
+}
 
 
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
@@ -37,6 +50,15 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
         chunks.append(text[:cut])
         text = text[cut:].lstrip()
     return chunks
+
+
+def public_ask_rejection_reason(request: str) -> str | None:
+    text = request.casefold()
+    if any(term in text for term in PUBLIC_ASK_BLOCK_TERMS):
+        return PUBLIC_ASK_REDIRECT
+    if not any(term in text for term in PUBLIC_ASK_DOMAIN_TERMS):
+        return PUBLIC_ASK_REDIRECT
+    return None
 
 
 def _can_manage_role(guild: discord.Guild, actor: discord.Member, bot_member: discord.Member, role: discord.Role) -> tuple[bool, str]:
@@ -251,6 +273,12 @@ async def run_hermes_command(
         return
 
     if not owner_only:
+        if rate_bucket == "ask":
+            rejection = public_ask_rejection_reason(request)
+            if rejection:
+                await interaction.response.send_message(rejection, ephemeral=not public, allowed_mentions=safe_allowed_mentions())
+                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary="public ask rejected")
+                return
         max_chars = bot.settings.public_prompt_max_chars
         if len(request) > max_chars:
             await interaction.response.send_message(
@@ -292,6 +320,9 @@ async def run_hermes_command(
         reasoning_effort = bot.settings.ask_reasoning_effort
     if not owner_only:
         toolsets = "safe"
+        ignore_rules = True
+    else:
+        ignore_rules = False
     result = await run_hermes(
         hermes_bin=bot.settings.hermes_bin,
         profile=bot.settings.hermes_profile,
@@ -302,6 +333,7 @@ async def run_hermes_command(
         provider=provider,
         reasoning_effort=reasoning_effort,
         toolsets=toolsets,
+        ignore_rules=ignore_rules,
     )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     status = "ok" if result.ok else "failed"
