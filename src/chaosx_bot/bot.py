@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import discord
+import hashlib
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from discord import app_commands
@@ -11,6 +12,7 @@ from .hermes_bridge import build_owner_prompt, run_hermes
 from .knowledge import Knowledge
 from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
+from .webhook_server import GitHubWebhookServer
 
 BOT_DESCRIPTION = "Community Chaos Redux knowledge bot with protected operations"
 
@@ -54,6 +56,11 @@ def _dangerous_role_flags(role: discord.Role) -> list[str]:
     return flags
 
 
+def _stable_id(prefix: str, *parts: object) -> str:
+    raw = "|".join(str(p) for p in parts)
+    return f"{prefix}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
+
+
 class ChaosXBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
@@ -64,9 +71,16 @@ class ChaosXBot(discord.Client):
         self.store = Store(settings.db_path)
         self.rate_limiter = FixedWindowRateLimiter()
         self.knowledge = Knowledge(settings.chaos_redux_repo, settings.db_path)
+        self.webhook_server = GitHubWebhookServer(
+            store=self.store,
+            secret=settings.github_webhook_secret,
+            host=settings.webhook_host,
+            port=settings.webhook_port,
+        )
 
     async def setup_hook(self) -> None:
         await self.store.init()
+        await self.webhook_server.start()
         register_commands(self)
         if self.settings.command_guild_id:
             guild = discord.Object(id=self.settings.command_guild_id)
@@ -86,6 +100,10 @@ class ChaosXBot(discord.Client):
             status=discord.Status.online,
         )
         print(f"ChaosX logged in as {self.user} owner_id={self.settings.owner_id}")
+
+    async def close(self) -> None:
+        await self.webhook_server.stop()
+        await super().close()
 
 
 async def owner_gate(interaction: discord.Interaction, settings: Settings) -> bool:
@@ -378,7 +396,18 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @work.command(name="issue-draft", description="Draft a GitHub issue from text/message context.")
     async def work_issue_draft(interaction: discord.Interaction, summary: str, event: str = "", surface: str = "") -> None:
-        await run_owner_hermes(bot, interaction, f"/work issue-draft summary={summary!r} event={event!r} surface={surface!r}. Draft only; duplicate search; no issue creation.", command_name="work issue-draft")
+        if not await owner_gate(interaction, settings):
+            return
+        draft_id = _stable_id("issue", interaction.user.id, interaction.created_at.isoformat(), summary)
+        body = (
+            f"Summary: {summary}\n"
+            f"Event/entity: {event or 'unknown'}\n"
+            f"Surface: {surface or 'unknown'}\n\n"
+            "Expected behavior:\n- TBD\n\nActual behavior:\n- TBD\n\nReproduction steps:\n1. TBD\n\nEvidence:\n- Discord draft created by ChaosX; no GitHub issue created yet."
+        )
+        await bot.store.create_issue_draft(draft_id=draft_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, summary=summary, body=body)
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="work issue-draft", summary=draft_id)
+        await interaction.response.send_message(f"Created issue draft `{draft_id}`. No GitHub issue was created.\n```text\n{body[:1600]}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @work.command(name="suggestion", description="Structure a suggestion and check duplicates.")
     async def work_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
@@ -406,15 +435,27 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @playtest.command(name="schedule", description="Prepare a playtest Scheduled Event plan.")
     async def playtest_schedule(interaction: discord.Interaction, target: str, start: str, duration: int, voice: str = "none", build: str = "") -> None:
-        await run_owner_hermes(bot, interaction, f"/playtest schedule target={target!r} start={start!r} duration={duration} voice={voice!r} build={build!r}. Preview first; create only if explicit current approval and permissions exist.", command_name="playtest schedule")
+        if not await owner_gate(interaction, settings):
+            return
+        playtest_id = _stable_id("playtest", target, start, duration, voice, build)
+        await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=target, start_time=start, duration_minutes=duration, voice=voice, build=build)
+        preview = f"Playtest draft `{playtest_id}`\nTarget: `{target}`\nStart: `{start}`\nDuration: `{duration}` minutes\nVoice: `{voice}`\nBuild: `{build or 'unspecified'}`\nNo Discord Scheduled Event was created by this draft command."
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="playtest schedule", summary=playtest_id)
+        await interaction.response.send_message(preview, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @playtest.command(name="report", description="Draft a structured playtest report.")
     async def playtest_report(interaction: discord.Interaction, event: str, observation: str) -> None:
-        await run_hermes_command(bot, interaction, f"/playtest report event={event!r} observation={observation!r}. Structure result and optional issue draft.", command_name="playtest report")
+        report = {"event": event, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
+        await bot.store.add_playtest_report(playtest_id=event, report=report)
+        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event, render=lambda: f"Recorded playtest observation for `{event}` if that draft exists.\n```text\n{observation[:1500]}\n```")
 
     @playtest.command(name="summary", description="Summarize a playtest.")
-    async def playtest_summary(interaction: discord.Interaction, event: str) -> None:
-        await run_hermes_command(bot, interaction, f"/playtest summary event={event!r}. Distinguish observations from reproduced defects.", command_name="playtest summary")
+    async def playtest_summary(interaction: discord.Interaction, event: str = "latest") -> None:
+        rows = await bot.store.list_playtests(limit=10)
+        lines = ["## Playtest records"]
+        for playtest_id, target, start_time, duration_minutes, voice, build, status in rows:
+            lines.append(f"- `{playtest_id}` target=`{target}` start=`{start_time}` duration=`{duration_minutes}` voice=`{voice}` build=`{build}` status=`{status}`")
+        await send_scripted_response(bot, interaction, command_name="playtest summary", summary=event, render=lambda: "\n".join(lines))
 
     @playtest.command(name="cancel", description="Prepare/cancel playtest reminders/event if approved.")
     async def playtest_cancel(interaction: discord.Interaction, event: str) -> None:
@@ -458,11 +499,33 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @admin.command(name="automation", description="List/enable/disable automation by name.")
     async def admin_automation(interaction: discord.Interaction, action: str = "list", name: str = "") -> None:
-        await run_owner_hermes(bot, interaction, f"/admin automation action={action!r} name={name!r}. Config diffs and approval gates required for changes.", command_name="admin automation")
+        if not await owner_gate(interaction, settings):
+            return
+        action = action.lower().strip()
+        if action in {"enable", "disable"} and name:
+            ok = await bot.store.set_automation(name, action == "enable")
+            await interaction.response.send_message((f"Automation `{name}` set to `{action}`." if ok else f"Unknown automation `{name}`."), ephemeral=True)
+            return
+        rows = await bot.store.list_automations()
+        text = "## ChaosX automations\n" + "\n".join(f"- `{n}` enabled=`{bool(e)}` destination=`{d or 'unset'}`" for n, e, d in rows)
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="config", description="Show/validate config with secrets redacted.")
     async def admin_config(interaction: discord.Interaction, action: str = "show") -> None:
-        await run_owner_hermes(bot, interaction, f"/admin config action={action!r}. Redact secrets.", command_name="admin config")
+        if not await owner_gate(interaction, settings):
+            return
+        text = (
+            "## ChaosX config\n"
+            f"- allowed_guild_id: `{settings.allowed_guild_id}`\n"
+            f"- command_guild_id: `{settings.command_guild_id}`\n"
+            f"- broad ask provider/model: `{settings.ask_provider}` / `{settings.ask_model}`\n"
+            f"- public ask limit/hour: `{settings.public_ask_limit_per_hour}`\n"
+            f"- scripted limit/hour: `{settings.public_scripted_limit_per_hour}`\n"
+            f"- webhook listener: `{settings.webhook_host}:{settings.webhook_port}` enabled=`{bool(settings.github_webhook_secret)}`\n"
+            f"- repo: `{settings.chaos_redux_repo}`\n"
+            f"- db: `{settings.db_path}`\n"
+        )
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="permissions-audit", description="Audit Discord/GitHub permissions.")
     async def admin_permissions_audit(interaction: discord.Interaction) -> None:

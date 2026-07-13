@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     hermes_timeout_seconds: int = Field(default=300, ge=30, le=1800)
     ask_model: str = Field(default="luna-medium", description="Model override for broad ask commands")
     ask_provider: str = Field(default="nous", description="Provider override for broad ask commands")
+    webhook_host: str = Field(default="127.0.0.1")
+    webhook_port: int = Field(default=8787, ge=1, le=65535)
+    github_webhook_secret: str = Field(default="", repr=False)
+    webhook_public_base_url: str = Field(default="")
     db_path: Path = Field(default=Path("./chaosx.db"))
 
     @field_validator("discord_token")
