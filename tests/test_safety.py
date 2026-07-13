@@ -1,5 +1,5 @@
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import PUBLIC_ASK_REDIRECT, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_public_ask_output
+from chaosx_bot.bot import PUBLIC_ASK_REDIRECT, community_help_text, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -45,6 +45,9 @@ def test_blank_optional_guild_ids_are_allowed():
 
 def test_ask_model_defaults_to_openai_luna():
     settings = Settings(_env_file=None, discord_token="dummy")
+    assert settings.allowed_guild_id == 1395459671598436533
+    assert settings.command_guild_id == 1395459671598436533
+    assert settings.github_repo == "klimPaskov/Chaos-Redux"
     assert settings.public_ask_limit_per_hour == 10
     assert settings.ask_model == "gpt-5.6-luna"
     assert settings.ask_provider == "openai-codex"
@@ -61,6 +64,40 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/server ask request:<text>" in help_text
     assert "No file/Discord actions" in help_text
     assert "/work handoff" in help_text
+
+
+def test_community_help_uses_search_and_root_feedback_commands():
+    help_text = community_help_text()
+    assert "/search query:<text>" in help_text
+    assert "/mechanic" not in help_text
+    assert "/suggestion suggestion:<idea>" in help_text
+    assert "/event-idea idea:<idea>" in help_text
+    assert "/work suggestion" not in help_text
+    assert "/issue" in help_text
+
+
+def test_issue_validation_requires_logs_for_bugs_and_formats_body():
+    assert validate_issue_report(issue_type="bug", title="Crash in setup", description="The mod crashes during setup after clicking the scenario button.")
+    assert validate_issue_report(
+        issue_type="bug",
+        title="Crash in setup",
+        description="The mod crashes during setup after clicking the scenario button.",
+        steps="Open the scenario menu and click launch.",
+        actual="Game exits to desktop after selecting the scenario.",
+        error_log_lines="[12:00:00][effect.cpp:1]: relevant crash line",
+    ) is None
+    assert validate_issue_report(issue_type="enhancement", title="Improve scenario UI", description="The scenario UI should explain intensity choices more clearly.") is None
+    body = format_github_issue_body(
+        issue_type="crash",
+        title="Crash in setup",
+        description="Crash after launch.",
+        steps="Open menu.",
+        actual="Crashes.",
+        error_log_lines="[error] bad effect",
+        reporter="tester",
+    )
+    assert "## Relevant error.log lines" in body
+    assert "tester" in body
 
 
 def test_fixed_window_rate_limiter_blocks_after_limit():

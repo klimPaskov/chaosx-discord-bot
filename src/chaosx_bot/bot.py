@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,8 @@ PUBLIC_ASK_SOURCE_REQUEST_TERMS = {
     "path", "paths", "file", "files", "source", "sources", "repo", "repository", "code", "implementation",
     "where is", "where are", "stored", "located", "spec", "specs", "documentation", "docs",
 }
+ISSUE_TYPES = {"bug", "crash", "enhancement", "balance", "content", "general"}
+ISSUE_TYPES_REQUIRING_LOG = {"bug", "crash"}
 
 
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
@@ -106,6 +109,56 @@ def public_ask_wants_sources(request: str) -> bool:
     return any(term in text for term in PUBLIC_ASK_SOURCE_REQUEST_TERMS)
 
 
+def validate_issue_report(*, issue_type: str, title: str, description: str, steps: str = "", expected: str = "", actual: str = "", error_log_lines: str = "") -> str | None:
+    kind = issue_type.casefold().strip()
+    if kind not in ISSUE_TYPES:
+        return f"Unsupported issue type `{issue_type}`. Use one of: {', '.join(sorted(ISSUE_TYPES))}."
+    if len(title.strip()) < 8:
+        return "Please use a clearer title, at least 8 characters."
+    if len(description.strip()) < 20:
+        return "Please include a fuller description of what happened or what should change."
+    if kind in ISSUE_TYPES_REQUIRING_LOG:
+        if len(error_log_lines.strip()) < 20:
+            return "Bug/crash reports need the relevant `error.log` lines pasted into `error_log_lines`."
+        if len((steps or "").strip()) < 10:
+            return "Bug/crash reports need reproduction steps in `steps`."
+        if len((actual or "").strip()) < 10:
+            return "Bug/crash reports need `actual` behavior."
+    return None
+
+
+def format_github_issue_body(*, issue_type: str, title: str, description: str, steps: str = "", expected: str = "", actual: str = "", error_log_lines: str = "", reporter: str = "", source: str = "Discord /issue") -> str:
+    kind = issue_type.casefold().strip()
+    sections = [
+        f"## Type\n{kind}",
+        f"## Summary\n{description.strip()}",
+    ]
+    if steps.strip():
+        sections.append(f"## Reproduction steps\n{steps.strip()}")
+    if expected.strip():
+        sections.append(f"## Expected behavior\n{expected.strip()}")
+    if actual.strip():
+        sections.append(f"## Actual behavior\n{actual.strip()}")
+    if error_log_lines.strip():
+        sections.append(f"## Relevant error.log lines\n```text\n{error_log_lines.strip()[:3500]}\n```")
+    sections.append(f"## Reporter / source\n- Reporter: {reporter or 'Discord user'}\n- Source: {source}\n- Created by ChaosX after validating required fields.")
+    return "\n\n".join(sections)
+
+
+async def create_github_issue(repo: str, *, title: str, body: str) -> tuple[bool, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "gh", "issue", "create", "--repo", repo, "--title", title, "--body", body,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    out = stdout.decode("utf-8", errors="replace").strip()
+    err = stderr.decode("utf-8", errors="replace").strip()
+    if proc.returncode == 0:
+        return True, out or "GitHub issue created."
+    return False, (err or out or f"gh issue create failed with exit code {proc.returncode}")[:1800]
+
+
 def _can_manage_role(guild: discord.Guild, actor: discord.Member, bot_member: discord.Member, role: discord.Role) -> tuple[bool, str]:
     if role.is_default():
         return False, "Cannot manage the @everyone role."
@@ -132,27 +185,27 @@ def _stable_id(prefix: str, *parts: object) -> str:
 
 def community_help_text() -> str:
     return """## ChaosX community help
-Use ChaosX for Chaos Redux event info, scenario info, mechanics, testing notes, and cleaner idea/report drafts.
+Use ChaosX for Chaos Redux event info, scenario info, project search, issue reports, testing notes, and cleaner idea/report drafts.
 
-### Ask a question
-- `/ask question:<text>` — ask a broader Chaos Redux question. Good for “how does this work?” or “where should I look?” answers. It shows your remaining asks at the end.
+### Ask or search
+- `/ask question:<text>` — ask a broader Chaos Redux question. It shows your remaining asks at the end.
+- `/search query:<text>` — search events, mechanics, docs, specs, and testing info when you do not know the exact command.
 
 ### Look things up
 - `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, and evolutions.
 - `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry, e.g. `5` = SCN-005 The World in Fury.
 - `/cluster cluster:<id or name>` — event cluster summary and members.
-- `/mechanic mechanic:<topic>` — search mechanics docs, like chaos meter, zombies, scenarios, disasters.
-- `/search query:<text>` — general project search when you do not know the exact command.
 - `/status` — project catalog totals and event breakdowns.
 - `/testing query:<text>` — find testing notes or queues matching a topic.
 
-### Draft feedback
-- `/work suggestion text:<idea>` — turn a rough suggestion into a clearer review note.
-- `/work event-idea idea:<idea>` — check whether an event idea overlaps existing catalog entries.
+### Report or draft feedback
+- `/issue` — create a formatted GitHub issue after ChaosX validates the report fields. Bugs/crashes require relevant `error.log` lines.
+- `/suggestion suggestion:<idea>` — turn a rough suggestion into a clearer review note.
+- `/event-idea idea:<idea>` — check whether an event idea overlaps existing catalog entries.
 - `/playtest report report:<text>` — format a playtest finding into a useful report.
 - `/playtest queue` and `/playtest summary` — see or summarize playtest work.
 
-Tip: lookup commands are fastest for exact IDs. Use `/ask` for broader explanations."""
+Tip: use `/search` for mechanics, event systems, and general project lookup."""
 
 
 def operator_help_text(settings: Settings) -> str:
@@ -179,8 +232,10 @@ Use this when you want private controls. Regular users should mostly use `/help`
 - `/server timeout` — timeout a member if permissions allow it.
 
 ### Project/work tools
-- `/work issue-draft` — create a private draft only; no GitHub issue is filed.
-- `/work handoff` — make a Codex/Hermes handoff prompt.
+- Public `/issue` — validates a report and creates a GitHub issue in `{settings.github_repo}`. Bugs/crashes require relevant `error.log` lines.
+- Public `/suggestion` / `/event-idea` — community suggestion cleanup and event-idea overlap checks.
+- `/work issue-draft` — private draft only; no GitHub issue is filed.
+- `/work handoff` — make a protected Codex/Hermes handoff prompt.
 - `/work changelog` — draft player-facing changelog text.
 - `/work release-draft` — draft announcement/release notes; does not publish.
 - `/playtest schedule` / `/playtest cancel` — manage playtest records.
@@ -239,7 +294,23 @@ class ChaosXBot(discord.Client):
             activity=discord.Activity(type=discord.ActivityType.watching, name="Chaos Redux ops"),
             status=discord.Status.online,
         )
+        await self.leave_unauthorized_guilds()
         print(f"ChaosX logged in as {self.user} owner_id={self.settings.owner_id}")
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        allowed = self.settings.allowed_guild_id or self.settings.command_guild_id
+        if allowed and guild.id != allowed:
+            print(f"ChaosX leaving unauthorized guild {guild.id} ({guild.name})")
+            await guild.leave()
+
+    async def leave_unauthorized_guilds(self) -> None:
+        allowed = self.settings.allowed_guild_id or self.settings.command_guild_id
+        if not allowed:
+            return
+        for guild in list(self.guilds):
+            if guild.id != allowed:
+                print(f"ChaosX leaving unauthorized guild {guild.id} ({guild.name})")
+                await guild.leave()
 
     async def close(self) -> None:
         await self.webhook_server.stop()
@@ -463,7 +534,7 @@ def register_commands(bot: ChaosXBot) -> None:
             return
         await interaction.response.send_message(community_help_text(), ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
-    work = app_commands.Group(name="work", description="Draft and organize Chaos Redux suggestions/reports")
+    work = app_commands.Group(name="work", description="Protected Chaos Redux work drafts", default_permissions=discord.Permissions(administrator=True))
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
     hermes = app_commands.Group(name="hermes", description="Hermes agent routing/task commands", default_permissions=discord.Permissions(administrator=True))
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
@@ -485,10 +556,6 @@ def register_commands(bot: ChaosXBot) -> None:
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster), owner_render=lambda: bot.knowledge.cluster(cluster, show_evidence=True))
 
-    @bot.tree.command(name="mechanic", description="Explain a Chaos Redux mechanic.")
-    async def chaosx_mechanic(interaction: discord.Interaction, mechanic: str) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx mechanic", summary=mechanic, render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6), owner_render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6, show_evidence=True))
-
     @bot.tree.command(name="search", description="Search public-facing Chaos Redux info.")
     async def chaosx_search(interaction: discord.Interaction, query: str, scope: str = "all") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx search", summary=query, render=lambda: bot.knowledge.search(query, scope=scope, limit=8), owner_render=lambda: bot.knowledge.search(query, scope=scope, limit=8, show_evidence=True))
@@ -500,6 +567,81 @@ def register_commands(bot: ChaosXBot) -> None:
     @bot.tree.command(name="testing", description="Show prioritized testing queue.")
     async def chaosx_testing(interaction: discord.Interaction, kind: str = "all", limit: int = 10) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx testing", summary=kind, render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit), owner_render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit, show_evidence=True))
+
+
+    @bot.tree.command(name="suggestion", description="Clean up a Chaos Redux suggestion and note likely overlap.")
+    async def chaosx_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
+        await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
+
+    @bot.tree.command(name="event-idea", description="Check whether a Chaos Redux event idea already exists or fits a catalog gap.")
+    async def chaosx_event_idea(interaction: discord.Interaction, idea: str) -> None:
+        await run_hermes_command(bot, interaction, f"/event-idea idea={idea!r}. Search assigned events and unassigned ideas; summarize overlap/gap; never allocate an ID.", command_name="event-idea")
+
+    @bot.tree.command(name="issue", description="Create a formatted GitHub issue after ChaosX validates the report.")
+    @app_commands.choices(issue_type=[
+        app_commands.Choice(name="Bug", value="bug"),
+        app_commands.Choice(name="Crash", value="crash"),
+        app_commands.Choice(name="Enhancement request", value="enhancement"),
+        app_commands.Choice(name="Balance issue", value="balance"),
+        app_commands.Choice(name="Content issue", value="content"),
+        app_commands.Choice(name="General", value="general"),
+    ])
+    async def chaosx_issue(
+        interaction: discord.Interaction,
+        issue_type: app_commands.Choice[str],
+        title: str,
+        description: str,
+        steps: str = "",
+        expected: str = "",
+        actual: str = "",
+        error_log_lines: str = "",
+    ) -> None:
+        if not await public_gate(interaction, settings):
+            return
+        rate = bot.rate_limiter.check(bucket="issue", user_id=interaction.user.id, limit=5, window_seconds=3600)
+        if not rate.allowed:
+            await interaction.response.send_message(
+                f"Issue-report rate limit hit. Try again in about {_format_duration(rate.retry_after_seconds)}.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        kind = issue_type.value
+        validation_error = validate_issue_report(
+            issue_type=kind,
+            title=title,
+            description=description,
+            steps=steps,
+            expected=expected,
+            actual=actual,
+            error_log_lines=error_log_lines,
+        )
+        if validation_error:
+            await interaction.response.send_message(validation_error, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            return
+        await interaction.response.defer(ephemeral=False, thinking=True)
+        body = format_github_issue_body(
+            issue_type=kind,
+            title=title,
+            description=description,
+            steps=steps,
+            expected=expected,
+            actual=actual,
+            error_log_lines=error_log_lines,
+            reporter=str(interaction.user),
+            source=f"Discord /issue in guild {interaction.guild_id}, channel {interaction.channel_id}",
+        )
+        issue_title = f"[{kind.title()}] {title.strip()}"
+        ok, result = await create_github_issue(settings.github_repo, title=issue_title, body=body)
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="issue", summary=issue_title)
+        if ok:
+            await interaction.followup.send(
+                f"GitHub issue created: {result}\nIssue type: `{kind}` · Issue reports left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`",
+                ephemeral=False,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+        else:
+            await interaction.followup.send(f"ChaosX approved the report fields, but GitHub issue creation failed:\n```text\n{result}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
 
     @work.command(name="issue-draft", description="Turn a report into a private issue-style draft for Hoops review.")
@@ -516,14 +658,6 @@ def register_commands(bot: ChaosXBot) -> None:
         await bot.store.create_issue_draft(draft_id=draft_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, summary=summary, body=body)
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="work issue-draft", summary=draft_id)
         await interaction.response.send_message(f"Created issue draft `{draft_id}`. No GitHub issue was created.\n```text\n{body[:1600]}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @work.command(name="suggestion", description="Clean up a gameplay suggestion and note likely overlap.")
-    async def work_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
-        await run_hermes_command(bot, interaction, f"/work suggestion suggestion={suggestion!r}. Structure and duplicate-check; do not promote to accepted design.", command_name="work suggestion")
-
-    @work.command(name="event-idea", description="Check whether an event idea already exists or fits a catalog gap.")
-    async def work_event_idea(interaction: discord.Interaction, idea: str) -> None:
-        await run_hermes_command(bot, interaction, f"/work event-idea idea={idea!r}. Search assigned events and unassigned ideas; never allocate ID.", command_name="work event-idea")
 
     @work.command(name="handoff", description="Create a clear implementation/review handoff draft.")
     async def work_handoff(interaction: discord.Interaction, task: str) -> None:

@@ -7,7 +7,8 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 ## What it does now
 
 - Registers slash commands with Discord.
-- Community read-only/project-question commands are available in the configured guild and auto-refresh the local index when repo/catalog files change.
+- Community commands are available only in the configured Chaos Redux guild; the bot leaves unauthorized guilds on join/startup.
+- Public lookup/project-question commands auto-refresh the local index when repo/catalog files change.
 - Admin/automation/server-write commands refuse every user unless `interaction.user.id == CHAOSX_OWNER_ID`.
 - Optional guild lock with `CHAOSX_ALLOWED_GUILD_ID`.
 - Uses no Message Content privileged intent by default.
@@ -20,8 +21,10 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=openai-codex`, `CHAOSX_OPERATOR_MODEL=gpt-5.6-luna`, `CHAOSX_OPERATOR_REASONING_EFFORT=xhigh`.
 - Provides:
   - `/help` — public community command guide.
-  - `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands. `/scenario` reads triggerable SCN scenario docs, not event IDs.
-  - `/work ...` — suggestion cleanup, event idea overlap checks, issue-style drafts, handoffs, changelog, and release draft command family.
+  - `/ask`, `/event`, `/scenario`, `/cluster`, `/search`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands. `/search` replaces the older duplicate `/mechanic`; `/scenario` reads triggerable SCN scenario docs, not event IDs.
+  - `/suggestion`, `/event-idea` — public suggestion/event idea cleanup and overlap checks.
+  - `/issue` — validates bug/crash/enhancement/balance/content/general reports and creates a GitHub issue in `CHAOSX_GITHUB_REPO`; bugs/crashes require relevant `error.log` lines.
+  - `/work ...` — protected issue-style drafts, handoffs, changelog, and release draft command family.
   - `/playtest ...` — queue/schedule/report/summary/cancel command family.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
   - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family. `/admin help` explains what each admin-only command is for and when to use it.

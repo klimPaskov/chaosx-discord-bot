@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     discord_token: str = Field(default="", description="Discord bot token", repr=False)
     application_description: str = Field(default="Ask ChaosX questions about Chaos Redux events, scenarios, mechanics, testing, and mod info.")
     owner_id: int = Field(default=789502982122373150, description="Discord user ID with admin/automation access")
-    allowed_guild_id: Optional[int] = Field(default=None)
-    command_guild_id: Optional[int] = Field(default=None)
+    allowed_guild_id: Optional[int] = Field(default=1395459671598436533)
+    command_guild_id: Optional[int] = Field(default=1395459671598436533)
     public_ask_limit_per_hour: int = Field(default=10, ge=0, le=100)
     public_scripted_limit_per_hour: int = Field(default=20, ge=0, le=500)
     public_prompt_max_chars: int = Field(default=600, ge=100, le=4000)
@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     github_webhook_secret: str = Field(default="", repr=False)
     webhook_public_base_url: str = Field(default="")
     db_path: Path = Field(default=Path("./chaosx.db"))
+    github_repo: str = Field(default="klimPaskov/Chaos-Redux", description="GitHub repo for public /issue creation")
+
+    @model_validator(mode="after")
+    def default_allowed_guild_to_command_guild(self):
+        if self.allowed_guild_id is None and self.command_guild_id is not None:
+            self.allowed_guild_id = self.command_guild_id
+        return self
 
     @field_validator("discord_token")
     @classmethod
