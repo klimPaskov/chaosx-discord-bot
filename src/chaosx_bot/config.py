@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     chaos_redux_repo: Path = Field(default=Path("/home/klim/projects/chaos_redux"))
     hermes_bin: Path = Field(default=Path("/home/klim/.local/bin/hermes"))
     hermes_profile: str = Field(default="chaos_redux")
-    hermes_timeout_seconds: int = Field(default=300, ge=30, le=1800)
+    hermes_timeout_seconds: int = Field(default=900, ge=30, le=1800)
     ask_model: str = Field(default="gpt-5.6-luna", description="Model override for broad ask commands")
     ask_provider: str = Field(default="openai-codex", description="Provider override for broad ask commands")
     ask_reasoning_effort: str = Field(default="medium", description="Reasoning effort for broad ask commands")

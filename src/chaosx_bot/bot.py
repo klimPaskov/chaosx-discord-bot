@@ -692,6 +692,12 @@ async def run_hermes_command(
         ignore_rules=ignore_rules,
     )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
+    if result.timed_out:
+        output = (
+            f"Hermes run timed out after {bot.settings.hermes_timeout_seconds}s. "
+            "I increased the ChaosX timeout for future runs; retry the same `/admin ask`. "
+            "For very broad server actions, ask for a preview/scope first, then confirm execution."
+        )
     if not owner_only and rate_bucket == "ask":
         output = sanitize_public_ask_output(output)
         if rate:
