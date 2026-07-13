@@ -1,6 +1,6 @@
 # ChaosX Discord Bot
 
-Community-facing Discord knowledge bot plus owner-only operations agent for the Chaos Redux server.
+Community-facing Discord knowledge bot plus protected operations agent for the Chaos Redux server.
 
 ChaosX is intended for the Chaos Redux community to ask bounded project questions while keeping operational/admin actions restricted to the configured owner Discord user ID. Public token-consuming commands are rate-limited and length-limited.
 
@@ -12,13 +12,13 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Optional guild lock with `CHAOSX_ALLOWED_GUILD_ID`.
 - Uses no Message Content privileged intent by default.
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
-- Bot presence/description: `Community Chaos Redux knowledge bot with owner-only operations` / watching `Chaos Redux ops`.
+- Bot presence/description: `Community Chaos Redux knowledge bot with protected operations` / watching `Chaos Redux ops`.
 - Public limits by default: 3 broad `/chaosx ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
 - Provides:
   - `/health` — private runtime/status check.
   - `/inventory` — private read-only guild/channel/role inventory.
   - `/ask` — runs the local `chaos_redux` Hermes profile with Discord safety boundaries.
-  - `/say` — owner-only exact post to the current channel with mentions disabled.
+  - `/say` — operator-only exact post to the current channel with mentions disabled.
   - `/chaosx ...` — knowledge/status/testing/source command family.
   - `/repo ...` — repository status/search/file/diff/history command family.
   - `/work ...` — issue draft/suggestion/event idea/handoff/changelog/release draft command family.
@@ -68,7 +68,7 @@ CHAOSX_COMMAND_GUILD_ID=<Chaos Redux guild id>
 CHAOSX_ALLOWED_GUILD_ID=<Chaos Redux guild id>
 ```
 
-## Owner-only Hermes bridge
+## Protected Hermes bridge
 
 `/ask` executes:
 

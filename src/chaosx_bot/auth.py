@@ -27,7 +27,7 @@ def public_deny_reason(guild_id: int | None, allowed_guild_id: int | None) -> st
 
 def owner_deny_reason(user_id: int, owner_id: int, guild_id: int | None, allowed_guild_id: int | None) -> str | None:
     if not is_owner(user_id, owner_id):
-        return "This ChaosX command is owner-only."
+        return "This ChaosX command is restricted to the bot operator."
     if not is_allowed_guild(guild_id, allowed_guild_id):
         return "ChaosX is locked to a different guild."
     return None

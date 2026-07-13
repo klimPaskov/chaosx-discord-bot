@@ -4,7 +4,7 @@
 
 - `discord.py` interaction-only bot.
 - No Message Content intent.
-- Owner-only interaction gate before every command.
+- Public read-only command gate plus protected admin/automation gate.
 - Optional single-guild lock.
 - Local SQLite audit log.
 - Hermes subprocess bridge for owner-directed autonomous project operations.

@@ -74,4 +74,4 @@ In the target server, as Hoops/Klim only:
 /inventory
 ```
 
-Other users should receive an owner-only denial.
+Other users should be denied only for protected operator commands.

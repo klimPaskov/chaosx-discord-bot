@@ -6,10 +6,11 @@ from discord import app_commands
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
 from .config import Settings
 from .hermes_bridge import build_owner_prompt, run_hermes
+from .knowledge import Knowledge
 from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
 
-BOT_DESCRIPTION = "Community Chaos Redux knowledge bot with owner-only operations"
+BOT_DESCRIPTION = "Community Chaos Redux knowledge bot with protected operations"
 
 
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
@@ -41,6 +42,7 @@ class ChaosXBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.store = Store(settings.db_path)
         self.rate_limiter = FixedWindowRateLimiter()
+        self.knowledge = Knowledge(settings.chaos_redux_repo, settings.db_path)
 
     async def setup_hook(self) -> None:
         await self.store.init()
@@ -90,6 +92,33 @@ async def public_gate(interaction: discord.Interaction, settings: Settings) -> b
             await interaction.response.send_message(reason, ephemeral=True, allowed_mentions=safe_allowed_mentions())
         return False
     return True
+
+
+async def send_scripted_response(
+    bot: ChaosXBot,
+    interaction: discord.Interaction,
+    *,
+    command_name: str,
+    summary: str,
+    render,
+    public: bool = False,
+) -> None:
+    if not await public_gate(interaction, bot.settings):
+        return
+    limit = bot.settings.public_scripted_limit_per_hour
+    rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
+    if not rate.allowed:
+        minutes = max(1, rate.retry_after_seconds // 60)
+        await interaction.response.send_message(f"Rate limit hit for ChaosX scripted commands. Try again in about {minutes} minute(s).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=not public, thinking=True)
+    try:
+        output = render()
+    except Exception as exc:
+        output = f"ChaosX scripted command failed: `{type(exc).__name__}: {exc}`"
+    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)
+    for part in _chunk(output):
+        await interaction.followup.send(part, ephemeral=not public, allowed_mentions=safe_allowed_mentions())
 
 
 async def run_hermes_command(
@@ -184,7 +213,7 @@ async def run_owner_hermes(
 def register_commands(bot: ChaosXBot) -> None:
     settings = bot.settings
 
-    @bot.tree.command(name="health", description="Owner-only ChaosX runtime health check.")
+    @bot.tree.command(name="health", description="Protected ChaosX runtime health check.")
     async def health(interaction: discord.Interaction) -> None:
         if not await owner_gate(interaction, settings):
             return
@@ -237,7 +266,7 @@ def register_commands(bot: ChaosXBot) -> None:
     async def ask(interaction: discord.Interaction, request: str) -> None:
         await run_owner_hermes(bot, interaction, request, command_name="ask")
 
-    @bot.tree.command(name="say", description="Owner-only: post an exact message to the current channel without mention parsing.")
+    @bot.tree.command(name="say", description="Protected: post an exact message to the current channel without mention parsing.")
     @app_commands.describe(message="Message to post. Mentions are not parsed.")
     async def say(interaction: discord.Interaction, message: str) -> None:
         if not await owner_gate(interaction, settings):
@@ -259,27 +288,27 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @chaosx.command(name="event", description="Look up an event by ID or name.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx event event={event!r} view={view!r}. Include catalog, specs, implementation evidence, testing state.", command_name="chaosx event")
+        await send_scripted_response(bot, interaction, command_name="chaosx event", summary=event, render=lambda: bot.knowledge.event(event, view))
 
     @chaosx.command(name="scenario", description="Look up a scenario by ID or name.")
     async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx scenario scenario={scenario!r} view={view!r}. Include evidence and testing status.", command_name="chaosx scenario")
+        await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.event(scenario, view))
 
     @chaosx.command(name="cluster", description="Look up an event cluster.")
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx cluster cluster={cluster!r}. Never invent IDs for planned clusters.", command_name="chaosx cluster")
+        await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster))
 
     @chaosx.command(name="mechanic", description="Explain a Chaos Redux mechanic.")
     async def chaosx_mechanic(interaction: discord.Interaction, mechanic: str) -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx mechanic mechanic={mechanic!r}. Distinguish design docs from implementation evidence.", command_name="chaosx mechanic")
+        await send_scripted_response(bot, interaction, command_name="chaosx mechanic", summary=mechanic, render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6))
 
     @chaosx.command(name="search", description="Search indexed/project sources.")
     async def chaosx_search(interaction: discord.Interaction, query: str, scope: str = "all") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx search query={query!r} scope={scope!r}. Return ranked source snippets and evidence metadata.", command_name="chaosx search")
+        await send_scripted_response(bot, interaction, command_name="chaosx search", summary=query, render=lambda: bot.knowledge.search(query, scope=scope, limit=8))
 
     @chaosx.command(name="source", description="Show source-of-truth map for an entity/path.")
     async def chaosx_source(interaction: discord.Interaction, query: str) -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx source query={query!r}. Explain intended design/current behavior/player wording/plans.", command_name="chaosx source")
+        await send_scripted_response(bot, interaction, command_name="chaosx source", summary=query, render=lambda: bot.knowledge.source(query))
 
     @chaosx.command(name="compare", description="Compare two sources/entities.")
     async def chaosx_compare(interaction: discord.Interaction, left: str, right: str) -> None:
@@ -287,27 +316,27 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @chaosx.command(name="status", description="Show completion/status matrix.")
     async def chaosx_status(interaction: discord.Interaction, entity: str = "global", surface: str = "all") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx status entity={entity!r} surface={surface!r}. Separate finished/partial/blocked/unknown evidence.", command_name="chaosx status")
+        await send_scripted_response(bot, interaction, command_name="chaosx status", summary=entity, render=lambda: bot.knowledge.status() if entity == "global" else bot.knowledge.source(entity))
 
     @chaosx.command(name="testing", description="Show prioritized testing queue.")
     async def chaosx_testing(interaction: discord.Interaction, kind: str = "all", limit: int = 10) -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx testing kind={kind!r} limit={limit}. Prioritize Needs Testing, recent changes, issues, missing playtest evidence.", command_name="chaosx testing")
+        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary=kind, render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit))
 
     @chaosx.command(name="help", description="Show ChaosX command help.")
     async def chaosx_help(interaction: discord.Interaction, topic: str = "all") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx help topic={topic!r}. Keep compact.", command_name="chaosx help")
+        await send_scripted_response(bot, interaction, command_name="chaosx help", summary=topic, render=lambda: bot.knowledge.help(topic))
 
     @repo.command(name="status", description="Show repository/index status.")
     async def repo_status(interaction: discord.Interaction) -> None:
-        await run_hermes_command(bot, interaction, "/repo status. Include branch, commit, dirty state, index health if available.", command_name="repo status")
+        await send_scripted_response(bot, interaction, command_name="repo status", summary="status", render=bot.knowledge.status)
 
     @repo.command(name="search", description="Search repo content/symbols.")
     async def repo_search(interaction: discord.Interaction, query: str, path: str = "") -> None:
-        await run_hermes_command(bot, interaction, f"/repo search query={query!r} path={path!r}. Use exact/symbol search first.", command_name="repo search")
+        await send_scripted_response(bot, interaction, command_name="repo search", summary=query, render=lambda: bot.knowledge.search(f'{path} {query}' if path else query, limit=8))
 
     @repo.command(name="file", description="Show safe excerpt from a repo file.")
     async def repo_file(interaction: discord.Interaction, path: str, lines: str = "") -> None:
-        await run_hermes_command(bot, interaction, f"/repo file path={path!r} lines={lines!r}. Enforce size limits and redact secret-like values.", command_name="repo file")
+        await send_scripted_response(bot, interaction, command_name="repo file", summary=path, render=lambda: bot.knowledge.file_excerpt(path, lines))
 
     @repo.command(name="diff", description="Summarize a git diff.")
     async def repo_diff(interaction: discord.Interaction, ref_a: str, ref_b: str, path: str = "") -> None:

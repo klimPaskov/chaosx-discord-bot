@@ -1,7 +1,7 @@
 [project]
 name = "chaosx-discord-bot"
 version = "0.1.0"
-description = "Owner-only Discord command agent for Chaos Redux server operations."
+description = "Community Discord knowledge bot and protected operations agent for Chaos Redux."
 requires-python = ">=3.11"
 dependencies = [
     "discord.py>=2.4.0,<3",

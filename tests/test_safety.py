@@ -7,7 +7,7 @@ from chaosx_bot.rate_limit import FixedWindowRateLimiter
 def test_owner_only_gate():
     assert is_owner(123, 123)
     assert not is_owner(456, 123)
-    assert "owner-only" in deny_reason(456, 123, 1, None)
+    assert "restricted" in deny_reason(456, 123, 1, None)
 
 
 def test_guild_lock():
