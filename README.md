@@ -23,8 +23,8 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
   - `/help` — public community command guide.
   - `/ask`, `/suggestion`, `/event-idea` — public AI-backed Chaos Redux question/drafting commands.
   - `/event`, `/scenario`, `/cluster`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/cluster` names member events, `/testing` shows events marked as needing playtesting, and `/scenario` reads triggerable SCN scenario docs, not event IDs.
-  - `/event-idea` formats a rough event idea with name, ID placeholder, type, baseline description, evolutions, world-end/scenario hooks, testing notes, and overlap/gap notes.
-  - `/issue` — validates bug/crash/enhancement/balance/content/general reports and creates a GitHub issue in `CHAOSX_GITHUB_REPO`; bugs/crashes require relevant `error.log` lines.
+  - `/event-idea` formats a rough event idea with name, ID placeholder, optional type/cluster/evolutions/world-end/scenario fields, baseline description, testing notes, and overlap/gap notes.
+  - `/issue` — opens a report form, validates bug/crash/enhancement/balance/cosmetic/general reports, and creates a GitHub issue in `CHAOSX_GITHUB_REPO`; bug/crash forms require relevant `error.log` lines, while other report types use expected/desired-result fields instead.
   - `/work ...` — protected issue-style drafts, handoffs, changelog, and release draft command family.
   - `/playtest queue` shows the same testing queue, `/playtest report event_id:<id> observation:<text>` records tester feedback, and `/playtest summary` recaps reports. Scheduling/cancel helpers are protected.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.

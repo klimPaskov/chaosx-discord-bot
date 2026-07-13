@@ -1,5 +1,5 @@
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import PUBLIC_ASK_REDIRECT, community_help_text, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, community_help_text, format_github_issue_body, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -85,6 +85,8 @@ def test_community_help_uses_search_and_root_feedback_commands():
 
 
 def test_issue_validation_requires_logs_for_bugs_and_formats_body():
+    assert "cosmetic" in ISSUE_TYPES
+    assert "content" not in ISSUE_TYPES
     assert validate_issue_report(issue_type="bug", title="Crash in setup", description="The mod crashes during setup after clicking the scenario button.")
     assert validate_issue_report(
         issue_type="bug",
@@ -95,6 +97,7 @@ def test_issue_validation_requires_logs_for_bugs_and_formats_body():
         error_log_lines="[12:00:00][effect.cpp:1]: relevant crash line",
     ) is None
     assert validate_issue_report(issue_type="enhancement", title="Improve scenario UI", description="The scenario UI should explain intensity choices more clearly.") is None
+    assert validate_issue_report(issue_type="cosmetic", title="Fix icon color", description="The decision icon color looks wrong in the scenario menu.") is None
     body = format_github_issue_body(
         issue_type="crash",
         title="Crash in setup",

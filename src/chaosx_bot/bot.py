@@ -49,7 +49,7 @@ PUBLIC_ASK_SOURCE_REQUEST_TERMS = {
     "path", "paths", "file", "files", "source", "sources", "repo", "repository", "code", "implementation",
     "where is", "where are", "stored", "located", "spec", "specs", "documentation", "docs",
 }
-ISSUE_TYPES = {"bug", "crash", "enhancement", "balance", "content", "general"}
+ISSUE_TYPES = {"bug", "crash", "enhancement", "balance", "cosmetic", "general"}
 ISSUE_TYPES_REQUIRING_LOG = {"bug", "crash"}
 
 
@@ -145,6 +145,49 @@ def format_github_issue_body(*, issue_type: str, title: str, description: str, s
     return "\n\n".join(sections)
 
 
+async def submit_validated_issue(
+    bot: "ChaosXBot",
+    *,
+    actor_id: int,
+    guild_id: int | None,
+    channel_id: int | None,
+    reporter: str,
+    issue_type: str,
+    title: str,
+    description: str,
+    steps: str = "",
+    expected: str = "",
+    actual: str = "",
+    error_log_lines: str = "",
+) -> tuple[bool, str, str | None]:
+    validation_error = validate_issue_report(
+        issue_type=issue_type,
+        title=title,
+        description=description,
+        steps=steps,
+        expected=expected,
+        actual=actual,
+        error_log_lines=error_log_lines,
+    )
+    if validation_error:
+        return False, validation_error, None
+    body = format_github_issue_body(
+        issue_type=issue_type,
+        title=title,
+        description=description,
+        steps=steps,
+        expected=expected,
+        actual=actual,
+        error_log_lines=error_log_lines,
+        reporter=reporter,
+        source=f"Discord /issue in guild {guild_id}, channel {channel_id}",
+    )
+    issue_title = f"[{issue_type.title()}] {title.strip()}"
+    ok, result = await create_github_issue(bot.settings.github_repo, title=issue_title, body=body)
+    await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="issue", summary=issue_title)
+    return ok, result, issue_title
+
+
 async def create_github_issue(repo: str, *, title: str, body: str) -> tuple[bool, str]:
     proc = await asyncio.create_subprocess_exec(
         "gh", "issue", "create", "--repo", repo, "--title", title, "--body", body,
@@ -206,7 +249,7 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/testing` — show events currently marked as needing testing.
 
 ### Report or draft feedback
-- `/issue` — create a formatted GitHub issue after ChaosX validates the report fields. Bugs/crashes require relevant `error.log` lines.
+- `/issue` — create a formatted GitHub issue through a report form. Bug/crash forms ask for relevant `error.log` lines.
 - `/suggestion suggestion:<idea>` — uses AI to turn a rough suggestion into a clearer review note.
 - `/event-idea idea:<idea>` — uses AI to format an event idea with a name, ID placeholder, type, baseline description, evolutions, and scenario hooks.
 
@@ -536,6 +579,48 @@ async def run_owner_hermes(
     await run_hermes_command(bot, interaction, request, command_name=command_name, public=public, owner_only=True, use_ask_model=use_ask_model, use_operator_model=use_operator_model)
 
 
+class IssueReportModal(discord.ui.Modal):
+    def __init__(self, bot: ChaosXBot, issue_type: str):
+        super().__init__(title=f"{issue_type.title()} issue report")
+        self.bot = bot
+        self.issue_type = issue_type
+        requires_log = issue_type in ISSUE_TYPES_REQUIRING_LOG
+        self.issue_title = discord.ui.TextInput(label="Short title", max_length=120, required=True)
+        self.description = discord.ui.TextInput(label="What happened / what should change?", style=discord.TextStyle.paragraph, max_length=1800, required=True)
+        self.steps = discord.ui.TextInput(label="Steps to reproduce" if requires_log else "Steps / context", style=discord.TextStyle.paragraph, max_length=1200, required=requires_log)
+        self.actual = discord.ui.TextInput(label="Actual behavior" if requires_log else "Current behavior / notes", style=discord.TextStyle.paragraph, max_length=1200, required=requires_log)
+        self.error_or_expected = discord.ui.TextInput(
+            label="Relevant error.log lines" if requires_log else "Expected / desired result",
+            style=discord.TextStyle.paragraph,
+            max_length=3500,
+            required=requires_log,
+        )
+        for item in (self.issue_title, self.description, self.steps, self.actual, self.error_or_expected):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=False, thinking=True)
+        requires_log = self.issue_type in ISSUE_TYPES_REQUIRING_LOG
+        ok, result, issue_title = await submit_validated_issue(
+            self.bot,
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            reporter=str(interaction.user),
+            issue_type=self.issue_type,
+            title=str(self.issue_title.value),
+            description=str(self.description.value),
+            steps=str(self.steps.value),
+            expected="" if requires_log else str(self.error_or_expected.value),
+            actual=str(self.actual.value),
+            error_log_lines=str(self.error_or_expected.value) if requires_log else "",
+        )
+        if ok:
+            await interaction.followup.send(f"GitHub issue created: {result}\nIssue type: `{self.issue_type}`", ephemeral=False, allowed_mentions=safe_allowed_mentions())
+        else:
+            await interaction.followup.send(f"Issue was not created:\n```text\n{result}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+
 def register_commands(bot: ChaosXBot) -> None:
     settings = bot.settings
 
@@ -581,12 +666,35 @@ def register_commands(bot: ChaosXBot) -> None:
         await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
 
     @bot.tree.command(name="event-idea", description="Format a Chaos Redux event idea into a structured review draft.")
-    async def chaosx_event_idea(interaction: discord.Interaction, idea: str) -> None:
+    async def chaosx_event_idea(
+        interaction: discord.Interaction,
+        idea: str,
+        event_type: str = "",
+        cluster: str = "",
+        evo_i: str = "",
+        evo_ii: str = "",
+        evo_iii: str = "",
+        evo_iv: str = "",
+        evo_v: str = "",
+        world_end: str = "",
+        triggerable_scenario: str = "",
+    ) -> None:
+        extra = {
+            "event_type": event_type,
+            "cluster": cluster,
+            "evo_i": evo_i,
+            "evo_ii": evo_ii,
+            "evo_iii": evo_iii,
+            "evo_iv": evo_iv,
+            "evo_v": evo_v,
+            "world_end": world_end,
+            "triggerable_scenario": triggerable_scenario,
+        }
         await run_hermes_command(
             bot,
             interaction,
-            f"""/event-idea idea={idea!r}. Use AI to format this as a Chaos Redux event idea review draft, not just a duplicate check.
-Include: proposed event name, ID placeholder like TBD-###, event type, baseline description, trigger/conditions if inferable, immediate effects, evolution ideas, possible world-end relationship, possible triggerable/manual scenario hooks, likely cluster/tags, testing notes, and a short overlap/gap note if relevant. Do not allocate a real ID or claim acceptance.""",
+            f"""/event-idea idea={idea!r} optional_fields={extra!r}. Use AI to format this as a Chaos Redux event idea review draft, not just a duplicate check.
+Include: proposed event name, ID placeholder like TBD-###, event type, baseline description, trigger/conditions if inferable, immediate effects, evolution ideas, world-end relationship if supplied/relevant, triggerable/manual scenario hooks if supplied/relevant, likely cluster/tags, testing notes, and a short overlap/gap note if relevant. Preserve supplied optional fields and leave missing fields as placeholders/questions. Do not allocate a real ID or claim acceptance.""",
             command_name="event-idea",
         )
 
@@ -596,18 +704,12 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
         app_commands.Choice(name="Crash", value="crash"),
         app_commands.Choice(name="Enhancement request", value="enhancement"),
         app_commands.Choice(name="Balance issue", value="balance"),
-        app_commands.Choice(name="Content issue", value="content"),
+        app_commands.Choice(name="Cosmetic issue", value="cosmetic"),
         app_commands.Choice(name="General", value="general"),
     ])
     async def chaosx_issue(
         interaction: discord.Interaction,
         issue_type: app_commands.Choice[str],
-        title: str,
-        description: str,
-        steps: str = "",
-        expected: str = "",
-        actual: str = "",
-        error_log_lines: str = "",
     ) -> None:
         if not await public_gate(interaction, settings):
             return
@@ -620,41 +722,7 @@ Include: proposed event name, ID placeholder like TBD-###, event type, baseline 
             )
             return
         kind = issue_type.value
-        validation_error = validate_issue_report(
-            issue_type=kind,
-            title=title,
-            description=description,
-            steps=steps,
-            expected=expected,
-            actual=actual,
-            error_log_lines=error_log_lines,
-        )
-        if validation_error:
-            await interaction.response.send_message(validation_error, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-            return
-        await interaction.response.defer(ephemeral=False, thinking=True)
-        body = format_github_issue_body(
-            issue_type=kind,
-            title=title,
-            description=description,
-            steps=steps,
-            expected=expected,
-            actual=actual,
-            error_log_lines=error_log_lines,
-            reporter=str(interaction.user),
-            source=f"Discord /issue in guild {interaction.guild_id}, channel {interaction.channel_id}",
-        )
-        issue_title = f"[{kind.title()}] {title.strip()}"
-        ok, result = await create_github_issue(settings.github_repo, title=issue_title, body=body)
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="issue", summary=issue_title)
-        if ok:
-            await interaction.followup.send(
-                f"GitHub issue created: {result}\nIssue type: `{kind}` · Issue reports left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`",
-                ephemeral=False,
-                allowed_mentions=safe_allowed_mentions(),
-            )
-        else:
-            await interaction.followup.send(f"ChaosX approved the report fields, but GitHub issue creation failed:\n```text\n{result}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        await interaction.response.send_modal(IssueReportModal(bot, kind))
 
 
     @work.command(name="issue-draft", description="Turn a report into a private issue-style draft for Hoops review.")
