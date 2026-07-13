@@ -171,7 +171,7 @@ class Knowledge:
     def help(self, topic: str = "all") -> str:
         return (
             "## ChaosX help\n"
-            "Community commands: `/chaosx ask`, `/chaosx event`, `/chaosx scenario`, `/chaosx cluster`, `/chaosx mechanic`, `/chaosx search`, `/chaosx source`, `/chaosx status`, `/chaosx testing`, `/repo search`, `/repo file`, `/work suggestion`, `/work event-idea`, `/playtest queue`.\n"
+            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/source`, `/status`, `/testing`, `/repo search`, `/repo file`, `/work suggestion`, `/work event-idea`, `/playtest queue`.\n"
             "Admin/automation commands are restricted. Public broad ask is rate-limited."
         )
 

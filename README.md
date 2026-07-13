@@ -13,20 +13,20 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Uses no Message Content privileged intent by default.
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
 - Bot presence/description: `Community Chaos Redux knowledge bot with protected operations` / watching `Chaos Redux ops`.
-- Public limits by default: 3 broad `/chaosx ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
+- Public limits by default: 3 broad `/ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
 - Broad ask model override: `CHAOSX_ASK_PROVIDER=nous`, `CHAOSX_ASK_MODEL=luna-medium`; requires `hermes auth add nous` / working Nous Portal auth on the host.
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=nous`, `CHAOSX_OPERATOR_MODEL=luna-xhigh`.
 - Provides:
   - `/health` — private runtime/status check.
   - `/inventory` — private read-only guild/channel/role inventory.
-  - `/ask` — runs the local `chaos_redux` Hermes profile with Discord safety boundaries.
+  - `/help` — public community command guide.
+  - `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/source`, `/compare`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands.
   - `/say` — operator-only exact post to the current channel with mentions disabled.
-  - `/chaosx ...` — knowledge/status/testing/source command family.
   - `/repo ...` — repository status/search/file/diff/history command family.
   - `/work ...` — issue draft/suggestion/event idea/handoff/changelog/release draft command family.
   - `/playtest ...` — queue/schedule/report/summary/cancel command family.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
-  - `/admin ...` — health/sync/reindex/automation/config/permissions/jobs/rollback command family.
+  - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family.
   - `/server ...` — protected autonomous ask, role audit, behaviour scan, member info, role assignment/removal, and timeout commands.
 - Stores a local SQLite audit log in `CHAOSX_DB_PATH`.
 
@@ -73,7 +73,9 @@ CHAOSX_ALLOWED_GUILD_ID=<Chaos Redux guild id>
 
 ## Protected Hermes bridge
 
-`/ask` executes:
+`/ask` is the public/community broad question command. Protected owner/operator asks live under `/admin ask` and `/server ask`.
+
+Protected Hermes-backed commands execute:
 
 ```bash
 hermes --profile chaos_redux chat -q '<bounded prompt>' --quiet

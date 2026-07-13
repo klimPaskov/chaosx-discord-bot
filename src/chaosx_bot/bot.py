@@ -63,22 +63,22 @@ def _stable_id(prefix: str, *parts: object) -> str:
 
 def community_help_text() -> str:
     return """## ChaosX community commands
-`/chaosx ask` — broad rate-limited Chaos Redux question.
-`/chaosx event` — event lookup by ID/name.
-`/chaosx scenario` — scenario lookup.
-`/chaosx cluster` — cluster lookup.
-`/chaosx mechanic` — mechanic/source search.
-`/chaosx search` — indexed repo/docs search.
-`/chaosx source` — source-of-truth map.
-`/chaosx compare` — compare entities/sources.
-`/chaosx status` — repo/index or entity status.
-`/chaosx testing` — testing queue search.
-`/chaosx help` — this guide.
+`/help` — show this guide.
+`/ask` — broad rate-limited Chaos Redux question.
+`/event` — event lookup by ID/name.
+`/scenario` — scenario lookup.
+`/cluster` — cluster lookup.
+`/mechanic` — mechanic/source search.
+`/search` — indexed repo/docs search.
+`/source` — source-of-truth map.
+`/compare` — compare entities/sources.
+`/status` — repo/index or entity status.
+`/testing` — testing queue search.
 `/repo status`, `/repo search`, `/repo file`, `/repo diff`, `/repo history` — read-only repo tools.
 `/work suggestion`, `/work event-idea` — draft/check ideas without creating GitHub issues.
 `/playtest queue`, `/playtest report`, `/playtest summary` — playtest info/reporting.
 
-Public broad ask is rate-limited; scripted lookups should be preferred."""
+Public broad ask is rate-limited; scripted lookups should be preferred. Admin/operator commands are under `/admin`, `/server`, and `/hermes`."""
 
 
 def operator_help_text(settings: Settings) -> str:
@@ -88,9 +88,11 @@ Models:
 - Autonomous server ops: `{settings.operator_provider}` / `{settings.operator_model}`
 
 Root protected:
-`/health`, `/inventory`, `/ask`, `/say`
+`/health`, `/inventory`, `/say`
 
 Protected server/admin:
+`/admin help` — this private operator guide.
+`/admin ask` — protected project/server request through the configured ask model.
 `/server ask` — autonomous server-management request using the smarter operator model.
 `/server role-audit`, `/server scan-behaviour`, `/server member-info`, `/server add-role`, `/server remove-role`, `/server timeout`
 `/admin health`, `/admin sync`, `/admin reindex`, `/admin automation`, `/admin config`, `/admin permissions-audit`, `/admin jobs`, `/admin rollback`
@@ -320,13 +322,6 @@ def register_commands(bot: ChaosXBot) -> None:
             return
         await interaction.response.send_message(community_help_text(), ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
-    @bot.tree.command(name="operator-help", description="Show protected ChaosX operator commands.")
-    @app_commands.default_permissions(administrator=True)
-    async def operator_help(interaction: discord.Interaction) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        await interaction.response.send_message(operator_help_text(settings), ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
     @bot.tree.command(name="health", description="Protected ChaosX runtime health check.")
     @app_commands.default_permissions(administrator=True)
     async def health(interaction: discord.Interaction) -> None:
@@ -377,12 +372,6 @@ def register_commands(bot: ChaosXBot) -> None:
         for part in _chunk("\n".join(lines)):
             await interaction.followup.send(f"```text\n{part}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    @bot.tree.command(name="ask", description="Ask the local Chaos Redux Hermes profile to reason about a server/project task.")
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(request="Operator instruction. ChaosX will run local Hermes with Discord safety boundaries.")
-    async def ask(interaction: discord.Interaction, request: str) -> None:
-        await run_owner_hermes(bot, interaction, request, command_name="ask", use_ask_model=True)
-
     @bot.tree.command(name="say", description="Protected: post an exact message to the current channel without mention parsing.")
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(message="Message to post. Mentions are not parsed.")
@@ -393,7 +382,6 @@ def register_commands(bot: ChaosXBot) -> None:
         await interaction.response.send_message("Posting message with mentions disabled.", ephemeral=True)
         await interaction.channel.send(message, allowed_mentions=safe_allowed_mentions())  # type: ignore[union-attr]
 
-    chaosx = app_commands.Group(name="chaosx", description="Chaos Redux knowledge commands")
     repo = app_commands.Group(name="repo", description="Chaos Redux repository commands")
     work = app_commands.Group(name="work", description="Chaos Redux work-item drafting commands")
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
@@ -401,49 +389,45 @@ def register_commands(bot: ChaosXBot) -> None:
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
     server = app_commands.Group(name="server", description="Protected Discord server administration", default_permissions=discord.Permissions(administrator=True))
 
-    @chaosx.command(name="ask", description="Answer a Chaos Redux question.")
+    @bot.tree.command(name="ask", description="Answer a Chaos Redux question.")
     async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "public") -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx ask question={question!r} visibility={visibility!r}. Answer concisely for the community; do not include internal source/debug metadata unless asked.", command_name="chaosx ask", public=visibility != "private", rate_bucket="ask", use_ask_model=True)
+        await run_hermes_command(bot, interaction, f"/ask question={question!r} visibility={visibility!r}. Answer concisely for the community; do not include internal source/debug metadata unless asked.", command_name="ask", public=visibility != "private", rate_bucket="ask", use_ask_model=True)
 
-    @chaosx.command(name="event", description="Look up an event by ID or name.")
+    @bot.tree.command(name="event", description="Look up an event by ID or name.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx event", summary=event, render=lambda: bot.knowledge.event(event, view), owner_render=lambda: bot.knowledge.event(event, view, show_evidence=True))
 
-    @chaosx.command(name="scenario", description="Look up a scenario by ID or name.")
+    @bot.tree.command(name="scenario", description="Look up a scenario by ID or name.")
     async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.event(scenario, view), owner_render=lambda: bot.knowledge.event(scenario, view, show_evidence=True))
 
-    @chaosx.command(name="cluster", description="Look up an event cluster.")
+    @bot.tree.command(name="cluster", description="Look up an event cluster.")
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster), owner_render=lambda: bot.knowledge.cluster(cluster, show_evidence=True))
 
-    @chaosx.command(name="mechanic", description="Explain a Chaos Redux mechanic.")
+    @bot.tree.command(name="mechanic", description="Explain a Chaos Redux mechanic.")
     async def chaosx_mechanic(interaction: discord.Interaction, mechanic: str) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx mechanic", summary=mechanic, render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6), owner_render=lambda: bot.knowledge.search(mechanic, scope="all", limit=6, show_evidence=True))
 
-    @chaosx.command(name="search", description="Search indexed/project sources.")
+    @bot.tree.command(name="search", description="Search indexed/project sources.")
     async def chaosx_search(interaction: discord.Interaction, query: str, scope: str = "all") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx search", summary=query, render=lambda: bot.knowledge.search(query, scope=scope, limit=8), owner_render=lambda: bot.knowledge.search(query, scope=scope, limit=8, show_evidence=True))
 
-    @chaosx.command(name="source", description="Show source-of-truth map for an entity/path.")
+    @bot.tree.command(name="source", description="Show source-of-truth map for an entity/path.")
     async def chaosx_source(interaction: discord.Interaction, query: str) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx source", summary=query, render=lambda: bot.knowledge.source(query), owner_render=lambda: bot.knowledge.source(query, show_evidence=True))
 
-    @chaosx.command(name="compare", description="Compare two sources/entities.")
+    @bot.tree.command(name="compare", description="Compare two sources/entities.")
     async def chaosx_compare(interaction: discord.Interaction, left: str, right: str) -> None:
-        await run_hermes_command(bot, interaction, f"/chaosx compare left={left!r} right={right!r}. Highlight conflicts, missing surfaces, stale docs. Do not apply changes.", command_name="chaosx compare")
+        await run_hermes_command(bot, interaction, f"/compare left={left!r} right={right!r}. Highlight conflicts, missing surfaces, stale docs. Do not apply changes.", command_name="compare")
 
-    @chaosx.command(name="status", description="Show completion/status matrix.")
+    @bot.tree.command(name="status", description="Show completion/status matrix.")
     async def chaosx_status(interaction: discord.Interaction, entity: str = "global", surface: str = "all") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx status", summary=entity, render=lambda: bot.knowledge.status() if entity == "global" else bot.knowledge.source(entity), owner_render=lambda: bot.knowledge.status() if entity == "global" else bot.knowledge.source(entity, show_evidence=True))
 
-    @chaosx.command(name="testing", description="Show prioritized testing queue.")
+    @bot.tree.command(name="testing", description="Show prioritized testing queue.")
     async def chaosx_testing(interaction: discord.Interaction, kind: str = "all", limit: int = 10) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx testing", summary=kind, render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit), owner_render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit, show_evidence=True))
-
-    @chaosx.command(name="help", description="Show ChaosX command help.")
-    async def chaosx_help(interaction: discord.Interaction, topic: str = "all") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx help", summary=topic, render=community_help_text)
 
     @repo.command(name="status", description="Show repository/index status.")
     async def repo_status(interaction: discord.Interaction) -> None:
@@ -555,6 +539,16 @@ def register_commands(bot: ChaosXBot) -> None:
     @hermes.command(name="review-pr", description="Review a pull request against project evidence.")
     async def hermes_review_pr(interaction: discord.Interaction, number: int) -> None:
         await run_owner_hermes(bot, interaction, f"/hermes review-pr number={number}. Cannot approve or merge.", command_name="hermes review-pr")
+
+    @admin.command(name="help", description="Show protected operator command help.")
+    async def admin_help(interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        await interaction.response.send_message(operator_help_text(settings), ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="ask", description="Protected project/server request through Hermes.")
+    async def admin_ask(interaction: discord.Interaction, request: str) -> None:
+        await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_ask_model=True)
 
     @admin.command(name="health", description="Admin health check.")
     async def admin_health(interaction: discord.Interaction) -> None:
@@ -757,5 +751,5 @@ def register_commands(bot: ChaosXBot) -> None:
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="server timeout", summary=f"{member.id} {minutes}m")
         await interaction.response.send_message(f"Timed out `{member}` for `{minutes}` minute(s).", ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    for group in (chaosx, repo, work, playtest, hermes, admin, server):
+    for group in (repo, work, playtest, hermes, admin, server):
         bot.tree.add_command(group)
