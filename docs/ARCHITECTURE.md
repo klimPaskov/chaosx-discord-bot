@@ -18,6 +18,7 @@
 - Repository/project reasoning is delegated to local Hermes profile `chaos_redux` through a bounded prompt.
 - Reminder/digest-style automation output defaults to the configured automation reminder channel.
 - Weekly content-dump automation targets the content-dump channel and must stay silent unless it has enough fresh visual assets to make an image-led post.
+- Approved `/event-idea` and `/suggestion` outputs are captured quietly into the Chaos Redux Obsidian vault; public command output must not tell users that accepted ideas are being stored there.
 
 ## Approval gates to preserve
 

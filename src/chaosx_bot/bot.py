@@ -12,8 +12,9 @@ import discord
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
+from .community_notes import write_event_idea_note, write_suggestion_note
 from .config import Settings
-from .hermes_bridge import build_owner_prompt, build_public_prompt, run_hermes
+from .hermes_bridge import HermesResult, build_owner_prompt, build_public_prompt, run_hermes
 from .knowledge import Knowledge
 from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
@@ -686,7 +687,7 @@ async def run_hermes_command(
     use_ask_model: bool = False,
     use_operator_model: bool = False,
     max_chars_override: int | None = None,
-) -> None:
+) -> tuple[HermesResult, str] | None:
     rate = None
     if owner_only:
         if not await owner_gate(interaction, bot.settings):
@@ -803,6 +804,7 @@ async def run_hermes_command(
             ephemeral=not public,
             allowed_mentions=safe_allowed_mentions(),
         )
+    return result, output
 
 
 async def run_owner_hermes(
@@ -899,7 +901,22 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @bot.tree.command(name="suggestion", description="Clean up a Chaos Redux suggestion and note likely overlap.")
     async def chaosx_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
-        await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
+        result = await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
+        if result and result[0].ok and settings.community_notes_enabled:
+            try:
+                note = write_suggestion_note(
+                    vault_path=settings.obsidian_vault_path,
+                    suggestions_folder=settings.community_suggestions_folder,
+                    raw_suggestion=suggestion,
+                    draft=result[1],
+                    actor_id=interaction.user.id,
+                    guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                )
+                if note:
+                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion", summary=str(note.path))
+            except Exception as exc:
+                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion error", summary=type(exc).__name__)
 
     @bot.tree.command(name="event-idea", description="Format a Chaos Redux event idea into a structured review draft.")
     async def chaosx_event_idea(
@@ -929,13 +946,38 @@ def register_commands(bot: ChaosXBot) -> None:
             "easter_egg": easter_egg,
         }
         request = f"/event-idea idea={idea!r} fields={extra!r}. Format a Chaos Redux event idea draft with name, TBD ID, type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use placeholders for missing parts. Do not assign a real ID or claim acceptance."
-        await run_hermes_command(
+        result = await run_hermes_command(
             bot,
             interaction,
             request,
             command_name="event-idea",
             max_chars_override=2200,
         )
+        if result and result[0].ok and settings.community_notes_enabled:
+            try:
+                note = write_event_idea_note(
+                    vault_path=settings.obsidian_vault_path,
+                    event_specs_folder=settings.community_event_specs_folder,
+                    raw_idea=idea,
+                    draft=result[1],
+                    actor_id=interaction.user.id,
+                    guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                    event_type=event_type,
+                    cluster=cluster,
+                    evo_i=evo_i,
+                    evo_ii=evo_ii,
+                    evo_iii=evo_iii,
+                    evo_iv=evo_iv,
+                    evo_v=evo_v,
+                    world_end=world_end,
+                    triggerable_scenario=triggerable_scenario,
+                    easter_egg=easter_egg,
+                )
+                if note:
+                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
+            except Exception as exc:
+                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)
 
     @bot.tree.command(name="issue", description="AI-review a report form, then create a GitHub issue if approved.")
     @app_commands.choices(issue_type=[
