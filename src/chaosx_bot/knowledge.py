@@ -52,17 +52,28 @@ class Knowledge:
             meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
             docs = conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0]
             events = conn.execute("SELECT COUNT(*) FROM catalog_events").fetchone()[0]
+            repeatable_events = conn.execute("SELECT COUNT(*) FROM catalog_events WHERE type LIKE '%Repeatable%'").fetchone()[0]
+            fire_once_events = conn.execute("SELECT COUNT(*) FROM catalog_events WHERE type LIKE '%Fire-Once%'").fetchone()[0]
+            major_events = conn.execute("SELECT COUNT(*) FROM catalog_events WHERE type LIKE '%Major%'").fetchone()[0]
             scenarios = conn.execute("SELECT COUNT(*) FROM catalog_scenarios").fetchone()[0]
             clusters = conn.execute("SELECT COUNT(*) FROM catalog_clusters").fetchone()[0]
+            status_rows = conn.execute("SELECT COALESCE(NULLIF(status, ''), 'Unmarked') AS status, COUNT(*) FROM catalog_events GROUP BY 1 ORDER BY COUNT(*) DESC, status LIMIT 6").fetchall()
+            scenario_rows = conn.execute("SELECT scenario_id, name, status FROM catalog_scenarios ORDER BY CAST(scenario_id AS INTEGER) LIMIT 8").fetchall()
         finally:
             conn.close()
+        status_text = ", ".join(f"{name}: {count}" for name, count in status_rows) or "none"
+        scenario_text = ", ".join(f"SCN-{int(sid):03d} {name}" for sid, name, _status in scenario_rows if sid) or "none"
         return (
-            "## ChaosX status\n"
-            f"- Known events: `{events}`\n"
-            f"- Known scenarios: `{scenarios}`\n"
-            f"- Known clusters: `{clusters}`\n"
-            f"- Index health: `ready`\n"
-            f"- Refresh mode: `auto when repo/catalog files change`\n"
+            "## Chaos Redux catalog status\n"
+            f"- Events: `{events}` total\n"
+            f"- Repeatable events: `{repeatable_events}`\n"
+            f"- Fire-once events: `{fire_once_events}`\n"
+            f"- Major events: `{major_events}`\n"
+            f"- Triggerable scenarios: `{scenarios}`\n"
+            f"- Clusters: `{clusters}`\n"
+            f"- Indexed docs/files: `{docs}`\n"
+            f"- Event status breakdown: {status_text}\n"
+            f"- Scenario list: {scenario_text}\n"
         )
 
     def search(self, query: str, scope: str = "all", limit: int = 5, show_evidence: bool = False) -> str:
@@ -181,13 +192,11 @@ class Knowledge:
             return self.search(scenario, scope="all", limit=5, show_evidence=show_evidence) + "\n\nNo exact scenario match; showing public search results instead."
         keys = ["row_key", "scenario_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
         data = dict(zip(keys, row))
-        scenario_label = f"Scenario {data['scenario_id']}: {data['name']}" if data["scenario_id"] else f"Unassigned scenario idea: {data['name']}"
+        scenario_label = f"SCN-{int(data['scenario_id']):03d}: {data['name']}" if data["scenario_id"] else f"Unassigned scenario idea: {data['name']}"
         lines = [
             f"## {scenario_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
             f"- Status: `{data['status'] or 'unknown'}`",
-            f"- Cluster: `{data['cluster_id'] or 'none'}`",
-            f"- Member severity: `{data['member_severity'] or 'none'}`",
             "",
             data["details"][:MAX_EXCERPT_CHARS] or "No details available.",
         ]
@@ -198,7 +207,7 @@ class Knowledge:
         if data["world_end"]:
             lines += ["", "### World-end relationship", data["world_end"][:700]]
         if show_evidence:
-            lines += ["", self._footer("catalog", "docs/spreadsheets/chaos_redux_scenarios_catalog.csv")]
+            lines += ["", self._footer("scenario docs", "docs/systems/triggerable_scenarios.md")]
         return "\n".join(lines)
 
     def cluster(self, cluster: str, show_evidence: bool = False) -> str:

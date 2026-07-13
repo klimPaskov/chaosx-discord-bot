@@ -13,7 +13,7 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     stats = rebuild_index(repo, db)
     assert stats.docs > 100
     assert stats.events >= 180
-    assert stats.scenarios >= 100
+    assert stats.scenarios >= 8
     assert stats.clusters >= 14
     knowledge = Knowledge(repo, db)
     event = knowledge.event('2')
@@ -25,12 +25,13 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'docs/specs/' not in search
     owner_event = knowledge.event('2', show_evidence=True)
     assert 'Private source detail' in owner_event
-    scenario = knowledge.scenario('2')
-    assert 'Scenario 2: Zombie Outbreak' in scenario
+    scenario = knowledge.scenario('5')
+    assert 'SCN-005: The World in Fury' in scenario
+    assert 'Soviet Union Collapse' not in scenario
     assert 'Event 2:' not in scenario
     assert 'docs/spreadsheets' not in scenario
-    owner_scenario = knowledge.scenario('2', show_evidence=True)
-    assert 'chaos_redux_scenarios_catalog.csv' in owner_scenario
+    owner_scenario = knowledge.scenario('5', show_evidence=True)
+    assert 'triggerable_scenarios' in owner_scenario
     owner_search = knowledge.search('Zombie Outbreak', limit=2, show_evidence=True)
     assert 'Evidence:' in owner_search
     search = knowledge.search('Zombie Outbreak', limit=2)
@@ -43,7 +44,11 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Source:' in ask_context_with_sources
     assert 'docs/' in ask_context_with_sources or 'events/' in ask_context_with_sources or 'common/' in ask_context_with_sources
     status = knowledge.status()
-    assert 'Known scenarios' in status
+    assert 'Events:' in status
+    assert 'Repeatable events:' in status
+    assert 'Fire-once events:' in status
+    assert 'Triggerable scenarios:' in status
+    assert 'Known' not in status
     assert 'Indexed commit' not in status
     assert 'source docs' not in status
 

@@ -65,11 +65,17 @@ def test_operator_help_explains_when_to_use_admin_commands():
 
 def test_fixed_window_rate_limiter_blocks_after_limit():
     limiter = FixedWindowRateLimiter()
-    assert limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600).allowed
-    assert limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600).allowed
+    first = limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600)
+    second = limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600)
+    assert first.allowed
+    assert first.remaining == 1
+    assert second.allowed
+    assert second.remaining == 0
     blocked = limiter.check(bucket="ask", user_id=1, limit=2, window_seconds=3600)
     assert not blocked.allowed
     assert blocked.retry_after_seconds > 0
+    assert blocked.reset_after_seconds > 0
+    assert blocked.remaining == 0
     assert limiter.check(bucket="ask", user_id=2, limit=2, window_seconds=3600).allowed
 
 

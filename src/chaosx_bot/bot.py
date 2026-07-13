@@ -70,6 +70,17 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
     return chunks
 
 
+def _format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{sec}s"
+
+
 def public_ask_rejection_reason(request: str) -> str | None:
     text = request.casefold()
     if any(term in text for term in PUBLIC_ASK_BLOCK_TERMS):
@@ -120,20 +131,28 @@ def _stable_id(prefix: str, *parts: object) -> str:
 
 
 def community_help_text() -> str:
-    return """## ChaosX community commands
-`/help` — show this guide.
-`/ask` — broad rate-limited Chaos Redux question.
-`/event` — event lookup by ID/name.
-`/scenario` — scenario lookup.
-`/cluster` — cluster lookup.
-`/mechanic` — mechanic lookup.
-`/search` — search public-facing indexed info.
-`/status` — known event/cluster index status.
-`/testing` — testing queue search.
-`/work suggestion`, `/work event-idea` — draft/check ideas without creating GitHub issues.
-`/playtest queue`, `/playtest report`, `/playtest summary` — playtest info/reporting.
+    return """## ChaosX community help
+Use ChaosX for Chaos Redux event info, scenario info, mechanics, testing notes, and cleaner idea/report drafts.
 
-General questions are rate-limited; lookups are usually faster and more reliable for event, scenario, mechanic, and testing info."""
+### Ask a question
+- `/ask question:<text>` — ask a broader Chaos Redux question. Good for “how does this work?” or “where should I look?” answers. It shows your remaining asks at the end.
+
+### Look things up
+- `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, and evolutions.
+- `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry, e.g. `5` = SCN-005 The World in Fury.
+- `/cluster cluster:<id or name>` — event cluster summary and members.
+- `/mechanic mechanic:<topic>` — search mechanics docs, like chaos meter, zombies, scenarios, disasters.
+- `/search query:<text>` — general project search when you do not know the exact command.
+- `/status` — project catalog totals and event breakdowns.
+- `/testing query:<text>` — find testing notes or queues matching a topic.
+
+### Draft feedback
+- `/work suggestion text:<idea>` — turn a rough suggestion into a clearer review note.
+- `/work event-idea idea:<idea>` — check whether an event idea overlaps existing catalog entries.
+- `/playtest report report:<text>` — format a playtest finding into a useful report.
+- `/playtest queue` and `/playtest summary` — see or summarize playtest work.
+
+Tip: lookup commands are fastest for exact IDs. Use `/ask` for broader explanations."""
 
 
 def operator_help_text(settings: Settings) -> str:
@@ -315,6 +334,7 @@ async def run_hermes_command(
     use_ask_model: bool = False,
     use_operator_model: bool = False,
 ) -> None:
+    rate = None
     if owner_only:
         if not await owner_gate(interaction, bot.settings):
             return
@@ -394,6 +414,8 @@ async def run_hermes_command(
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if not owner_only and rate_bucket == "ask":
         output = sanitize_public_ask_output(output)
+        if rate:
+            output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
         actor_id=interaction.user.id,
@@ -441,7 +463,7 @@ def register_commands(bot: ChaosXBot) -> None:
             return
         await interaction.response.send_message(community_help_text(), ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
-    work = app_commands.Group(name="work", description="Chaos Redux work-item drafting commands")
+    work = app_commands.Group(name="work", description="Draft and organize Chaos Redux suggestions/reports")
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
     hermes = app_commands.Group(name="hermes", description="Hermes agent routing/task commands", default_permissions=discord.Permissions(administrator=True))
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
@@ -455,7 +477,7 @@ def register_commands(bot: ChaosXBot) -> None:
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx event", summary=event, render=lambda: bot.knowledge.event(event, view), owner_render=lambda: bot.knowledge.event(event, view, show_evidence=True))
 
-    @bot.tree.command(name="scenario", description="Look up a scenario by ID or name.")
+    @bot.tree.command(name="scenario", description="Look up a triggerable scenario by SCN ID or name.")
     async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.scenario(scenario, view), owner_render=lambda: bot.knowledge.scenario(scenario, view, show_evidence=True))
 
@@ -471,7 +493,7 @@ def register_commands(bot: ChaosXBot) -> None:
     async def chaosx_search(interaction: discord.Interaction, query: str, scope: str = "all") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx search", summary=query, render=lambda: bot.knowledge.search(query, scope=scope, limit=8), owner_render=lambda: bot.knowledge.search(query, scope=scope, limit=8, show_evidence=True))
 
-    @bot.tree.command(name="status", description="Show known event/cluster index status.")
+    @bot.tree.command(name="status", description="Show Chaos Redux catalog totals and breakdowns.")
     async def chaosx_status(interaction: discord.Interaction, entity: str = "global", surface: str = "all") -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx status", summary=entity, render=bot.knowledge.status, owner_render=bot.knowledge.status)
 
@@ -480,7 +502,7 @@ def register_commands(bot: ChaosXBot) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx testing", summary=kind, render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit), owner_render=lambda: bot.knowledge.search('Needs Testing', scope='catalog', limit=limit, show_evidence=True))
 
 
-    @work.command(name="issue-draft", description="Draft a GitHub issue from text/message context.")
+    @work.command(name="issue-draft", description="Turn a report into a private issue-style draft for Hoops review.")
     async def work_issue_draft(interaction: discord.Interaction, summary: str, event: str = "", surface: str = "") -> None:
         if not await owner_gate(interaction, settings):
             return
@@ -495,15 +517,15 @@ def register_commands(bot: ChaosXBot) -> None:
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="work issue-draft", summary=draft_id)
         await interaction.response.send_message(f"Created issue draft `{draft_id}`. No GitHub issue was created.\n```text\n{body[:1600]}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    @work.command(name="suggestion", description="Structure a suggestion and check duplicates.")
+    @work.command(name="suggestion", description="Clean up a gameplay suggestion and note likely overlap.")
     async def work_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
         await run_hermes_command(bot, interaction, f"/work suggestion suggestion={suggestion!r}. Structure and duplicate-check; do not promote to accepted design.", command_name="work suggestion")
 
-    @work.command(name="event-idea", description="Check an event idea against assigned/unassigned catalogs.")
+    @work.command(name="event-idea", description="Check whether an event idea already exists or fits a catalog gap.")
     async def work_event_idea(interaction: discord.Interaction, idea: str) -> None:
         await run_hermes_command(bot, interaction, f"/work event-idea idea={idea!r}. Search assigned events and unassigned ideas; never allocate ID.", command_name="work event-idea")
 
-    @work.command(name="handoff", description="Create a Codex/Hermes handoff summary.")
+    @work.command(name="handoff", description="Create a clear implementation/review handoff draft.")
     async def work_handoff(interaction: discord.Interaction, task: str) -> None:
         await run_owner_hermes(bot, interaction, f"/work handoff task={task!r}. Include files, identifiers, validation, blockers, next owner.", command_name="work handoff")
 

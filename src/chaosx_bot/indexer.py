@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import os
+import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass
@@ -272,7 +273,13 @@ def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int
 
 
 def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int:
-    path = repo / "docs/spreadsheets/chaos_redux_scenarios_catalog.csv"
+    """Load triggerable/manual scenarios, not the event catalog copy.
+
+    `chaos_redux_scenarios_catalog.csv` currently mirrors event rows, while the
+    player-facing `/scenario` command is meant to answer SCN-* triggerable
+    scenario IDs from the scenario system docs.
+    """
+    path = repo / "docs/systems/triggerable_scenarios.md"
     conn.execute("DROP TABLE IF EXISTS catalog_scenarios")
     conn.execute("""
     CREATE TABLE catalog_scenarios (
@@ -293,30 +300,30 @@ def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> 
         indexed_at REAL NOT NULL
     )
     """)
-    if not path.exists():
+    text = read_text(path)
+    if not text:
         return 0
+    pattern = re.compile(r"^###\s+SCN-(\d{3}):\s+(.+?)\s*$", re.MULTILINE)
+    matches = list(pattern.finditer(text))
     count = 0
-    with path.open(newline="", encoding="utf-8-sig") as fp:
-        reader = csv.DictReader(fp)
-        for row_number, row in enumerate(reader, 1):
-            scenario_id = (row.get("ID") or "").strip()
-            name = (row.get("Event Name") or row.get("Scenario Name") or "").strip()
-            if not scenario_id and not name:
-                continue
-            row_key = scenario_id if scenario_id else f"unassigned:{row_number}:{name}"
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO catalog_scenarios(row_key, scenario_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row_key, scenario_id, name, row.get("Details") or "", row.get("Evo I") or "", row.get("Evo II") or "",
-                    row.get("Evo III") or "", row.get("Evo IV") or "", row.get("Evo V") or "",
-                    row.get("World-End Scenario") or "", row.get("Type") or "", row.get("Cluster ID") or "",
-                    row.get("Member Severity") or "", row.get("Status") or "", indexed_at,
-                ),
-            )
-            count += 1
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        scenario_id = str(int(match.group(1)))
+        name = match.group(2).strip()
+        details = text[start:end].strip()
+        status = "Reserved" if "reserved" in details.casefold() or "placeholder" in details.casefold() else "Implemented"
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO catalog_scenarios(row_key, scenario_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scenario_id, scenario_id, name, details, "", "", "", "", "", "",
+                "Triggerable Scenario", "", "", status, indexed_at,
+            ),
+        )
+        count += 1
     return count
 
 

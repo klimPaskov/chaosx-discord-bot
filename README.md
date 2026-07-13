@@ -14,14 +14,14 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
 - Bot presence/description: `Chaos Redux community knowledge bot` / watching `Chaos Redux ops`.
 - Bot profile description: `Ask ChaosX questions about Chaos Redux events, scenarios, mechanics, testing, and mod info.`
-- Public limits by default: 10 broad `/ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
+- Public limits by default: 10 broad `/ask` calls per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap. `/ask` answers show remaining asks and time until reset.
 - Broad ask model override: `CHAOSX_ASK_PROVIDER=openai-codex`, `CHAOSX_ASK_MODEL=gpt-5.6-luna`, `CHAOSX_ASK_REASONING_EFFORT=medium`.
 - Public Hermes-backed commands run with the `safe` toolset and a public prompt boundary: answer only Chaos Redux/mod/server-use questions, refuse dangerous/off-topic requests, do not perform external actions, and include repo/spec/code paths only when explicitly asked.
 - Protected autonomous server-management model override: `CHAOSX_OPERATOR_PROVIDER=openai-codex`, `CHAOSX_OPERATOR_MODEL=gpt-5.6-luna`, `CHAOSX_OPERATOR_REASONING_EFFORT=xhigh`.
 - Provides:
   - `/help` — public community command guide.
-  - `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands. `/scenario` reads the scenario catalog, not the event catalog.
-  - `/work ...` — issue draft/suggestion/event idea/handoff/changelog/release draft command family.
+  - `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/status`, `/testing` — public Chaos Redux knowledge/testing commands. `/scenario` reads triggerable SCN scenario docs, not event IDs.
+  - `/work ...` — suggestion cleanup, event idea overlap checks, issue-style drafts, handoffs, changelog, and release draft command family.
   - `/playtest ...` — queue/schedule/report/summary/cancel command family.
   - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
   - `/admin ...` — private owner/operator help, ask, health/sync/reindex/automation/config/permissions/jobs/rollback command family. `/admin help` explains what each admin-only command is for and when to use it.

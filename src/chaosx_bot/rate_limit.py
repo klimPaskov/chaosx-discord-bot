@@ -8,6 +8,8 @@ from time import monotonic
 class RateLimitResult:
     allowed: bool
     retry_after_seconds: int = 0
+    remaining: int = 0
+    reset_after_seconds: int = 0
 
 
 class FixedWindowRateLimiter:
@@ -21,10 +23,11 @@ class FixedWindowRateLimiter:
         key = (bucket, int(user_id))
         window_start, count = self._windows.get(key, (now, 0))
         elapsed = now - window_start
+        reset_after = max(1, int(window_seconds - elapsed))
         if elapsed >= window_seconds:
             self._windows[key] = (now, 1)
-            return RateLimitResult(True)
+            return RateLimitResult(True, remaining=max(0, limit - 1), reset_after_seconds=window_seconds)
         if count >= limit:
-            return RateLimitResult(False, max(1, int(window_seconds - elapsed)))
+            return RateLimitResult(False, reset_after, remaining=0, reset_after_seconds=reset_after)
         self._windows[key] = (window_start, count + 1)
-        return RateLimitResult(True)
+        return RateLimitResult(True, remaining=max(0, limit - count - 1), reset_after_seconds=reset_after)
