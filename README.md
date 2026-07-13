@@ -11,11 +11,18 @@ This is intentionally **not** a public community chatbot. It is a private contro
 - Optional guild lock with `CHAOSX_ALLOWED_GUILD_ID`.
 - Uses no Message Content privileged intent by default.
 - Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
+- Bot presence/description: `Owner-only Chaos Redux Discord operations agent` / watching `Chaos Redux ops`.
 - Provides:
   - `/health` — private runtime/status check.
   - `/inventory` — private read-only guild/channel/role inventory.
   - `/ask` — runs the local `chaos_redux` Hermes profile with Discord safety boundaries.
   - `/say` — owner-only exact post to the current channel with mentions disabled.
+  - `/chaosx ...` — knowledge/status/testing/source command family.
+  - `/repo ...` — repository status/search/file/diff/history command family.
+  - `/work ...` — issue draft/suggestion/event idea/handoff/changelog/release draft command family.
+  - `/playtest ...` — queue/schedule/report/summary/cancel command family.
+  - `/hermes ...` — route/task/status/cancel/audit/review-pr command family.
+  - `/admin ...` — health/sync/reindex/automation/config/permissions/jobs/rollback command family.
 - Stores a local SQLite audit log in `CHAOSX_DB_PATH`.
 
 ## Security model
