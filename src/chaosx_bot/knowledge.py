@@ -10,6 +10,7 @@ from pathlib import Path
 from .indexer import connect, rebuild_index
 
 MAX_EXCERPT_CHARS = 1400
+PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
 
 
 @dataclass(frozen=True)
@@ -36,20 +37,11 @@ class Knowledge:
             clusters = conn.execute("SELECT COUNT(*) FROM catalog_clusters").fetchone()[0]
         finally:
             conn.close()
-        branch = _git(self.repo, ["branch", "--show-current"])
-        dirty = _git(self.repo, ["status", "--short"])
-        indexed_at = _fmt_ts(meta.get("indexed_at"))
         return (
-            "## ChaosX repository/index status\n"
-            f"- Repo: `{self.repo}`\n"
-            f"- Branch: `{branch or 'unknown'}`\n"
-            f"- Indexed commit: `{meta.get('commit_sha', 'unknown')}`\n"
-            f"- Last sync: `{indexed_at}`\n"
-            f"- Indexed source docs: `{docs}`\n"
+            "## ChaosX status\n"
             f"- Known events: `{events}`\n"
             f"- Known clusters: `{clusters}`\n"
-            f"- Dirty state: `{('yes' if dirty else 'no')}`\n"
-            + (f"\n```text\n{dirty[:1200]}\n```" if dirty else "")
+            f"- Index health: `ready`\n"
         )
 
     def search(self, query: str, scope: str = "all", limit: int = 5, show_evidence: bool = False) -> str:
@@ -59,6 +51,9 @@ class Knowledge:
         try:
             params: list[object] = [safe_query]
             where = "source_docs_fts MATCH ?"
+            if not show_evidence:
+                where += " AND d.source_class NOT IN ({})".format(",".join("?" for _ in PRIVATE_SOURCE_CLASSES))
+                params.extend(sorted(PRIVATE_SOURCE_CLASSES))
             if scope != "all":
                 where += " AND d.source_class LIKE ?"
                 params.append(f"%{scope}%")
@@ -171,7 +166,7 @@ class Knowledge:
     def help(self, topic: str = "all") -> str:
         return (
             "## ChaosX help\n"
-            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/source`, `/status`, `/testing`, `/repo search`, `/repo file`, `/work suggestion`, `/work event-idea`, `/playtest queue`.\n"
+            "Community commands: `/ask`, `/event`, `/scenario`, `/cluster`, `/mechanic`, `/search`, `/status`, `/testing`, `/work suggestion`, `/work event-idea`, `/playtest queue`.\n"
             "General questions are rate-limited; lookup commands are usually faster for event, scenario, mechanic, and testing info."
         )
 
