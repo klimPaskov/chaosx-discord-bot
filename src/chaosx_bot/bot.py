@@ -388,8 +388,8 @@ def community_help_text() -> str:
 Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing notes, and cleaner idea/report drafts.
 
 ### Ask
-- `/ask question:<text>` — uses AI to answer any Chaos Redux question.
-- `@ChaosX <question>` — same as `/ask` when you want to ping the bot directly.
+- `/ask question:<text>` — uses AI to answer any Chaos Redux question. You can also ask by directly mentioning `@ChaosX <question>`.
+- Reply to a ChaosX answer to continue that conversation. ChaosX remembers only what was discussed in that reply chain, not unrelated channel history.
 
 ### Look things up
 - `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, evolutions, and world-end scenario notes.
@@ -416,7 +416,7 @@ def operator_help_text(settings: Settings) -> str:
 Use this only for private owner tools. If you are unsure, use `/admin ask` and write the request normally.
 
 ### Main command
-- `/admin ask request:<text>` — the command you will usually use. Ask it to check Chaos Redux, explain bot/server state, fetch and analyze recent channel/user messages, summarize tester reports, draft Codex handoffs, or decide what should be done next. It remembers recent `/admin ask` turns in this same channel/thread for follow-ups. Say `reset context` to clear that follow-up memory. It uses the stronger private model path.
+- `/admin ask request:<text>` — the command you will usually use. Ask it to check Chaos Redux, explain bot/server state, fetch and analyze recent channel/user messages, summarize tester reports, draft Codex handoffs, or decide what should be done next. It remembers recent owner/admin requests in this same channel/thread as broad follow-up context, not as per-reply chain memory. Say `reset context` to clear that follow-up memory. It uses the stronger private model path.
 
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
