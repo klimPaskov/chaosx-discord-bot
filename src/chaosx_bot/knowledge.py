@@ -198,16 +198,18 @@ class Knowledge:
         keys = ["row_key", "event_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
         data = dict(zip(keys, row))
         event_label = f"Event {data['event_id']}: {data['name']}" if data["event_id"] else f"Unassigned event idea: {data['name']}"
+        evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
+        evolution_stage_count = sum(1 for _label, text in evos if text)
         lines = [
             f"## {event_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
+            f"- Evolution stages: `{evolution_stage_count}`",
             f"- Status: `{data['status'] or 'unknown'}`",
             f"- Cluster: `{data['cluster_id'] or 'none'}`",
             f"- Member severity: `{data['member_severity'] or 'none'}`",
             "",
             data["details"][:MAX_EXCERPT_CHARS] or "No details available.",
         ]
-        evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
         shown_evos = [f"- **{label}:** {text[:400]}" for label, text in evos if text]
         if shown_evos and view in {"overview", "design", "history"}:
             lines += ["", "### Evolution tracks", *shown_evos]

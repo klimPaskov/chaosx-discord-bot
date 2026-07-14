@@ -19,6 +19,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     knowledge = Knowledge(repo, db, vault if vault.exists() else None)
     event = knowledge.event('2')
     assert 'Zombie Outbreak' in event
+    event_lines = event.splitlines()
+    assert event_lines[1].startswith('- Type:')
+    assert event_lines[2] == '- Evolution stages: `3`'
+    assert event_lines[3].startswith('- Status:')
     assert 'Evidence:' not in event
     assert 'docs/spreadsheets' not in event
     assert 'Fully Functional' in knowledge.event('4')
