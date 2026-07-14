@@ -199,9 +199,9 @@ DEFAULT_AUTOMATIONS = {
 AUTOMATION_DESCRIPTIONS = {
     "repository_index_refresh": "Refreshes ChaosX's local event/scenario/cluster/search index from the Chaos Redux repo.",
     "question_answer_tracking": "Stores successful public ChaosX Q&A pairs and supports /admin qna list/search/popular.",
-    "auto_question_answering": "Zero-token per-message scanner that auto-answers only clear Chaos Redux/server questions with exact local/scripted knowledge and saves Q&A.",
-    "auto_soft_rule_warnings": "Zero-token per-message scanner that gives soft warnings for obvious rule problems and reports them to the automations channel.",
-    "auto_bot_topic_banter": "Zero-token per-message scanner that joins explicit conversations about ChaosX/the bot with short deterministic banter.",
+    "auto_question_answering": "Scanner gates clear Chaos Redux/server questions, then uses the public model to answer from exact local/catalog context and saves Q&A.",
+    "auto_soft_rule_warnings": "Scanner gates obvious rule problems, then uses the public model to write a short soft warning and reports it to the automations channel.",
+    "auto_bot_topic_banter": "Scanner gates explicit conversations about ChaosX/the bot, then uses the public model to write short dynamic banter.",
     "skill_subagent_change_summary": "Would summarize changes made by agent/skill-driven work.",
     "playtest_reminders": "Sends playtest reminder messages when a playtest is scheduled.",
     "post_playtest_result_request": "Asks testers for results/observations after a playtest window.",

@@ -21,7 +21,15 @@ from .community_notes import (
 )
 from .config import Settings
 from .vault_index import refresh_vault_indexes
-from .hermes_bridge import HermesResult, build_owner_prompt, build_public_prompt, run_hermes
+from .hermes_bridge import (
+    HermesResult,
+    build_auto_scan_answer_prompt,
+    build_auto_scan_banter_prompt,
+    build_auto_scan_warning_prompt,
+    build_owner_prompt,
+    build_public_prompt,
+    run_hermes,
+)
 from .knowledge import Knowledge
 from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
@@ -283,9 +291,6 @@ def auto_scan_channel_excluded(message: discord.Message, settings: Settings) -> 
     return any(isinstance(value, int) and value in excluded for value in ids)
 
 
-def auto_scan_prompt_hash(message_content: str, response: str) -> str:
-    return hashlib.sha256(("auto-scan\n" + message_content + "\n" + response).encode("utf-8", errors="replace")).hexdigest()[:16]
-
 
 def format_auto_scan_events(rows: list[tuple]) -> str:
     lines = ["## ChaosX auto-scan events"]
@@ -359,6 +364,64 @@ async def record_auto_scan_event(bot: ChaosXBot, decision: AutoScanDecision, mes
         pass
 
 
+def auto_scan_model_failure_reason(decision: AutoScanDecision, result: HermesResult, output: str) -> str:
+    if result.timed_out:
+        return f"{decision.action} model timed out"
+    if not result.ok:
+        return f"{decision.action} model failed rc={result.returncode}"
+    if not output.strip():
+        return f"{decision.action} model returned empty output"
+    return f"{decision.action} model output rejected"
+
+
+async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message) -> tuple[HermesResult, str]:
+    guild_name = message.guild.name if message.guild else None
+    channel_name = getattr(message.channel, "name", None)
+    user_message = decision.question or message.content or ""
+    if decision.action == "answer":
+        prompt = build_auto_scan_answer_prompt(
+            user_message=user_message,
+            guild_name=guild_name,
+            channel_name=channel_name,
+            reference_context=decision.reference_context,
+            gate_reason=decision.reason,
+        )
+    elif decision.action == "banter":
+        prompt = build_auto_scan_banter_prompt(
+            user_message=user_message,
+            guild_name=guild_name,
+            channel_name=channel_name,
+            gate_reason=decision.reason,
+        )
+    elif decision.action == "soft_warning":
+        prompt = build_auto_scan_warning_prompt(
+            user_message=user_message,
+            guild_name=guild_name,
+            channel_name=channel_name,
+            gate_reason=decision.reason,
+        )
+    else:
+        raise ValueError(f"auto-scan action has no model response: {decision.action}")
+
+    async with message.channel.typing():
+        result = await run_hermes(
+            hermes_bin=bot.settings.hermes_bin,
+            profile=bot.settings.hermes_profile,
+            repo=bot.settings.chaos_redux_repo,
+            prompt=prompt,
+            timeout_seconds=bot.settings.hermes_timeout_seconds,
+            model=bot.settings.ask_model,
+            provider=bot.settings.ask_provider,
+            reasoning_effort=bot.settings.ask_reasoning_effort,
+            toolsets="safe",
+            ignore_rules=True,
+        )
+    output = ""
+    if result.ok:
+        output = sanitize_public_ask_output(result.stdout.strip())
+    return result, output
+
+
 async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.auto_scan_enabled or bot.user is None:
         return False
@@ -400,16 +463,21 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason="auto-answer rate limited"), message, bot_message_id=None, response="")
             return False
         if bot.settings.auto_scan_shadow_mode:
-            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow auto-answer: {decision.reason}"), message, bot_message_id=None, response=decision.answer)
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow auto-answer: {decision.reason}"), message, bot_message_id=None, response=decision.reference_context)
             return True
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        if not result.ok or not model_output.strip():
+            reason = auto_scan_model_failure_reason(decision, result, model_output)
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
+            await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer model failure", summary=reason)
+            return False
         first_sent: discord.Message | None = None
-        for i, part in enumerate(_chunk(decision.answer)):
-            content_part = ("ChaosX auto-answer\n" if i == 0 else "") + part
+        for i, part in enumerate(_chunk(model_output)):
             if i == 0:
-                first_sent = await message.reply(content_part, mention_author=False, allowed_mentions=safe_allowed_mentions())
+                first_sent = await message.reply(part, mention_author=False, allowed_mentions=safe_allowed_mentions())
             else:
-                await message.channel.send(content_part, allowed_mentions=safe_allowed_mentions())
-        prompt_hash_value = auto_scan_prompt_hash(message.content or "", decision.answer)
+                await message.channel.send(part, allowed_mentions=safe_allowed_mentions())
+        prompt_hash_value = result.prompt_hash
         await record_public_question_answer(
             bot,
             mode="auto scan",
@@ -420,7 +488,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             bot_message_id=first_sent.id if first_sent else None,
             parent_bot_message_id=None,
             question=decision.question or message.content or "",
-            answer=decision.answer,
+            answer=model_output,
             prompt_hash=prompt_hash_value,
             status="ok",
         )
@@ -437,12 +505,12 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
                     prompt_hash=prompt_hash_value,
                     status="ok",
                     request=sanitize_admin_context_text(decision.question or message.content or "", limit=1200),
-                    output_excerpt=sanitize_admin_context_text(decision.answer, limit=2500),
+                    output_excerpt=sanitize_admin_context_text(model_output, limit=2500),
                     keep_last=bot.settings.reply_memory_keep_last,
                 )
             except Exception as exc:
                 await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan reply memory error", summary=type(exc).__name__)
-        await record_auto_scan_event(bot, decision, message, bot_message_id=first_sent.id if first_sent else None, response=decision.answer)
+        await record_auto_scan_event(bot, decision, message, bot_message_id=first_sent.id if first_sent else None, response=model_output)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer", summary=decision.reason)
         return True
 
@@ -457,10 +525,16 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason="bot-topic banter rate limited"), message, bot_message_id=None, response="")
             return False
         if bot.settings.auto_scan_shadow_mode:
-            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow bot-topic banter: {decision.reason}"), message, bot_message_id=None, response=decision.answer)
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow bot-topic banter: {decision.reason}"), message, bot_message_id=None, response="")
             return True
-        sent = await message.reply(decision.answer, mention_author=False, allowed_mentions=safe_allowed_mentions())
-        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=decision.answer)
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        if not result.ok or not model_output.strip():
+            reason = auto_scan_model_failure_reason(decision, result, model_output)
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
+            await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan banter model failure", summary=reason)
+            return False
+        sent = await message.reply(model_output, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=model_output)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan bot-topic banter", summary=decision.reason)
         return True
 
@@ -475,11 +549,17 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason="soft-warning rate limited"), message, bot_message_id=None, response="")
             return False
         if bot.settings.auto_scan_shadow_mode:
-            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow soft-warning: {decision.reason}"), message, bot_message_id=None, response=decision.warning)
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow soft-warning: {decision.reason}"), message, bot_message_id=None, response="")
             await send_auto_scan_notice(bot, decision, message, bot_message_id=None)
             return True
-        sent = await message.reply(decision.warning, mention_author=False, allowed_mentions=safe_allowed_mentions())
-        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=decision.warning)
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        if not result.ok or not model_output.strip():
+            reason = auto_scan_model_failure_reason(decision, result, model_output)
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
+            await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning model failure", summary=reason)
+            return False
+        sent = await message.reply(model_output, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=model_output)
         await send_auto_scan_notice(bot, decision, message, bot_message_id=sent.id)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning", summary=decision.reason)
         return True
@@ -768,7 +848,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
 - `/admin qna action:list|search|popular [query:<text>] [limit:<n>]` — owner-only Q&A manager for successful public `/ask`, `@ChaosX`, reply-chain, and auto-scan questions/answers. Use `popular` to see which questions are asked most.
-- `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for zero-token auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
+- `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for model-generated auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
 
@@ -780,9 +860,10 @@ class ChaosXBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
         # Message content is only used for approved active surfaces:
-        # direct/reply asks plus the zero-token auto-scan gate. The scanner
-        # ignores other guilds, bot/webhook messages, slash-like text, and
-        # anything that is not a high-confidence local/scripted match.
+        # direct/reply asks plus the auto-scan gate. The scanner ignores other
+        # guilds, bot/webhook messages, slash-like text, and anything that is
+        # not a high-confidence local engagement opportunity; public text is
+        # generated by the configured model, not hardcoded here.
         intents.message_content = settings.mention_ask_enabled or settings.auto_scan_enabled
         super().__init__(intents=intents, allowed_mentions=safe_allowed_mentions())
         self.settings = settings

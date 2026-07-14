@@ -43,11 +43,11 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert by_name["question_answer_tracking"][0] == 1
     assert "/admin qna" in by_name["question_answer_tracking"][2]
     assert by_name["auto_question_answering"][0] == 1
-    assert "Zero-token" in by_name["auto_question_answering"][2]
+    assert "uses the public model" in by_name["auto_question_answering"][2]
     assert by_name["auto_soft_rule_warnings"][0] == 1
-    assert "soft warnings" in by_name["auto_soft_rule_warnings"][2]
+    assert "public model" in by_name["auto_soft_rule_warnings"][2]
     assert by_name["auto_bot_topic_banter"][0] == 1
-    assert "deterministic banter" in by_name["auto_bot_topic_banter"][2]
+    assert "dynamic banter" in by_name["auto_bot_topic_banter"][2]
     assert await store.automation_enabled("question_answer_tracking")
     assert await store.automation_enabled("auto_question_answering")
     assert await store.automation_enabled("auto_soft_rule_warnings")
@@ -204,7 +204,7 @@ async def test_auto_scan_event_log_is_scoped_and_listable(tmp_path):
         source_message_id=1004,
         bot_message_id=2004,
         content_excerpt="this chaos bot is so stupid",
-        response_excerpt="Who are you calling stupid?",
+        response_excerpt="Model-generated bot-topic response",
     )
 
     rows = await store.list_auto_scan_events(guild_id=456, limit=10)

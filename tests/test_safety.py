@@ -6,7 +6,7 @@ from typing import Any, cast
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
 from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
-from chaosx_bot.hermes_bridge import build_owner_prompt, build_public_prompt, prompt_hash
+from chaosx_bot.hermes_bridge import build_auto_scan_answer_prompt, build_auto_scan_banter_prompt, build_auto_scan_warning_prompt, build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
 
 
@@ -240,6 +240,37 @@ def test_public_prompt_can_include_lower_priority_reply_chain_context():
     assert "current message is replying to a prior ChaosX answer" in prompt
     assert "Internal reference notes for answer accuracy" in prompt
     assert "Community user question" in prompt
+
+
+def test_auto_scan_prompts_require_dynamic_model_generated_text():
+    answer_prompt = build_auto_scan_answer_prompt(
+        user_message="What is event 2?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="Event 2: Zombie Outbreak",
+        gate_reason="explicit event id 2",
+    )
+    banter_prompt = build_auto_scan_banter_prompt(
+        user_message="this chaos bot is so stupid",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        gate_reason="bot-topic insult/roast",
+    )
+    warning_prompt = build_auto_scan_warning_prompt(
+        user_message="@everyone free steam keys",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        gate_reason="mass ping usage",
+    )
+
+    for prompt in (answer_prompt, banter_prompt, warning_prompt):
+        assert "generate the actual public text dynamically" in prompt
+        assert "Do not use canned wording" in prompt
+        assert "Do not use @everyone" in prompt
+    assert "Reference context for the model-generated answer" in answer_prompt
+    assert "Event 2: Zombie Outbreak" in answer_prompt
+    assert "Write one short playful response" in banter_prompt
+    assert "soft warning" in warning_prompt
 
 
 def test_community_help_uses_search_and_root_feedback_commands():

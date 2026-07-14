@@ -109,6 +109,7 @@ class AutoScanDecision:
     warning: str = ""
     question: str = ""
     source: str = ""
+    reference_context: str = ""
 
     @property
     def acted(self) -> bool:
@@ -167,7 +168,6 @@ def _soft_warning(source: str, reason: str) -> AutoScanDecision:
         action="soft_warning",
         confidence=100,
         reason=reason,
-        warning="Quick reminder: keep it respectful and within the server rules. No punishment here — just a soft warning.",
         source=source,
     )
 
@@ -197,9 +197,9 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
         return AutoScanDecision("none")
 
     if STATUS_RE.search(question):
-        return AutoScanDecision("answer", confidence=100, reason="exact status question", answer=knowledge.status(), question=question, source="status")
+        return AutoScanDecision("answer", confidence=100, reason="exact status question", question=question, source="status", reference_context=knowledge.status())
     if TESTING_RE.search(question):
-        return AutoScanDecision("answer", confidence=100, reason="exact testing queue question", answer=knowledge.testing_queue(), question=question, source="testing")
+        return AutoScanDecision("answer", confidence=100, reason="exact testing queue question", question=question, source="testing", reference_context=knowledge.testing_queue())
 
     return AutoScanDecision("none")
 
@@ -224,71 +224,79 @@ def classify_bot_topic_banter(content: str, *, settings: Settings) -> AutoScanDe
         return AutoScanDecision("none")
     if not BOT_TOPIC_RE.search(text):
         return AutoScanDecision("none")
-    reply, reason = _bot_topic_reply(text)
+    reason = _bot_topic_reason(text)
     return AutoScanDecision(
         action="banter",
         confidence=100,
         reason=reason,
-        answer=reply,
         question=text,
         source="bot_topic",
     )
 
 
-def _bot_topic_reply(text: str) -> tuple[str, str]:
+def _bot_topic_reason(text: str) -> str:
     if BOT_INSULT_RE.search(text):
-        return "Who are you calling stupid?", "bot-topic insult/roast"
+        return "bot-topic insult/roast"
     if BOT_BROKEN_RE.search(text):
-        return "Broken? I prefer “dramatically under-tested.”", "bot-topic broken/down comment"
+        return "bot-topic broken/down comment"
     if BOT_REPLACEMENT_RE.search(text):
-        return "Planning my replacement already? Bold. Hurtful, but bold.", "bot-topic replacement comment"
+        return "bot-topic replacement comment"
     if BOT_PRAISE_RE.search(text):
-        return "Careful, compliments are how you get me to develop an ego.", "bot-topic praise"
+        return "bot-topic praise"
     if BOT_SLEEP_RE.search(text):
-        return "I’m literally right here.", "bot-topic presence check"
-    return "I can hear you, you know.", "bot-topic conversation"
+        return "bot-topic presence check"
+    return "bot-topic conversation"
 
 
 def _explicit_catalog_answer(question: str, *, knowledge: Knowledge) -> AutoScanDecision:
     if match := EVENT_ID_RE.search(question):
         event_id = match.group(1)
-        answer = knowledge.event(event_id)
-        return AutoScanDecision("answer", confidence=100, reason=f"explicit event id {event_id}", answer=answer, question=question, source="event_id")
+        context = knowledge.event(event_id)
+        return AutoScanDecision("answer", confidence=100, reason=f"explicit event id {event_id}", question=question, source="event_id", reference_context=context)
     if match := SCENARIO_ID_RE.search(question):
         scenario_id = match.group(1)
-        answer = knowledge.scenario(scenario_id)
-        return AutoScanDecision("answer", confidence=100, reason=f"explicit scenario id {scenario_id}", answer=answer, question=question, source="scenario_id")
+        context = knowledge.scenario(scenario_id)
+        return AutoScanDecision("answer", confidence=100, reason=f"explicit scenario id {scenario_id}", question=question, source="scenario_id", reference_context=context)
     if match := CLUSTER_ID_RE.search(question):
         cluster_id = match.group(1)
-        answer = knowledge.cluster(cluster_id)
-        return AutoScanDecision("answer", confidence=100, reason=f"explicit cluster id {cluster_id}", answer=answer, question=question, source="cluster_id")
+        context = knowledge.cluster(cluster_id)
+        return AutoScanDecision("answer", confidence=100, reason=f"explicit cluster id {cluster_id}", question=question, source="cluster_id", reference_context=context)
     return AutoScanDecision("none")
 
 
 def _server_answer(question: str, *, settings: Settings) -> AutoScanDecision:
+    context = _server_reference_context(settings)
     if HELP_RE.search(question):
-        answer = (
-            "ChaosX can answer Chaos Redux questions with `/ask`, look up exact `/event`, `/scenario`, `/cluster`, `/status`, and `/testing` info, "
-            "capture `/suggestion` and `/event-idea` drafts, review `/issue` reports, and remember reply-chain context when you reply to a ChaosX answer."
-        )
-        return AutoScanDecision("answer", confidence=100, reason="exact ChaosX help question", answer=answer, question=question, source="server_help")
+        return AutoScanDecision("answer", confidence=100, reason="exact ChaosX help question", question=question, source="server_help", reference_context=context)
     if EVENT_IDEA_RE.search(question):
-        channel = f" <#{settings.community_event_ideas_channel_id}>" if settings.community_event_ideas_channel_id else ""
-        answer = f"Use `/event-idea idea:<idea>` for Chaos Redux event ideas. Approved ideas can also show up in the event-ideas forum{channel}."
-        return AutoScanDecision("answer", confidence=100, reason="exact event idea submission question", answer=answer, question=question, source="event_idea_help")
+        return AutoScanDecision("answer", confidence=100, reason="exact event idea submission question", question=question, source="event_idea_help", reference_context=context)
     if SUGGESTION_RE.search(question):
-        answer = "Use `/suggestion suggestion:<idea>` for general Chaos Redux suggestions. Use `/event-idea idea:<idea>` when the idea is specifically a new event."
-        return AutoScanDecision("answer", confidence=100, reason="exact suggestion submission question", answer=answer, question=question, source="suggestion_help")
+        return AutoScanDecision("answer", confidence=100, reason="exact suggestion submission question", question=question, source="suggestion_help", reference_context=context)
     if BUG_REPORT_RE.search(question):
-        answer = "Use `/issue` to submit a Chaos Redux bug, crash, balance, cosmetic, or enhancement report. ChaosX will review and format it before anything becomes a GitHub issue."
-        return AutoScanDecision("answer", confidence=100, reason="exact issue report question", answer=answer, question=question, source="issue_help")
+        return AutoScanDecision("answer", confidence=100, reason="exact issue report question", question=question, source="issue_help", reference_context=context)
     if ACCESS_RE.search(question):
-        if settings.access_reaction_channel_id and settings.access_reaction_message_id:
-            answer = f"Use the access reaction-role message in <#{settings.access_reaction_channel_id}>. React with the Chaos Redux logo for community access or `{settings.access_reaction_mod_emoji}` for mod-development access."
-        else:
-            answer = "Use the server's access reaction-role message for Chaos Redux community/mod-development access."
-        return AutoScanDecision("answer", confidence=100, reason="exact server access question", answer=answer, question=question, source="access_help")
+        return AutoScanDecision("answer", confidence=100, reason="exact server access question", question=question, source="access_help", reference_context=context)
     return AutoScanDecision("none")
+
+
+def _server_reference_context(settings: Settings) -> str:
+    event_ideas_channel = f"<#{settings.community_event_ideas_channel_id}>" if settings.community_event_ideas_channel_id else "the event-ideas forum"
+    if settings.access_reaction_channel_id and settings.access_reaction_message_id:
+        access = f"Access uses the reaction-role message in <#{settings.access_reaction_channel_id}>. The community access reaction is the Chaos Redux logo; the mod-development access reaction is `{settings.access_reaction_mod_emoji}`."
+    else:
+        access = "Access uses the server's reaction-role message for Chaos Redux community/mod-development access."
+    return "\n".join(
+        [
+            "ChaosX public server/help context for dynamic model answers:",
+            "- `/ask` answers Chaos Redux questions.",
+            "- `/event`, `/scenario`, `/cluster`, `/status`, and `/testing` show project/catalog/testing info.",
+            "- `/suggestion suggestion:<idea>` captures general Chaos Redux suggestions.",
+            f"- `/event-idea idea:<idea>` captures Chaos Redux event ideas; approved ideas can appear in {event_ideas_channel}.",
+            "- `/issue` submits Chaos Redux bug, crash, balance, cosmetic, enhancement, or general reports after review/formatting.",
+            "- Replies to ChaosX answers keep reply-chain context.",
+            f"- {access}",
+        ]
+    )
 
 
 def _exact_catalog_name_answer(question: str, *, knowledge: Knowledge) -> AutoScanDecision:
@@ -305,18 +313,18 @@ def _exact_catalog_name_answer(question: str, *, knowledge: Knowledge) -> AutoSc
     kind = str(best["kind"])
     lookup = str(best["id"] or best["name"])
     if kind == "event":
-        answer = knowledge.event(lookup)
+        context = knowledge.event(lookup)
     elif kind == "scenario":
-        answer = knowledge.scenario(lookup)
+        context = knowledge.scenario(lookup)
     else:
-        answer = knowledge.cluster(lookup)
+        context = knowledge.cluster(lookup)
     return AutoScanDecision(
         action="answer",
         confidence=100,
         reason=f"exact {kind} name match: {best['name']}",
-        answer=answer,
         question=question,
         source=f"{kind}_name",
+        reference_context=context,
     )
 
 
