@@ -25,7 +25,7 @@
 
 - Do not broaden Message Content use beyond explicitly mentioned asks, replies to stored ChaosX answer messages, Hoops' owner/admin mention/reply path, and owner-requested `/admin ask` message analysis; no passive public monitoring.
 - Public reply-chain context must remain keyed to the replied-to bot answer message, not broad channel history.
-- Hoops wants ChaosX to have maximum server control on the Discord side, but execution must remain owner-only through `/admin ask`; do not expose public or cluttery moderation/member-management commands.
+- Hoops wants ChaosX to have maximum server control on the Discord side, but execution must remain owner-only through `/admin ask`; do not expose public or cluttery moderation/member-management commands. In owner mode, explicit current-request admin instructions are authorization, including explicitly requested announcement pings/mentions.
 - `/admin ask` follow-up memory must remain private, owner-scoped, channel/thread-scoped, and resettable with `reset context`.
 - Do not create/delete/rename/reorder channels or roles from generic public `/ask` output.
 - Do not create announcements, scheduled events, or PRs without a preview + owner confirmation flow.

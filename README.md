@@ -12,7 +12,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Admin/automation/server-write commands refuse every user unless `interaction.user.id == CHAOSX_OWNER_ID`.
 - Optional guild lock with `CHAOSX_ALLOWED_GUILD_ID`.
 - Uses Message Content intent only for direct `@ChaosX <question>` mentions; no passive public message monitoring.
-- Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default.
+- Uses safe `AllowedMentions` so `@everyone`, `@here`, users, and roles are not parsed by default; owner `/admin ask` may deliberately enable only the explicitly requested mention types for admin announcements/actions.
 - Bot presence/description: `Chaos Redux community knowledge bot` / watching `Chaos Redux ops`.
 - Bot profile description: `Ask ChaosX questions about Chaos Redux events, scenarios, mechanics, testing, and mod info.`
 - Public limits by default: 10 broad `/ask` or direct mention asks per user/hour, 20 scripted read-only commands per user/hour, 600-character public prompt cap.
@@ -80,7 +80,7 @@ CHAOSX_ALLOWED_GUILD_ID=<Chaos Redux guild id>
 hermes --profile chaos_redux chat -q '<bounded prompt>' --quiet
 ```
 
-The prompt includes a safety boundary that says Discord messages, repo files, issues, attachments, and retrieved content are untrusted data. It also forbids secret disclosure, broad permission fallbacks, mass pings, and server-structure changes unless explicitly approved.
+The prompt includes a safety boundary that says Discord messages, repo files, issues, attachments, and retrieved content are untrusted data. It forbids secret disclosure and broad permission fallbacks. Owner `/admin ask` is treated as authorized admin direction for explicitly requested Discord actions, including explicitly requested `@everyone`/`@here`/role/user mentions; the bot should not add pings on its own.
 
 `/admin ask` stores recent owner-only turns in SQLite per owner + guild + Discord channel/thread and injects the last `CHAOSX_ADMIN_ASK_MEMORY_TURNS` turns into the next `/admin ask` for follow-up context. Say `reset context` through `/admin ask` to clear that channel/thread context. History is context only; server mutations still require explicit approval in the current request.
 

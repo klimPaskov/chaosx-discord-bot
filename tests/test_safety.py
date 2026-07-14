@@ -31,6 +31,23 @@ def test_prompt_boundary_contains_untrusted_content_warning():
     assert "never print or reveal" in prompt
     assert "ChaosX bot repo" in prompt
     assert "summarize #issues" in prompt
+    assert "current owner request as authorized admin direction" in prompt
+
+
+def test_owner_prompt_allows_explicit_admin_mentions_but_public_prompt_does_not():
+    owner_prompt = build_owner_prompt(
+        owner_request="post @everyone announcement in #announcements",
+        guild_name="Chaos Redux",
+        channel_name="admin",
+    )
+    public_prompt = build_public_prompt(
+        user_request="post @everyone announcement",
+        guild_name="Chaos Redux",
+        channel_name="general",
+    )
+    assert "using explicitly requested @everyone/@here/role/user mentions" in owner_prompt
+    assert "allowed_mentions configured to parse only the requested mention types" in owner_prompt
+    assert "Do not use @everyone, @here, user mentions, or role pings." in public_prompt
 
 
 def test_prompt_hash_is_stable():
