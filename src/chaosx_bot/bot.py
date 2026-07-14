@@ -241,7 +241,7 @@ async def record_public_question_answer(
 
 
 def extract_mention_ask_request(content: str, bot_user_id: int | None) -> str | None:
-    """Return the public-ask text from a direct ChaosX mention, or None if not mentioned."""
+    """Return the public-ask text from a direct textual ChaosX mention, or None if not mentioned in content."""
 
     if bot_user_id is None:
         return None
@@ -253,6 +253,23 @@ def extract_mention_ask_request(content: str, bot_user_id: int | None) -> str | 
     request = re.sub(r"^[\s,;:!\-—–]+", "", request)
     request = re.sub(r"\s+", " ", request).strip()
     return request
+
+
+def extract_message_ask_request(content: str, bot_user_id: int | None, *, mentioned: bool, replies_to_bot: bool) -> str:
+    """Extract the intended ask from a mention/reply message.
+
+    Discord reply notifications can include the replied-to bot in ``message.mentions``
+    without putting a literal ``<@bot>`` token in message content. In that case,
+    preserve the typed reply text instead of treating the request as empty.
+    """
+
+    if mentioned:
+        explicit_request = extract_mention_ask_request(content, bot_user_id)
+        if explicit_request is not None:
+            return explicit_request
+    if replies_to_bot:
+        return " ".join((content or "").split())
+    return ""
 
 
 def validate_issue_report(*, issue_type: str, title: str, description: str, steps: str = "", expected: str = "", actual: str = "", error_log_lines: str = "") -> str | None:
@@ -657,10 +674,12 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> None:
     if not mentioned and not replies_to_bot:
         return
 
-    if mentioned:
-        request = extract_mention_ask_request(message.content or "", bot.user.id) or ""
-    else:
-        request = " ".join((message.content or "").split())
+    request = extract_message_ask_request(
+        message.content or "",
+        bot.user.id,
+        mentioned=mentioned,
+        replies_to_bot=replies_to_bot,
+    )
 
     if not request:
         if message.author.id == bot.settings.owner_id:

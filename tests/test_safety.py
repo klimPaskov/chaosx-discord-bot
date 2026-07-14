@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -308,6 +308,34 @@ def test_mention_ask_extracts_only_direct_bot_mentions():
     assert extract_mention_ask_request("how does Zombie Outbreak work?", bot_id) is None
     assert extract_mention_ask_request("<@999999999999999999> how does Zombie Outbreak work?", bot_id) is None
     assert extract_mention_ask_request(f"<@{bot_id}>", bot_id) == ""
+
+
+def test_reply_ping_mentions_preserve_typed_request_text():
+    bot_id = 123456789012345678
+    assert extract_message_ask_request(
+        "what about its evolutions?",
+        bot_id,
+        mentioned=True,
+        replies_to_bot=True,
+    ) == "what about its evolutions?"
+    assert extract_message_ask_request(
+        f"<@{bot_id}> what about its evolutions?",
+        bot_id,
+        mentioned=True,
+        replies_to_bot=False,
+    ) == "what about its evolutions?"
+    assert extract_message_ask_request(
+        "what about its evolutions?",
+        bot_id,
+        mentioned=False,
+        replies_to_bot=True,
+    ) == "what about its evolutions?"
+    assert extract_message_ask_request(
+        "what about its evolutions?",
+        bot_id,
+        mentioned=True,
+        replies_to_bot=False,
+    ) == ""
 
 
 def test_public_ask_output_sanitizer_blocks_leaky_or_offtopic_output():
