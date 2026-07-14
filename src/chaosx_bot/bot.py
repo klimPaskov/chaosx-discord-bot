@@ -423,6 +423,24 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             prompt_hash=prompt_hash_value,
             status="ok",
         )
+        if first_sent:
+            try:
+                await bot.store.record_message_ask_turn(
+                    mode="auto scan",
+                    actor_id=message.author.id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    source_message_id=message.id,
+                    bot_message_id=first_sent.id,
+                    parent_bot_message_id=None,
+                    prompt_hash=prompt_hash_value,
+                    status="ok",
+                    request=sanitize_admin_context_text(decision.question or message.content or "", limit=1200),
+                    output_excerpt=sanitize_admin_context_text(decision.answer, limit=2500),
+                    keep_last=bot.settings.reply_memory_keep_last,
+                )
+            except Exception as exc:
+                await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan reply memory error", summary=type(exc).__name__)
         await record_auto_scan_event(bot, decision, message, bot_message_id=first_sent.id if first_sent else None, response=decision.answer)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer", summary=decision.reason)
         return True

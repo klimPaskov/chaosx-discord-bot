@@ -2,11 +2,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from chaosx_bot.auto_scan import AutoScanDecision, classify_auto_answer, classify_message, classify_soft_warning, has_domain_signal, is_question_like
-from chaosx_bot.bot import auto_scan_channel_excluded, format_auto_scan_events, format_auto_scan_notice, parse_channel_id_set
+from chaosx_bot.bot import auto_scan_channel_excluded, format_auto_scan_events, format_auto_scan_notice, handle_auto_scan, parse_channel_id_set
 from chaosx_bot.config import Settings
 from chaosx_bot.indexer import rebuild_index
 from chaosx_bot.knowledge import Knowledge
+from chaosx_bot.rate_limit import FixedWindowRateLimiter
 
 
 def test_auto_scan_question_and_warning_gates_are_zero_token_rules():
@@ -28,7 +31,7 @@ def test_auto_scan_question_and_warning_gates_are_zero_token_rules():
 
 
 def test_auto_scan_server_answers_and_blocks_unsafe_prompts():
-    settings = Settings(_env_file=None, discord_token="dummy")
+    settings = Settings(discord_token="dummy")
     knowledge = cast(Any, SimpleNamespace())
 
     help_answer = classify_auto_answer("What can ChaosX do?", knowledge=knowledge, settings=settings)
@@ -52,7 +55,7 @@ def test_auto_scan_catalog_answers_exact_ids_and_names(tmp_path: Path):
     db = tmp_path / "chaosx-auto-scan.db"
     rebuild_index(repo, db, vault if vault.exists() else None)
     knowledge = Knowledge(repo, db, vault if vault.exists() else None)
-    settings = Settings(_env_file=None, discord_token="dummy")
+    settings = Settings(discord_token="dummy")
 
     event_id = classify_message("What is event 2?", knowledge=knowledge, settings=settings)
     assert event_id.action == "answer"
@@ -74,7 +77,7 @@ def test_auto_scan_catalog_answers_exact_ids_and_names(tmp_path: Path):
 
 
 def test_auto_scan_formatters_and_channel_exclusion_are_sanitized():
-    settings = Settings(_env_file=None, discord_token="dummy", auto_scan_excluded_channel_ids="<#111>, 222")
+    settings = Settings(discord_token="dummy", auto_scan_excluded_channel_ids="<#111>, 222")
     message = cast(Any, SimpleNamespace(channel=SimpleNamespace(id=222, parent_id=None, category_id=None)))
     assert parse_channel_id_set("<#111>, 222") == {111, 222}
     assert auto_scan_channel_excluded(message, settings)
@@ -115,3 +118,98 @@ def test_auto_scan_formatters_and_channel_exclusion_are_sanitized():
     assert "ChaosX soft warning notice" in notice
     assert "Action taken: soft warning only" in notice
     assert "secret" not in notice
+
+
+class _FakeStore:
+    def __init__(self) -> None:
+        self.qnas: list[dict[str, Any]] = []
+        self.turns: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+        self.audits: list[dict[str, Any]] = []
+
+    async def automation_enabled(self, name: str) -> bool:
+        return True
+
+    async def record_question_answer(self, **kwargs: Any) -> None:
+        self.qnas.append(kwargs)
+
+    async def record_message_ask_turn(self, **kwargs: Any) -> None:
+        self.turns.append(kwargs)
+
+    async def record_auto_scan_event(self, **kwargs: Any) -> None:
+        self.events.append(kwargs)
+
+    async def audit(self, **kwargs: Any) -> None:
+        self.audits.append(kwargs)
+
+
+class _FakeMessage:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.id = 1000
+        self.author = SimpleNamespace(id=123, bot=False)
+        self.guild = SimpleNamespace(id=1395459671598436533)
+        self.channel = SimpleNamespace(id=456, parent_id=None, category_id=None, sent=[])
+        self.mentions: list[Any] = []
+        self.webhook_id = None
+        self.reference = None
+        self.jump_url = "https://discord.com/channels/1395459671598436533/456/1000"
+        self.replies: list[dict[str, Any]] = []
+
+    async def reply(self, content: str, **kwargs: Any) -> SimpleNamespace:
+        self.replies.append({"content": content, "kwargs": kwargs})
+        return SimpleNamespace(id=9001)
+
+
+class _FakeBot:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.user = SimpleNamespace(id=999)
+        self.knowledge = cast(Any, SimpleNamespace())
+        self.rate_limiter = FixedWindowRateLimiter()
+        self.store = _FakeStore()
+
+    def get_channel(self, channel_id: int) -> None:
+        return None
+
+    async def fetch_channel(self, channel_id: int) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_auto_answer_replies_and_records(monkeypatch):
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
+    bot = _FakeBot(settings)
+    message = _FakeMessage("What is event 2?")
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        return AutoScanDecision("answer", confidence=100, reason="explicit event id 2", answer="## Event 2: Zombie Outbreak", question="What is event 2?", source="event_id")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is True
+    assert message.replies[0]["content"].startswith("ChaosX auto-answer")
+    assert bot.store.qnas[0]["mode"] == "auto scan"
+    assert bot.store.turns[0]["bot_message_id"] == 9001
+    assert bot.store.events[0]["action"] == "answer"
+    assert bot.store.audits[0]["command"] == "auto scan answer"
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_shadow_mode_records_without_reply(monkeypatch):
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None, auto_scan_shadow_mode=True)
+    bot = _FakeBot(settings)
+    message = _FakeMessage("What is event 2?")
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        return AutoScanDecision("answer", confidence=100, reason="explicit event id 2", answer="## Event 2: Zombie Outbreak", question="What is event 2?", source="event_id")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is True
+    assert message.replies == []
+    assert bot.store.qnas == []
+    assert bot.store.events[0]["action"] == "shadow"
+    assert bot.store.events[0]["reason"] == "shadow auto-answer: explicit event id 2"
