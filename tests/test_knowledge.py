@@ -22,10 +22,18 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     event_lines = event.splitlines()
     assert event_lines[1].startswith('- Type:')
     assert event_lines[2] == '- Evolution stages: `3`'
-    assert event_lines[3] == '- World-end scenario: `true`'
+    assert event_lines[3] == '- Has world-end scenario: Yes'
     assert event_lines[4].startswith('- Status:')
     assert 'Evidence:' not in event
     assert 'docs/spreadsheets' not in event
+    assert knowledge.event('999') == 'No event for id `999` was found.'
+    assert knowledge.event('event 999') == 'No event for id `999` was found.'
+    scenario_miss = knowledge.scenario('10')
+    assert scenario_miss == 'No scenario for id `10` was found.'
+    assert 'Search results' not in scenario_miss
+    assert knowledge.scenario('SCN-999') == 'No scenario for id `999` was found.'
+    assert knowledge.cluster('999') == 'No cluster for id `999` was found.'
+    assert knowledge.cluster('cluster 999') == 'No cluster for id `999` was found.'
     assert 'Fully Functional' in knowledge.event('4')
     search = knowledge.search('Zombie Outbreak')
     assert 'Evidence:' not in search

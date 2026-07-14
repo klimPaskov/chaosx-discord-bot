@@ -192,8 +192,11 @@ class Knowledge:
 
     def event(self, event: str, view: str = "overview", show_evidence: bool = False) -> str:
         self.ensure_index()
-        row = self._find_event(event)
+        requested_event_id = _explicit_numeric_lookup_id(event, "event")
+        row = self._find_event_by_id(requested_event_id) if requested_event_id else self._find_event(event)
         if not row:
+            if requested_event_id:
+                return f"No event for id `{requested_event_id}` was found."
             return self.search(event, scope="all", limit=5, show_evidence=show_evidence) + "\n\nNo exact event match; showing search results instead."
         keys = ["row_key", "event_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
         data = dict(zip(keys, row))
@@ -205,7 +208,7 @@ class Knowledge:
             f"## {event_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
             f"- Evolution stages: `{evolution_stage_count}`",
-            f"- World-end scenario: `{str(has_world_end_scenario).lower()}`",
+            f"- Has world-end scenario: {'Yes' if has_world_end_scenario else 'No'}",
             f"- Status: `{data['status'] or 'unknown'}`",
             f"- Cluster: `{data['cluster_id'] or 'none'}`",
             f"- Member severity: `{data['member_severity'] or 'none'}`",
@@ -226,8 +229,11 @@ class Knowledge:
 
     def scenario(self, scenario: str, view: str = "overview", show_evidence: bool = False) -> str:
         self.ensure_index()
-        row = self._find_scenario(scenario)
+        requested_scenario_id = _explicit_numeric_lookup_id(scenario, "scenario", "scn")
+        row = self._find_scenario_by_id(requested_scenario_id) if requested_scenario_id else self._find_scenario(scenario)
         if not row:
+            if requested_scenario_id:
+                return f"No scenario for id `{requested_scenario_id}` was found."
             return self.search(scenario, scope="all", limit=5, show_evidence=show_evidence) + "\n\nNo exact scenario match; showing public search results instead."
         keys = ["row_key", "scenario_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
         data = dict(zip(keys, row))
@@ -251,15 +257,18 @@ class Knowledge:
 
     def cluster(self, cluster: str, show_evidence: bool = False) -> str:
         self.ensure_index()
+        requested_cluster_id = _explicit_numeric_lookup_id(cluster, "cluster")
         conn = connect(self.db_path)
         try:
-            if cluster.strip().isdigit():
-                row = conn.execute("SELECT * FROM catalog_clusters WHERE cluster_id = ?", (cluster.strip(),)).fetchone()
+            if requested_cluster_id:
+                row = conn.execute("SELECT * FROM catalog_clusters WHERE cluster_id = ?", (requested_cluster_id,)).fetchone()
             else:
                 row = conn.execute("SELECT * FROM catalog_clusters WHERE lower(name) LIKE ? ORDER BY cluster_id LIMIT 1", (f"%{cluster.lower()}%",)).fetchone()
         finally:
             conn.close()
         if not row:
+            if requested_cluster_id:
+                return f"No cluster for id `{requested_cluster_id}` was found."
             return f"No registered cluster match for `{cluster}`. Planned clusters without IDs remain unassigned."
         row_key, cluster_id, name, details, members, type_, chaos_level, status, indexed_at = row
         label = f"Cluster {cluster_id}: {name}" if cluster_id else f"Planned cluster idea: {name}"
@@ -339,6 +348,13 @@ class Knowledge:
         finally:
             conn.close()
 
+    def _find_event_by_id(self, event_id: str):
+        conn = connect(self.db_path)
+        try:
+            return conn.execute("SELECT * FROM catalog_events WHERE event_id = ?", (event_id,)).fetchone()
+        finally:
+            conn.close()
+
     def _find_scenario(self, scenario: str):
         value = scenario.strip()
         conn = connect(self.db_path)
@@ -349,6 +365,13 @@ class Knowledge:
                 if row:
                     return row
             return conn.execute("SELECT * FROM catalog_scenarios WHERE lower(name) LIKE ? ORDER BY CAST(scenario_id AS INTEGER) LIMIT 1", (f"%{value.lower()}%",)).fetchone()
+        finally:
+            conn.close()
+
+    def _find_scenario_by_id(self, scenario_id: str):
+        conn = connect(self.db_path)
+        try:
+            return conn.execute("SELECT * FROM catalog_scenarios WHERE scenario_id = ?", (scenario_id,)).fetchone()
         finally:
             conn.close()
 
@@ -427,6 +450,17 @@ def _latest_vault_indexable_mtime(vault_path: Path | None) -> float:
 def _extract_number(value: str) -> str | None:
     m = re.search(r"\b(?:event\s*)?(\d{1,3})\b", value, re.I)
     return m.group(1) if m else None
+
+
+def _explicit_numeric_lookup_id(value: str, *prefixes: str) -> str | None:
+    value = value.strip()
+    if not value:
+        return None
+    if re.fullmatch(r"\d{1,3}", value):
+        return str(int(value))
+    prefix_pattern = "|".join(re.escape(prefix) for prefix in prefixes)
+    match = re.fullmatch(rf"(?i)(?:{prefix_pattern})[\s#:_-]*(\d{{1,3}})", value)
+    return str(int(match.group(1))) if match else None
 
 
 def _fts_query(query: str) -> str:
