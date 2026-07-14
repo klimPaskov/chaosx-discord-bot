@@ -76,10 +76,12 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.auto_scan_enabled is True
     assert settings.auto_scan_auto_answer_enabled is True
     assert settings.auto_scan_soft_warning_enabled is True
+    assert settings.auto_scan_bot_topic_enabled is True
     assert settings.auto_scan_shadow_mode is False
     assert settings.auto_scan_min_confidence == 100
     assert settings.auto_scan_answer_limit_per_user_hour == 6
     assert settings.auto_scan_warning_limit_per_user_hour == 3
+    assert settings.auto_scan_banter_limit_per_user_hour == 8
     assert settings.hermes_timeout_seconds == 900
     assert settings.admin_ask_timeout_seconds == 0
     assert settings.ask_model == "gpt-5.6-luna"

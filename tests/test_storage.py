@@ -46,9 +46,12 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert "Zero-token" in by_name["auto_question_answering"][2]
     assert by_name["auto_soft_rule_warnings"][0] == 1
     assert "soft warnings" in by_name["auto_soft_rule_warnings"][2]
+    assert by_name["auto_bot_topic_banter"][0] == 1
+    assert "deterministic banter" in by_name["auto_bot_topic_banter"][2]
     assert await store.automation_enabled("question_answer_tracking")
     assert await store.automation_enabled("auto_question_answering")
     assert await store.automation_enabled("auto_soft_rule_warnings")
+    assert await store.automation_enabled("auto_bot_topic_banter")
     for deleted_name in {
         "agent_draft_pr_mode",
         "ci_failure_first_recovery",
@@ -191,11 +194,23 @@ async def test_auto_scan_event_log_is_scoped_and_listable(tmp_path):
         content_excerpt="What is event 2?",
         response_excerpt="Zombie Outbreak",
     )
+    await store.record_auto_scan_event(
+        action="banter",
+        reason="bot-topic insult/roast",
+        confidence=100,
+        actor_id=127,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=1004,
+        bot_message_id=2004,
+        content_excerpt="this chaos bot is so stupid",
+        response_excerpt="Who are you calling stupid?",
+    )
 
     rows = await store.list_auto_scan_events(guild_id=456, limit=10)
     warnings = await store.list_auto_scan_events(guild_id=456, limit=10, action="soft_warning")
 
-    assert [row[2] for row in rows] == ["shadow", "answer", "soft_warning"]
+    assert [row[2] for row in rows] == ["banter", "shadow", "answer", "soft_warning"]
     assert len(warnings) == 1
     assert warnings[0][3] == "mass ping usage"
     assert warnings[0][10] == "@everyone hello"

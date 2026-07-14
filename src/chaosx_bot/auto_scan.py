@@ -9,7 +9,7 @@ from .config import Settings
 from .indexer import connect
 from .knowledge import Knowledge
 
-AutoScanAction = Literal["none", "answer", "soft_warning", "shadow"]
+AutoScanAction = Literal["none", "answer", "soft_warning", "banter", "shadow"]
 
 AUTO_SCAN_QUESTION_TERMS = {
     "who",
@@ -80,6 +80,16 @@ BUG_REPORT_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:report|submit)\s+(?:a\s+)?(?
 SUGGESTION_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:suggest|submit)\s+(?:an?\s+)?(?:idea|suggestion)|where\s+do\s+i\s+(?:post|submit)\s+(?:an?\s+)?(?:idea|suggestion))\b", re.I)
 EVENT_IDEA_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:suggest|submit)\s+(?:an?\s+)?event\s+idea|where\s+do\s+i\s+(?:post|submit)\s+(?:an?\s+)?event\s+idea)\b", re.I)
 ACCESS_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:get|gain)\s+access|where\s+do\s+i\s+get\s+access|reaction\s+role|join\s+the\s+community)\b", re.I)
+
+BOT_TOPIC_RE = re.compile(
+    r"\b(?:chaosx|chaos\s*x|chaos\s*bot|chaosx\s*bot|this\s+bot|that\s+bot|the\s+bot|our\s+bot|your\s+bot)\b",
+    re.I,
+)
+BOT_INSULT_RE = re.compile(r"\b(?:stupid|dumb|idiot|useless|trash|garbage|terrible|bad|awful|annoying|lame|sucks?)\b", re.I)
+BOT_BROKEN_RE = re.compile(r"\b(?:broken|buggy|glitched|crashed|down|dead|offline|not\s+working|doesn't\s+work|wont\s+work|won't\s+work)\b", re.I)
+BOT_PRAISE_RE = re.compile(r"\b(?:smart|good|great|cool|based|useful|helpful|love|thanks|thank\s+you|nice\s+bot)\b", re.I)
+BOT_REPLACEMENT_RE = re.compile(r"\b(?:replace|replacement|another\s+bot|better\s+bot|new\s+bot|old\s+bot)\b", re.I)
+BOT_SLEEP_RE = re.compile(r"\b(?:wake\s+up|asleep|sleeping|alive|listening|hear\s+me|can\s+you\s+hear)\b", re.I)
 
 MASS_PING_RE = re.compile(r"@everyone|@here", re.I)
 DISCORD_INVITE_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[a-z0-9-]+", re.I)
@@ -198,7 +208,45 @@ def classify_message(content: str, *, knowledge: Knowledge, settings: Settings, 
     warning = classify_soft_warning(content, mention_count=mention_count)
     if warning.acted:
         return warning
-    return classify_auto_answer(content, knowledge=knowledge, settings=settings)
+    answer = classify_auto_answer(content, knowledge=knowledge, settings=settings)
+    if answer.acted:
+        return answer
+    return classify_bot_topic_banter(content, settings=settings)
+
+
+def classify_bot_topic_banter(content: str, *, settings: Settings) -> AutoScanDecision:
+    text = (content or "").strip()
+    if not settings.auto_scan_bot_topic_enabled:
+        return AutoScanDecision("none")
+    if not text or len(text) > settings.auto_scan_max_message_chars:
+        return AutoScanDecision("none")
+    if is_blocked_for_auto_answer(text):
+        return AutoScanDecision("none")
+    if not BOT_TOPIC_RE.search(text):
+        return AutoScanDecision("none")
+    reply, reason = _bot_topic_reply(text)
+    return AutoScanDecision(
+        action="banter",
+        confidence=100,
+        reason=reason,
+        answer=reply,
+        question=text,
+        source="bot_topic",
+    )
+
+
+def _bot_topic_reply(text: str) -> tuple[str, str]:
+    if BOT_INSULT_RE.search(text):
+        return "Who are you calling stupid?", "bot-topic insult/roast"
+    if BOT_BROKEN_RE.search(text):
+        return "Broken? I prefer “dramatically under-tested.”", "bot-topic broken/down comment"
+    if BOT_REPLACEMENT_RE.search(text):
+        return "Planning my replacement already? Bold. Hurtful, but bold.", "bot-topic replacement comment"
+    if BOT_PRAISE_RE.search(text):
+        return "Careful, compliments are how you get me to develop an ego.", "bot-topic praise"
+    if BOT_SLEEP_RE.search(text):
+        return "I’m literally right here.", "bot-topic presence check"
+    return "I can hear you, you know.", "bot-topic conversation"
 
 
 def _explicit_catalog_answer(question: str, *, knowledge: Knowledge) -> AutoScanDecision:

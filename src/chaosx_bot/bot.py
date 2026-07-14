@@ -31,6 +31,7 @@ BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
 QNA_AUTOMATION_NAME = "question_answer_tracking"
 AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
 AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
+AUTO_BANTER_AUTOMATION_NAME = "auto_bot_topic_banter"
 PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
 PUBLIC_ASK_DOMAIN_TERMS = {
     "chaos redux", "chaosx", "hoi4", "hearts of iron", "mod", "event", "scenario", "cluster", "mechanic",
@@ -445,6 +446,24 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer", summary=decision.reason)
         return True
 
+    if decision.action == "banter":
+        if not bot.settings.auto_scan_bot_topic_enabled or not await bot.store.automation_enabled(AUTO_BANTER_AUTOMATION_NAME):
+            return False
+        limit = bot.settings.auto_scan_banter_limit_per_user_hour
+        if limit <= 0:
+            return False
+        rate = bot.rate_limiter.check(bucket="auto_banter", user_id=message.author.id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason="bot-topic banter rate limited"), message, bot_message_id=None, response="")
+            return False
+        if bot.settings.auto_scan_shadow_mode:
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow bot-topic banter: {decision.reason}"), message, bot_message_id=None, response=decision.answer)
+            return True
+        sent = await message.reply(decision.answer, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=decision.answer)
+        await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan bot-topic banter", summary=decision.reason)
+        return True
+
     if decision.action == "soft_warning":
         if not bot.settings.auto_scan_soft_warning_enabled or not await bot.store.automation_enabled(AUTO_WARNING_AUTOMATION_NAME):
             return False
@@ -780,7 +799,7 @@ class ChaosXBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await self.store.init()
-        await self.store.set_automation_destination(["auto_question_answering"], "source channel")
+        await self.store.set_automation_destination(["auto_question_answering", "auto_bot_topic_banter"], "source channel")
         auto_scan_notice_channel = self.settings.auto_scan_notify_channel_id or self.settings.automation_reminder_channel_id
         if auto_scan_notice_channel:
             await self.store.set_automation_destination(["auto_soft_rule_warnings"], str(auto_scan_notice_channel))
