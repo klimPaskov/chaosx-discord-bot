@@ -42,7 +42,13 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert "fresh visuals" in by_name["weekly_content_dump"][2]
     assert by_name["question_answer_tracking"][0] == 1
     assert "/admin qna" in by_name["question_answer_tracking"][2]
+    assert by_name["auto_question_answering"][0] == 1
+    assert "Zero-token" in by_name["auto_question_answering"][2]
+    assert by_name["auto_soft_rule_warnings"][0] == 1
+    assert "soft warnings" in by_name["auto_soft_rule_warnings"][2]
     assert await store.automation_enabled("question_answer_tracking")
+    assert await store.automation_enabled("auto_question_answering")
+    assert await store.automation_enabled("auto_soft_rule_warnings")
     for deleted_name in {
         "agent_draft_pr_mode",
         "ci_failure_first_recovery",
@@ -132,6 +138,67 @@ async def test_message_ask_memory_is_channel_scoped_pruned_and_chainable(tmp_pat
     assert await store.list_recent_message_ask_memory(guild_id=456, channel_id=999, limit=10)
     assert await store.list_recent_message_ask_memory(guild_id=111, channel_id=789, limit=10) == []
     assert await store.list_message_ask_chain(bot_message_id=2003, guild_id=111, channel_id=789, limit=10) == []
+
+
+async def test_auto_scan_event_log_is_scoped_and_listable(tmp_path):
+    store = Store(tmp_path / "chaosx-test.db")
+    await store.init()
+    await store.record_auto_scan_event(
+        action="soft_warning",
+        reason="mass ping usage",
+        confidence=100,
+        actor_id=123,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=1000,
+        bot_message_id=2000,
+        content_excerpt="@everyone hello",
+        response_excerpt="soft warning",
+    )
+    await store.record_auto_scan_event(
+        action="answer",
+        reason="explicit event id 2",
+        confidence=100,
+        actor_id=124,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=1001,
+        bot_message_id=2001,
+        content_excerpt="What is event 2?",
+        response_excerpt="Zombie Outbreak",
+    )
+    await store.record_auto_scan_event(
+        action="answer",
+        reason="other guild",
+        confidence=100,
+        actor_id=125,
+        guild_id=999,
+        channel_id=789,
+        source_message_id=1002,
+        bot_message_id=2002,
+        content_excerpt="What is event 2?",
+        response_excerpt="Other guild",
+    )
+    await store.record_auto_scan_event(
+        action="shadow",
+        reason="shadow auto-answer: explicit event id 2",
+        confidence=100,
+        actor_id=126,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=1003,
+        bot_message_id=None,
+        content_excerpt="What is event 2?",
+        response_excerpt="Zombie Outbreak",
+    )
+
+    rows = await store.list_auto_scan_events(guild_id=456, limit=10)
+    warnings = await store.list_auto_scan_events(guild_id=456, limit=10, action="soft_warning")
+
+    assert [row[2] for row in rows] == ["shadow", "answer", "soft_warning"]
+    assert len(warnings) == 1
+    assert warnings[0][3] == "mass ping usage"
+    assert warnings[0][10] == "@everyone hello"
 
 
 async def test_question_answer_log_lists_searches_and_counts_popular_questions(tmp_path):

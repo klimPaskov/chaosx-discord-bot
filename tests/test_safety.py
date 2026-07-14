@@ -73,6 +73,13 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.github_repo == "klimPaskov/Chaos-Redux"
     assert settings.public_ask_limit_per_hour == 10
     assert settings.mention_ask_enabled is True
+    assert settings.auto_scan_enabled is True
+    assert settings.auto_scan_auto_answer_enabled is True
+    assert settings.auto_scan_soft_warning_enabled is True
+    assert settings.auto_scan_shadow_mode is False
+    assert settings.auto_scan_min_confidence == 100
+    assert settings.auto_scan_answer_limit_per_user_hour == 6
+    assert settings.auto_scan_warning_limit_per_user_hour == 3
     assert settings.hermes_timeout_seconds == 900
     assert settings.admin_ask_timeout_seconds == 0
     assert settings.ask_model == "gpt-5.6-luna"
@@ -105,6 +112,7 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "analyze recent channel/user messages" in help_text
     assert "recent owner/admin requests in this same channel/thread" in help_text
     assert "/admin qna action:list|search|popular" in help_text
+    assert "/admin autoscan action:list|answers|warnings" in help_text
     assert "which questions are asked most" in help_text
     assert "broad follow-up context" in help_text
     assert "not as per-reply chain memory" in help_text

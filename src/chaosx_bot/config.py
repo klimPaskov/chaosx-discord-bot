@@ -26,6 +26,16 @@ class Settings(BaseSettings):
     public_scripted_limit_per_hour: int = Field(default=20, ge=0, le=500)
     public_prompt_max_chars: int = Field(default=600, ge=100, le=4000)
     mention_ask_enabled: bool = Field(default=True, description="Allow direct @ChaosX mentions to act like public /ask; requires Discord Message Content Intent")
+    auto_scan_enabled: bool = Field(default=True, description="Scan every new guild message with zero-token local rules for high-confidence answers and soft warnings")
+    auto_scan_auto_answer_enabled: bool = Field(default=True, description="Allow auto-scan to answer clearly in-domain questions using only local scripted/catalog knowledge")
+    auto_scan_soft_warning_enabled: bool = Field(default=True, description="Allow auto-scan to issue soft public warnings for obvious rule problems")
+    auto_scan_shadow_mode: bool = Field(default=False, description="Classify and log auto-scan actions without posting public replies")
+    auto_scan_max_message_chars: int = Field(default=800, ge=80, le=4000)
+    auto_scan_min_confidence: int = Field(default=100, ge=1, le=100)
+    auto_scan_answer_limit_per_user_hour: int = Field(default=6, ge=0, le=100)
+    auto_scan_warning_limit_per_user_hour: int = Field(default=3, ge=0, le=50)
+    auto_scan_notify_channel_id: Optional[int] = Field(default=None, description="Channel for auto-scan moderation notices; defaults to automation_reminder_channel_id")
+    auto_scan_excluded_channel_ids: str = Field(default="", description="Comma-separated Discord channel/thread IDs ignored by auto-scan")
     admin_context_message_limit: int = Field(default=120, ge=10, le=500, description="Max recent Discord messages /admin ask may fetch for explicit analysis requests")
 
     @model_validator(mode="before")
@@ -43,6 +53,7 @@ class Settings(BaseSettings):
                 "access_reaction_chaos_emoji_id",
                 "access_reaction_member_role_id",
                 "access_reaction_modder_role_id",
+                "auto_scan_notify_channel_id",
             ):
                 if data.get(key) == "":
                     data[key] = None

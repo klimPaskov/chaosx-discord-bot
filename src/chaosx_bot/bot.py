@@ -12,6 +12,7 @@ import discord
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
+from .auto_scan import AutoScanDecision, classify_message
 from .community_notes import (
     format_event_idea_post_body,
     format_event_idea_post_title,
@@ -28,6 +29,8 @@ from .webhook_server import GitHubWebhookServer
 
 BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
 QNA_AUTOMATION_NAME = "question_answer_tracking"
+AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
+AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
 PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
 PUBLIC_ASK_DOMAIN_TERMS = {
     "chaos redux", "chaosx", "hoi4", "hearts of iron", "mod", "event", "scenario", "cluster", "mechanic",
@@ -256,6 +259,194 @@ async def record_public_question_answer(
             await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="qna tracking error", summary=type(exc).__name__)
         except Exception:
             pass
+
+
+def parse_channel_id_set(value: str) -> set[int]:
+    ids: set[int] = set()
+    for chunk in re.split(r"[,\s]+", value or ""):
+        token = chunk.strip().strip("<#>")
+        if token.isdigit():
+            ids.add(int(token))
+    return ids
+
+
+def auto_scan_channel_excluded(message: discord.Message, settings: Settings) -> bool:
+    excluded = parse_channel_id_set(settings.auto_scan_excluded_channel_ids)
+    if not excluded:
+        return False
+    ids = {
+        getattr(message.channel, "id", None),
+        getattr(message.channel, "parent_id", None),
+        getattr(message.channel, "category_id", None),
+    }
+    return any(isinstance(value, int) and value in excluded for value in ids)
+
+
+def auto_scan_prompt_hash(message_content: str, response: str) -> str:
+    return hashlib.sha256(("auto-scan\n" + message_content + "\n" + response).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def format_auto_scan_events(rows: list[tuple]) -> str:
+    lines = ["## ChaosX auto-scan events"]
+    if not rows:
+        lines.append("No auto-scan events recorded yet.")
+        return "\n".join(lines)
+    for entry_id, created_at, action, reason, confidence, actor_id, guild_id, channel_id, source_message_id, bot_message_id, content_excerpt, response_excerpt in rows:
+        safe_content = sanitize_admin_context_text(str(content_excerpt), limit=350)
+        safe_response = sanitize_admin_context_text(str(response_excerpt), limit=500)
+        lines.append(
+            f"- `#{entry_id}` — {created_at} — action `{action}` — confidence `{confidence}` — user `{actor_id}` — channel `{channel_id}`\n"
+            f"  - Reason: {sanitize_admin_context_text(str(reason), limit=220)}\n"
+            f"  - Message: {safe_content}\n"
+            f"  - Response: {safe_response}"
+            + (f"\n  - Source msg: `{source_message_id}`" if source_message_id else "")
+            + (f" · Bot msg: `{bot_message_id}`" if bot_message_id else "")
+        )
+    return "\n".join(lines)
+
+
+def format_auto_scan_notice(decision: AutoScanDecision, message: discord.Message, *, bot_message_id: int | None) -> str:
+    guild_id = message.guild.id if message.guild else None
+    channel_id = getattr(message.channel, "id", None)
+    message_link = getattr(message, "jump_url", "")
+    excerpt = sanitize_admin_context_text(message.content or "", limit=650)
+    return (
+        "## ChaosX soft warning notice\n"
+        f"- User: `<@{message.author.id}>` (`{message.author.id}`)\n"
+        f"- Channel: `<#{channel_id}>` (`{channel_id}`)\n"
+        f"- Guild: `{guild_id}`\n"
+        f"- Reason: {sanitize_admin_context_text(decision.reason, limit=220)}\n"
+        f"- Confidence: `{decision.confidence}`\n"
+        f"- Action taken: soft warning only\n"
+        + (f"- Message: {message_link}\n" if message_link else "")
+        + (f"- Warning message ID: `{bot_message_id}`\n" if bot_message_id else "")
+        + f"\n```text\n{excerpt}\n```"
+    )
+
+
+async def send_auto_scan_notice(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message, *, bot_message_id: int | None) -> None:
+    channel_id = bot.settings.auto_scan_notify_channel_id or bot.settings.automation_reminder_channel_id
+    if not channel_id:
+        return
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            return
+    if not isinstance(channel, discord.abc.Messageable):
+        return
+    for part in _chunk(format_auto_scan_notice(decision, message, bot_message_id=bot_message_id)):
+        await channel.send(part, allowed_mentions=safe_allowed_mentions())
+
+
+async def record_auto_scan_event(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message, *, bot_message_id: int | None, response: str) -> None:
+    try:
+        await bot.store.record_auto_scan_event(
+            action=decision.action,
+            reason=decision.reason,
+            confidence=decision.confidence,
+            actor_id=message.author.id,
+            guild_id=message.guild.id if message.guild else None,
+            channel_id=getattr(message.channel, "id", None),
+            source_message_id=message.id,
+            bot_message_id=bot_message_id,
+            content_excerpt=sanitize_admin_context_text(message.content or "", limit=1600),
+            response_excerpt=sanitize_admin_context_text(response, limit=4000),
+        )
+    except Exception:
+        pass
+
+
+async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
+    if not bot.settings.auto_scan_enabled or bot.user is None:
+        return False
+    if message.author.bot or getattr(message, "webhook_id", None):
+        return False
+    guild_id = message.guild.id if message.guild else None
+    channel_id = getattr(message.channel, "id", None)
+    if public_deny_reason(guild_id, bot.settings.allowed_guild_id):
+        return False
+    content = (message.content or "").strip()
+    if not content or content.startswith("/"):
+        return False
+    if auto_scan_channel_excluded(message, bot.settings):
+        return False
+    mentioned = any(user.id == bot.user.id for user in getattr(message, "mentions", []) or [])
+    if mentioned or referenced_message_id(message):
+        return False
+    try:
+        decision = classify_message(
+            content,
+            knowledge=bot.knowledge,
+            settings=bot.settings,
+            mention_count=len(getattr(message, "mentions", []) or []),
+        )
+    except Exception as exc:
+        await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan error", summary=type(exc).__name__)
+        return False
+    if not decision.acted or decision.confidence < bot.settings.auto_scan_min_confidence:
+        return False
+
+    if decision.action == "answer":
+        if not bot.settings.auto_scan_auto_answer_enabled or not await bot.store.automation_enabled(AUTO_QA_AUTOMATION_NAME):
+            return False
+        limit = bot.settings.auto_scan_answer_limit_per_user_hour
+        if limit <= 0:
+            return False
+        rate = bot.rate_limiter.check(bucket="auto_answer", user_id=message.author.id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason="auto-answer rate limited"), message, bot_message_id=None, response="")
+            return False
+        if bot.settings.auto_scan_shadow_mode:
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow auto-answer: {decision.reason}"), message, bot_message_id=None, response=decision.answer)
+            return True
+        first_sent: discord.Message | None = None
+        for i, part in enumerate(_chunk(decision.answer)):
+            content_part = ("ChaosX auto-answer\n" if i == 0 else "") + part
+            if i == 0:
+                first_sent = await message.reply(content_part, mention_author=False, allowed_mentions=safe_allowed_mentions())
+            else:
+                await message.channel.send(content_part, allowed_mentions=safe_allowed_mentions())
+        prompt_hash_value = auto_scan_prompt_hash(message.content or "", decision.answer)
+        await record_public_question_answer(
+            bot,
+            mode="auto scan",
+            actor_id=message.author.id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            source_message_id=message.id,
+            bot_message_id=first_sent.id if first_sent else None,
+            parent_bot_message_id=None,
+            question=decision.question or message.content or "",
+            answer=decision.answer,
+            prompt_hash=prompt_hash_value,
+            status="ok",
+        )
+        await record_auto_scan_event(bot, decision, message, bot_message_id=first_sent.id if first_sent else None, response=decision.answer)
+        await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer", summary=decision.reason)
+        return True
+
+    if decision.action == "soft_warning":
+        if not bot.settings.auto_scan_soft_warning_enabled or not await bot.store.automation_enabled(AUTO_WARNING_AUTOMATION_NAME):
+            return False
+        limit = bot.settings.auto_scan_warning_limit_per_user_hour
+        if limit <= 0:
+            return False
+        rate = bot.rate_limiter.check(bucket="auto_warning", user_id=message.author.id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason="soft-warning rate limited"), message, bot_message_id=None, response="")
+            return False
+        if bot.settings.auto_scan_shadow_mode:
+            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow soft-warning: {decision.reason}"), message, bot_message_id=None, response=decision.warning)
+            await send_auto_scan_notice(bot, decision, message, bot_message_id=None)
+            return True
+        sent = await message.reply(decision.warning, mention_author=False, allowed_mentions=safe_allowed_mentions())
+        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=decision.warning)
+        await send_auto_scan_notice(bot, decision, message, bot_message_id=sent.id)
+        await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning", summary=decision.reason)
+        return True
+    return False
 
 
 def extract_mention_ask_request(content: str, bot_user_id: int | None) -> str | None:
@@ -539,7 +730,8 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
-- `/admin qna action:list|search|popular [query:<text>] [limit:<n>]` — owner-only Q&A manager for successful public `/ask`, `@ChaosX`, and reply-chain questions/answers. Use `popular` to see which questions are asked most.
+- `/admin qna action:list|search|popular [query:<text>] [limit:<n>]` — owner-only Q&A manager for successful public `/ask`, `@ChaosX`, reply-chain, and auto-scan questions/answers. Use `popular` to see which questions are asked most.
+- `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for zero-token auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
 
@@ -550,11 +742,11 @@ Removed from your command surface: config dumps, rollback drafts, separate Herme
 class ChaosXBot(discord.Client):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
-        # Mention-triggered public ask needs message content, but stays passive:
-        # ChaosX only responds when its own bot mention is present and still
-        # applies the normal public /ask guild lock, rate limit, prompt cap, and
-        # safe/no-action Hermes toolset.
-        intents.message_content = settings.mention_ask_enabled
+        # Message content is only used for approved active surfaces:
+        # direct/reply asks plus the zero-token auto-scan gate. The scanner
+        # ignores other guilds, bot/webhook messages, slash-like text, and
+        # anything that is not a high-confidence local/scripted match.
+        intents.message_content = settings.mention_ask_enabled or settings.auto_scan_enabled
         super().__init__(intents=intents, allowed_mentions=safe_allowed_mentions())
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
@@ -570,6 +762,10 @@ class ChaosXBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await self.store.init()
+        await self.store.set_automation_destination(["auto_question_answering"], "source channel")
+        auto_scan_notice_channel = self.settings.auto_scan_notify_channel_id or self.settings.automation_reminder_channel_id
+        if auto_scan_notice_channel:
+            await self.store.set_automation_destination(["auto_soft_rule_warnings"], str(auto_scan_notice_channel))
         if self.settings.automation_reminder_channel_id:
             await self.store.set_automation_destination(
                 [
@@ -613,7 +809,9 @@ class ChaosXBot(discord.Client):
             await guild.leave()
 
     async def on_message(self, message: discord.Message) -> None:
-        await handle_message_ask(self, message)
+        if await handle_message_ask(self, message):
+            return
+        await handle_auto_scan(self, message)
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         await self.handle_access_reaction(payload, added=True)
@@ -767,16 +965,16 @@ async def public_gate(interaction: discord.Interaction, settings: Settings) -> b
     return True
 
 
-async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> None:
+async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.mention_ask_enabled or bot.user is None:
-        return
+        return False
     if message.author.bot or getattr(message, "webhook_id", None):
-        return
+        return False
 
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
     if public_deny_reason(guild_id, bot.settings.allowed_guild_id):
-        return
+        return False
 
     mentioned = any(user.id == bot.user.id for user in getattr(message, "mentions", []) or [])
     parent_bot_message_id = referenced_message_id(message)
@@ -788,7 +986,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> None:
     replies_to_known_chain = known_parent_turn is not None
     replies_to_bot = replies_to_known_chain or reply_resolved_to_bot(message, bot.user.id)
     if not mentioned and not replies_to_bot:
-        return
+        return False
 
     request = extract_message_ask_request(
         message.content or "",
@@ -803,7 +1001,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> None:
         else:
             guidance = "Ask me a Chaos Redux question after the mention or in your reply, like `@ChaosX how does Zombie Outbreak work?`"
         await message.reply(guidance, mention_author=False, allowed_mentions=safe_allowed_mentions())
-        return
+        return True
 
     if message.author.id == bot.settings.owner_id:
         await run_admin_ask_message(
@@ -812,16 +1010,17 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> None:
             request,
             parent_bot_message_id=parent_bot_message_id if replies_to_bot else None,
         )
-        return
+        return True
 
     if not mentioned and not replies_to_known_chain:
-        return
+        return False
     await run_public_ask_message(
         bot,
         message,
         request,
         parent_bot_message_id=parent_bot_message_id if replies_to_known_chain else None,
     )
+    return True
 
 
 async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, request: str, *, parent_bot_message_id: int | None = None) -> None:
@@ -1944,6 +2143,30 @@ def register_commands(bot: ChaosXBot) -> None:
         else:
             text = "Unknown Q&A action. Use `list`, `search`, or `popular`."
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin qna", summary=f"{action} {query}".strip())
+        for part in _chunk(text):
+            if interaction.response.is_done():
+                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            else:
+                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="autoscan", description="List recent ChaosX auto-scan actions.")
+    async def admin_autoscan(interaction: discord.Interaction, action: str = "list", limit: int = 10) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = action.lower().strip() or "list"
+        limit = max(1, min(limit, 25))
+        action_filter = ""
+        if action in {"answers", "answer"}:
+            action_filter = "answer"
+        elif action in {"warnings", "soft_warning", "warning"}:
+            action_filter = "soft_warning"
+        elif action != "list":
+            text = "Unknown auto-scan action. Use `list`, `answers`, or `warnings`."
+            await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            return
+        rows = await bot.store.list_auto_scan_events(guild_id=interaction.guild_id, limit=limit, action=action_filter)
+        text = format_auto_scan_events(rows)
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin autoscan", summary=action)
         for part in _chunk(text):
             if interaction.response.is_done():
                 await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())

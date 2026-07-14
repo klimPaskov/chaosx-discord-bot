@@ -89,6 +89,27 @@ ON question_answers(question_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_question_answers_scope
 ON question_answers(guild_id, channel_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS auto_scan_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    confidence INTEGER NOT NULL,
+    actor_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    channel_id INTEGER,
+    source_message_id INTEGER,
+    bot_message_id INTEGER,
+    content_excerpt TEXT NOT NULL,
+    response_excerpt TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auto_scan_events_scope
+ON auto_scan_events(guild_id, channel_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_auto_scan_events_action
+ON auto_scan_events(action, created_at DESC);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS question_answers_fts USING fts5(
     question,
     answer,
@@ -165,6 +186,8 @@ CREATE TABLE IF NOT EXISTS automation_config (
 DEFAULT_AUTOMATIONS = {
     "repository_index_refresh": 1,
     "question_answer_tracking": 1,
+    "auto_question_answering": 1,
+    "auto_soft_rule_warnings": 1,
     "skill_subagent_change_summary": 1,
     "playtest_reminders": 1,
     "post_playtest_result_request": 1,
@@ -175,6 +198,8 @@ DEFAULT_AUTOMATIONS = {
 AUTOMATION_DESCRIPTIONS = {
     "repository_index_refresh": "Refreshes ChaosX's local event/scenario/cluster/search index from the Chaos Redux repo.",
     "question_answer_tracking": "Stores successful public ChaosX Q&A pairs and supports /admin qna list/search/popular.",
+    "auto_question_answering": "Zero-token per-message scanner that auto-answers only clear Chaos Redux/server questions with exact local/scripted knowledge and saves Q&A.",
+    "auto_soft_rule_warnings": "Zero-token per-message scanner that gives soft warnings for obvious rule problems and reports them to the automations channel.",
     "skill_subagent_change_summary": "Would summarize changes made by agent/skill-driven work.",
     "playtest_reminders": "Sends playtest reminder messages when a playtest is scheduled.",
     "post_playtest_result_request": "Asks testers for results/observations after a playtest window.",
@@ -532,6 +557,68 @@ class Store:
             ORDER BY grouped.ask_count DESC, grouped.last_asked_at DESC
             LIMIT ?
         """
+        params.append(limit)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(sql, tuple(params))
+            return [tuple(row) for row in await cur.fetchall()]
+
+    async def record_auto_scan_event(
+        self,
+        *,
+        action: str,
+        reason: str,
+        confidence: int,
+        actor_id: int,
+        guild_id: int | None,
+        channel_id: int | None,
+        source_message_id: int | None,
+        bot_message_id: int | None,
+        content_excerpt: str,
+        response_excerpt: str,
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO auto_scan_events(
+                    created_at, action, reason, confidence, actor_id, guild_id, channel_id,
+                    source_message_id, bot_message_id, content_excerpt, response_excerpt
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso(),
+                    action[:40],
+                    reason[:500],
+                    max(0, min(100, int(confidence))),
+                    actor_id,
+                    guild_id,
+                    channel_id,
+                    source_message_id,
+                    bot_message_id,
+                    content_excerpt[:1600],
+                    response_excerpt[:4000],
+                ),
+            )
+            await db.commit()
+
+    async def list_auto_scan_events(self, *, guild_id: int | None = None, limit: int = 10, action: str = "") -> list[tuple]:
+        limit = max(1, min(limit, 50))
+        where: list[str] = []
+        params: list[object] = []
+        if guild_id is not None:
+            where.append("guild_id IS ?")
+            params.append(guild_id)
+        if action.strip():
+            where.append("action = ?")
+            params.append(action.strip()[:40])
+        sql = """
+            SELECT id, created_at, action, reason, confidence, actor_id, guild_id, channel_id,
+                   source_message_id, bot_message_id, content_excerpt, response_excerpt
+            FROM auto_scan_events
+        """
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(sql, tuple(params))
