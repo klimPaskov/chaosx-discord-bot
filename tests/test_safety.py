@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -71,6 +71,13 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.admin_ask_memory_keep_last == 20
     assert settings.reply_context_turns == 6
     assert settings.reply_memory_keep_last == 0
+
+
+def test_access_reaction_keys_use_custom_logo_and_unicode_computer():
+    settings = Settings(_env_file=None, discord_token="dummy")
+    assert access_reaction_key(SimpleNamespace(id=1525495423949864960, name="chaosx_logo"), settings) == "chaos"
+    assert access_reaction_key(SimpleNamespace(id=None, name="💻"), settings) == "mod"
+    assert access_reaction_key(SimpleNamespace(id=None, name="🌪"), settings) is None
 
 
 def test_operator_help_explains_when_to_use_admin_commands():

@@ -63,6 +63,24 @@ ISSUE_TYPES = {"bug", "crash", "enhancement", "balance", "cosmetic", "general"}
 ISSUE_TYPES_REQUIRING_LOG = {"bug", "crash"}
 
 
+def access_reaction_key(emoji: object, settings: Settings) -> str | None:
+    """Return the configured access option represented by a Discord emoji."""
+
+    emoji_id = getattr(emoji, "id", None)
+    emoji_name = getattr(emoji, "name", None)
+    if settings.access_reaction_chaos_emoji_id and emoji_id == settings.access_reaction_chaos_emoji_id:
+        return "chaos"
+    if emoji_id is None and emoji_name == settings.access_reaction_mod_emoji:
+        return "mod"
+    return None
+
+
+def access_reaction_emoji(key: str, settings: Settings) -> discord.PartialEmoji | str:
+    if key == "chaos":
+        return discord.PartialEmoji(name=settings.access_reaction_chaos_emoji_name, id=settings.access_reaction_chaos_emoji_id)
+    return settings.access_reaction_mod_emoji
+
+
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
     guild_name = interaction.guild.name if interaction.guild else None
     channel = interaction.channel
@@ -596,6 +614,104 @@ class ChaosXBot(discord.Client):
 
     async def on_message(self, message: discord.Message) -> None:
         await handle_message_ask(self, message)
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        await self.handle_access_reaction(payload, added=True)
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        await self.handle_access_reaction(payload, added=False)
+
+    async def handle_access_reaction(self, payload: discord.RawReactionActionEvent, *, added: bool) -> None:
+        if self.user is None or payload.user_id == self.user.id:
+            return
+        if payload.guild_id is None:
+            return
+        allowed_guild_id = self.settings.allowed_guild_id or self.settings.command_guild_id
+        if allowed_guild_id != payload.guild_id:
+            return
+        if payload.channel_id != self.settings.access_reaction_channel_id or payload.message_id != self.settings.access_reaction_message_id:
+            return
+        key = access_reaction_key(payload.emoji, self.settings)
+        if key is None:
+            return
+
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        member = guild.get_member(payload.user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                print(f"ChaosX access reaction member lookup failed: {type(exc).__name__}")
+                return
+
+        channel = self.get_channel(payload.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            try:
+                channel = await self.fetch_channel(payload.channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                print(f"ChaosX access reaction channel lookup failed: {type(exc).__name__}")
+                return
+        if not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+            print(f"ChaosX access reaction message lookup failed: {type(exc).__name__}")
+            return
+
+        if added:
+            try:
+                await self.sync_access_roles(member, key)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                print(f"ChaosX access reaction role update failed: {type(exc).__name__}")
+                return
+            other_key = "mod" if key == "chaos" else "chaos"
+            try:
+                await message.remove_reaction(access_reaction_emoji(other_key, self.settings), member)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                print(f"ChaosX access reaction cleanup failed: {type(exc).__name__}")
+            return
+
+        selected_key = await self.remaining_access_reaction(message, payload.user_id)
+        try:
+            await self.sync_access_roles(member, selected_key)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"ChaosX access reaction role update failed: {type(exc).__name__}")
+
+    async def remaining_access_reaction(self, message: discord.Message, user_id: int) -> str | None:
+        for reaction in message.reactions:
+            key = access_reaction_key(reaction.emoji, self.settings)
+            if key is None:
+                continue
+            try:
+                async for user in reaction.users(limit=None):
+                    if user.id == user_id:
+                        return key
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                print(f"ChaosX access reaction user lookup failed: {type(exc).__name__}")
+                return None
+        return None
+
+    async def sync_access_roles(self, member: discord.Member, selected_key: str | None) -> None:
+        guild = member.guild
+        member_role = guild.get_role(self.settings.access_reaction_member_role_id) if self.settings.access_reaction_member_role_id else None
+        modder_role = guild.get_role(self.settings.access_reaction_modder_role_id) if self.settings.access_reaction_modder_role_id else None
+        if selected_key == "mod":
+            roles_to_add = [role for role in (member_role, modder_role) if role and role not in member.roles]
+            if roles_to_add:
+                await member.add_roles(*roles_to_add, reason="ChaosX access reaction role selection")
+            return
+        if selected_key == "chaos":
+            if member_role and member_role not in member.roles:
+                await member.add_roles(member_role, reason="ChaosX access reaction role selection")
+            if modder_role and modder_role in member.roles:
+                await member.remove_roles(modder_role, reason="ChaosX access reaction role selection")
+            return
+        roles_to_remove = [role for role in (member_role, modder_role) if role and role in member.roles]
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="ChaosX access reaction role removal")
 
     async def leave_unauthorized_guilds(self) -> None:
         allowed = self.settings.allowed_guild_id or self.settings.command_guild_id

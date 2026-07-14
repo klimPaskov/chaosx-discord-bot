@@ -38,6 +38,11 @@ class Settings(BaseSettings):
                 "automation_reminder_channel_id",
                 "content_dump_channel_id",
                 "community_event_ideas_channel_id",
+                "access_reaction_channel_id",
+                "access_reaction_message_id",
+                "access_reaction_chaos_emoji_id",
+                "access_reaction_member_role_id",
+                "access_reaction_modder_role_id",
             ):
                 if data.get(key) == "":
                     data[key] = None
@@ -71,6 +76,13 @@ class Settings(BaseSettings):
     community_event_ideas_channel_id: Optional[int] = Field(default=1395464994639839356, description="Discord forum/text channel for approved /event-idea posts; blank disables auto-posting")
     automation_reminder_channel_id: Optional[int] = Field(default=1395464062367698977, description="Discord channel for automation reminders/digests")
     content_dump_channel_id: Optional[int] = Field(default=1516054706286235768, description="Discord channel for weekly image-led content dumps")
+    access_reaction_channel_id: Optional[int] = Field(default=1396027815786188890, description="Info channel for the access reaction-role message")
+    access_reaction_message_id: Optional[int] = Field(default=1526508030886154331, description="Message whose reactions control community access roles")
+    access_reaction_chaos_emoji_id: Optional[int] = Field(default=1525495423949864960, description="Custom Chaos Redux logo emoji ID for the community-only role")
+    access_reaction_chaos_emoji_name: str = Field(default="chaosx_logo", description="Custom Chaos Redux logo emoji name")
+    access_reaction_mod_emoji: str = Field(default="💻", description="Unicode computer emoji for mod-development access")
+    access_reaction_member_role_id: Optional[int] = Field(default=1526507892310675539, description="Role granted for Chaos Redux community access")
+    access_reaction_modder_role_id: Optional[int] = Field(default=1526507893837529138, description="Role granted for mod-development access")
 
     @model_validator(mode="after")
     def default_allowed_guild_to_command_guild(self):
