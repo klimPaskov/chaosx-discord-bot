@@ -41,6 +41,8 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert by_name["weekly_content_dump"][0] == 1
     assert "fresh visuals" in by_name["weekly_content_dump"][2]
     for deleted_name in {
+        "agent_draft_pr_mode",
+        "ci_failure_first_recovery",
         "stale_blocker_reminder",
         "trusted_role_direct_issue_creation",
         "weekly_project_digest",

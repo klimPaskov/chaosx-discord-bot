@@ -120,24 +120,20 @@ CREATE TABLE IF NOT EXISTS automation_config (
 
 DEFAULT_AUTOMATIONS = {
     "repository_index_refresh": 1,
-    "ci_failure_first_recovery": 1,
     "skill_subagent_change_summary": 1,
     "playtest_reminders": 1,
     "post_playtest_result_request": 1,
     "weekly_content_dump": 1,
     "release_announcement_posting": 0,
-    "agent_draft_pr_mode": 0,
 }
 
 AUTOMATION_DESCRIPTIONS = {
     "repository_index_refresh": "Refreshes ChaosX's local event/scenario/cluster/search index from the Chaos Redux repo.",
-    "ci_failure_first_recovery": "Would summarize CI failures and the first likely recovery step.",
     "skill_subagent_change_summary": "Would summarize changes made by agent/skill-driven work.",
     "playtest_reminders": "Sends playtest reminder messages when a playtest is scheduled.",
     "post_playtest_result_request": "Asks testers for results/observations after a playtest window.",
     "weekly_content_dump": "Image-led weekly content-dump post. Posts only when enough fresh visuals/assets exist.",
     "release_announcement_posting": "Reserved for release announcement posting; should stay off until explicitly used.",
-    "agent_draft_pr_mode": "Reserved mode for agent-created draft PRs; currently not a normal ChaosX workflow.",
 }
 
 
