@@ -22,7 +22,8 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     event_lines = event.splitlines()
     assert event_lines[1].startswith('- Type:')
     assert event_lines[2] == '- Evolution stages: `3`'
-    assert event_lines[3].startswith('- Status:')
+    assert event_lines[3] == '- World-end scenario: `true`'
+    assert event_lines[4].startswith('- Status:')
     assert 'Evidence:' not in event
     assert 'docs/spreadsheets' not in event
     assert 'Fully Functional' in knowledge.event('4')

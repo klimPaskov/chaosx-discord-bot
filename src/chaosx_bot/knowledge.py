@@ -200,10 +200,12 @@ class Knowledge:
         event_label = f"Event {data['event_id']}: {data['name']}" if data["event_id"] else f"Unassigned event idea: {data['name']}"
         evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
         evolution_stage_count = sum(1 for _label, text in evos if text)
+        has_world_end_scenario = bool((data["world_end"] or "").strip())
         lines = [
             f"## {event_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
             f"- Evolution stages: `{evolution_stage_count}`",
+            f"- World-end scenario: `{str(has_world_end_scenario).lower()}`",
             f"- Status: `{data['status'] or 'unknown'}`",
             f"- Cluster: `{data['cluster_id'] or 'none'}`",
             f"- Member severity: `{data['member_severity'] or 'none'}`",
