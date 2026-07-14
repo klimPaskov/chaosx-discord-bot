@@ -208,7 +208,7 @@ class Knowledge:
             f"## {event_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
             f"- Evolution stages: `{evolution_stage_count}`",
-            f"- Has world-end scenario: {'Yes' if has_world_end_scenario else 'No'}",
+            f"- Has world-end scenario: `{'Yes' if has_world_end_scenario else 'No'}`",
             f"- Status: `{data['status'] or 'unknown'}`",
             f"- Cluster: `{data['cluster_id'] or 'none'}`",
             f"- Member severity: `{data['member_severity'] or 'none'}`",
