@@ -27,6 +27,7 @@ from .storage import Store
 from .webhook_server import GitHubWebhookServer
 
 BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
+QNA_AUTOMATION_NAME = "question_answer_tracking"
 PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
 PUBLIC_ASK_DOMAIN_TERMS = {
     "chaos redux", "chaosx", "hoi4", "hearts of iron", "mod", "event", "scenario", "cluster", "mechanic",
@@ -165,6 +166,78 @@ async def fetch_message_ask_chain_context(bot: ChaosXBot, *, bot_message_id: int
         limit=bot.settings.reply_context_turns,
     )
     return format_message_ask_chain_context(rows)
+
+
+def format_qna_entries(rows: list[tuple]) -> str:
+    lines = ["## Saved ChaosX Q&A"]
+    if not rows:
+        lines.append("No saved Q&A yet.")
+        return "\n".join(lines)
+    for entry_id, created_at, mode, actor_id, guild_id, channel_id, question, answer, bot_message_id, prompt_hash_value, status in rows:
+        safe_question = sanitize_admin_context_text(str(question), limit=500)
+        safe_answer = sanitize_admin_context_text(str(answer), limit=700)
+        safe_mode = sanitize_admin_context_text(str(mode), limit=40)
+        safe_status = sanitize_admin_context_text(str(status), limit=40)
+        lines.append(
+            f"- `#{entry_id}` — {created_at} — mode `{safe_mode}` — status `{safe_status}` — asked by `{actor_id}`"
+            + (f" — bot msg `{bot_message_id}`" if bot_message_id else "")
+            + f"\n  - Q: {safe_question}\n  - A: {safe_answer}"
+        )
+    return "\n".join(lines)
+
+
+def format_popular_qna(rows: list[tuple]) -> str:
+    lines = ["## Most-asked ChaosX Q&A"]
+    if not rows:
+        lines.append("No saved Q&A yet.")
+        return "\n".join(lines)
+    for question_key, ask_count, last_asked_at, question, answer in rows:
+        safe_question = sanitize_admin_context_text(str(question), limit=500)
+        safe_answer = sanitize_admin_context_text(str(answer), limit=650)
+        lines.append(
+            f"- `{ask_count}` ask(s) — last asked `{last_asked_at}`\n"
+            f"  - Q: {safe_question}\n"
+            f"  - Latest A: {safe_answer}"
+        )
+    return "\n".join(lines)
+
+
+async def record_public_question_answer(
+    bot: ChaosXBot,
+    *,
+    mode: str,
+    actor_id: int,
+    guild_id: int | None,
+    channel_id: int | None,
+    source_message_id: int | None,
+    bot_message_id: int | None,
+    parent_bot_message_id: int | None,
+    question: str,
+    answer: str,
+    prompt_hash: str,
+    status: str = "ok",
+) -> None:
+    try:
+        if not await bot.store.automation_enabled(QNA_AUTOMATION_NAME):
+            return
+        await bot.store.record_question_answer(
+            mode=mode,
+            actor_id=actor_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            source_message_id=source_message_id,
+            bot_message_id=bot_message_id,
+            parent_bot_message_id=parent_bot_message_id,
+            question=sanitize_admin_context_text(question, limit=1600),
+            answer=sanitize_admin_context_text(answer, limit=4000),
+            prompt_hash=prompt_hash,
+            status=status,
+        )
+    except Exception as exc:
+        try:
+            await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="qna tracking error", summary=type(exc).__name__)
+        except Exception:
+            pass
 
 
 def extract_mention_ask_request(content: str, bot_user_id: int | None) -> str | None:
@@ -431,6 +504,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
+- `/admin qna action:list|search|popular [query:<text>] [limit:<n>]` — owner-only Q&A manager for successful public `/ask`, `@ChaosX`, and reply-chain questions/answers. Use `popular` to see which questions are asked most.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
 
@@ -802,6 +876,20 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
             output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
             keep_last=bot.settings.reply_memory_keep_last,
         )
+        await record_public_question_answer(
+            bot,
+            mode=command_name,
+            actor_id=message.author.id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            source_message_id=message.id,
+            bot_message_id=first_sent.id,
+            parent_bot_message_id=parent_bot_message_id,
+            question=request,
+            answer=memory_output,
+            prompt_hash=result.prompt_hash,
+            status=status,
+        )
 
 
 async def send_scripted_response(
@@ -1083,6 +1171,8 @@ async def run_hermes_command(
     use_ask_model: bool = False,
     use_operator_model: bool = False,
     max_chars_override: int | None = None,
+    qna_question: str = "",
+    qna_mode: str = "slash",
 ) -> tuple[HermesResult, str] | None:
     rate = None
     source_paths_allowed = False
@@ -1248,6 +1338,20 @@ async def run_hermes_command(
             output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
             keep_last=bot.settings.reply_memory_keep_last,
         )
+        await record_public_question_answer(
+            bot,
+            mode=qna_mode,
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            source_message_id=None,
+            bot_message_id=first_sent_id,
+            parent_bot_message_id=None,
+            question=qna_question or request,
+            answer=memory_output,
+            prompt_hash=result.prompt_hash,
+            status=status,
+        )
     return result, output
 
 
@@ -1386,7 +1490,17 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @bot.tree.command(name="ask", description="Answer a Chaos Redux question.")
     async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "public") -> None:
-        await run_hermes_command(bot, interaction, f"/ask question={question!r} visibility={visibility!r}. Answer concisely for the community; do not include internal source/debug metadata unless asked.", command_name="ask", public=visibility != "private", rate_bucket="ask", use_ask_model=True)
+        await run_hermes_command(
+            bot,
+            interaction,
+            f"/ask question={question!r} visibility={visibility!r}. Answer concisely for the community; do not include internal source/debug metadata unless asked.",
+            command_name="ask",
+            public=visibility != "private",
+            rate_bucket="ask",
+            use_ask_model=True,
+            qna_question=question,
+            qna_mode="slash",
+        )
 
     @bot.tree.command(name="event", description="Look up an event by ID or name.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
@@ -1679,6 +1793,27 @@ def register_commands(bot: ChaosXBot) -> None:
             lines.append(f"- `{name}` — enabled=`{bool(enabled)}` — destination=`{destination or 'unset'}`\n  - {description}")
         text = "\n".join(lines)
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="qna", description="List/search popular saved ChaosX Q&A.")
+    async def admin_qna(interaction: discord.Interaction, action: str = "list", query: str = "", limit: int = 10) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = action.lower().strip() or "list"
+        limit = max(1, min(limit, 25))
+        if action == "popular":
+            rows = await bot.store.list_popular_question_answers(guild_id=interaction.guild_id, limit=limit, query=query)
+            text = format_popular_qna(rows)
+        elif action in {"list", "search"}:
+            rows = await bot.store.list_question_answers(guild_id=interaction.guild_id, limit=limit, query=query)
+            text = format_qna_entries(rows)
+        else:
+            text = "Unknown Q&A action. Use `list`, `search`, or `popular`."
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin qna", summary=f"{action} {query}".strip())
+        for part in _chunk(text):
+            if interaction.response.is_done():
+                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            else:
+                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="permissions-audit", description="Audit Discord/GitHub permissions.")
     async def admin_permissions_audit(interaction: discord.Interaction) -> None:

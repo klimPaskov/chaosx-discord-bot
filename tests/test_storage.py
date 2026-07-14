@@ -1,6 +1,6 @@
 import json
 
-from chaosx_bot.storage import Store
+from chaosx_bot.storage import Store, normalize_question_key
 
 
 async def test_list_playtest_reports_returns_observations(tmp_path):
@@ -40,6 +40,9 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert "weekly_content_dump" in by_name
     assert by_name["weekly_content_dump"][0] == 1
     assert "fresh visuals" in by_name["weekly_content_dump"][2]
+    assert by_name["question_answer_tracking"][0] == 1
+    assert "/admin qna" in by_name["question_answer_tracking"][2]
+    assert await store.automation_enabled("question_answer_tracking")
     for deleted_name in {
         "agent_draft_pr_mode",
         "ci_failure_first_recovery",
@@ -129,3 +132,69 @@ async def test_message_ask_memory_is_channel_scoped_pruned_and_chainable(tmp_pat
     assert await store.list_recent_message_ask_memory(guild_id=456, channel_id=999, limit=10)
     assert await store.list_recent_message_ask_memory(guild_id=111, channel_id=789, limit=10) == []
     assert await store.list_message_ask_chain(bot_message_id=2003, guild_id=111, channel_id=789, limit=10) == []
+
+
+async def test_question_answer_log_lists_searches_and_counts_popular_questions(tmp_path):
+    store = Store(tmp_path / "chaosx-test.db")
+    await store.init()
+    assert normalize_question_key("<@123> How does Zombie Outbreak work?!") == "how does zombie outbreak work"
+
+    await store.record_question_answer(
+        mode="slash",
+        actor_id=100,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=None,
+        bot_message_id=2000,
+        parent_bot_message_id=None,
+        question="How does Zombie Outbreak work?",
+        answer="Zombie Outbreak starts a spreading crisis.",
+        prompt_hash="hash-1",
+    )
+    await store.record_question_answer(
+        mode="mention ask",
+        actor_id=101,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=1001,
+        bot_message_id=2001,
+        parent_bot_message_id=None,
+        question="how does zombie outbreak work",
+        answer="Zombie Outbreak spreads through infected states.",
+        prompt_hash="hash-2",
+    )
+    await store.record_question_answer(
+        mode="slash",
+        actor_id=102,
+        guild_id=456,
+        channel_id=999,
+        source_message_id=None,
+        bot_message_id=2002,
+        parent_bot_message_id=None,
+        question="What is Fury?",
+        answer="Fury is an event concept when documented.",
+        prompt_hash="hash-3",
+    )
+    await store.record_question_answer(
+        mode="slash",
+        actor_id=103,
+        guild_id=999,
+        channel_id=789,
+        source_message_id=None,
+        bot_message_id=2003,
+        parent_bot_message_id=None,
+        question="How does Zombie Outbreak work?",
+        answer="Other guild answer.",
+        prompt_hash="hash-4",
+    )
+
+    rows = await store.list_question_answers(guild_id=456, limit=10)
+    search_rows = await store.list_question_answers(guild_id=456, limit=10, query="Fury")
+    popular = await store.list_popular_question_answers(guild_id=456, limit=10)
+
+    assert [row[6] for row in rows] == ["What is Fury?", "how does zombie outbreak work", "How does Zombie Outbreak work?"]
+    assert len(search_rows) == 1
+    assert search_rows[0][6] == "What is Fury?"
+    assert popular[0][1] == 2
+    assert popular[0][3] == "how does zombie outbreak work"
+    assert "infected states" in popular[0][4]

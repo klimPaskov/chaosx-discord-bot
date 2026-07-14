@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -80,6 +80,8 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/admin ask request:<text>" in help_text
     assert "analyze recent channel/user messages" in help_text
     assert "recent owner/admin requests in this same channel/thread" in help_text
+    assert "/admin qna action:list|search|popular" in help_text
+    assert "which questions are asked most" in help_text
     assert "broad follow-up context" in help_text
     assert "not as per-reply chain memory" in help_text
     assert "reset context" in help_text
@@ -173,6 +175,23 @@ def test_message_reply_detection_helpers_use_referenced_bot_message():
     assert reply_resolved_to_bot(message, 999)
     assert not reply_resolved_to_bot(message, 123)
     assert referenced_message_id(cast(Any, SimpleNamespace(reference=None))) is None
+
+
+def test_qna_formatters_are_sanitized_and_show_counts():
+    entries = format_qna_entries([
+        (1, "2026-07-14T00:00:00+00:00", "mention ask", 123, 456, 789, "What about <@111111111111111111>?", "Use @everyone token=secret carefully", 222, "abcdef", "ok"),
+    ])
+    popular = format_popular_qna([
+        ("what about fury", 3, "2026-07-14T00:00:00+00:00", "What about Fury?", "Fury answer with @here token=secret"),
+    ])
+    assert "Saved ChaosX Q&A" in entries
+    assert "Most-asked ChaosX Q&A" in popular
+    assert "`3` ask(s)" in popular
+    assert "user:111111111111111111" in entries
+    assert "＠everyone" in entries
+    assert "＠here" in popular
+    assert "secret" not in entries
+    assert "secret" not in popular
 
 
 def test_public_prompt_can_include_lower_priority_reply_chain_context():
