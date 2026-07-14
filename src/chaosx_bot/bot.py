@@ -389,7 +389,7 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 
 ### Ask
 - `/ask question:<text>` — uses AI to answer any Chaos Redux question. You can also ask by directly mentioning `@ChaosX <question>`.
-- Reply to a ChaosX answer to continue that conversation. ChaosX remembers only what was discussed in that reply chain, not unrelated channel history.
+- Reply to a ChaosX answer to continue that conversation. ChaosX remembers what was discussed in that reply chain.
 
 ### Look things up
 - `/event event:<id or name>` — event catalog entry: status, type, cluster, severity, details, evolutions, and world-end scenario notes.

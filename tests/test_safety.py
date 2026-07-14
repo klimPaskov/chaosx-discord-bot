@@ -196,8 +196,8 @@ def test_community_help_uses_search_and_root_feedback_commands():
     assert "uses AI to answer any Chaos Redux question" in help_text
     assert "directly mentioning `@ChaosX <question>`" in help_text
     assert "Reply to a ChaosX answer" in help_text
-    assert "only what was discussed in that reply chain" in help_text
-    assert "not unrelated channel history" in help_text
+    assert "ChaosX remembers what was discussed in that reply chain" in help_text
+    assert "not unrelated channel history" not in help_text
     assert "world-end scenario notes" in help_text
     assert "uses AI to review a report form" in help_text
     assert "It shows your remaining asks" not in help_text
