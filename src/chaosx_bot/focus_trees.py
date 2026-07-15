@@ -39,6 +39,8 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
     """Run read-only render sessions with disposable MCP artifacts and server state."""
 
     args = shlex.split(settings.focus_mcp_args)
+    workspace_cwd = (settings.focus_tree_repo or settings.chaos_redux_repo).expanduser()
+    cwd = str(workspace_cwd) if workspace_cwd.is_dir() else None
     configured_path = settings.focus_mcp_config_path.expanduser()
     config_argument_found = False
     for index, argument in enumerate(args):
@@ -55,7 +57,7 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
     if not configured_path.is_file():
         if not config_argument_found:
             args.extend(("--config", str(configured_path)))
-        yield StdioServerParameters(command=settings.focus_mcp_command, args=args)
+        yield StdioServerParameters(command=settings.focus_mcp_command, args=args, cwd=cwd)
         return
     try:
         config = json.loads(configured_path.read_text(encoding="utf-8"))
@@ -86,7 +88,7 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
                 break
         if not replaced:
             args.extend(("--config", str(isolated_path)))
-        yield StdioServerParameters(command=settings.focus_mcp_command, args=args)
+        yield StdioServerParameters(command=settings.focus_mcp_command, args=args, cwd=cwd)
 
 
 @dataclass(frozen=True)
@@ -287,6 +289,9 @@ class FocusTreeMcpClient:
         configured = self.settings.focus_mcp_workspace_id.strip()
         if configured:
             return configured
+        tools = await session.list_tools()
+        if not any(tool.name == "hoi4.mods" for tool in tools.tools):
+            return "current"
         result = await session.call_tool("hoi4.mods", {})
         structured = _structured_content(result)
         mods = (structured.get("data") or {}).get("mods") or []

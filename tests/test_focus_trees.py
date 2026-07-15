@@ -91,6 +91,8 @@ def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
     )
     settings = Settings(
         discord_token="dummy",
+        chaos_redux_repo=tmp_path,
+        focus_tree_repo=tmp_path,
         focus_mcp_args=f"server --config {config_path}",
         focus_mcp_config_path=config_path,
     )
@@ -102,6 +104,7 @@ def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
         assert isolated["modRoots"] == ["/mods"]
         assert Path(isolated["serverStateRoot"]).is_relative_to(temporary_root)
         assert Path(isolated["workspaceStorageRoot"]).is_relative_to(temporary_root)
+        assert parameters.cwd == str(tmp_path)
 
     assert not temporary_root.exists()
 
@@ -182,6 +185,20 @@ async def test_mcp_workspace_is_discovered_by_exact_name() -> None:
     async def call_tool(*_args, **_kwargs):
         return result
 
+    async def list_tools():
+        return SimpleNamespace(tools=[SimpleNamespace(name="hoi4.mods")])
+
     session.call_tool = call_tool
+    session.list_tools = list_tools
     client = FocusTreeMcpClient(Settings(discord_token="dummy"))
     assert await client._workspace_id(cast(Any, session)) == "mod_chaos"
+
+
+@pytest.mark.asyncio
+async def test_mcp_workspace_uses_current_for_inventory_free_server() -> None:
+    async def list_tools():
+        return SimpleNamespace(tools=[SimpleNamespace(name="hoi4.gui_render")])
+
+    session = SimpleNamespace(list_tools=list_tools)
+    client = FocusTreeMcpClient(Settings(discord_token="dummy"))
+    assert await client._workspace_id(cast(Any, session)) == "current"

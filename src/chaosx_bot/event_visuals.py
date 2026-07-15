@@ -311,6 +311,9 @@ class EventVisualMcpClient:
         configured = self.settings.focus_mcp_workspace_id.strip()
         if configured:
             return configured
+        tools = await session.list_tools()
+        if not any(tool.name == "hoi4.mods" for tool in tools.tools):
+            return "current"
         payload = _structured_content(await session.call_tool("hoi4.mods", {}))
         expected = self.settings.focus_mcp_workspace_name.casefold().strip()
         workspaces = (payload.get("data") or {}).get("mods") or payload.get("workspaces") or []
