@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,7 +53,6 @@ class Knowledge:
         self.ensure_index()
         conn = connect(self.db_path)
         try:
-            meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
             docs = conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0]
             events = conn.execute("SELECT COUNT(*) FROM catalog_events").fetchone()[0]
             repeatable_events = conn.execute("SELECT COUNT(*) FROM catalog_events WHERE type LIKE '%Repeatable%'").fetchone()[0]

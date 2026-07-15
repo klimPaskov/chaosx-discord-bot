@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -9,7 +10,12 @@ import pytest
 
 from chaosx_bot.bot import ChaosXBot, register_commands
 from chaosx_bot.config import Settings
-from chaosx_bot.focus_trees import FocusTreeCatalog, FocusTreeMcpClient, read_resource_bytes
+from chaosx_bot.focus_trees import (
+    FocusTreeCatalog,
+    FocusTreeMcpClient,
+    isolated_mcp_server_parameters,
+    read_resource_bytes,
+)
 
 
 def _write(path: Path, text: str) -> None:
@@ -75,6 +81,29 @@ def test_focus_tree_command_is_registered() -> None:
     bot = ChaosXBot(Settings(discord_token="dummy", command_guild_id=None, allowed_guild_id=None))
     register_commands(bot)
     assert {command.name for command in bot.tree.get_commands()} >= {"event", "focus-tree", "event-chain", "scripted-gui"}
+
+
+def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        '{"version":1,"modRoots":["/mods"],"serverStateRoot":"/old/state","workspaceStorageRoot":"/old/workspaces"}',
+        encoding="utf-8",
+    )
+    settings = Settings(
+        discord_token="dummy",
+        focus_mcp_args=f"server --config {config_path}",
+        focus_mcp_config_path=config_path,
+    )
+
+    with isolated_mcp_server_parameters(settings) as parameters:
+        isolated_path = Path(parameters.args[parameters.args.index("--config") + 1])
+        isolated = json.loads(isolated_path.read_text(encoding="utf-8"))
+        temporary_root = isolated_path.parent
+        assert isolated["modRoots"] == ["/mods"]
+        assert Path(isolated["serverStateRoot"]).is_relative_to(temporary_root)
+        assert Path(isolated["workspaceStorageRoot"]).is_relative_to(temporary_root)
+
+    assert not temporary_root.exists()
 
 
 class _DumpResult:

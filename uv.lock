@@ -390,6 +390,7 @@ dependencies = [
     { name = "cairosvg" },
     { name = "discord-py" },
     { name = "mcp" },
+    { name = "pillow" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
 ]
@@ -407,6 +408,7 @@ requires-dist = [
     { name = "cairosvg", specifier = ">=2.7,<3" },
     { name = "discord-py", specifier = ">=2.4.0,<3" },
     { name = "mcp", specifier = ">=1.21.0,<2" },
+    { name = "pillow", specifier = ">=10,<13" },
     { name = "pydantic-settings", specifier = ">=2.6.0,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0,<9" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0,<1" },

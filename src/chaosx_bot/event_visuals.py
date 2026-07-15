@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import re
-import shlex
+import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -12,11 +13,12 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Sequence
 
 import cairosvg
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession
 from mcp.client.stdio import stdio_client
+from PIL import Image, ImageChops
 
 from .config import Settings
-from .focus_trees import _structured_content, read_resource_bytes
+from .focus_trees import _structured_content, isolated_mcp_server_parameters, read_resource_bytes
 
 EVENTS_ROOT = Path("events")
 SCRIPTED_GUI_ROOT = Path("common/scripted_guis")
@@ -29,6 +31,10 @@ CONTEXT_TYPE_RE = re.compile(r"\bcontext_type\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_
 
 class EventVisualError(RuntimeError):
     """A public event-chain or scripted-GUI render could not be produced."""
+
+
+class EmptyGuiPreviewError(EventVisualError):
+    """The MCP render succeeded but contained no useful visible interface."""
 
 
 @dataclass(frozen=True)
@@ -286,23 +292,19 @@ class EventVisualMcpClient:
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[tuple[ClientSession, str]]:
-        args = shlex.split(self.settings.focus_mcp_args)
-        config_path = self.settings.focus_mcp_config_path.expanduser()
-        if config_path and "--config" not in args:
-            args.extend(("--config", str(config_path)))
-        params = StdioServerParameters(command=self.settings.focus_mcp_command, args=args)
         timeout = self.settings.focus_mcp_timeout_seconds
         total_timeout = min(timeout * 2, 900)
         async with asyncio.timeout(total_timeout):
-            with open(os.devnull, "w", encoding="utf-8") as errlog:
-                async with stdio_client(params, errlog=errlog) as (read, write):
-                    async with ClientSession(
-                        read,
-                        write,
-                        read_timeout_seconds=timedelta(seconds=timeout),
-                    ) as session:
-                        await session.initialize()
-                        yield session, await self._workspace_id(session)
+            with isolated_mcp_server_parameters(self.settings) as params:
+                with open(os.devnull, "w", encoding="utf-8") as errlog:
+                    async with stdio_client(params, errlog=errlog) as (read, write):
+                        async with ClientSession(
+                            read,
+                            write,
+                            read_timeout_seconds=timedelta(seconds=timeout),
+                        ) as session:
+                            await session.initialize()
+                            yield session, await self._workspace_id(session)
 
     async def _workspace_id(self, session: ClientSession) -> str:
         configured = self.settings.focus_mcp_workspace_id.strip()
@@ -326,6 +328,7 @@ class EventVisualMcpClient:
         workspace_id: str,
         record: EventChainRecord,
     ) -> bytes:
+        render_nodes = min(240, max(self.settings.event_chain_max_nodes, len(record.event_keys) * 3))
         payload = _structured_content(
             await session.call_tool(
                 "hoi4.event_render",
@@ -338,19 +341,44 @@ class EventVisualMcpClient:
                     },
                     "direction": "both",
                     "maxDepth": self.settings.event_chain_max_depth,
-                    "maxNodes": self.settings.event_chain_max_nodes,
+                    "maxNodes": render_nodes,
                     "expandHelpers": False,
                     "includeHtml": False,
                     "refresh": False,
                 },
             )
         )
-        artifact = _artifact(payload, "image/png")
-        return await read_resource_bytes(
+        artifact = next(
+            (
+                item
+                for item in payload.get("artifacts") or []
+                if isinstance(item, dict)
+                and item.get("mimeType") == "application/json"
+                and item.get("uri")
+                and not str(item.get("name") or "").endswith("-manifest.json")
+            ),
+            None,
+        )
+        if artifact is None:
+            raise EventVisualError("MCP event render did not return authoritative graph data")
+        raw = await read_resource_bytes(
             session,
             str(artifact["uri"]),
             max_bytes=self.settings.focus_tree_max_attachment_bytes,
-            expected_mime="image/png",
+            expected_mime="application/json",
+        )
+        try:
+            graph = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EventVisualError("MCP event graph data is invalid") from exc
+        if not isinstance(graph, dict):
+            raise EventVisualError("MCP event graph data is invalid")
+        return await asyncio.to_thread(
+            _render_compact_event_chain,
+            graph,
+            record,
+            self.settings.event_chain_graphviz_command,
+            self.settings.focus_tree_max_attachment_bytes,
         )
 
     async def _render_gui_records(
@@ -368,6 +396,8 @@ class EventVisualMcpClient:
                 try:
                     png = await self._render_gui(session, workspace_id, record)
                     self._gui_cache[key] = png
+                except EmptyGuiPreviewError:
+                    continue
                 except Exception:
                     failed += 1
                     continue
@@ -391,9 +421,11 @@ class EventVisualMcpClient:
                     "scenario": {
                         "id": "discord-preview",
                         "resolution": {"width": width, "height": height},
-                        "state": "normal",
+                        "state": "active",
+                        "scriptedGui": {record.gui_id: True},
+                        "visibility": {record.window_name: True, record.gui_id: True},
                     },
-                    "states": ["normal"],
+                    "states": ["active"],
                     "resolutions": [{"width": width, "height": height, "uiScale": 1.0}],
                 },
             )
@@ -407,7 +439,7 @@ class EventVisualMcpClient:
         )
         output = io.BytesIO()
         cairosvg.svg2png(bytestring=svg, write_to=output, output_width=width, output_height=height)
-        png = output.getvalue()
+        png = _crop_and_scale_gui_preview(output.getvalue(), width, height)
         if not png.startswith(b"\x89PNG\r\n\x1a\n"):
             raise EventVisualError("MCP scripted-GUI preview did not convert to PNG")
         if len(png) > self.settings.focus_tree_max_attachment_bytes:
@@ -434,6 +466,145 @@ class EventVisualMcpClient:
             self.settings.scripted_gui_preview_width,
             self.settings.scripted_gui_preview_height,
         )
+
+
+def _render_compact_event_chain(
+    graph: dict[str, Any],
+    record: EventChainRecord,
+    graphviz_command: str,
+    max_bytes: int,
+) -> bytes:
+    raw_nodes = graph.get("nodes") or []
+    raw_edges = graph.get("edges") or []
+    nodes = {
+        str(node.get("id")): node
+        for node in raw_nodes
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    }
+    wanted = {f"event:{event_key}" for event_key in record.event_keys}
+    event_nodes = {node_id: nodes[node_id] for node_id in wanted if node_id in nodes}
+    if not event_nodes:
+        raise EventVisualError("MCP event graph contains no package events")
+
+    adjacency: dict[str, set[str]] = {}
+    for edge in raw_edges:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("from") or "")
+        target = str(edge.get("to") or "")
+        if source in nodes and target in nodes:
+            adjacency.setdefault(source, set()).add(target)
+
+    projected: set[tuple[str, str]] = set()
+    for source in event_nodes:
+        pending = [(target, 0) for target in adjacency.get(source, ())]
+        visited: set[str] = set()
+        while pending:
+            target, depth = pending.pop()
+            if target in visited or depth > 5:
+                continue
+            visited.add(target)
+            if target in event_nodes:
+                if target != source:
+                    projected.add((source, target))
+                continue
+            if str(nodes.get(target, {}).get("kind") or "") == "event":
+                continue
+            pending.extend((next_target, depth + 1) for next_target in adjacency.get(target, ()))
+
+    title = f"{record.label} — event flow"
+    subtitle = f"{len(event_nodes)} events • {len(projected)} internal links • options/helpers collapsed"
+    degree = max((sum(1 for source, _ in projected if source == node_id) for node_id in event_nodes), default=0)
+    use_force_layout = len(event_nodes) > 20 or degree > 8
+    layout_attributes = (
+        'layout=sfdp, overlap=prism, splines=true, sep="+18", K=1.1, repulsiveforce=1.8, '
+        if use_force_layout
+        else 'rankdir=LR, splines=ortho, concentrate=true, nodesep="0.32", ranksep="0.62", '
+    )
+    dot: list[str] = [
+        "digraph event_chain {",
+        f'graph [bgcolor="#111923", {layout_attributes}pad="0.28", outputorder=edgesfirst, '
+        'fontname="DejaVu Sans", fontcolor="#f4f6f8", fontsize=22, labelloc=t, '
+        f'label={json.dumps(title + chr(10) + subtitle, ensure_ascii=False)}];',
+        'node [shape=box, style="rounded,filled", fillcolor="#1d2a38", color="#d9a928", '
+        'fontcolor="#f4f6f8", penwidth=1.6, fontname="DejaVu Sans", fontsize=13, margin="0.14,0.09"];',
+        'edge [color="#7890a6", penwidth=1.4, arrowsize=0.72];',
+    ]
+    primary = f"event:{record.primary_event_key}"
+    for node_id, node in sorted(event_nodes.items(), key=lambda item: _event_sort_key(item[0])):
+        event_key = str(node.get("eventId") or node_id.removeprefix("event:"))
+        label = event_key.removeprefix("chaosx.")
+        metadata_value = node.get("metadata")
+        metadata: dict[str, Any] = metadata_value if isinstance(metadata_value, dict) else {}
+        attributes = [f"label={json.dumps(label, ensure_ascii=False)}"]
+        if node_id == primary:
+            attributes.extend(('fillcolor="#6b481d"', 'penwidth=2.4'))
+        elif metadata.get("hidden") is True:
+            attributes.extend(('fillcolor="#29313b"', 'style="rounded,filled,dashed"'))
+        dot.append(f"{json.dumps(node_id)} [{', '.join(attributes)}];")
+    for source, target in sorted(projected):
+        dot.append(f"{json.dumps(source)} -> {json.dumps(target)};")
+    dot.append("}")
+    try:
+        command = [graphviz_command]
+        if use_force_layout:
+            command.append("-Ksfdp")
+        command.extend(("-Tpng", "-Gdpi=144", "-Gsize=18,12"))
+        completed = subprocess.run(
+            command,
+            input="\n".join(dot).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EventVisualError("Compact event-chain rendering failed") from exc
+    png = completed.stdout
+    if completed.returncode != 0 or not png.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise EventVisualError("Compact event-chain rendering failed")
+    if len(png) > max_bytes:
+        raise EventVisualError("Compact event-chain image exceeds the Discord upload limit")
+    return png
+
+
+def _event_sort_key(node_id: str) -> tuple[Any, ...]:
+    parts = re.split(r"(\d+)", node_id.casefold())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def _crop_and_scale_gui_preview(png: bytes, max_width: int, max_height: int) -> bytes:
+    try:
+        image = Image.open(io.BytesIO(png)).convert("RGBA")
+    except Exception as exc:
+        raise EventVisualError("MCP scripted-GUI preview PNG is invalid") from exc
+    background = Image.new("RGBA", image.size, image.getpixel((image.width - 1, image.height - 1)))
+    difference = ImageChops.difference(image, background).convert("L")
+    mask = difference.point([0 if value <= 8 else 255 for value in range(256)])
+    content_top = min(32, image.height)
+    content_histogram = mask.crop((0, content_top, image.width, image.height)).histogram()
+    visible_pixels = content_histogram[255] if len(content_histogram) > 255 else 0
+    if visible_pixels < 500:
+        raise EmptyGuiPreviewError("Scripted-GUI preview contains no useful visible interface")
+    bounds = mask.getbbox()
+    if bounds is None:
+        raise EmptyGuiPreviewError("Scripted-GUI preview is blank")
+    left, top, right, bottom = bounds
+    padding = 14
+    crop_box = (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(image.width, right + padding),
+        min(image.height, bottom + padding),
+    )
+    cropped = image.crop(crop_box)
+    scale = min(max_width / cropped.width, max_height / cropped.height, 4.0)
+    if scale != 1.0:
+        target = (max(1, round(cropped.width * scale)), max(1, round(cropped.height * scale)))
+        cropped = cropped.resize(target, Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    cropped.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def _artifact(payload: dict[str, Any], mime_type: str) -> dict[str, Any]:

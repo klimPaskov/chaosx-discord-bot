@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     event_chain_graphs_enabled: bool = Field(default=True, description="Attach MCP-rendered event-chain diagrams to event lookups")
     event_chain_max_depth: int = Field(default=2, ge=1, le=12)
     event_chain_max_nodes: int = Field(default=60, ge=1, le=240)
+    event_chain_graphviz_command: str = Field(default="dot", min_length=1, max_length=256)
     scripted_gui_previews_enabled: bool = Field(default=True, description="Attach MCP-rendered offline scripted-GUI previews")
     scripted_gui_max_previews: int = Field(default=2, ge=1, le=6)
     scripted_gui_preview_width: int = Field(default=1280, ge=320, le=3840)

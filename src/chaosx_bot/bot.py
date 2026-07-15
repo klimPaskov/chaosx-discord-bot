@@ -5,8 +5,7 @@ import hashlib
 import io
 import json
 import re
-from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -1650,6 +1649,12 @@ async def send_scripted_gui_lookup(bot: ChaosXBot, interaction: discord.Interact
         )
         await interaction.followup.send("Scripted-GUI previews are unavailable right now.", ephemeral=False, allowed_mentions=safe_allowed_mentions())
         return
+    if not previews and not failed:
+        await interaction.followup.send(
+            "The matched scripted GUI has no useful visible offline preview. It likely depends on in-game context or a hardcoded parent window.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
     for preview in previews:
         await interaction.followup.send(
             f"### Scripted GUI — {preview.record.label}\n`{preview.record.window_name}` · *Offline MCP preview; in-game rendering may differ.*",

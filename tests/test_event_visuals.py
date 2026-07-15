@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import base64
+import io
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from PIL import Image, ImageDraw
 
 from chaosx_bot.config import Settings
 from chaosx_bot.event_visuals import (
     EventChainCatalog,
     EventChainRecord,
+    EmptyGuiPreviewError,
     EventVisualMcpClient,
     ScriptedGuiCatalog,
     ScriptedGuiRecord,
+    _crop_and_scale_gui_preview,
 )
 
 
@@ -72,6 +76,7 @@ class FakeSession:
                     "mimeType": self.mime_type,
                     "uri": "hoi4-agent://workspace/test/artifact/render",
                     "size": len(self.data),
+                    "name": "event-neighborhood.json" if self.mime_type == "application/json" else "render.svg",
                 }
             ]
         )
@@ -137,21 +142,38 @@ def test_scripted_gui_catalog_discovers_windows_and_event_matches(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_event_chain_render_calls_mcp_and_reads_png() -> None:
-    png = b"\x89PNG\r\n\x1a\nchain"
-    session = FakeSession(mime_type="image/png", data=png)
+async def test_event_chain_render_calls_mcp_and_builds_compact_png() -> None:
+    graph = b'''{
+      "nodes": [
+        {"id":"event:chaosx.nr7.1","kind":"event","eventId":"chaosx.nr7.1","metadata":{}},
+        {"id":"option:one","kind":"option"},
+        {"id":"event:chaosx.nr7.2","kind":"event","eventId":"chaosx.nr7.2","metadata":{}}
+      ],
+      "edges": [
+        {"from":"event:chaosx.nr7.1","to":"option:one"},
+        {"from":"option:one","to":"event:chaosx.nr7.2"}
+      ]
+    }'''
+    session = FakeSession(mime_type="application/json", data=graph)
     settings = Settings(discord_token="dummy", event_chain_max_depth=2, event_chain_max_nodes=40)
     client = EventVisualMcpClient(settings)
-    record = EventChainRecord("events/007_fury.txt", "Fury", 7, ("chaosx.nr7.1",), 1, 2)
+    record = EventChainRecord(
+        "events/007_fury.txt",
+        "Fury",
+        7,
+        ("chaosx.nr7.1", "chaosx.nr7.2"),
+        1,
+        2,
+    )
 
     rendered = await client._render_event_chain(cast(Any, session), "workspace", record)
 
-    assert rendered == png
+    assert rendered.startswith(b"\x89PNG\r\n\x1a\n")
     assert session.calls[0][0] == "hoi4.event_render"
     arguments = session.calls[0][1]
     assert arguments["selector"] == {
         "kind": "manifest",
-        "manifest": {"eventIds": ["chaosx.nr7.1"]},
+        "manifest": {"eventIds": ["chaosx.nr7.1", "chaosx.nr7.2"]},
     }
     assert arguments["maxDepth"] == 2
     assert arguments["maxNodes"] == 40
@@ -159,7 +181,10 @@ async def test_event_chain_render_calls_mcp_and_reads_png() -> None:
 
 @pytest.mark.asyncio
 async def test_scripted_gui_render_reads_svg_and_converts_to_png() -> None:
-    svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="320" height="200" fill="#123456"/></svg>'
+    svg = b'''<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200">
+      <rect width="320" height="200" fill="#111923"/>
+      <rect x="20" y="50" width="220" height="100" fill="#345678" stroke="#d9a928" stroke-width="4"/>
+    </svg>'''
     session = FakeSession(mime_type="image/svg+xml", data=svg, text=True)
     settings = Settings(discord_token="dummy", scripted_gui_preview_width=320, scripted_gui_preview_height=200)
     client = EventVisualMcpClient(settings)
@@ -183,5 +208,18 @@ async def test_scripted_gui_render_reads_svg_and_converts_to_png() -> None:
     assert arguments["scenario"] == {
         "id": "discord-preview",
         "resolution": {"width": 320, "height": 200},
-        "state": "normal",
+        "state": "active",
+        "scriptedGui": {"fury_gui": True},
+        "visibility": {"fury_window": True, "fury_gui": True},
     }
+    assert arguments["states"] == ["active"]
+
+
+def test_empty_scripted_gui_preview_is_suppressed() -> None:
+    image = Image.new("RGB", (320, 200), "#111923")
+    ImageDraw.Draw(image).rectangle((8, 5, 220, 24), outline="#d9a928", width=2)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+
+    with pytest.raises(EmptyGuiPreviewError):
+        _crop_and_scale_gui_preview(output.getvalue(), 320, 200)

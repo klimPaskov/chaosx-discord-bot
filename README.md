@@ -62,6 +62,8 @@ cp .env.example .env
 uv run chaosx-bot
 ```
 
+Event-chain rendering also requires Graphviz (`dot`; on Debian/Ubuntu: `sudo apt install graphviz`).
+
 Focus-tree, event-chain, and scripted-GUI rendering also need the HOI4 Agent Tools MCP server configured with the parent directory that contains the Chaos Redux mod:
 
 ```bash
@@ -69,7 +71,7 @@ npx -y -p hoi4-agent-tools@1.2.0 hoi4-agent-tools-setup --init --mod-root "/path
 npx -y -p hoi4-agent-tools@1.2.0 hoi4-agent-tools-setup --diagnose
 ```
 
-ChaosX launches that MCP server over stdio only when a visual is needed. The command, config path, workspace name/ID, timeout, graph limits, event-chain bounds, scripted-GUI preview size, render scale, and Discord attachment cap are configurable in `.env.example`. Scripted-GUI output is an offline MCP approximation, not an in-game screenshot.
+ChaosX launches that MCP server over stdio only when a visual is needed. Each read-only render session uses disposable MCP state/artifact storage, preventing bot previews from filling the server's persistent artifact-retention budget. Event-chain PNGs collapse option/helper nodes into compact event-to-event flows. Scripted-GUI previews force the matched window visible, crop away empty canvas, and suppress renders with no useful visible interface. The command, config path, workspace name/ID, timeout, graph limits, event-chain bounds, Graphviz command, scripted-GUI preview size, render scale, and Discord attachment cap are configurable in `.env.example`. Scripted-GUI output is an offline MCP approximation, not an in-game screenshot.
 
 Create the Discord app/bot in the Discord Developer Portal, copy the bot token into `.env`, and invite the bot to the Chaos Redux server with `applications.commands` plus the chosen bot permission set. Current maximum-control invite uses permission integer `8`.
 

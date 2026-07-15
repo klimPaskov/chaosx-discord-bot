@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import re
 import shlex
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -29,6 +32,61 @@ COUNTRY_TAG_DEF_RE = re.compile(r'^\s*([A-Z][A-Z0-9_]{1,7})\s*=\s*"countries/([^
 
 class FocusTreeError(RuntimeError):
     """Internal focus-tree failure whose details must not be posted publicly."""
+
+
+@contextmanager
+def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerParameters]:
+    """Run read-only render sessions with disposable MCP artifacts and server state."""
+
+    args = shlex.split(settings.focus_mcp_args)
+    configured_path = settings.focus_mcp_config_path.expanduser()
+    config_argument_found = False
+    for index, argument in enumerate(args):
+        if argument == "--config":
+            if index + 1 >= len(args):
+                raise FocusTreeError("HOI4 Agent Tools MCP --config argument has no value")
+            configured_path = Path(args[index + 1]).expanduser()
+            config_argument_found = True
+            break
+        if argument.startswith("--config="):
+            configured_path = Path(argument.split("=", 1)[1]).expanduser()
+            config_argument_found = True
+            break
+    if not configured_path.is_file():
+        if not config_argument_found:
+            args.extend(("--config", str(configured_path)))
+        yield StdioServerParameters(command=settings.focus_mcp_command, args=args)
+        return
+    try:
+        config = json.loads(configured_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FocusTreeError("HOI4 Agent Tools MCP config could not be isolated") from exc
+    if not isinstance(config, dict):
+        raise FocusTreeError("HOI4 Agent Tools MCP config is invalid")
+    with tempfile.TemporaryDirectory(prefix="chaosx-hoi4-mcp-") as temporary:
+        root = Path(temporary)
+        isolated = {
+            **config,
+            "serverStateRoot": str(root / "state"),
+            "workspaceStorageRoot": str(root / "workspaces"),
+        }
+        isolated_path = root / "config.json"
+        isolated_path.write_text(json.dumps(isolated), encoding="utf-8")
+        replaced = False
+        for index, argument in enumerate(args):
+            if argument == "--config":
+                if index + 1 >= len(args):
+                    raise FocusTreeError("HOI4 Agent Tools MCP --config argument has no value")
+                args[index + 1] = str(isolated_path)
+                replaced = True
+                break
+            if argument.startswith("--config="):
+                args[index] = f"--config={isolated_path}"
+                replaced = True
+                break
+        if not replaced:
+            args.extend(("--config", str(isolated_path)))
+        yield StdioServerParameters(command=settings.focus_mcp_command, args=args)
 
 
 @dataclass(frozen=True)
@@ -206,27 +264,23 @@ class FocusTreeMcpClient:
         return FocusTreeRenderBatch(tuple(graphs), len(selected), failed)
 
     async def _render_uncached(self, records: Sequence[FocusTreeRecord]) -> tuple[list[FocusTreeGraph], int]:
-        args = shlex.split(self.settings.focus_mcp_args)
-        config_path = self.settings.focus_mcp_config_path.expanduser()
-        if config_path and "--config" not in args:
-            args.extend(("--config", str(config_path)))
-        params = StdioServerParameters(command=self.settings.focus_mcp_command, args=args)
         rendered: list[FocusTreeGraph] = []
         failed = 0
         timeout = self.settings.focus_mcp_timeout_seconds
         async with asyncio.timeout(timeout):
-            with open(os.devnull, "w", encoding="utf-8") as errlog:
-                async with stdio_client(params, errlog=errlog) as (read, write):
-                    async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=timeout)) as session:
-                        await session.initialize()
-                        workspace_id = await self._workspace_id(session)
-                        for record in records:
-                            try:
-                                png = await self._render_one(session, workspace_id, record)
-                            except Exception:
-                                failed += 1
-                                continue
-                            rendered.append(FocusTreeGraph(record, png))
+            with isolated_mcp_server_parameters(self.settings) as params:
+                with open(os.devnull, "w", encoding="utf-8") as errlog:
+                    async with stdio_client(params, errlog=errlog) as (read, write):
+                        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=timeout)) as session:
+                            await session.initialize()
+                            workspace_id = await self._workspace_id(session)
+                            for record in records:
+                                try:
+                                    png = await self._render_one(session, workspace_id, record)
+                                except Exception:
+                                    failed += 1
+                                    continue
+                                rendered.append(FocusTreeGraph(record, png))
         return rendered, failed
 
     async def _workspace_id(self, session: ClientSession) -> str:
