@@ -21,6 +21,12 @@ from .community_notes import (
     write_suggestion_note,
 )
 from .config import Settings
+from .event_visuals import (
+    EventChainCatalog,
+    EventVisualError,
+    EventVisualMcpClient,
+    ScriptedGuiCatalog,
+)
 from .focus_trees import FocusTreeCatalog, FocusTreeError, FocusTreeMcpClient, FocusTreeRecord
 from .vault_index import refresh_vault_indexes
 from .hermes_bridge import (
@@ -829,8 +835,10 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - Reply to a ChaosX answer to continue that conversation. ChaosX remembers what was discussed in that reply chain.
 
 ### Look things up
-- `/event event:<id or name>` — event status, details, evolutions, and world-end scenario notes; implemented focus-tree graphs are attached automatically.
+- `/event event:<id or name>` — event status, details, evolutions, and world-end scenario notes; related focus trees, event chains, and scripted-GUI previews are attached automatically.
 - `/focus-tree query:<event, country tag, country, or tree name>` — find and view implemented Chaos Redux focus-tree graphs.
+- `/event-chain query:<event id, name, or internal event id>` — view an MCP-rendered event-chain diagram.
+- `/scripted-gui query:<event, window, or scripted-GUI name>` — view offline MCP previews of Chaos Redux scripted GUIs.
 - `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry.
 - `/cluster cluster:<id or name>` — event cluster summary with member event names.
 - `/status` — project catalog totals and event breakdowns.
@@ -893,8 +901,12 @@ class ChaosXBot(discord.Client):
         self.store = Store(settings.db_path)
         self.rate_limiter = FixedWindowRateLimiter()
         self.knowledge = Knowledge(settings.chaos_redux_repo, settings.db_path, settings.obsidian_vault_path)
-        self.focus_tree_catalog = FocusTreeCatalog(settings.focus_tree_repo or settings.chaos_redux_repo)
+        visual_repo = settings.focus_tree_repo or settings.chaos_redux_repo
+        self.focus_tree_catalog = FocusTreeCatalog(visual_repo)
         self.focus_tree_mcp = FocusTreeMcpClient(settings)
+        self.event_chain_catalog = EventChainCatalog(visual_repo)
+        self.scripted_gui_catalog = ScriptedGuiCatalog(visual_repo)
+        self.event_visual_mcp = EventVisualMcpClient(settings)
         self.webhook_server = GitHubWebhookServer(
             store=self.store,
             secret=settings.github_webhook_secret,
@@ -1406,7 +1418,7 @@ async def send_scripted_response(
                 command=f"{command_name} attachment error",
                 summary=type(exc).__name__,
             )
-            await interaction.followup.send("Focus-tree graphs are unavailable right now.", ephemeral=not public, allowed_mentions=safe_allowed_mentions())
+            await interaction.followup.send("Related visual attachments are unavailable right now.", ephemeral=not public, allowed_mentions=safe_allowed_mentions())
     if owner_render and public and interaction.user.id == bot.settings.owner_id:
         try:
             owner_output = owner_render()
@@ -1490,6 +1502,170 @@ async def send_focus_tree_lookup(bot: ChaosXBot, interaction: discord.Interactio
         lines.append(f"- **{record.label}** · `{record.tree_id}`{event}")
     await interaction.followup.send("\n".join(lines), ephemeral=False, allowed_mentions=safe_allowed_mentions())
     await send_focus_tree_graphs(bot, interaction, records)
+
+
+async def send_related_event_visuals(bot: ChaosXBot, interaction: discord.Interaction, event_id: int) -> None:
+    chain = bot.event_chain_catalog.for_event(event_id) if bot.settings.event_chain_graphs_enabled else None
+    guis = bot.scripted_gui_catalog.for_event(event_id) if bot.settings.scripted_gui_previews_enabled else []
+    if chain is None and not guis:
+        return
+    try:
+        visuals = await bot.event_visual_mcp.render_related(chain, guis)
+    except EventVisualError as exc:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="related event visuals error",
+            summary=type(exc.__cause__ or exc).__name__,
+        )
+        await interaction.followup.send(
+            "Event-chain and scripted-GUI previews are unavailable right now.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    if visuals.chain is not None:
+        await interaction.followup.send(
+            f"### Event chain — {visuals.chain.record.label}",
+            file=discord.File(io.BytesIO(visuals.chain.png), filename=visuals.chain.record.filename),
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    elif visuals.chain_failed:
+        await interaction.followup.send(
+            "The related event-chain graph could not be rendered.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    for preview in visuals.guis:
+        await interaction.followup.send(
+            f"### Scripted GUI — {preview.record.label}\n*Offline MCP preview; in-game rendering may differ.*",
+            file=discord.File(io.BytesIO(preview.png), filename=preview.record.filename),
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    hidden = max(0, len(guis) - bot.settings.scripted_gui_max_previews)
+    if hidden:
+        await interaction.followup.send(
+            f"Showing `{bot.settings.scripted_gui_max_previews}` of `{len(guis)}` related scripted GUIs. Use `/scripted-gui` to view a specific window.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    if visuals.failed_guis:
+        await interaction.followup.send(
+            f"`{visuals.failed_guis}` scripted-GUI preview(s) could not be rendered.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+
+async def send_event_chain_lookup(bot: ChaosXBot, interaction: discord.Interaction, query: str) -> None:
+    if not await public_gate(interaction, bot.settings):
+        return
+    limit = bot.settings.public_scripted_limit_per_hour
+    rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
+    if not rate.allowed:
+        minutes = max(1, rate.retry_after_seconds // 60)
+        await interaction.response.send_message(f"Rate limit hit for ChaosX scripted commands. Try again in about {minutes} minute(s).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=False, thinking=True)
+    record = bot.event_chain_catalog.find(query)
+    await bot.store.audit(
+        actor_id=interaction.user.id,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        command="chaosx event-chain",
+        summary=query,
+    )
+    safe_query = query.replace("`", "'").replace("\n", " ")[:120]
+    if record is None:
+        await interaction.followup.send(
+            f"No viewable event chain matched `{safe_query}`.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    try:
+        graph = await bot.event_visual_mcp.render_event_chain(record)
+    except EventVisualError as exc:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="event chain render error",
+            summary=type(exc.__cause__ or exc).__name__,
+        )
+        await interaction.followup.send("Event-chain graphs are unavailable right now.", ephemeral=False, allowed_mentions=safe_allowed_mentions())
+        return
+    await interaction.followup.send(
+        f"### Event chain — {record.label}\nIncludes `{len(record.event_keys)}` event definition(s) from this event package.",
+        file=discord.File(io.BytesIO(graph.png), filename=record.filename),
+        ephemeral=False,
+        allowed_mentions=safe_allowed_mentions(),
+    )
+
+
+async def send_scripted_gui_lookup(bot: ChaosXBot, interaction: discord.Interaction, query: str) -> None:
+    if not await public_gate(interaction, bot.settings):
+        return
+    limit = bot.settings.public_scripted_limit_per_hour
+    rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
+    if not rate.allowed:
+        minutes = max(1, rate.retry_after_seconds // 60)
+        await interaction.response.send_message(f"Rate limit hit for ChaosX scripted commands. Try again in about {minutes} minute(s).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=False, thinking=True)
+    records = bot.scripted_gui_catalog.search(query)
+    await bot.store.audit(
+        actor_id=interaction.user.id,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        command="chaosx scripted-gui",
+        summary=query,
+    )
+    safe_query = query.replace("`", "'").replace("\n", " ")[:120]
+    if not records:
+        await interaction.followup.send(
+            f"No scripted GUI matched `{safe_query}`.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    selected = records[: bot.settings.scripted_gui_max_previews]
+    lines = [f"## Scripted GUIs matching `{safe_query}`"]
+    for record in selected:
+        event = f" · Event `{record.event_id}`" if record.event_id is not None else ""
+        lines.append(f"- **{record.label}** · `{record.window_name}`{event}")
+    await interaction.followup.send("\n".join(lines), ephemeral=False, allowed_mentions=safe_allowed_mentions())
+    try:
+        previews, failed = await bot.event_visual_mcp.render_scripted_guis(records)
+    except EventVisualError as exc:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="scripted gui render error",
+            summary=type(exc.__cause__ or exc).__name__,
+        )
+        await interaction.followup.send("Scripted-GUI previews are unavailable right now.", ephemeral=False, allowed_mentions=safe_allowed_mentions())
+        return
+    for preview in previews:
+        await interaction.followup.send(
+            f"### Scripted GUI — {preview.record.label}\n`{preview.record.window_name}` · *Offline MCP preview; in-game rendering may differ.*",
+            file=discord.File(io.BytesIO(preview.png), filename=preview.record.filename),
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    hidden = max(0, len(records) - bot.settings.scripted_gui_max_previews)
+    if hidden:
+        await interaction.followup.send(
+            f"Showing `{len(selected)}` of `{len(records)}` matches. Use the exact window or scripted-GUI name to narrow it down.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    if failed:
+        await interaction.followup.send(f"`{failed}` scripted-GUI preview(s) could not be rendered.", ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
 
 SECRETISH_PATTERN = re.compile(r"(?i)(token|password|secret|api[_-]?key|authorization|cookie)\s*[:=]\s*\S+")
@@ -2067,13 +2243,14 @@ def register_commands(bot: ChaosXBot) -> None:
             qna_mode="slash",
         )
 
-    @bot.tree.command(name="event", description="Look up an event by ID or name and show related focus trees.")
+    @bot.tree.command(name="event", description="Look up an event and show its chain, focus trees, and scripted GUIs.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
-        async def show_event_focus_trees() -> None:
+        async def show_event_visuals() -> None:
             event_id = bot.knowledge.resolve_event_id(event)
             if event_id is None:
                 return
             await send_focus_tree_graphs(bot, interaction, bot.focus_tree_catalog.for_event(event_id))
+            await send_related_event_visuals(bot, interaction, event_id)
 
         await send_scripted_response(
             bot,
@@ -2082,12 +2259,20 @@ def register_commands(bot: ChaosXBot) -> None:
             summary=event,
             render=lambda: bot.knowledge.event(event, view),
             owner_render=lambda: bot.knowledge.event(event, view, show_evidence=True),
-            after_send=show_event_focus_trees,
+            after_send=show_event_visuals,
         )
 
     @bot.tree.command(name="focus-tree", description="View a Chaos Redux focus tree by event, country tag, country, or tree name.")
     async def chaosx_focus_tree(interaction: discord.Interaction, query: str) -> None:
         await send_focus_tree_lookup(bot, interaction, query)
+
+    @bot.tree.command(name="event-chain", description="View an MCP-rendered Chaos Redux event-chain diagram.")
+    async def chaosx_event_chain(interaction: discord.Interaction, query: str) -> None:
+        await send_event_chain_lookup(bot, interaction, query)
+
+    @bot.tree.command(name="scripted-gui", description="View an offline MCP preview of a Chaos Redux scripted GUI.")
+    async def chaosx_scripted_gui(interaction: discord.Interaction, query: str) -> None:
+        await send_scripted_gui_lookup(bot, interaction, query)
 
     @bot.tree.command(name="scenario", description="Look up a triggerable scenario by SCN ID or name.")
     async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:

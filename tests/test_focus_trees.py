@@ -74,7 +74,7 @@ def test_catalog_discovers_dynamic_country_selector(tmp_path: Path) -> None:
 def test_focus_tree_command_is_registered() -> None:
     bot = ChaosXBot(Settings(discord_token="dummy", command_guild_id=None, allowed_guild_id=None))
     register_commands(bot)
-    assert {command.name for command in bot.tree.get_commands()} >= {"event", "focus-tree"}
+    assert {command.name for command in bot.tree.get_commands()} >= {"event", "focus-tree", "event-chain", "scripted-gui"}
 
 
 class _DumpResult:

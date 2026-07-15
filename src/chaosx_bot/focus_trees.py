@@ -299,12 +299,16 @@ async def read_resource_bytes(session: ClientSession, uri: str, *, max_bytes: in
         if str(content.get("mimeType") or "") != expected_mime:
             raise FocusTreeError("Unexpected MCP artifact MIME type")
         blob = content.get("blob")
-        if not isinstance(blob, str):
-            raise FocusTreeError("MCP artifact resource did not contain binary data")
-        try:
-            chunk = base64.b64decode(blob, validate=True)
-        except (ValueError, TypeError) as exc:
-            raise FocusTreeError("Invalid base64 MCP artifact data") from exc
+        text = content.get("text")
+        if isinstance(blob, str):
+            try:
+                chunk = base64.b64decode(blob, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise FocusTreeError("Invalid base64 MCP artifact data") from exc
+        elif isinstance(text, str):
+            chunk = text.encode("utf-8")
+        else:
+            raise FocusTreeError("MCP artifact resource did not contain data")
         meta = content.get("_meta") or {}
         range_meta = next((value for key, value in meta.items() if key.endswith("artifact-byte-range")), {})
         returned = range_meta.get("returnedRange") or {}
