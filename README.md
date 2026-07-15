@@ -23,7 +23,7 @@ ChaosX is intended for the Chaos Redux community to ask bounded project question
 - Provides:
   - `/help` — public community command guide.
   - `/ask`, direct `@ChaosX <question>` mentions, `/suggestion`, `/event-idea` — public AI-backed Chaos Redux question/drafting commands.
-  - `/event`, `/scenario`, `/cluster`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/cluster` names member events, `/testing` shows events marked as needing playtesting, and `/scenario` reads triggerable SCN scenario docs, not event IDs.
+  - `/event`, `/focus-tree`, `/scenario`, `/cluster`, `/status`, `/testing` — public scripted Chaos Redux knowledge/testing commands. `/event` automatically attaches MCP-rendered graphs for implemented focus trees associated with that event; `/focus-tree` can look them up directly by event, country tag/name, or tree name.
   - `/event-idea` formats a rough event idea with name, ID placeholder, optional type/cluster/evolutions/world-end/scenario/easter-egg fields, baseline description, testing notes, and overlap/gap notes. When approved, ChaosX also creates a sanitized forum post in the configured event-ideas channel.
   - `/issue` — opens a report form, uses AI to review it, then formats approved bug/crash/enhancement/balance/cosmetic/general reports into GitHub issues in `CHAOSX_GITHUB_REPO`; bug/crash forms require relevant `error.log` lines, while other report types use expected/desired-result fields instead.
   - `/testing` shows the tester queue. `/playtest report observation:<text> [event_id:<id>]` records informal tester observations that are not ready for GitHub; `/playtest summary` shows recent reported playtests. `/playtest schedule request:<plain English>` is protected and AI-powered: it stores a local draft and returns a private plan/ready-to-post message, but does not create a Discord Scheduled Event or public post unless Hoops confirms a follow-up action.
@@ -61,6 +61,15 @@ cp .env.example .env
 # edit .env locally; never paste the token in Discord
 uv run chaosx-bot
 ```
+
+Focus-tree rendering also needs the HOI4 Agent Tools MCP server configured with the parent directory that contains the Chaos Redux mod:
+
+```bash
+npx -y -p hoi4-agent-tools@1.2.0 hoi4-agent-tools-setup --init --mod-root "/path/to/Hearts of Iron IV/mod"
+npx -y -p hoi4-agent-tools@1.2.0 hoi4-agent-tools-setup --diagnose
+```
+
+ChaosX launches that MCP server over stdio only when a graph is needed. The command, config path, workspace name/ID, timeout, graph limit, render scale, and Discord attachment cap are configurable through the `CHAOSX_FOCUS_*` variables in `.env.example`.
 
 Create the Discord app/bot in the Discord Developer Portal, copy the bot token into `.env`, and invite the bot to the Chaos Redux server with `applications.commands` plus the chosen bot permission set. Current maximum-control invite uses permission integer `8`.
 

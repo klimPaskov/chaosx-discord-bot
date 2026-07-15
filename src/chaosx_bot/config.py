@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def blank_optional_ints_to_none(cls, data):
+    def blank_optionals_to_none(cls, data):
         if isinstance(data, dict):
             for key in (
                 "allowed_guild_id",
@@ -56,12 +56,24 @@ class Settings(BaseSettings):
                 "access_reaction_member_role_id",
                 "access_reaction_modder_role_id",
                 "auto_scan_notify_channel_id",
+                "focus_tree_repo",
             ):
                 if data.get(key) == "":
                     data[key] = None
         return data
 
     chaos_redux_repo: Path = Field(default=Path("/home/klim/projects/chaos_redux"))
+    focus_tree_repo: Path | None = Field(default=None, description="Optional live mod checkout used to discover focus trees; defaults to chaos_redux_repo")
+    focus_tree_graphs_enabled: bool = Field(default=True, description="Render public focus-tree graphs through HOI4 Agent Tools MCP")
+    focus_mcp_command: str = Field(default="npx", description="Executable used to launch the HOI4 Agent Tools MCP server")
+    focus_mcp_args: str = Field(default="-y hoi4-agent-tools@1.2.0", description="Shell-style arguments for the HOI4 Agent Tools MCP command")
+    focus_mcp_config_path: Path = Field(default=Path("/home/klim/.config/hoi4-agent-tools/config.json"))
+    focus_mcp_workspace_id: str = Field(default="", description="Optional exact HOI4 Agent Tools workspace ID")
+    focus_mcp_workspace_name: str = Field(default="chaos_redux", description="Workspace name discovered through hoi4.mods when no exact ID is configured")
+    focus_mcp_timeout_seconds: int = Field(default=300, ge=30, le=900)
+    focus_tree_max_graphs: int = Field(default=6, ge=1, le=20)
+    focus_tree_review_scale: float = Field(default=0.5, ge=0.25, le=1.0)
+    focus_tree_max_attachment_bytes: int = Field(default=8_000_000, ge=1024, le=25_000_000)
     hermes_bin: Path = Field(default=Path("/home/klim/.local/bin/hermes"))
     hermes_profile: str = Field(default="chaos_redux")
     hermes_timeout_seconds: int = Field(default=900, ge=30, le=1800)

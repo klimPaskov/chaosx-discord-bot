@@ -190,6 +190,18 @@ class Knowledge:
             total += len(item)
         return "\n".join(snippets)
 
+    def resolve_event_id(self, event: str) -> int | None:
+        """Resolve a public event ID/name query to its numeric catalog ID."""
+        self.ensure_index()
+        requested_event_id = _explicit_numeric_lookup_id(event, "event")
+        row = self._find_event_by_id(requested_event_id) if requested_event_id else self._find_event(event)
+        if not row or row[1] is None:
+            return None
+        try:
+            return int(row[1])
+        except (TypeError, ValueError):
+            return None
+
     def event(self, event: str, view: str = "overview", show_evidence: bool = False) -> str:
         self.ensure_index()
         requested_event_id = _explicit_numeric_lookup_id(event, "event")
