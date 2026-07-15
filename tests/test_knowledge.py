@@ -24,6 +24,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert event_lines[2] == '- Evolution stages: `3`'
     assert event_lines[3] == '- Has world-end scenario: `Yes`'
     assert event_lines[4].startswith('- Status:')
+    assert '### Evolution stages' in event
+    assert '### World-end scenario' in event
+    assert 'Evolution tracks' not in event
+    assert 'World-end relationship' not in event
     assert 'Evidence:' not in event
     assert 'docs/spreadsheets' not in event
     assert knowledge.event('999') == 'No event for id `999` was found.'

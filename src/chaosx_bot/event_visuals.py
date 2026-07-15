@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+from xml.etree import ElementTree
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -438,7 +439,12 @@ class EventVisualMcpClient:
             expected_mime="image/svg+xml",
         )
         output = io.BytesIO()
-        cairosvg.svg2png(bytestring=svg, write_to=output, output_width=width, output_height=height)
+        cairosvg.svg2png(
+            bytestring=_remove_offline_banner(svg),
+            write_to=output,
+            output_width=width,
+            output_height=height,
+        )
         png = _crop_and_scale_gui_preview(output.getvalue(), width, height)
         if not png.startswith(b"\x89PNG\r\n\x1a\n"):
             raise EventVisualError("MCP scripted-GUI preview did not convert to PNG")
@@ -605,6 +611,33 @@ def _crop_and_scale_gui_preview(png: bytes, max_width: int, max_height: int) -> 
     output = io.BytesIO()
     cropped.save(output, format="PNG", optimize=True)
     return output.getvalue()
+
+
+def _remove_offline_banner(svg: bytes) -> bytes:
+    """Remove HOI4 Agent Tools' in-image disclaimer; Discord captions retain the preview label."""
+
+    try:
+        root = ElementTree.fromstring(svg)
+    except ElementTree.ParseError as exc:
+        raise EventVisualError("MCP scripted-GUI SVG is invalid") from exc
+    for child in reversed(root):
+        if child.tag.rsplit("}", 1)[-1] != "g":
+            continue
+        rectangle = next(
+            (
+                item
+                for item in child
+                if item.tag.rsplit("}", 1)[-1] == "rect"
+                and item.attrib.get("width") == "215"
+                and item.attrib.get("height") == "20"
+                and item.attrib.get("fill") == "#05080c"
+            ),
+            None,
+        )
+        if rectangle is not None:
+            root.remove(child)
+            break
+    return ElementTree.tostring(root, encoding="utf-8")
 
 
 def _artifact(payload: dict[str, Any], mime_type: str) -> dict[str, Any]:

@@ -17,6 +17,7 @@ from chaosx_bot.event_visuals import (
     ScriptedGuiCatalog,
     ScriptedGuiRecord,
     _crop_and_scale_gui_preview,
+    _remove_offline_banner,
 )
 
 
@@ -223,3 +224,15 @@ def test_empty_scripted_gui_preview_is_suppressed() -> None:
 
     with pytest.raises(EmptyGuiPreviewError):
         _crop_and_scale_gui_preview(output.getvalue(), 320, 200)
+
+
+def test_offline_disclaimer_is_removed_from_gui_svg() -> None:
+    svg = b'''<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200">
+      <rect width="320" height="200" fill="#111923"/>
+      <g><rect x="8" y="8" width="215" height="20" fill="#05080c"/><text>OFFLINE APPROXIMATION - NOT HOI4</text></g>
+    </svg>'''
+
+    cleaned = _remove_offline_banner(svg)
+
+    assert b"OFFLINE APPROXIMATION" not in cleaned
+    assert b"#111923" in cleaned

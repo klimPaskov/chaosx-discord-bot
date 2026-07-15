@@ -227,9 +227,9 @@ class Knowledge:
         ]
         shown_evos = [f"- **{label}:** {text[:400]}" for label, text in evos if text]
         if shown_evos and view in {"overview", "design", "history"}:
-            lines += ["", "### Evolution tracks", *shown_evos]
+            lines += ["", "### Evolution stages", *shown_evos]
         if data["world_end"]:
-            lines += ["", "### World-end relationship", data["world_end"][:700]]
+            lines += ["", "### World-end scenario", data["world_end"][:700]]
         if show_evidence:
             paths = self._entity_paths(data["event_id"], data["name"])
             if paths:
@@ -258,9 +258,9 @@ class Knowledge:
         evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
         shown_evos = [f"- **{label}:** {text[:400]}" for label, text in evos if text]
         if shown_evos and view in {"overview", "design", "history"}:
-            lines += ["", "### Evolution tracks", *shown_evos]
+            lines += ["", "### Evolution stages", *shown_evos]
         if data["world_end"]:
-            lines += ["", "### World-end relationship", data["world_end"][:700]]
+            lines += ["", "### World-end scenario", data["world_end"][:700]]
         if show_evidence:
             lines += ["", self._footer("scenario docs", "docs/systems/triggerable_scenarios.md")]
         return "\n".join(lines)
