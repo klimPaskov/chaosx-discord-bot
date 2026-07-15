@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import shutil
+import signal
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -171,6 +173,7 @@ async def run_hermes(
     if toolsets:
         cmd.extend(["--toolsets", toolsets])
     config_path = Path.home() / ".hermes" / "profiles" / profile / "config.yaml"
+    proc: asyncio.subprocess.Process | None = None
     try:
         async with _temporary_reasoning_effort(config_path, reasoning_effort):
             proc = await asyncio.create_subprocess_exec(
@@ -178,17 +181,23 @@ async def run_hermes(
                 cwd=str(repo),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name != "nt",
             )
             if timeout_seconds is None or timeout_seconds <= 0:
                 stdout_b, stderr_b = await proc.communicate()
             else:
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()  # type: ignore[possibly-undefined]
-        except Exception:
-            pass
+        if proc is not None and proc.returncode is None:
+            if os.name != "nt":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+            await proc.communicate()
         return HermesResult(prompt_hash=digest, returncode=124, stdout="", stderr="Hermes run timed out", timed_out=True)
+
+    if proc is None:
+        raise RuntimeError("Hermes subprocess was not started")
 
     return HermesResult(
         prompt_hash=digest,

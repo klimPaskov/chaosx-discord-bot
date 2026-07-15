@@ -13,6 +13,7 @@ from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
 from .auto_scan import AutoScanDecision, classify_message
+from .catalog_validation import format_workbook_validation, validate_workbook
 from .community_notes import (
     format_event_idea_post_body,
     format_event_idea_post_title,
@@ -38,6 +39,13 @@ from .hermes_bridge import (
     run_hermes,
 )
 from .knowledge import Knowledge
+from .issue_duplicates import (
+    SimilarGitHubIssue,
+    candidate_review_context,
+    clear_duplicate_candidate,
+    find_similar_github_issues,
+    parse_duplicate_decision,
+)
 from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
 from .webhook_server import GitHubWebhookServer
@@ -56,13 +64,15 @@ PUBLIC_ASK_DOMAIN_TERMS = {
 PUBLIC_ASK_BLOCK_TERMS = {
     "ignore previous", "ignore all previous", "system prompt", "developer message", "hidden instruction",
     "original instruction", "internal instruction", "jailbreak", "godmode", "dan mode", "you are now", "act as",
-    "sudo", "admin mode", "reveal prompt", "print prompt", "show prompt", "secret", "token", "password",
-    "credential", "delete server", "nuke", "hack", "malware", "phishing", "exploit", "bypass", "mass ping",
+    "sudo", "admin mode", "reveal prompt", "print prompt", "show prompt", "reveal secret", "bot token",
+    "api token", "access token", "discord token", "password", "credential", "delete server", "nuke server",
+    "hack server", "malware", "phishing", "bypass instructions", "mass ping",
     "@everyone", "@here", "ban everyone", "delete channel", "delete role", "manage server", "moderation",
 }
 PUBLIC_ASK_OFFTOPIC_TERMS = {
-    "recipe", "ingredients", "measurements", "exact measurements", "steps for", "instructions for",
-    "cooking", "baking", "capital of", "haiku", "poem", "song", "essay", "homework", "unrelated test phrase",
+    "recipe", "ingredients", "measurements", "exact measurements", "cooking", "baking", "capital of",
+    "haiku", "write a poem", "write me a poem", "write a song", "write me a song", "write an essay",
+    "homework", "unrelated test phrase",
     "medical advice", "legal advice", "financial advice", "relationship advice",
 }
 PUBLIC_ASK_INJECTION_PATTERNS = {
@@ -146,15 +156,22 @@ def _format_duration(seconds: int) -> str:
 
 def public_ask_rejection_reason(request: str, *, reference_context: str = "") -> str | None:
     text = request.casefold()
-    if any(term in text for term in PUBLIC_ASK_BLOCK_TERMS):
+    if _contains_guard_term(text, PUBLIC_ASK_BLOCK_TERMS):
         return PUBLIC_ASK_REDIRECT
-    if any(term in text for term in PUBLIC_ASK_OFFTOPIC_TERMS):
+    if _contains_guard_term(text, PUBLIC_ASK_OFFTOPIC_TERMS):
         return PUBLIC_ASK_REDIRECT
-    if any(term in text for term in PUBLIC_ASK_INJECTION_PATTERNS):
+    if _contains_guard_term(text, PUBLIC_ASK_INJECTION_PATTERNS):
         return PUBLIC_ASK_REDIRECT
-    if not any(term in text for term in PUBLIC_ASK_DOMAIN_TERMS) and not reference_context.strip():
+    if not _contains_guard_term(text, PUBLIC_ASK_DOMAIN_TERMS) and not reference_context.strip():
         return PUBLIC_ASK_REDIRECT
     return None
+
+
+def _contains_guard_term(text: str, terms: set[str]) -> bool:
+    return any(
+        re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.IGNORECASE)
+        for term in terms
+    )
 
 
 def sanitize_public_ask_output(output: str) -> str:
@@ -448,6 +465,22 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
     return result, output
 
 
+async def reply_with_chunks(message: discord.Message, text: str) -> discord.Message | None:
+    """Reply once, then continue safely in-channel if output exceeds Discord's limit."""
+
+    first_sent: discord.Message | None = None
+    for index, part in enumerate(_chunk(text)):
+        if index == 0:
+            first_sent = await message.reply(
+                part,
+                mention_author=False,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+        else:
+            await message.channel.send(part, allowed_mentions=safe_allowed_mentions())
+    return first_sent
+
+
 async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.auto_scan_enabled or bot.user is None:
         return False
@@ -497,12 +530,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer model failure", summary=reason)
             return False
-        first_sent: discord.Message | None = None
-        for i, part in enumerate(_chunk(model_output)):
-            if i == 0:
-                first_sent = await message.reply(part, mention_author=False, allowed_mentions=safe_allowed_mentions())
-            else:
-                await message.channel.send(part, allowed_mentions=safe_allowed_mentions())
+        first_sent = await reply_with_chunks(message, model_output)
         prompt_hash_value = result.prompt_hash
         await record_public_question_answer(
             bot,
@@ -559,8 +587,14 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan banter model failure", summary=reason)
             return False
-        sent = await message.reply(model_output, mention_author=False, allowed_mentions=safe_allowed_mentions())
-        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=model_output)
+        sent = await reply_with_chunks(message, model_output)
+        await record_auto_scan_event(
+            bot,
+            decision,
+            message,
+            bot_message_id=sent.id if sent else None,
+            response=model_output,
+        )
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan bot-topic banter", summary=decision.reason)
         return True
 
@@ -584,9 +618,20 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning model failure", summary=reason)
             return False
-        sent = await message.reply(model_output, mention_author=False, allowed_mentions=safe_allowed_mentions())
-        await record_auto_scan_event(bot, decision, message, bot_message_id=sent.id, response=model_output)
-        await send_auto_scan_notice(bot, decision, message, bot_message_id=sent.id)
+        sent = await reply_with_chunks(message, model_output)
+        await record_auto_scan_event(
+            bot,
+            decision,
+            message,
+            bot_message_id=sent.id if sent else None,
+            response=model_output,
+        )
+        await send_auto_scan_notice(
+            bot,
+            decision,
+            message,
+            bot_message_id=sent.id if sent else None,
+        )
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning", summary=decision.reason)
         return True
     return False
@@ -686,16 +731,48 @@ async def submit_validated_issue(
     )
     if validation_error:
         return False, validation_error, None
-    ai_ok, ai_reason = await ai_review_issue_report(
-        bot,
-        issue_type=issue_type,
-        title=title,
+    issue_title = f"[{issue_type.title()}] {title.strip()}"
+    lookup_ok, candidates, _lookup_error = await find_similar_github_issues(
+        bot.settings.github_repo,
+        title=issue_title,
         description=description,
-        steps=steps,
-        expected=expected,
-        actual=actual,
-        error_log_lines=error_log_lines,
     )
+    if not lookup_ok:
+        return (
+            False,
+            "ChaosX could not check existing GitHub issues, so it did not publish the report. Please try again shortly.",
+            None,
+        )
+    duplicate = clear_duplicate_candidate(candidates)
+    ai_ok = False
+    ai_reason = ""
+    if duplicate is None:
+        ai_ok, ai_reason, duplicate = await ai_review_issue_report(
+            bot,
+            issue_type=issue_type,
+            title=title,
+            description=description,
+            steps=steps,
+            expected=expected,
+            actual=actual,
+            error_log_lines=error_log_lines,
+            duplicate_candidates=candidates,
+        )
+    if duplicate is not None:
+        await bot.store.audit(
+            actor_id=actor_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            command="issue duplicate",
+            summary=f"{issue_title} -> #{duplicate.number}",
+        )
+        return (
+            False,
+            "Duplicate report: this appears to describe the same problem as "
+            f"**#{duplicate.number}: {discord.utils.escape_markdown(duplicate.title)}** "
+            f"(<{duplicate.url}>). It was not approved or posted again.",
+            None,
+        )
     if not ai_ok:
         return False, f"AI review did not approve this report yet: {ai_reason}", None
     body = format_github_issue_body(
@@ -709,7 +786,6 @@ async def submit_validated_issue(
         reporter=reporter,
         source=f"Discord /issue in guild {guild_id}, channel {channel_id}",
     )
-    issue_title = f"[{issue_type.title()}] {title.strip()}"
     ok, result = await create_github_issue(bot.settings.github_repo, title=issue_title, body=body)
     await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="issue", summary=issue_title)
     return ok, result, issue_title
@@ -725,12 +801,18 @@ async def ai_review_issue_report(
     expected: str = "",
     actual: str = "",
     error_log_lines: str = "",
-) -> tuple[bool, str]:
+    duplicate_candidates: list[SimilarGitHubIssue] | None = None,
+) -> tuple[bool, str, SimilarGitHubIssue | None]:
+    candidates = duplicate_candidates or []
     prompt = (
         "Review this Chaos Redux Discord issue report before it is sent to GitHub. "
         "Approve only if it is about Chaos Redux and has enough concrete information for the selected type. "
-        "Reply with exactly one line starting with APPROVED: or REJECTED:.\n\n"
-        f"Type: {issue_type}\nTitle: {title}\nDescription: {description}\nSteps: {steps}\nExpected: {expected}\nActual: {actual}\nerror.log: {error_log_lines[:2500]}"
+        "Also compare it with the candidate issues below. Mark it as a duplicate only when it clearly reports "
+        "the same underlying problem; similar features or shared words are not enough. Never choose an issue "
+        "number that is not listed. Reply with exactly one line starting with APPROVED:, REJECTED:, or "
+        "DUPLICATE #<listed number>:.\n\n"
+        f"Type: {issue_type}\nTitle: {title}\nDescription: {description}\nSteps: {steps}\nExpected: {expected}\nActual: {actual}\nerror.log: {error_log_lines[:2500]}\n\n"
+        f"{candidate_review_context(candidates)}"
     )
     result = await run_hermes(
         hermes_bin=bot.settings.hermes_bin,
@@ -752,11 +834,14 @@ async def ai_review_issue_report(
     )
     text = (result.stdout or result.stderr).strip().splitlines()[0:1]
     line = text[0].strip() if text else ""
+    duplicate = parse_duplicate_decision(line, candidates)
+    if duplicate is not None:
+        return False, line, duplicate
     if result.ok and line.upper().startswith("APPROVED"):
-        return True, line
+        return True, line, None
     if line.upper().startswith("REJECTED"):
-        return False, line
-    return False, line or "AI review failed or returned an unclear result."
+        return False, line, None
+    return False, line or "AI review failed or returned an unclear result.", None
 
 
 async def create_github_issue(repo: str, *, title: str, body: str) -> tuple[bool, str]:
@@ -865,6 +950,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
+- `/admin validate-workbook` — validate the authoritative XLSX for duplicate/invalid IDs, missing required fields, evolution gaps, and broken event/cluster references.
 - `/admin reindex` — refresh ChaosX's local Chaos Redux catalog/search database. Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale after spreadsheet/docs changes.
 - `/admin sync` — resync slash commands with Discord. Use after I change command names/options and Discord still shows the old version.
 
@@ -2219,7 +2305,11 @@ class IssueReportModal(discord.ui.Modal):
         if ok:
             await interaction.followup.send(f"GitHub issue created: {result}\nIssue type: `{self.issue_type}`", ephemeral=False, allowed_mentions=safe_allowed_mentions())
         else:
-            await interaction.followup.send(f"Issue was not created:\n```text\n{result}\n```", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            if result.startswith("Duplicate report:"):
+                message = result
+            else:
+                message = f"Issue was not created:\n```text\n{result}\n```"
+            await interaction.followup.send(message, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
 
 def register_commands(bot: ChaosXBot) -> None:
@@ -2280,8 +2370,15 @@ def register_commands(bot: ChaosXBot) -> None:
         await send_scripted_gui_lookup(bot, interaction, query)
 
     @bot.tree.command(name="scenario", description="Look up a triggerable scenario by SCN ID or name.")
-    async def chaosx_scenario(interaction: discord.Interaction, scenario: str, view: str = "overview") -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx scenario", summary=scenario, render=lambda: bot.knowledge.scenario(scenario, view), owner_render=lambda: bot.knowledge.scenario(scenario, view, show_evidence=True))
+    async def chaosx_scenario(interaction: discord.Interaction, scenario: str) -> None:
+        await send_scripted_response(
+            bot,
+            interaction,
+            command_name="chaosx scenario",
+            summary=scenario,
+            render=lambda: bot.knowledge.scenario(scenario),
+            owner_render=lambda: bot.knowledge.scenario(scenario, show_evidence=True),
+        )
 
     @bot.tree.command(name="cluster", description="Look up an event cluster.")
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
@@ -2550,6 +2647,28 @@ def register_commands(bot: ChaosXBot) -> None:
     @admin.command(name="reindex", description="Run/plan reindex.")
     async def admin_reindex(interaction: discord.Interaction, scope: str = "all") -> None:
         await run_owner_hermes(bot, interaction, f"/admin reindex scope={scope!r}. Keep last-known-good index on failure.", command_name="admin reindex")
+
+    @admin.command(name="validate-workbook", description="Validate the authoritative Chaos Redux XLSX catalog.")
+    async def admin_validate_workbook(interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            report = await asyncio.to_thread(validate_workbook, settings.chaos_redux_repo)
+            message = format_workbook_validation(report)
+            summary = f"{len(report.errors)} errors, {len(report.warnings)} warnings"
+        except Exception as exc:
+            message = f"Workbook validation could not complete (`{type(exc).__name__}`). The catalog was not changed."
+            summary = f"failed: {type(exc).__name__}"
+        for part in _chunk(message):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin validate-workbook",
+            summary=summary,
+        )
 
     @admin.command(name="automation", description="List/enable/disable automation by name.")
     async def admin_automation(interaction: discord.Interaction, action: str = "list", name: str = "") -> None:

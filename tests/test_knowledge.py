@@ -1,7 +1,10 @@
 from pathlib import Path
+from shutil import copy2
 import sqlite3
 
-from chaosx_bot.indexer import is_vault_indexable, rebuild_index
+import pytest
+
+from chaosx_bot.indexer import CatalogReadError, _catalog_rows, is_vault_indexable, rebuild_index
 from chaosx_bot.knowledge import Knowledge
 
 
@@ -45,12 +48,15 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     owner_event = knowledge.event('2', show_evidence=True)
     assert 'Private source detail' in owner_event
     scenario = knowledge.scenario('5')
-    assert 'SCN-005: The World in Fury' in scenario
+    assert 'SCN-005: World in Fury' in scenario
+    assert '- Type options: Pact creates' in scenario
+    assert '- Intensity scaling: Low/Medium/High/Maximum' in scenario
+    assert '- Status: `Needs Testing`' in scenario
     assert 'Soviet Union Collapse' not in scenario
     assert 'Event 2:' not in scenario
     assert 'docs/spreadsheets' not in scenario
     owner_scenario = knowledge.scenario('5', show_evidence=True)
-    assert 'triggerable_scenarios' in owner_scenario
+    assert 'chaos_redux_events_catalog.xlsx' in owner_scenario
     owner_search = knowledge.search('Zombie Outbreak', limit=2, show_evidence=True)
     assert 'Evidence:' in owner_search
     search = knowledge.search('Zombie Outbreak', limit=2)
@@ -113,6 +119,44 @@ def test_knowledge_auto_refreshes_stale_index(tmp_path: Path):
     finally:
         conn.close()
     assert after > before
+
+
+def test_catalog_workbook_takes_precedence_over_stale_csv(tmp_path: Path):
+    source = Path('/home/klim/projects/chaos_redux/docs/spreadsheets/chaos_redux_events_catalog.xlsx')
+    if not source.exists():
+        return
+    catalog_root = tmp_path / 'docs/spreadsheets'
+    catalog_root.mkdir(parents=True)
+    copy2(source, catalog_root / source.name)
+    (catalog_root / 'chaos_redux_events_catalog.csv').write_text(
+        'ID,Event Name,Details\n2,Stale CSV Name,Old details\n',
+        encoding='utf-8',
+    )
+
+    rows = _catalog_rows(
+        tmp_path,
+        csv_name='chaos_redux_events_catalog.csv',
+        sheet_index=1,
+    )
+    event_two = next(row for row in rows if row.get('ID') == '2')
+    assert event_two['Event Name'] == 'Zombie Outbreak'
+
+
+def test_unreadable_workbook_never_silently_uses_stale_csv(tmp_path: Path):
+    catalog_root = tmp_path / 'docs/spreadsheets'
+    catalog_root.mkdir(parents=True)
+    (catalog_root / 'chaos_redux_events_catalog.xlsx').write_bytes(b'incomplete-save')
+    (catalog_root / 'chaos_redux_events_catalog.csv').write_text(
+        'ID,Event Name,Details\n2,Stale CSV Name,Old details\n',
+        encoding='utf-8',
+    )
+
+    with pytest.raises(CatalogReadError):
+        _catalog_rows(
+            tmp_path,
+            csv_name='chaos_redux_events_catalog.csv',
+            sheet_index=1,
+        )
 
 
 def test_vault_index_whitelist_and_secret_exclusions(tmp_path: Path):

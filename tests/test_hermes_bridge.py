@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from chaosx_bot.hermes_bridge import build_public_prompt, _temporary_reasoning_effort
+from chaosx_bot.hermes_bridge import build_public_prompt, run_hermes, _temporary_reasoning_effort
 
 
 @pytest.mark.asyncio
@@ -18,6 +18,25 @@ async def test_temporary_reasoning_effort_restores_config(tmp_path: Path):
 
     restored = yaml.safe_load(config.read_text(encoding="utf-8"))
     assert restored == original
+
+
+@pytest.mark.asyncio
+async def test_run_hermes_reaps_timed_out_process(tmp_path: Path):
+    fake_hermes = tmp_path / "fake-hermes"
+    fake_hermes.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+    fake_hermes.chmod(0o755)
+
+    result = await run_hermes(
+        hermes_bin=fake_hermes,
+        profile="unused-test-profile",
+        repo=tmp_path,
+        prompt="timeout test",
+        timeout_seconds=1,
+    )
+
+    assert result.timed_out is True
+    assert result.returncode == 124
+    assert result.stderr == "Hermes run timed out"
 
 
 def test_public_prompt_scopes_and_refuses_dangerous_requests():

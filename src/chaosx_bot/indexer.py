@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 TEXT_EXTENSIONS = {
     ".md", ".txt", ".csv", ".yml", ".yaml", ".json", ".toml", ".mod",
@@ -35,6 +35,11 @@ VAULT_SKIP_FILES = {"important tokens.md", "index.md", "log.md", "SCHEMA.md", "T
 MAX_FILE_BYTES = 750_000
 SECRET_ASSIGNMENT_RE = re.compile(r"(?i)\b(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*[^\s`'\"]+")
 DISCORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}")
+INDEX_SCHEMA_VERSION = "2"
+
+
+class CatalogReadError(RuntimeError):
+    """The authoritative XLSX catalog could not be read safely."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS index_meta (
@@ -96,15 +101,8 @@ CREATE TABLE IF NOT EXISTS catalog_scenarios (
     scenario_id TEXT,
     name TEXT NOT NULL,
     details TEXT NOT NULL,
-    evo_i TEXT,
-    evo_ii TEXT,
-    evo_iii TEXT,
-    evo_iv TEXT,
-    evo_v TEXT,
-    world_end TEXT,
-    type TEXT,
-    cluster_id TEXT,
-    member_severity TEXT,
+    type_options TEXT,
+    intensity_scaling TEXT,
     status TEXT,
     indexed_at REAL NOT NULL
 );
@@ -322,6 +320,7 @@ def rebuild_index(repo: Path, db_path: Path, vault_path: Path | None = None) -> 
         events = _load_events(conn, repo, indexed_at)
         scenarios = _load_scenarios(conn, repo, indexed_at)
         clusters = _load_clusters(conn, repo, indexed_at)
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('schema_version', ?)", (INDEX_SCHEMA_VERSION,))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('commit_sha', ?)", (commit,))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('indexed_at', ?)", (str(indexed_at),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('doc_count', ?)", (str(docs),))
@@ -332,12 +331,21 @@ def rebuild_index(repo: Path, db_path: Path, vault_path: Path | None = None) -> 
 
 
 def _catalog_rows(repo: Path, *, csv_name: str, sheet_index: int) -> list[dict[str, str]]:
+    """Read the maintained workbook first, with CSV as a compatibility fallback."""
+
+    xlsx_path = repo / "docs/spreadsheets/chaos_redux_events_catalog.xlsx"
+    if xlsx_path.exists():
+        try:
+            return _xlsx_sheet_rows(xlsx_path, sheet_index=sheet_index)
+        except (BadZipFile, ET.ParseError, KeyError, OSError, ValueError) as exc:
+            raise CatalogReadError(
+                f"Could not read catalog workbook sheet {sheet_index}"
+            ) from exc
     csv_path = repo / "docs/spreadsheets" / csv_name
     if csv_path.exists():
         with csv_path.open(newline="", encoding="utf-8-sig") as fp:
             return [dict(row) for row in csv.DictReader(fp)]
-    xlsx_path = repo / "docs/spreadsheets/chaos_redux_events_catalog.xlsx"
-    return _xlsx_sheet_rows(xlsx_path, sheet_index=sheet_index)
+    return []
 
 
 def _xlsx_sheet_rows(path: Path, *, sheet_index: int) -> list[dict[str, str]]:
@@ -446,13 +454,6 @@ def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int
 
 
 def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int:
-    """Load triggerable/manual scenarios, not the event catalog copy.
-
-    `chaos_redux_scenarios_catalog.csv` currently mirrors event rows, while the
-    player-facing `/scenario` command is meant to answer SCN-* triggerable
-    scenario IDs from the scenario system docs.
-    """
-    path = repo / "docs/systems/triggerable_scenarios.md"
     conn.execute("DROP TABLE IF EXISTS catalog_scenarios")
     conn.execute("""
     CREATE TABLE catalog_scenarios (
@@ -460,40 +461,41 @@ def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> 
         scenario_id TEXT,
         name TEXT NOT NULL,
         details TEXT NOT NULL,
-        evo_i TEXT,
-        evo_ii TEXT,
-        evo_iii TEXT,
-        evo_iv TEXT,
-        evo_v TEXT,
-        world_end TEXT,
-        type TEXT,
-        cluster_id TEXT,
-        member_severity TEXT,
+        type_options TEXT,
+        intensity_scaling TEXT,
         status TEXT,
         indexed_at REAL NOT NULL
     )
     """)
-    text = read_text(path)
-    if not text:
-        return 0
-    pattern = re.compile(r"^###\s+SCN-(\d{3}):\s+(.+?)\s*$", re.MULTILINE)
-    matches = list(pattern.finditer(text))
     count = 0
-    for idx, match in enumerate(matches):
-        start = match.end()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        scenario_id = str(int(match.group(1)))
-        name = match.group(2).strip()
-        details = text[start:end].strip()
-        status = "Reserved" if "reserved" in details.casefold() or "placeholder" in details.casefold() else "Fully Functional"
+    for row_number, row in enumerate(
+        _catalog_rows(repo, csv_name="chaos_redux_scenarios_catalog.csv", sheet_index=3),
+        1,
+    ):
+        raw_id = (row.get("Scenario ID") or "").strip()
+        id_match = re.fullmatch(r"(?:SCN-)?0*(\d+)", raw_id, re.IGNORECASE)
+        scenario_id = str(int(id_match.group(1))) if id_match else ""
+        name = (row.get("Scenario Name") or "").strip()
+        if not scenario_id and not name:
+            continue
+        row_key = scenario_id if scenario_id else f"unassigned:{row_number}:{name}"
         conn.execute(
             """
-            INSERT OR REPLACE INTO catalog_scenarios(row_key, scenario_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO catalog_scenarios(
+                row_key, scenario_id, name, details, type_options,
+                intensity_scaling, status, indexed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                scenario_id, scenario_id, name, details, "", "", "", "", "", "",
-                "Triggerable Scenario", "", "", status, indexed_at,
+                row_key,
+                scenario_id,
+                name,
+                row.get("Details") or "",
+                row.get("Type Options") or "",
+                row.get("Intensity Scaling") or "",
+                row.get("Status") or "",
+                indexed_at,
             ),
         )
         count += 1

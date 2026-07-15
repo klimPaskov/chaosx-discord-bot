@@ -6,7 +6,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .indexer import connect, index_commit, iter_indexable_files, iter_vault_indexable_files, rebuild_index
+from .indexer import (
+    CatalogReadError,
+    INDEX_SCHEMA_VERSION,
+    connect,
+    index_commit,
+    iter_indexable_files,
+    iter_vault_indexable_files,
+    rebuild_index,
+)
 
 MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
@@ -38,15 +46,24 @@ class Knowledge:
         latest_source_mtime = max(
             _latest_indexable_mtime(self.repo),
             _latest_vault_indexable_mtime(self.vault_path),
+            _latest_catalog_mtime(self.repo),
         )
         needs_rebuild = (
             count == 0
             or scenarios == 0
+            or meta.get("schema_version") != INDEX_SCHEMA_VERSION
             or meta.get("commit_sha") != current_commit
             or latest_source_mtime > indexed_at
         )
         if needs_rebuild:
-            rebuild_index(self.repo, self.db_path, self.vault_path)
+            try:
+                rebuild_index(self.repo, self.db_path, self.vault_path)
+            except CatalogReadError:
+                if count == 0 or scenarios == 0:
+                    raise
+                # Excel can briefly replace the workbook while saving. Keep the
+                # last complete index and retry naturally on the next command.
+                return
         object.__setattr__(self, "_last_freshness_check", now)
 
     def status(self) -> str:
@@ -234,10 +251,10 @@ class Knowledge:
             paths = self._entity_paths(data["event_id"], data["name"])
             if paths:
                 lines += ["", "### Private source paths", *[f"- `{p}` — {sc}" for p, sc in paths[:12]]]
-            lines += ["", self._footer("catalog", "docs/spreadsheets/chaos_redux_events_catalog.csv")]
+            lines += ["", self._footer("catalog workbook", "docs/spreadsheets/chaos_redux_events_catalog.xlsx")]
         return "\n".join(lines)
 
-    def scenario(self, scenario: str, view: str = "overview", show_evidence: bool = False) -> str:
+    def scenario(self, scenario: str, show_evidence: bool = False) -> str:
         self.ensure_index()
         requested_scenario_id = _explicit_numeric_lookup_id(scenario, "scenario", "scn")
         row = self._find_scenario_by_id(requested_scenario_id) if requested_scenario_id else self._find_scenario(scenario)
@@ -245,24 +262,28 @@ class Knowledge:
             if requested_scenario_id:
                 return f"No scenario for id `{requested_scenario_id}` was found."
             return self.search(scenario, scope="all", limit=5, show_evidence=show_evidence) + "\n\nNo exact scenario match; showing public search results instead."
-        keys = ["row_key", "scenario_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
+        keys = [
+            "row_key",
+            "scenario_id",
+            "name",
+            "details",
+            "type_options",
+            "intensity_scaling",
+            "status",
+            "indexed_at",
+        ]
         data = dict(zip(keys, row))
         scenario_label = f"SCN-{int(data['scenario_id']):03d}: {data['name']}" if data["scenario_id"] else f"Unassigned scenario idea: {data['name']}"
         lines = [
             f"## {scenario_label}",
-            f"- Type: `{data['type'] or 'unknown'}`",
+            f"- Type options: {data['type_options'] or 'Not specified'}",
+            f"- Intensity scaling: {data['intensity_scaling'] or 'Not specified'}",
             f"- Status: `{data['status'] or 'unknown'}`",
             "",
             data["details"][:MAX_EXCERPT_CHARS] or "No details available.",
         ]
-        evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
-        shown_evos = [f"- **{label}:** {text[:400]}" for label, text in evos if text]
-        if shown_evos and view in {"overview", "design", "history"}:
-            lines += ["", "### Evolution stages", *shown_evos]
-        if data["world_end"]:
-            lines += ["", "### World-end scenario", data["world_end"][:700]]
         if show_evidence:
-            lines += ["", self._footer("scenario docs", "docs/systems/triggerable_scenarios.md")]
+            lines += ["", self._footer("scenario catalog", "docs/spreadsheets/chaos_redux_events_catalog.xlsx")]
         return "\n".join(lines)
 
     def cluster(self, cluster: str, show_evidence: bool = False) -> str:
@@ -293,7 +314,7 @@ class Knowledge:
             f"{details or 'No details available.'}"
         )
         if show_evidence:
-            text += f"\n\n{self._footer('catalog', 'docs/spreadsheets/chaos_redux_clusters_catalog.csv')}"
+            text += f"\n\n{self._footer('catalog workbook', 'docs/spreadsheets/chaos_redux_events_catalog.xlsx')}"
         return text
 
     def _cluster_member_lines(self, members: str) -> list[str]:
@@ -443,6 +464,23 @@ def _latest_indexable_mtime(repo: Path) -> float:
         except OSError:
             continue
     return latest
+
+
+def _latest_catalog_mtime(repo: Path) -> float:
+    catalog_root = repo / "docs/spreadsheets"
+    candidates = [
+        catalog_root / "chaos_redux_events_catalog.xlsx",
+        catalog_root / "chaos_redux_events_catalog.csv",
+        catalog_root / "chaos_redux_scenarios_catalog.csv",
+        catalog_root / "chaos_redux_clusters_catalog.csv",
+    ]
+    mtimes: list[float] = []
+    for path in candidates:
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return max(mtimes, default=0.0)
 
 
 def _latest_vault_indexable_mtime(vault_path: Path | None) -> float:

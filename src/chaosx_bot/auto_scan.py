@@ -52,22 +52,25 @@ AUTO_SCAN_DOMAIN_TERMS = {
 }
 AUTO_SCAN_BLOCK_TERMS = {
     "ignore previous",
+    "ignore all instructions",
+    "bypass instructions",
     "system prompt",
     "developer message",
     "hidden instruction",
     "jailbreak",
     "reveal prompt",
     "print prompt",
-    "token",
+    "bot token",
+    "api token",
+    "access token",
+    "discord token",
     "password",
-    "secret",
+    "reveal secret",
     "credential",
     "delete server",
-    "nuke",
-    "hack",
+    "nuke server",
+    "hack server",
     "malware",
-    "phishing",
-    "exploit",
 }
 QUESTION_PREFIX_RE = re.compile(r"^\s*(?:hey\s+)?(?:anyone\s+know|does\s+anyone\s+know|can\s+someone|could\s+someone|do\s+you\s+know|i\s+have\s+a\s+question|quick\s+question|question[:,]?|(?:who|what|when|where|why|how|can|could|does|do|did|is|are|was|were|should|will)\b)", re.I)
 EVENT_ID_RE = re.compile(r"\b(?:event|ev)\s*(?:id\s*)?#?0*(\d{1,3})\b", re.I)
@@ -82,9 +85,11 @@ EVENT_IDEA_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:suggest|submit)\s+(?:an?\s+)
 ACCESS_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:get|gain)\s+access|where\s+do\s+i\s+get\s+access|reaction\s+role|join\s+the\s+community)\b", re.I)
 
 BOT_TOPIC_RE = re.compile(
-    r"\b(?:chaosx|chaos\s*x|chaos\s*bot|chaosx\s*bot|this\s+bot|that\s+bot|the\s+bot|our\s+bot|your\s+bot)\b",
+    r"\b(?:chaosx|chaos\s*x|chaos\s*bot|chaosx\s*bot)\b",
     re.I,
 )
+GENERIC_BOT_TOPIC_RE = re.compile(r"\b(?:this\s+bot|that\s+bot|the\s+bot|our\s+bot|your\s+bot)\b", re.I)
+OTHER_BOT_CONTEXT_RE = re.compile(r"\b(?:another|different|other)\s+(?:discord\s+)?server\b", re.I)
 BOT_INSULT_RE = re.compile(r"\b(?:stupid|dumb|idiot|useless|trash|garbage|terrible|bad|awful|annoying|lame|sucks?)\b", re.I)
 BOT_BROKEN_RE = re.compile(r"\b(?:broken|buggy|glitched|crashed|down|dead|offline|not\s+working|doesn't\s+work|wont\s+work|won't\s+work)\b", re.I)
 BOT_PRAISE_RE = re.compile(r"\b(?:smart|good|great|cool|based|useful|helpful|love|thanks|thank\s+you|nice\s+bot)\b", re.I)
@@ -222,9 +227,14 @@ def classify_bot_topic_banter(content: str, *, settings: Settings) -> AutoScanDe
         return AutoScanDecision("none")
     if is_blocked_for_auto_answer(text):
         return AutoScanDecision("none")
-    if not BOT_TOPIC_RE.search(text):
+    explicit_topic = bool(BOT_TOPIC_RE.search(text))
+    generic_topic = bool(GENERIC_BOT_TOPIC_RE.search(text))
+    if not explicit_topic and not generic_topic:
         return AutoScanDecision("none")
     reason = _bot_topic_reason(text)
+    if generic_topic and not explicit_topic:
+        if OTHER_BOT_CONTEXT_RE.search(text) or reason == "bot-topic conversation":
+            return AutoScanDecision("none")
     return AutoScanDecision(
         action="banter",
         confidence=100,
