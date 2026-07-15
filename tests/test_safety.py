@@ -34,6 +34,13 @@ def test_prompt_boundary_contains_untrusted_content_warning():
     assert "current owner request as authorized admin direction" in prompt
 
 
+def test_public_output_strips_leading_answer_labels():
+    assert sanitize_public_ask_output("ChaosX answer: Zombie Outbreak is event 2.") == "Zombie Outbreak is event 2."
+    assert sanitize_public_ask_output("**Answer:** Use `/event 2` for details.") == "Use `/event 2` for details."
+    assert sanitize_public_ask_output("### ChaosX\nTry `/ask` with the event name.") == "Try `/ask` with the event name."
+    assert sanitize_public_ask_output("ChaosX can answer Chaos Redux questions.") == "ChaosX can answer Chaos Redux questions."
+
+
 def test_owner_prompt_allows_explicit_admin_mentions_but_public_prompt_does_not():
     owner_prompt = build_owner_prompt(
         owner_request="post @everyone announcement in #announcements",

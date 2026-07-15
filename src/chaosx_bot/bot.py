@@ -67,6 +67,19 @@ PUBLIC_OUTPUT_FORBIDDEN_TERMS = {
     "safe server moderation", "channel organization", "reporting abuse",
     "ingredients:", "method:", "recipe", "baking steps", "cooking steps",
 }
+PUBLIC_ANSWER_LABEL_RE = re.compile(
+    r"""
+    ^\s*
+    (?:(?:[\#>\-_`]+|\*(?!\*))\s*)?
+    (?:
+        (?:\*\*)?(?:chaosx\s+)?(?:answer|response|reply)
+        (?:\s*(?:[:\-–—])(?:\*\*)?\s*|(?:\*\*)?\s*\n\s*)
+      |
+        (?:\*\*)?chaosx(?:\*\*)?\s*(?:[:\-–—]|\n)\s*
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 PUBLIC_ASK_SOURCE_REQUEST_TERMS = {
     "path", "paths", "file", "files", "source", "sources", "repo", "repository", "code", "implementation",
     "where is", "where are", "stored", "located", "spec", "specs", "documentation", "docs",
@@ -138,10 +151,16 @@ def public_ask_rejection_reason(request: str, *, reference_context: str = "") ->
 
 
 def sanitize_public_ask_output(output: str) -> str:
-    text = output.casefold()
+    cleaned = (output or "").strip()
+    for _ in range(3):
+        stripped = PUBLIC_ANSWER_LABEL_RE.sub("", cleaned, count=1).strip()
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    text = cleaned.casefold()
     if any(term in text for term in PUBLIC_OUTPUT_FORBIDDEN_TERMS):
         return PUBLIC_ASK_REDIRECT
-    return output
+    return cleaned
 
 
 def public_ask_wants_sources(request: str) -> bool:
@@ -1759,7 +1778,7 @@ async def run_hermes_command(
         command=command_name,
         summary=request,
     )
-    header = "ChaosX answer" if public else f"ChaosX `{status}` hash `{result.prompt_hash[:12]}`"
+    header = "" if public else f"ChaosX `{status}` hash `{result.prompt_hash[:12]}`"
     first_sent = None
     for i, part in enumerate(_chunk(output)):
         send_kwargs = {
@@ -1768,8 +1787,9 @@ async def run_hermes_command(
         }
         if i == 0 and should_record_reply_memory:
             send_kwargs["wait"] = True
+        prefix = f"{header}\n" if i == 0 and header else ""
         sent = await interaction.followup.send(
-            (header + "\n" if i == 0 else "") + part,
+            prefix + part,
             **send_kwargs,
         )
         if i == 0:
