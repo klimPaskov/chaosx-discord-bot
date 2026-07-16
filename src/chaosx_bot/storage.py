@@ -174,6 +174,22 @@ CREATE TABLE IF NOT EXISTS playtest_records (
     report_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS playtest_syntheses (
+    synthesis_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    guild_id INTEGER,
+    destination_channel_id INTEGER,
+    report_count INTEGER NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    discord_message_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS playtest_synthesis_sources (
+    synthesis_id TEXT NOT NULL,
+    playtest_id TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (synthesis_id, playtest_id)
+);
+
 CREATE TABLE IF NOT EXISTS automation_config (
     name TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 0,
@@ -192,6 +208,7 @@ DEFAULT_AUTOMATIONS = {
     "skill_subagent_change_summary": 1,
     "playtest_reminders": 1,
     "post_playtest_result_request": 1,
+    "playtest_result_synthesis": 1,
     "weekly_content_dump": 1,
     "release_announcement_posting": 0,
 }
@@ -205,6 +222,7 @@ AUTOMATION_DESCRIPTIONS = {
     "skill_subagent_change_summary": "Would summarize changes made by agent/skill-driven work.",
     "playtest_reminders": "Sends playtest reminder messages when a playtest is scheduled.",
     "post_playtest_result_request": "Asks testers for results/observations after a playtest window.",
+    "playtest_result_synthesis": "Batches new playtest observations into a private model-generated report with bugs, balance concerns, successful checks, uncertain findings, and next actions.",
     "weekly_content_dump": "Image-led weekly content-dump post. Posts only when enough fresh visuals/assets exist.",
     "release_announcement_posting": "Reserved for release announcement posting; should stay off until explicitly used.",
 }
@@ -697,6 +715,69 @@ class Store:
                 (limit,),
             )
             return [tuple(row) for row in await cur.fetchall()]
+
+    async def list_unsynthesized_playtest_reports(
+        self, *, guild_id: int, limit: int = 25
+    ) -> list[tuple]:
+        limit = max(1, min(limit, 100))
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT p.playtest_id, p.created_at, p.target, p.status, p.report_json
+                FROM playtest_records AS p
+                WHERE p.status = 'reported'
+                  AND p.guild_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM playtest_synthesis_sources AS source
+                      WHERE source.playtest_id = p.playtest_id
+                  )
+                ORDER BY p.created_at ASC
+                LIMIT ?
+                """,
+                (guild_id, limit),
+            )
+            return [tuple(row) for row in await cur.fetchall()]
+
+    async def record_playtest_synthesis(
+        self,
+        *,
+        synthesis_id: str,
+        guild_id: int,
+        destination_channel_id: int,
+        playtest_ids: list[str],
+        prompt_hash: str,
+        discord_message_id: int,
+    ) -> None:
+        if not playtest_ids:
+            raise ValueError("playtest synthesis requires at least one report")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                INSERT INTO playtest_syntheses(
+                    synthesis_id, created_at, guild_id, destination_channel_id,
+                    report_count, prompt_hash, discord_message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    synthesis_id,
+                    now_iso(),
+                    guild_id,
+                    destination_channel_id,
+                    len(playtest_ids),
+                    prompt_hash,
+                    discord_message_id,
+                ),
+            )
+            await db.executemany(
+                """
+                INSERT INTO playtest_synthesis_sources(synthesis_id, playtest_id)
+                VALUES (?, ?)
+                """,
+                [(synthesis_id, playtest_id) for playtest_id in playtest_ids],
+            )
+            await db.commit()
 
     async def list_automations(self) -> list[tuple[str, int, str, str]]:
         async with aiosqlite.connect(self.db_path) as db:

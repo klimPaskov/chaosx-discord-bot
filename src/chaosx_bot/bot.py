@@ -6,6 +6,7 @@ import io
 import json
 import re
 from datetime import datetime, timezone
+from typing import Awaitable, Callable, cast
 
 import aiohttp
 import discord
@@ -45,6 +46,13 @@ from .issue_duplicates import (
     clear_duplicate_candidate,
     find_similar_github_issues,
     parse_duplicate_decision,
+)
+from .playtest_synthesis import (
+    AUTOMATION_NAME as PLAYTEST_SYNTHESIS_AUTOMATION_NAME,
+    DEFAULT_DEBOUNCE_SECONDS as PLAYTEST_SYNTHESIS_DEBOUNCE_SECONDS,
+    MAX_REPORTS_PER_SYNTHESIS,
+    MAX_SYNTHESIS_OUTPUT_CHARS,
+    build_playtest_synthesis_prompt,
 )
 from .rate_limit import FixedWindowRateLimiter
 from .storage import Store
@@ -998,6 +1006,9 @@ class ChaosXBot(discord.Client):
             host=settings.webhook_host,
             port=settings.webhook_port,
         )
+        self._playtest_synthesis_task: asyncio.Task[None] | None = None
+        self._playtest_synthesis_lock = asyncio.Lock()
+        self._playtest_synthesis_requested = False
 
     async def setup_hook(self) -> None:
         await self.store.init()
@@ -1010,6 +1021,7 @@ class ChaosXBot(discord.Client):
                 [
                     "playtest_reminders",
                     "post_playtest_result_request",
+                    PLAYTEST_SYNTHESIS_AUTOMATION_NAME,
                 ],
                 str(self.settings.automation_reminder_channel_id),
             )
@@ -1039,7 +1051,129 @@ class ChaosXBot(discord.Client):
             status=discord.Status.online,
         )
         await self.leave_unauthorized_guilds()
+        self.schedule_playtest_result_synthesis(delay_seconds=5)
         print(f"ChaosX logged in as {self.user} owner_id={self.settings.owner_id}")
+
+    def schedule_playtest_result_synthesis(
+        self, *, delay_seconds: int = PLAYTEST_SYNTHESIS_DEBOUNCE_SECONDS
+    ) -> None:
+        if self._playtest_synthesis_task and not self._playtest_synthesis_task.done():
+            self._playtest_synthesis_requested = True
+            return
+        self._playtest_synthesis_requested = False
+        self._playtest_synthesis_task = asyncio.create_task(
+            self._playtest_synthesis_worker(max(0, delay_seconds)),
+            name="chaosx-playtest-result-synthesis",
+        )
+
+    async def _playtest_synthesis_worker(self, delay_seconds: int) -> None:
+        await asyncio.sleep(delay_seconds)
+        while True:
+            self._playtest_synthesis_requested = False
+            outcome = await self._run_playtest_result_synthesis_once()
+            if outcome == "disabled":
+                return
+            if outcome == "empty" and not self._playtest_synthesis_requested:
+                return
+            retry_delay = (
+                PLAYTEST_SYNTHESIS_DEBOUNCE_SECONDS
+                if outcome in {"sent", "empty"}
+                else 300
+            )
+            await asyncio.sleep(retry_delay)
+
+    async def _run_playtest_result_synthesis_once(self) -> str:
+        async with self._playtest_synthesis_lock:
+            if not await self.store.automation_enabled(
+                PLAYTEST_SYNTHESIS_AUTOMATION_NAME
+            ):
+                return "disabled"
+            guild_id = self.settings.allowed_guild_id or self.settings.command_guild_id
+            destination_id = self.settings.automation_reminder_channel_id
+            if not guild_id or not destination_id:
+                return "disabled"
+            rows = await self.store.list_unsynthesized_playtest_reports(
+                guild_id=guild_id,
+                limit=MAX_REPORTS_PER_SYNTHESIS,
+            )
+            if not rows:
+                return "empty"
+
+            prompt = build_playtest_synthesis_prompt(rows)
+            result = await run_hermes(
+                hermes_bin=self.settings.hermes_bin,
+                profile=self.settings.hermes_profile,
+                repo=self.settings.chaos_redux_repo,
+                prompt=prompt,
+                timeout_seconds=self.settings.hermes_timeout_seconds,
+                model=self.settings.ask_model,
+                provider=self.settings.ask_provider,
+                reasoning_effort=self.settings.ask_reasoning_effort,
+                toolsets="safe",
+                ignore_rules=True,
+            )
+            raw_output = result.stdout.strip()
+            output = (
+                raw_output
+                if len(raw_output) <= MAX_SYNTHESIS_OUTPUT_CHARS
+                else raw_output[: MAX_SYNTHESIS_OUTPUT_CHARS - 1] + "…"
+            )
+            if not result.ok or not output:
+                print(
+                    "ChaosX playtest synthesis failed: "
+                    f"returncode={result.returncode} timed_out={result.timed_out}"
+                )
+                return "retry"
+
+            channel = self.get_channel(destination_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(destination_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                    print(
+                        "ChaosX playtest synthesis channel lookup failed: "
+                        f"{type(exc).__name__}"
+                    )
+                    return "retry"
+            send_message = cast(
+                Callable[..., Awaitable[discord.Message]],
+                getattr(channel, "send", None),
+            )
+            if not callable(send_message):
+                print("ChaosX playtest synthesis destination is not messageable")
+                return "retry"
+
+            sent_message: discord.Message | None = None
+            try:
+                for part in _chunk(output):
+                    sent_message = await send_message(
+                        part,
+                        allowed_mentions=safe_allowed_mentions(),
+                    )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                print(f"ChaosX playtest synthesis delivery failed: {type(exc).__name__}")
+                return "retry"
+            if sent_message is None:
+                return "retry"
+
+            playtest_ids = [str(row[0]) for row in rows]
+            synthesis_id = _stable_id("playtest-synthesis", *playtest_ids)
+            await self.store.record_playtest_synthesis(
+                synthesis_id=synthesis_id,
+                guild_id=guild_id,
+                destination_channel_id=destination_id,
+                playtest_ids=playtest_ids,
+                prompt_hash=result.prompt_hash,
+                discord_message_id=sent_message.id,
+            )
+            await self.store.audit(
+                actor_id=self.settings.owner_id,
+                guild_id=guild_id,
+                channel_id=destination_id,
+                command="automation playtest result synthesis",
+                summary=f"{len(playtest_ids)} reports -> {synthesis_id}",
+            )
+            return "sent"
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         allowed = self.settings.allowed_guild_id or self.settings.command_guild_id
@@ -1160,6 +1294,13 @@ class ChaosXBot(discord.Client):
                 await guild.leave()
 
     async def close(self) -> None:
+        task = self._playtest_synthesis_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await self.webhook_server.stop()
         await super().close()
 
@@ -2565,6 +2706,7 @@ def register_commands(bot: ChaosXBot) -> None:
         report = {"event_id": event_id.strip() or None, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
         await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=target, start_time="", duration_minutes=0, voice="", build="")
         await bot.store.add_playtest_report(playtest_id=playtest_id, report=report)
+        bot.schedule_playtest_result_synthesis()
         heading = f"Recorded playtest observation for {label}." if event_id.strip() else "Recorded general playtest observation."
         await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id or "general", render=lambda: f"{heading}\nUse `/issue` instead if this should become a tracked GitHub bug/crash/request.\n```text\n{observation[:1500]}\n```")
 

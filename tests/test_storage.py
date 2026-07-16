@@ -48,6 +48,8 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert "public model" in by_name["auto_soft_rule_warnings"][2]
     assert by_name["auto_bot_topic_banter"][0] == 1
     assert "dynamic banter" in by_name["auto_bot_topic_banter"][2]
+    assert by_name["playtest_result_synthesis"][0] == 1
+    assert "private model-generated report" in by_name["playtest_result_synthesis"][2]
     assert await store.automation_enabled("question_answer_tracking")
     assert await store.automation_enabled("auto_question_answering")
     assert await store.automation_enabled("auto_soft_rule_warnings")
