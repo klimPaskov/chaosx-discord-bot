@@ -24,6 +24,7 @@ from .visual_cache import VisualArtifactCache, mcp_launcher_fingerprint
 
 FOCUS_ROOT = Path("common/national_focus")
 COUNTRY_TAGS_ROOT = Path("common/country_tags")
+FOCUS_RASTER_TOOL = "hoi4.focus_raster"
 EVENT_PREFIX_RE = re.compile(r"^(\d{3})(?:_|$)")
 ASSIGNMENT_VALUE_RE = r'(?:"([^"\n]+)"|([A-Za-z0-9_.:\-]+))'
 TREE_ID_RE = re.compile(rf"(?m)^\s*id\s*=\s*{ASSIGNMENT_VALUE_RE}")
@@ -450,7 +451,7 @@ class FocusTreeMcpClient:
 
     async def _render_one(self, session: ClientSession, workspace_id: str, record: FocusTreeRecord) -> bytes:
         result = await session.call_tool(
-            "hoi4.focus_render",
+            FOCUS_RASTER_TOOL,
             {
                 "workspaceId": workspace_id,
                 "relativePath": record.relative_path,
@@ -465,7 +466,7 @@ class FocusTreeMcpClient:
             None,
         )
         if not png_artifact or not png_artifact.get("uri"):
-            raise FocusTreeError("MCP focus render returned no PNG artifact")
+            raise FocusTreeError("MCP focus raster returned no PNG artifact")
         declared_size = int(png_artifact.get("size") or 0)
         if declared_size > self.settings.focus_tree_max_attachment_bytes:
             raise FocusTreeError("MCP focus graph is too large for Discord")
@@ -483,6 +484,7 @@ class FocusTreeMcpClient:
             record.source_mtime_ns,
             record.source_size,
             self.settings.focus_tree_review_scale,
+            FOCUS_RASTER_TOOL,
             self._launcher_fingerprint,
         )
 

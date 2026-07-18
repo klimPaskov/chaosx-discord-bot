@@ -16,6 +16,7 @@ from chaosx_bot.focus_trees import (
     FocusTreeCatalog,
     FocusTreeError,
     FocusTreeMcpClient,
+    FocusTreeRecord,
     SharedMcpSession,
     _validate_mcp_node_runtime,
     isolated_mcp_server_parameters,
@@ -243,6 +244,75 @@ async def test_read_resource_bytes_joins_verified_mcp_chunks() -> None:
     data = await read_resource_bytes(cast(Any, session), uri1, max_bytes=16, expected_mime="image/png")
     assert data == b"12345678"
     assert session.uris == [uri1, uri2]
+
+
+@pytest.mark.asyncio
+async def test_focus_png_uses_dedicated_raster_tool() -> None:
+    png = b"\x89PNG\r\n\x1a\nraster"
+    uri = "hoi4-agent://workspace/test/artifact/focus.png"
+
+    class RasterSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        async def call_tool(self, name: str, arguments: dict[str, object]):
+            self.calls.append((name, arguments))
+            return _DumpResult(
+                {
+                    "isError": False,
+                    "structuredContent": {
+                        "status": "ok",
+                        "artifacts": [
+                            {"mimeType": "image/png", "uri": uri, "size": len(png)}
+                        ],
+                    },
+                }
+            )
+
+        async def read_resource(self, requested_uri):
+            assert str(requested_uri) == uri
+            return _DumpResult(
+                {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "image/png",
+                            "blob": base64.b64encode(png).decode(),
+                        }
+                    ]
+                }
+            )
+
+    session = RasterSession()
+    client = FocusTreeMcpClient(
+        Settings(discord_token="dummy", focus_tree_review_scale=0.5)
+    )
+    record = FocusTreeRecord(
+        "test_tree",
+        "common/national_focus/test.txt",
+        3,
+        ("TST",),
+        ("Test",),
+        (),
+        12,
+        123,
+        456,
+    )
+
+    rendered = await client._render_one(cast(Any, session), "current", record)
+
+    assert rendered == png
+    assert session.calls == [
+        (
+            "hoi4.focus_raster",
+            {
+                "workspaceId": "current",
+                "relativePath": "common/national_focus/test.txt",
+                "treeId": "test_tree",
+                "reviewScale": 0.5,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
