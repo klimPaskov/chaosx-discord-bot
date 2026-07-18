@@ -28,7 +28,13 @@ from .event_visuals import (
     EventVisualMcpClient,
     ScriptedGuiCatalog,
 )
-from .focus_trees import FocusTreeCatalog, FocusTreeError, FocusTreeMcpClient, FocusTreeRecord
+from .focus_trees import (
+    FocusTreeCatalog,
+    FocusTreeError,
+    FocusTreeMcpClient,
+    FocusTreeRecord,
+    SharedMcpSession,
+)
 from .vault_index import refresh_vault_indexes
 from .hermes_bridge import (
     HermesResult,
@@ -998,11 +1004,12 @@ class ChaosXBot(discord.Client):
         self.rate_limiter = FixedWindowRateLimiter()
         self.knowledge = Knowledge(settings.chaos_redux_repo, settings.db_path, settings.obsidian_vault_path)
         visual_repo = settings.focus_tree_repo or settings.chaos_redux_repo
+        self.mcp_session = SharedMcpSession(settings)
         self.focus_tree_catalog = FocusTreeCatalog(visual_repo)
-        self.focus_tree_mcp = FocusTreeMcpClient(settings)
+        self.focus_tree_mcp = FocusTreeMcpClient(settings, self.mcp_session)
         self.event_chain_catalog = EventChainCatalog(visual_repo)
         self.scripted_gui_catalog = ScriptedGuiCatalog(visual_repo)
-        self.event_visual_mcp = EventVisualMcpClient(settings)
+        self.event_visual_mcp = EventVisualMcpClient(settings, self.mcp_session)
         self.webhook_server = GitHubWebhookServer(
             store=self.store,
             secret=settings.github_webhook_secret,
@@ -1010,6 +1017,7 @@ class ChaosXBot(discord.Client):
             port=settings.webhook_port,
         )
         self._playtest_synthesis_task: asyncio.Task[None] | None = None
+        self._mcp_warm_task: asyncio.Task[None] | None = None
         self._playtest_synthesis_lock = asyncio.Lock()
         self._playtest_synthesis_requested = False
 
@@ -1055,7 +1063,19 @@ class ChaosXBot(discord.Client):
         )
         await self.leave_unauthorized_guilds()
         self.schedule_playtest_result_synthesis(delay_seconds=5)
+        if self._mcp_warm_task is None or self._mcp_warm_task.done():
+            self._mcp_warm_task = asyncio.create_task(
+                self._warm_mcp_session(), name="chaosx-mcp-warmup"
+            )
         print(f"ChaosX logged in as {self.user} owner_id={self.settings.owner_id}")
+
+    async def _warm_mcp_session(self) -> None:
+        try:
+            await self.mcp_session.start()
+        except Exception as exc:
+            print(f"ChaosX MCP warmup failed: {type(exc).__name__}")
+            return
+        print("ChaosX MCP session ready")
 
     def schedule_playtest_result_synthesis(
         self, *, delay_seconds: int = PLAYTEST_SYNTHESIS_DEBOUNCE_SECONDS
@@ -1304,6 +1324,14 @@ class ChaosXBot(discord.Client):
                 await task
             except asyncio.CancelledError:
                 pass
+        warm_task = self._mcp_warm_task
+        if warm_task and not warm_task.done():
+            warm_task.cancel()
+            try:
+                await warm_task
+            except asyncio.CancelledError:
+                pass
+        await self.mcp_session.close()
         await self.webhook_server.stop()
         await super().close()
 

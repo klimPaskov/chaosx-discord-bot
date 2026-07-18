@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -214,6 +216,69 @@ async def test_scripted_gui_render_reads_svg_and_converts_to_png() -> None:
         "visibility": {"fury_window": True, "fury_gui": True},
     }
     assert arguments["states"] == ["active"]
+
+
+@pytest.mark.asyncio
+async def test_related_visuals_render_chain_and_useful_gui_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    client = EventVisualMcpClient(Settings(discord_token="dummy"))
+    chain = EventChainRecord(
+        "events/001_test.txt", "Test", 1, ("chaosx.nr1.1",), 101, 202
+    )
+    mapicon = ScriptedGuiRecord(
+        "common/scripted_guis/001_test.txt",
+        "Map icon",
+        "test_mapicon_gui",
+        "test_mapicon_window",
+        "player_context",
+        1,
+        101,
+        202,
+    )
+    dashboard = ScriptedGuiRecord(
+        "common/scripted_guis/001_test.txt",
+        "Dashboard",
+        "test_dashboard_gui",
+        "test_dashboard_window",
+        "player_context",
+        1,
+        101,
+        202,
+    )
+    started: set[str] = set()
+    release = asyncio.Event()
+
+    async def rendezvous(name: str) -> bytes:
+        started.add(name)
+        if len(started) == 2:
+            release.set()
+        await asyncio.wait_for(release.wait(), timeout=1)
+        return b"\x89PNG\r\n\x1a\nrendered"
+
+    async def render_chain(*_args: object) -> bytes:
+        return await rendezvous("chain")
+
+    async def render_gui(*args: object) -> bytes:
+        record = cast(ScriptedGuiRecord, args[-1])
+        return await rendezvous(record.gui_id)
+
+    @asynccontextmanager
+    async def fake_session():
+        yield cast(Any, object()), "workspace"
+
+    monkeypatch.setattr(client, "_render_event_chain", render_chain)
+    monkeypatch.setattr(client, "_render_gui", render_gui)
+    monkeypatch.setattr(client, "_session", fake_session)
+
+    result = await client.render_related(chain, (mapicon, dashboard))
+
+    assert started == {"chain", "test_dashboard_gui"}
+    assert result.chain is not None
+    assert [preview.record for preview in result.guis] == [dashboard]
+    assert not result.chain_failed
+    assert result.failed_guis == 0
 
 
 def test_empty_scripted_gui_preview_is_suppressed() -> None:

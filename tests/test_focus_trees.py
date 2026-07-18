@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -12,7 +14,10 @@ from chaosx_bot.bot import ChaosXBot, register_commands
 from chaosx_bot.config import Settings
 from chaosx_bot.focus_trees import (
     FocusTreeCatalog,
+    FocusTreeError,
     FocusTreeMcpClient,
+    SharedMcpSession,
+    _validate_mcp_node_runtime,
     isolated_mcp_server_parameters,
     read_resource_bytes,
 )
@@ -107,6 +112,82 @@ def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
         assert parameters.cwd == str(tmp_path)
 
     assert not temporary_root.exists()
+
+
+def test_local_mcp_rejects_obsolete_node_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    _validate_mcp_node_runtime.cache_clear()
+    monkeypatch.setattr(
+        "chaosx_bot.focus_trees.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="v18.19.1\n"),
+    )
+
+    with pytest.raises(FocusTreeError, match="Node.js 22 or newer"):
+        _validate_mcp_node_runtime("node")
+
+    _validate_mcp_node_runtime.cache_clear()
+
+
+def test_local_mcp_accepts_compatible_absolute_node_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _validate_mcp_node_runtime.cache_clear()
+    monkeypatch.setattr(
+        "chaosx_bot.focus_trees.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="v22.22.3\n"),
+    )
+
+    command = "/home/test/.nvm/versions/node/v22.22.3/bin/node"
+    assert _validate_mcp_node_runtime(command) == command
+
+    _validate_mcp_node_runtime.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_shared_mcp_session_opens_and_closes_stdio_in_worker_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle_tasks: list[asyncio.Task[object] | None] = []
+
+    @contextmanager
+    def fake_parameters(_settings: Settings):
+        yield object()
+
+    @asynccontextmanager
+    async def fake_stdio(_params: object, **_kwargs: object):
+        lifecycle_tasks.append(asyncio.current_task())
+        try:
+            yield object(), object()
+        finally:
+            lifecycle_tasks.append(asyncio.current_task())
+
+    class FakeClientSession:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "chaosx_bot.focus_trees.isolated_mcp_server_parameters", fake_parameters
+    )
+    monkeypatch.setattr("chaosx_bot.focus_trees.stdio_client", fake_stdio)
+    monkeypatch.setattr("chaosx_bot.focus_trees.ClientSession", FakeClientSession)
+    pool = SharedMcpSession(Settings(discord_token="dummy"))
+
+    await pool.start()
+    async with pool.session() as session:
+        assert isinstance(session, FakeClientSession)
+    await pool.close()
+
+    assert len(lifecycle_tasks) == 2
+    assert lifecycle_tasks[0] is lifecycle_tasks[1]
+    assert lifecycle_tasks[0] is not asyncio.current_task()
 
 
 class _DumpResult:

@@ -6,18 +6,21 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import tempfile
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, AsyncIterator, Iterable, Iterator, Sequence
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
 
 from .config import Settings
+from .visual_cache import VisualArtifactCache, mcp_launcher_fingerprint
 
 FOCUS_ROOT = Path("common/national_focus")
 COUNTRY_TAGS_ROOT = Path("common/country_tags")
@@ -34,11 +37,39 @@ class FocusTreeError(RuntimeError):
     """Internal focus-tree failure whose details must not be posted publicly."""
 
 
+@lru_cache(maxsize=16)
+def _validate_mcp_node_runtime(command: str) -> str:
+    """Fail clearly when a local HOI4 Agent Tools server uses an obsolete Node runtime."""
+
+    expanded = str(Path(command).expanduser()) if "/" in command else command
+    if Path(expanded).name.casefold() not in {"node", "node.exe"}:
+        return expanded
+    try:
+        completed = subprocess.run(
+            [expanded, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FocusTreeError("The configured Node.js runtime could not be started") from exc
+    match = re.fullmatch(r"v?(\d+)(?:\.\d+){0,2}", completed.stdout.strip())
+    if completed.returncode != 0 or match is None:
+        raise FocusTreeError("The configured Node.js runtime version could not be determined")
+    if int(match.group(1)) < 22:
+        raise FocusTreeError(
+            "HOI4 Agent Tools 2.x requires Node.js 22 or newer; configure an absolute compatible Node path"
+        )
+    return expanded
+
+
 @contextmanager
 def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerParameters]:
     """Run read-only render sessions with disposable MCP artifacts and server state."""
 
     args = shlex.split(settings.focus_mcp_args)
+    command = _validate_mcp_node_runtime(settings.focus_mcp_command)
     workspace_cwd = (settings.focus_tree_repo or settings.chaos_redux_repo).expanduser()
     cwd = str(workspace_cwd) if workspace_cwd.is_dir() else None
     configured_path = settings.focus_mcp_config_path.expanduser()
@@ -57,7 +88,7 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
     if not configured_path.is_file():
         if not config_argument_found:
             args.extend(("--config", str(configured_path)))
-        yield StdioServerParameters(command=settings.focus_mcp_command, args=args, cwd=cwd)
+        yield StdioServerParameters(command=command, args=args, cwd=cwd)
         return
     try:
         config = json.loads(configured_path.read_text(encoding="utf-8"))
@@ -88,7 +119,88 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
                 break
         if not replaced:
             args.extend(("--config", str(isolated_path)))
-        yield StdioServerParameters(command=settings.focus_mcp_command, args=args, cwd=cwd)
+        yield StdioServerParameters(command=command, args=args, cwd=cwd)
+
+
+class SharedMcpSession:
+    """One lazily initialized MCP process shared by all ChaosX visual renderers."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._start_lock = asyncio.Lock()
+        self._usage_lock = asyncio.Lock()
+        self._worker_task: asyncio.Task[None] | None = None
+        self._ready = asyncio.Event()
+        self._shutdown = asyncio.Event()
+        self._session: ClientSession | None = None
+        self._start_error: BaseException | None = None
+
+    async def start(self) -> None:
+        if self._session is not None:
+            return
+        async with self._start_lock:
+            if self._session is not None:
+                return
+            if self._worker_task is None or self._worker_task.done():
+                self._ready = asyncio.Event()
+                self._shutdown = asyncio.Event()
+                self._start_error = None
+                self._worker_task = asyncio.create_task(
+                    self._run_worker(), name="chaosx-shared-mcp-session"
+                )
+            await self._ready.wait()
+            if self._start_error is not None:
+                raise FocusTreeError("HOI4 Agent Tools MCP session failed to start") from self._start_error
+            if self._session is None:
+                raise FocusTreeError("HOI4 Agent Tools MCP session is unavailable")
+
+    async def _run_worker(self) -> None:
+        try:
+            with isolated_mcp_server_parameters(self.settings) as params:
+                with open(os.devnull, "w", encoding="utf-8") as errlog:
+                    async with stdio_client(params, errlog=errlog) as (read, write):
+                        timeout = self.settings.focus_mcp_timeout_seconds
+                        async with ClientSession(
+                            read,
+                            write,
+                            read_timeout_seconds=timedelta(seconds=timeout),
+                        ) as session:
+                            await session.initialize()
+                            self._session = session
+                            self._ready.set()
+                            await self._shutdown.wait()
+        except BaseException as exc:
+            if not self._ready.is_set():
+                self._start_error = exc
+                self._ready.set()
+            elif not isinstance(exc, asyncio.CancelledError):
+                self._start_error = exc
+        finally:
+            self._session = None
+            if not self._ready.is_set():
+                self._ready.set()
+
+    @asynccontextmanager
+    async def session(self) -> AsyncIterator[ClientSession]:
+        await self.start()
+        async with self._usage_lock:
+            if self._session is None:
+                raise FocusTreeError("HOI4 Agent Tools MCP session is unavailable")
+            yield self._session
+
+    async def close(self) -> None:
+        async with self._start_lock:
+            async with self._usage_lock:
+                task = self._worker_task
+                self._shutdown.set()
+                if task is not None:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                self._worker_task = None
+                self._session = None
+                self._start_error = None
 
 
 @dataclass(frozen=True)
@@ -236,9 +348,18 @@ class FocusTreeCatalog:
 
 
 class FocusTreeMcpClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, session_pool: SharedMcpSession | None = None
+    ) -> None:
         self.settings = settings
+        self.session_pool = session_pool
         self._cache: dict[tuple[Any, ...], bytes] = {}
+        self._disk_cache = VisualArtifactCache(
+            "focus-trees", max_item_bytes=settings.focus_tree_max_attachment_bytes
+        )
+        self._launcher_fingerprint = mcp_launcher_fingerprint(
+            settings.focus_mcp_command, settings.focus_mcp_args
+        )
 
     async def render(self, records: Sequence[FocusTreeRecord]) -> FocusTreeRenderBatch:
         selected = list(records[: self.settings.focus_tree_max_graphs])
@@ -247,7 +368,12 @@ class FocusTreeMcpClient:
         graphs: list[FocusTreeGraph] = []
         missing: list[FocusTreeRecord] = []
         for record in selected:
-            cached = self._cache.get(self._cache_key(record))
+            key = self._cache_key(record)
+            cached = self._cache.get(key)
+            if cached is None:
+                cached = self._disk_cache.get(key)
+                if cached is not None:
+                    self._cache[key] = cached
             if cached is None:
                 missing.append(record)
             else:
@@ -259,30 +385,49 @@ class FocusTreeMcpClient:
             except Exception as exc:
                 raise FocusTreeError("HOI4 Agent Tools MCP rendering failed") from exc
             for graph in rendered:
-                self._cache[self._cache_key(graph.record)] = graph.png
+                key = self._cache_key(graph.record)
+                self._cache[key] = graph.png
+                self._disk_cache.put(key, graph.png)
                 graphs.append(graph)
         graph_order = {record: index for index, record in enumerate(selected)}
         graphs.sort(key=lambda graph: graph_order[graph.record])
         return FocusTreeRenderBatch(tuple(graphs), len(selected), failed)
 
     async def _render_uncached(self, records: Sequence[FocusTreeRecord]) -> tuple[list[FocusTreeGraph], int]:
-        rendered: list[FocusTreeGraph] = []
-        failed = 0
         timeout = self.settings.focus_mcp_timeout_seconds
+        if self.session_pool is not None:
+            async with asyncio.timeout(timeout):
+                async with self.session_pool.session() as session:
+                    workspace_id = await self._workspace_id(session)
+                    return await self._render_records(session, workspace_id, records)
         async with asyncio.timeout(timeout):
             with isolated_mcp_server_parameters(self.settings) as params:
                 with open(os.devnull, "w", encoding="utf-8") as errlog:
                     async with stdio_client(params, errlog=errlog) as (read, write):
-                        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=timeout)) as session:
+                        async with ClientSession(
+                            read,
+                            write,
+                            read_timeout_seconds=timedelta(seconds=timeout),
+                        ) as session:
                             await session.initialize()
                             workspace_id = await self._workspace_id(session)
-                            for record in records:
-                                try:
-                                    png = await self._render_one(session, workspace_id, record)
-                                except Exception:
-                                    failed += 1
-                                    continue
-                                rendered.append(FocusTreeGraph(record, png))
+                            return await self._render_records(session, workspace_id, records)
+
+    async def _render_records(
+        self,
+        session: ClientSession,
+        workspace_id: str,
+        records: Sequence[FocusTreeRecord],
+    ) -> tuple[list[FocusTreeGraph], int]:
+        rendered: list[FocusTreeGraph] = []
+        failed = 0
+        for record in records:
+            try:
+                png = await self._render_one(session, workspace_id, record)
+            except Exception:
+                failed += 1
+                continue
+            rendered.append(FocusTreeGraph(record, png))
         return rendered, failed
 
     async def _workspace_id(self, session: ClientSession) -> str:
@@ -338,6 +483,7 @@ class FocusTreeMcpClient:
             record.source_mtime_ns,
             record.source_size,
             self.settings.focus_tree_review_scale,
+            self._launcher_fingerprint,
         )
 
 

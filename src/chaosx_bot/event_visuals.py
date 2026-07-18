@@ -19,7 +19,13 @@ from mcp.client.stdio import stdio_client
 from PIL import Image, ImageChops
 
 from .config import Settings
-from .focus_trees import _structured_content, isolated_mcp_server_parameters, read_resource_bytes
+from .focus_trees import (
+    SharedMcpSession,
+    _structured_content,
+    isolated_mcp_server_parameters,
+    read_resource_bytes,
+)
+from .visual_cache import VisualArtifactCache, mcp_launcher_fingerprint
 
 EVENTS_ROOT = Path("events")
 SCRIPTED_GUI_ROOT = Path("common/scripted_guis")
@@ -35,7 +41,12 @@ class EventVisualError(RuntimeError):
 
 
 class EmptyGuiPreviewError(EventVisualError):
-    """The MCP render succeeded but contained no useful visible interface."""
+    """Raised when the offline renderer produced no meaningful GUI content."""
+
+
+def _is_low_value_auto_gui(record: ScriptedGuiRecord) -> bool:
+    identity = f"{record.gui_id} {record.window_name}".casefold()
+    return any(token in identity for token in ("mapicon", "map_icon", "map icon"))
 
 
 @dataclass(frozen=True)
@@ -230,14 +241,50 @@ class ScriptedGuiCatalog:
 
 
 class EventVisualMcpClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, session_pool: SharedMcpSession | None = None
+    ) -> None:
         self.settings = settings
+        self.session_pool = session_pool
         self._event_cache: dict[tuple[Any, ...], bytes] = {}
         self._gui_cache: dict[tuple[Any, ...], bytes] = {}
+        self._event_disk_cache = VisualArtifactCache(
+            "event-chains", max_item_bytes=settings.focus_tree_max_attachment_bytes
+        )
+        self._gui_disk_cache = VisualArtifactCache(
+            "scripted-guis", max_item_bytes=settings.focus_tree_max_attachment_bytes
+        )
+        self._launcher_fingerprint = mcp_launcher_fingerprint(
+            settings.focus_mcp_command, settings.focus_mcp_args
+        )
+
+    def _cached_event(self, key: tuple[Any, ...]) -> bytes | None:
+        cached = self._event_cache.get(key)
+        if cached is None:
+            cached = self._event_disk_cache.get(key)
+            if cached is not None:
+                self._event_cache[key] = cached
+        return cached
+
+    def _store_event(self, key: tuple[Any, ...], png: bytes) -> None:
+        self._event_cache[key] = png
+        self._event_disk_cache.put(key, png)
+
+    def _cached_gui(self, key: tuple[Any, ...]) -> bytes | None:
+        cached = self._gui_cache.get(key)
+        if cached is None:
+            cached = self._gui_disk_cache.get(key)
+            if cached is not None:
+                self._gui_cache[key] = cached
+        return cached
+
+    def _store_gui(self, key: tuple[Any, ...], png: bytes) -> None:
+        self._gui_cache[key] = png
+        self._gui_disk_cache.put(key, png)
 
     async def render_event_chain(self, record: EventChainRecord) -> EventChainGraph:
         key = self._event_key(record)
-        cached = self._event_cache.get(key)
+        cached = self._cached_event(key)
         if cached is not None:
             return EventChainGraph(record, cached)
         try:
@@ -247,13 +294,23 @@ class EventVisualMcpClient:
             raise
         except Exception as exc:
             raise EventVisualError("Event-chain graph is unavailable") from exc
-        self._event_cache[key] = png
+        self._store_event(key, png)
         return EventChainGraph(record, png)
 
     async def render_scripted_guis(self, records: Sequence[ScriptedGuiRecord]) -> tuple[tuple[ScriptedGuiPreview, ...], int]:
         selected = list(records[: self.settings.scripted_gui_max_previews])
         if not selected:
             return (), 0
+        cached = [self._cached_gui(self._gui_key(record)) for record in selected]
+        if all(png is not None for png in cached):
+            return (
+                tuple(
+                    ScriptedGuiPreview(record, png)
+                    for record, png in zip(selected, cached, strict=True)
+                    if png is not None
+                ),
+                0,
+            )
         try:
             async with self._session() as (session, workspace_id):
                 return await self._render_gui_records(session, workspace_id, selected)
@@ -267,25 +324,48 @@ class EventVisualMcpClient:
         chain: EventChainRecord | None,
         guis: Sequence[ScriptedGuiRecord],
     ) -> RelatedEventVisuals:
-        selected_guis = list(guis[: self.settings.scripted_gui_max_previews])
+        useful_guis = [record for record in guis if not _is_low_value_auto_gui(record)]
+        candidates = useful_guis or list(guis)
+        selected_guis = list(candidates[: self.settings.scripted_gui_max_previews])
         if chain is None and not selected_guis:
             return RelatedEventVisuals(None, ())
+
+        graph: EventChainGraph | None = None
+        needs_chain = False
+        if chain is not None:
+            event_key = self._event_key(chain)
+            cached = self._cached_event(event_key)
+            if cached is None:
+                needs_chain = True
+            else:
+                graph = EventChainGraph(chain, cached)
+        guis_cached = all(
+            self._cached_gui(self._gui_key(record)) is not None for record in selected_guis
+        )
+        if not needs_chain and guis_cached:
+            previews = tuple(
+                ScriptedGuiPreview(record, self._cached_gui(self._gui_key(record)) or b"")
+                for record in selected_guis
+            )
+            return RelatedEventVisuals(graph, previews)
+
         try:
             async with self._session() as (session, workspace_id):
-                graph: EventChainGraph | None = None
-                chain_failed = False
-                if chain is not None:
+                async def render_chain() -> tuple[EventChainGraph | None, bool]:
+                    if chain is None or not needs_chain:
+                        return graph, False
                     try:
-                        key = self._event_key(chain)
-                        png = self._event_cache.get(key)
-                        if png is None:
-                            png = await self._render_event_chain(session, workspace_id, chain)
-                            self._event_cache[key] = png
-                        graph = EventChainGraph(chain, png)
+                        png = await self._render_event_chain(session, workspace_id, chain)
                     except Exception:
-                        chain_failed = True
-                previews, failed = await self._render_gui_records(session, workspace_id, selected_guis)
-                return RelatedEventVisuals(graph, previews, chain_failed, failed)
+                        return None, True
+                    self._store_event(self._event_key(chain), png)
+                    return EventChainGraph(chain, png), False
+
+                (rendered_graph, chain_failed), (previews, failed) = await asyncio.gather(
+                    render_chain(),
+                    self._render_gui_records(session, workspace_id, selected_guis),
+                )
+                return RelatedEventVisuals(rendered_graph, previews, chain_failed, failed)
         except EventVisualError:
             raise
         except Exception as exc:
@@ -296,6 +376,10 @@ class EventVisualMcpClient:
         timeout = self.settings.focus_mcp_timeout_seconds
         total_timeout = min(timeout * 2, 900)
         async with asyncio.timeout(total_timeout):
+            if self.session_pool is not None:
+                async with self.session_pool.session() as session:
+                    yield session, await self._workspace_id(session)
+                return
             with isolated_mcp_server_parameters(self.settings) as params:
                 with open(os.devnull, "w", encoding="utf-8") as errlog:
                     async with stdio_client(params, errlog=errlog) as (read, write):
@@ -391,22 +475,25 @@ class EventVisualMcpClient:
         workspace_id: str,
         records: Sequence[ScriptedGuiRecord],
     ) -> tuple[tuple[ScriptedGuiPreview, ...], int]:
-        previews: list[ScriptedGuiPreview] = []
-        failed = 0
-        for record in records:
+        async def render_one(
+            record: ScriptedGuiRecord,
+        ) -> tuple[ScriptedGuiPreview | None, bool]:
             key = self._gui_key(record)
-            png = self._gui_cache.get(key)
+            png = self._cached_gui(key)
             if png is None:
                 try:
                     png = await self._render_gui(session, workspace_id, record)
-                    self._gui_cache[key] = png
                 except EmptyGuiPreviewError:
-                    continue
+                    return None, False
                 except Exception:
-                    failed += 1
-                    continue
-            previews.append(ScriptedGuiPreview(record, png))
-        return tuple(previews), failed
+                    return None, True
+                self._store_gui(key, png)
+            return ScriptedGuiPreview(record, png), False
+
+        results = await asyncio.gather(*(render_one(record) for record in records))
+        previews = tuple(preview for preview, _failed in results if preview is not None)
+        failed = sum(1 for _preview, did_fail in results if did_fail)
+        return previews, failed
 
     async def _render_gui(
         self,
@@ -463,6 +550,7 @@ class EventVisualMcpClient:
             record.source_size,
             self.settings.event_chain_max_depth,
             self.settings.event_chain_max_nodes,
+            self._launcher_fingerprint,
         )
 
     def _gui_key(self, record: ScriptedGuiRecord) -> tuple[Any, ...]:
@@ -474,6 +562,7 @@ class EventVisualMcpClient:
             record.source_size,
             self.settings.scripted_gui_preview_width,
             self.settings.scripted_gui_preview_height,
+            self._launcher_fingerprint,
         )
 
 
