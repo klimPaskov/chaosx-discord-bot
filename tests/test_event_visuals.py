@@ -112,6 +112,34 @@ def test_event_chain_catalog_discovers_and_resolves_event(tmp_path: Path) -> Non
     assert catalog.find("chaosx.news.7007") == records[0]
 
 
+def test_death_package_keeps_all_seven_top_level_event_definitions(tmp_path: Path) -> None:
+    root = tmp_path / "events"
+    root.mkdir()
+    event_ids = (
+        "chaosx.nr10.1",
+        "chaosx.nr10.2",
+        "chaosx.nr10.3",
+        "chaosx.nr10.10",
+        "chaosx.nr10.20",
+        "chaosx.nr10.21",
+        "chaosx.nr10.24",
+    )
+    blocks = "\n".join(
+        f"country_event = {{ id = {event_id} is_triggered_only = yes }}"
+        for event_id in event_ids
+    )
+    (root / "010_death.txt").write_text(
+        f"add_namespace = chaosx.nr10\n{blocks}\n",
+        encoding="utf-8",
+    )
+
+    record = EventChainCatalog(tmp_path).for_event(10)
+
+    assert record is not None
+    assert record.event_keys == event_ids
+    assert record.primary_event_key == "chaosx.nr10.1"
+
+
 def test_scripted_gui_catalog_discovers_windows_and_event_matches(tmp_path: Path) -> None:
     root = tmp_path / "common" / "scripted_guis"
     root.mkdir(parents=True)

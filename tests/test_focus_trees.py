@@ -508,7 +508,7 @@ async def test_focus_graph_sends_country_assets_and_tree_in_one_message() -> Non
 
     assert len(followup.calls) == 1
     content, kwargs = followup.calls[0]
-    assert content == "### Focus tree — Test — Tst"
+    assert content == "### Baseline flag, portrait and focus tree"
     uploads = cast(list[Any], kwargs["files"])
     assert [upload.filename for upload in uploads] == [
         "tst-flag.png",

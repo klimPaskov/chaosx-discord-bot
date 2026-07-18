@@ -1737,7 +1737,7 @@ async def send_focus_tree_graphs(
         ]
         uploads.append(discord.File(io.BytesIO(graph.png), filename=graph.record.filename))
         await interaction.followup.send(
-            f"### Focus tree — {graph.record.label}",
+            "### Baseline flag, portrait and focus tree",
             files=uploads,
             ephemeral=not public,
             allowed_mentions=safe_allowed_mentions(),
