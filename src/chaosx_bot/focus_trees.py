@@ -409,9 +409,6 @@ class FocusTreeMcpClient:
         self.settings = settings
         self.session_pool = session_pool
         self._cache: dict[tuple[Any, ...], bytes] = {}
-        self._country_asset_cache: dict[
-            tuple[Any, ...], tuple[FocusCountryAsset, ...]
-        ] = {}
         self._disk_cache = VisualArtifactCache(
             "focus-trees", max_item_bytes=settings.focus_tree_max_attachment_bytes
         )
@@ -436,12 +433,11 @@ class FocusTreeMcpClient:
             if cached is None:
                 missing.append(record)
                 continue
-            country_assets = self._country_asset_cache.get(key)
-            if record.asset_country_tags and country_assets is None:
+            if record.asset_country_tags:
                 cached_pngs[record] = cached
                 missing.append(record)
             else:
-                graphs.append(FocusTreeGraph(record, cached, country_assets or ()))
+                graphs.append(FocusTreeGraph(record, cached))
         failed = 0
         if missing:
             try:
@@ -452,7 +448,6 @@ class FocusTreeMcpClient:
                 key = self._cache_key(graph.record)
                 self._cache[key] = graph.png
                 self._disk_cache.put(key, graph.png)
-                self._country_asset_cache[key] = graph.country_assets
                 graphs.append(graph)
         graph_order = {record: index for index, record in enumerate(selected)}
         graphs.sort(key=lambda graph: graph_order[graph.record])

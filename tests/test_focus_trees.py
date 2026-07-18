@@ -125,6 +125,8 @@ def test_focus_tree_command_is_registered() -> None:
     bot = ChaosXBot(Settings(discord_token="dummy", command_guild_id=None, allowed_guild_id=None))
     register_commands(bot)
     assert {command.name for command in bot.tree.get_commands()} >= {"event", "focus-tree", "event-chain", "scripted-gui"}
+    admin = next(command for command in bot.tree.get_commands() if command.name == "admin")
+    assert "restart" in {command.name for command in getattr(admin, "commands", [])}
 
 
 def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
@@ -513,6 +515,50 @@ async def test_focus_graph_sends_country_assets_and_tree_in_one_message() -> Non
         "tst-leader.png",
         "TST_focus.png",
     ]
+
+
+@pytest.mark.asyncio
+async def test_focus_render_refreshes_country_assets_while_reusing_focus_png() -> None:
+    client = FocusTreeMcpClient(Settings(discord_token="dummy"))
+    record = FocusTreeRecord(
+        "TST_focus",
+        "common/national_focus/003_test.txt",
+        3,
+        ("TST",),
+        ("Test",),
+        (),
+        12,
+        123,
+        456,
+    )
+    client._cache[client._cache_key(record)] = b"cached-tree"
+    calls: list[dict[FocusTreeRecord, bytes]] = []
+
+    async def refresh(records, cached_pngs=None):
+        assert records == [record]
+        assert cached_pngs == {record: b"cached-tree"}
+        calls.append(cast(dict[FocusTreeRecord, bytes], cached_pngs))
+        version = len(calls)
+        return [
+            FocusTreeGraph(
+                record,
+                b"cached-tree",
+                (
+                    FocusCountryAsset(
+                        "TST", "flag", "tst-flag.png", f"flag-{version}".encode()
+                    ),
+                ),
+            )
+        ], 0
+
+    client._render_uncached = refresh
+
+    first = await client.render([record])
+    second = await client.render([record])
+
+    assert first.graphs[0].country_assets[0].png == b"flag-1"
+    assert second.graphs[0].country_assets[0].png == b"flag-2"
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

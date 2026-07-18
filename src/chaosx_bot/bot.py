@@ -967,6 +967,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
+- `/admin restart` — safely restart the ChaosX systemd service. Flag and leader artwork refreshes automatically on each focus request, so this is only for restarting the bot itself.
 - `/admin validate-workbook` — validate the authoritative XLSX for duplicate/invalid IDs, missing required fields, evolution gaps, and broken event/cluster references.
 - `/admin reindex` — refresh ChaosX's local Chaos Redux catalog/search database. Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale after spreadsheet/docs changes.
 - `/admin sync` — resync slash commands with Discord. Use after I change command names/options and Discord still shows the old version.
@@ -986,6 +987,27 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 Removed from your command surface: config dumps, rollback drafts, separate Hermes routing, separate server groups, and tiny role-management commands. Use `/admin ask` instead if you ever need that kind of inspection.
 """
+
+
+async def schedule_chaosx_restart(request_id: int) -> None:
+    process = await asyncio.create_subprocess_exec(
+        "/usr/bin/systemd-run",
+        "--user",
+        "--collect",
+        f"--unit=chaosx-discord-bot-restart-{request_id}",
+        "--on-active=2s",
+        "--timer-property=AccuracySec=1s",
+        "/usr/bin/systemctl",
+        "--user",
+        "restart",
+        "chaosx-discord-bot.service",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or "systemd did not schedule the ChaosX restart")
 
 
 class ChaosXBot(discord.Client):
@@ -2816,6 +2838,38 @@ def register_commands(bot: ChaosXBot) -> None:
         )
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin health", summary="health check")
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="restart", description="Safely restart the ChaosX bot service.")
+    async def admin_restart(interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        await interaction.response.send_message(
+            "ChaosX restart scheduled. I should be back online in about 20 seconds.",
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        try:
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin restart",
+                summary="systemd restart scheduled",
+            )
+            await schedule_chaosx_restart(interaction.id)
+        except Exception as exc:
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin restart error",
+                summary=type(exc).__name__,
+            )
+            await interaction.followup.send(
+                "The restart could not be scheduled. ChaosX is still running.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
 
     @admin.command(name="sync", description="Run/plan index sync.")
     async def admin_sync(interaction: discord.Interaction, mode: str = "incremental") -> None:

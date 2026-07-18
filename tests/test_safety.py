@@ -1,10 +1,13 @@
 import ast
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, validate_issue_report
+import pytest
+
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, schedule_chaosx_restart, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_auto_scan_answer_prompt, build_auto_scan_banter_prompt, build_auto_scan_warning_prompt, build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -116,6 +119,7 @@ def test_access_reaction_keys_use_custom_logo_and_unicode_computer():
 def test_operator_help_explains_when_to_use_admin_commands():
     help_text = operator_help_text(Settings(_env_file=None, discord_token="dummy"))
     assert "/admin health" in help_text
+    assert "/admin restart" in help_text
     assert "Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale" in help_text
     assert "/admin ask request:<text>" in help_text
     assert "analyze recent channel/user messages" in help_text
@@ -137,6 +141,44 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/work" not in help_text
     assert "/issue" not in help_text
     assert "1395464062367698977" in help_text
+
+
+@pytest.mark.asyncio
+async def test_restart_uses_collected_transient_systemd_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"scheduled", b""
+
+    async def fake_exec(*args: str, **kwargs: object):
+        calls.append((args, kwargs))
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    await schedule_chaosx_restart(123456)
+
+    assert calls[0][0] == (
+        "/usr/bin/systemd-run",
+        "--user",
+        "--collect",
+        "--unit=chaosx-discord-bot-restart-123456",
+        "--on-active=2s",
+        "--timer-property=AccuracySec=1s",
+        "/usr/bin/systemctl",
+        "--user",
+        "restart",
+        "chaosx-discord-bot.service",
+    )
+    assert calls[0][1] == {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
 
 
 def test_playtest_schedule_prompt_is_one_field_ai_draft_only():
