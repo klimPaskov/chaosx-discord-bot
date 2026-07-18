@@ -33,6 +33,9 @@ FOCUS_RE = re.compile(r"(?m)^\s*focus\s*=\s*\{")
 SHARED_FOCUS_RE = re.compile(r"(?m)^\s*shared_focus\s*=\s*[A-Za-z0-9_.:\-]+")
 COUNTRY_TAG_RE = re.compile(r"\b(?:tag|original_tag)\s*=\s*([A-Z][A-Z0-9_]{1,7})\b")
 COUNTRY_TAG_DEF_RE = re.compile(r'^\s*([A-Z][A-Z0-9_]{1,7})\s*=\s*"countries/([^"\n]+)\.txt"', re.MULTILINE)
+PACKAGE_COUNTRY_TAG_RE = re.compile(
+    r"(?m)(?:\boriginal_tag|\btag)\s*=\s*([A-Z][A-Z0-9]{2})\b|^\s*([A-Z][A-Z0-9]{2})\s*=\s*\{"
+)
 
 
 class FocusTreeError(RuntimeError):
@@ -217,6 +220,7 @@ class FocusTreeRecord:
     focus_count: int
     source_mtime_ns: int
     source_size: int
+    package_country_tags: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -236,6 +240,8 @@ class FocusTreeRecord:
     def asset_country_tags(self) -> tuple[str, ...]:
         if self.country_tags:
             return self.country_tags[:4]
+        if self.package_country_tags:
+            return self.package_country_tags[:4]
         prefix = re.match(r"^([A-Z0-9]{3})(?:_|$)", self.tree_id)
         return (prefix.group(1),) if prefix else ()
 
@@ -283,6 +289,7 @@ class FocusTreeCatalog:
         if not root.is_dir():
             return []
         country_names = self._country_names()
+        package_tags: dict[int, tuple[str, ...]] = {}
         records: list[FocusTreeRecord] = []
         for path in sorted(root.rglob("*.txt")):
             try:
@@ -293,6 +300,10 @@ class FocusTreeCatalog:
             relative_path = path.relative_to(self.repo).as_posix()
             event_match = EVENT_PREFIX_RE.match(path.stem)
             event_id = int(event_match.group(1)) if event_match else None
+            if event_id is not None and event_id not in package_tags:
+                package_tags[event_id] = self._package_country_tags(
+                    event_id, set(country_names)
+                )
             for block in _named_blocks(_without_comments(raw), "focus_tree"):
                 tree_id = _first_assignment_value(TREE_ID_RE, block)
                 if not tree_id:
@@ -315,6 +326,9 @@ class FocusTreeCatalog:
                         focus_count=focus_count,
                         source_mtime_ns=stat.st_mtime_ns,
                         source_size=stat.st_size,
+                        package_country_tags=(
+                            package_tags.get(event_id, ()) if event_id is not None else ()
+                        ),
                     )
                 )
         return sorted(records, key=lambda item: (item.event_id is None, item.event_id or 0, item.relative_path, item.tree_id))
@@ -364,6 +378,28 @@ class FocusTreeCatalog:
             for tag, source_name in COUNTRY_TAG_DEF_RE.findall(raw):
                 names.setdefault(tag, _humanize(source_name))
         return names
+
+    def _package_country_tags(
+        self, event_id: int, known_tags: set[str]
+    ) -> tuple[str, ...]:
+        prefix = f"{event_id:03d}_"
+        tags: set[str] = set()
+        for relative_root in ("events", "common"):
+            root = self.repo / relative_root
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob(f"{prefix}*.txt")):
+                try:
+                    raw = _without_comments(
+                        path.read_text(encoding="utf-8-sig", errors="replace")
+                    )
+                except OSError:
+                    continue
+                for assignment_tag, scope_tag in PACKAGE_COUNTRY_TAG_RE.findall(raw):
+                    tag = assignment_tag or scope_tag
+                    if tag in known_tags:
+                        tags.add(tag)
+        return tuple(sorted(tags))
 
 
 class FocusTreeMcpClient:

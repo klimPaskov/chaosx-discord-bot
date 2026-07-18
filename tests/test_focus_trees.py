@@ -72,6 +72,40 @@ def test_catalog_discovers_event_country_and_tree_queries(tmp_path: Path) -> Non
     assert catalog.for_event(2) == []
 
 
+def test_catalog_infers_mod_defined_country_for_scripted_selector(tmp_path: Path) -> None:
+    repo = tmp_path / "mod"
+    _write(
+        repo / "common/national_focus/010_death.txt",
+        """
+        focus_tree = {
+            id = death_focus_tree
+            country = { factor = 0 modifier = { add = 10 is_death_country = yes } }
+            focus = { id = DEATH_START }
+        }
+        """,
+    )
+    _write(
+        repo / "common/country_tags/010_death.txt",
+        'DTH = "countries/Death.txt"\n',
+    )
+    _write(
+        repo / "common/scripted_effects/010_death_effects.txt",
+        """
+        death_create = {
+            DTH = { set_country_flag = death_country }
+            GER = { }
+        }
+        """,
+    )
+
+    record = FocusTreeCatalog(repo).for_event(10)[0]
+
+    assert record.country_tags == ()
+    assert record.country_names == ()
+    assert record.package_country_tags == ("DTH",)
+    assert record.asset_country_tags == ("DTH",)
+
+
 def test_catalog_discovers_dynamic_country_selector(tmp_path: Path) -> None:
     _write(
         tmp_path / "common/national_focus/010_dynamic.txt",
