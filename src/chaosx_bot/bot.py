@@ -1731,13 +1731,17 @@ async def send_focus_tree_graphs(
         return
 
     for graph in batch.graphs:
-        uploads = [
+        ordered_assets = sorted(
+            graph.country_assets,
+            key=lambda asset: ({"leader": 0, "flag": 1}.get(asset.kind, 2), asset.tag, asset.filename),
+        )
+        uploads = [discord.File(io.BytesIO(graph.png), filename=graph.record.filename)]
+        uploads.extend(
             discord.File(io.BytesIO(asset.png), filename=asset.filename)
-            for asset in graph.country_assets
-        ]
-        uploads.append(discord.File(io.BytesIO(graph.png), filename=graph.record.filename))
+            for asset in ordered_assets
+        )
         await interaction.followup.send(
-            "### Baseline flag, portrait and focus tree",
+            "### Baseline focus tree, portrait, and flag",
             files=uploads,
             ephemeral=not public,
             allowed_mentions=safe_allowed_mentions(),
