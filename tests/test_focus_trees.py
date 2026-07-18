@@ -10,13 +10,16 @@ from typing import Any, cast
 
 import pytest
 
-from chaosx_bot.bot import ChaosXBot, register_commands
+from chaosx_bot.bot import ChaosXBot, register_commands, send_focus_tree_graphs
 from chaosx_bot.config import Settings
 from chaosx_bot.focus_trees import (
     FocusTreeCatalog,
+    FocusCountryAsset,
     FocusTreeError,
+    FocusTreeGraph,
     FocusTreeMcpClient,
     FocusTreeRecord,
+    FocusTreeRenderBatch,
     SharedMcpSession,
     _validate_mcp_node_runtime,
     isolated_mcp_server_parameters,
@@ -59,6 +62,7 @@ def test_catalog_discovers_event_country_and_tree_queries(tmp_path: Path) -> Non
     assert record.tree_id == "ABC_story_focus_tree"
     assert record.country_tags == ("ABC",)
     assert record.country_names == ("Alpha Republic",)
+    assert record.asset_country_tags == ("ABC",)
     assert record.focus_count == 2
     assert catalog.for_event("007") == [record]
     assert catalog.search("event 7") == [record]
@@ -111,6 +115,8 @@ def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
         assert Path(isolated["serverStateRoot"]).is_relative_to(temporary_root)
         assert Path(isolated["workspaceStorageRoot"]).is_relative_to(temporary_root)
         assert parameters.cwd == str(tmp_path)
+        assert parameters.env is not None
+        assert parameters.env["HOI4_AGENT_TOOLS_CHAOSX"] == "1"
 
     assert not temporary_root.exists()
 
@@ -238,12 +244,20 @@ async def test_read_resource_bytes_joins_verified_mcp_chunks() -> None:
     session = _ResourceSession(
         [
             payload(b"1234", offset=0, complete=False, continuation=uri2),
-            payload(b"5678", offset=4, complete=True, continuation=None),
+            payload(b"5678", offset=4, complete=False, continuation=None),
         ]
     )
     data = await read_resource_bytes(cast(Any, session), uri1, max_bytes=16, expected_mime="image/png")
     assert data == b"12345678"
     assert session.uris == [uri1, uri2]
+
+    incomplete = _ResourceSession(
+        [payload(b"1234", offset=0, complete=False, continuation=None)]
+    )
+    with pytest.raises(FocusTreeError, match="Incomplete MCP artifact resource"):
+        await read_resource_bytes(
+            cast(Any, incomplete), uri1, max_bytes=16, expected_mime="image/png"
+        )
 
 
 @pytest.mark.asyncio
@@ -312,6 +326,158 @@ async def test_focus_png_uses_dedicated_raster_tool() -> None:
                 "reviewScale": 0.5,
             },
         )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_focus_country_assets_use_private_chaosx_tool() -> None:
+    flag = b"\x89PNG\r\n\x1a\nflag"
+    leader = b"\x89PNG\r\n\x1a\nleader"
+    flag_uri = "hoi4-agent://workspace/test/artifact/flag.png"
+    leader_uri = "hoi4-agent://workspace/test/artifact/leader.png"
+
+    class AssetSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        async def call_tool(self, name: str, arguments: dict[str, object]):
+            self.calls.append((name, arguments))
+            return _DumpResult(
+                {
+                    "isError": False,
+                    "structuredContent": {
+                        "status": "ok",
+                        "artifacts": [
+                            {
+                                "name": "chaosx-TST-flag.png",
+                                "mimeType": "image/png",
+                                "uri": flag_uri,
+                                "size": len(flag),
+                            },
+                            {
+                                "name": "chaosx-TST-leader.png",
+                                "mimeType": "image/png",
+                                "uri": leader_uri,
+                                "size": len(leader),
+                            },
+                        ],
+                        "data": {
+                            "countries": [
+                                {
+                                    "tag": "TST",
+                                    "flagArtifactName": "chaosx-TST-flag.png",
+                                    "leaderPortraitArtifactName": "chaosx-TST-leader.png",
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+
+        async def read_resource(self, requested_uri):
+            uri = str(requested_uri)
+            data = {flag_uri: flag, leader_uri: leader}[uri]
+            return _DumpResult(
+                {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "image/png",
+                            "blob": base64.b64encode(data).decode(),
+                        }
+                    ]
+                }
+            )
+
+    session = AssetSession()
+    client = FocusTreeMcpClient(Settings(discord_token="dummy"))
+    record = FocusTreeRecord(
+        "TST_focus",
+        "common/national_focus/003_test.txt",
+        3,
+        ("TST",),
+        ("Test",),
+        (),
+        12,
+        123,
+        456,
+    )
+
+    rendered = await client._render_country_assets(cast(Any, session), "current", record)
+
+    assert [(item.tag, item.kind, item.filename, item.png) for item in rendered] == [
+        ("TST", "flag", "tst-flag.png", flag),
+        ("TST", "leader", "tst-leader.png", leader),
+    ]
+    assert session.calls == [
+        (
+            "chaosx.focus_country_assets",
+            {
+                "workspaceId": "current",
+                "countryTags": ["TST"],
+                "eventId": 3,
+                "treeId": "TST_focus",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_focus_graph_sends_country_assets_and_tree_in_one_message() -> None:
+    record = FocusTreeRecord(
+        "TST_focus",
+        "common/national_focus/003_test.txt",
+        3,
+        ("TST",),
+        ("Test",),
+        (),
+        12,
+        123,
+        456,
+    )
+    graph = FocusTreeGraph(
+        record,
+        b"tree",
+        (
+            FocusCountryAsset("TST", "flag", "tst-flag.png", b"flag"),
+            FocusCountryAsset("TST", "leader", "tst-leader.png", b"leader"),
+        ),
+    )
+
+    class Renderer:
+        async def render(self, records):
+            assert records == [record]
+            return FocusTreeRenderBatch((graph,), 1, 0)
+
+    class Followup:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        async def send(self, content: str, **kwargs: object) -> None:
+            self.calls.append((content, kwargs))
+
+    followup = Followup()
+    bot = SimpleNamespace(
+        settings=Settings(discord_token="dummy", focus_tree_graphs_enabled=True),
+        focus_tree_mcp=Renderer(),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        guild_id=2,
+        channel_id=3,
+        followup=followup,
+    )
+
+    await send_focus_tree_graphs(cast(Any, bot), cast(Any, interaction), [record])
+
+    assert len(followup.calls) == 1
+    content, kwargs = followup.calls[0]
+    assert content == "### Focus tree — Test — Tst"
+    uploads = cast(list[Any], kwargs["files"])
+    assert [upload.filename for upload in uploads] == [
+        "tst-flag.png",
+        "tst-leader.png",
+        "TST_focus.png",
     ]
 
 

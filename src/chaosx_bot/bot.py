@@ -1709,10 +1709,14 @@ async def send_focus_tree_graphs(
         return
 
     for graph in batch.graphs:
-        upload = discord.File(io.BytesIO(graph.png), filename=graph.record.filename)
+        uploads = [
+            discord.File(io.BytesIO(asset.png), filename=asset.filename)
+            for asset in graph.country_assets
+        ]
+        uploads.append(discord.File(io.BytesIO(graph.png), filename=graph.record.filename))
         await interaction.followup.send(
             f"### Focus tree — {graph.record.label}",
-            file=upload,
+            files=uploads,
             ephemeral=not public,
             allowed_mentions=safe_allowed_mentions(),
         )

@@ -25,6 +25,7 @@ from .visual_cache import VisualArtifactCache, mcp_launcher_fingerprint
 FOCUS_ROOT = Path("common/national_focus")
 COUNTRY_TAGS_ROOT = Path("common/country_tags")
 FOCUS_RASTER_TOOL = "hoi4.focus_raster"
+COUNTRY_ASSET_TOOL = "chaosx.focus_country_assets"
 EVENT_PREFIX_RE = re.compile(r"^(\d{3})(?:_|$)")
 ASSIGNMENT_VALUE_RE = r'(?:"([^"\n]+)"|([A-Za-z0-9_.:\-]+))'
 TREE_ID_RE = re.compile(rf"(?m)^\s*id\s*=\s*{ASSIGNMENT_VALUE_RE}")
@@ -74,6 +75,7 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
     workspace_cwd = (settings.focus_tree_repo or settings.chaos_redux_repo).expanduser()
     cwd = str(workspace_cwd) if workspace_cwd.is_dir() else None
     configured_path = settings.focus_mcp_config_path.expanduser()
+    server_env = {**os.environ, "HOI4_AGENT_TOOLS_CHAOSX": "1"}
     config_argument_found = False
     for index, argument in enumerate(args):
         if argument == "--config":
@@ -89,7 +91,7 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
     if not configured_path.is_file():
         if not config_argument_found:
             args.extend(("--config", str(configured_path)))
-        yield StdioServerParameters(command=command, args=args, cwd=cwd)
+        yield StdioServerParameters(command=command, args=args, cwd=cwd, env=server_env)
         return
     try:
         config = json.loads(configured_path.read_text(encoding="utf-8"))
@@ -120,7 +122,7 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
                 break
         if not replaced:
             args.extend(("--config", str(isolated_path)))
-        yield StdioServerParameters(command=command, args=args, cwd=cwd)
+        yield StdioServerParameters(command=command, args=args, cwd=cwd, env=server_env)
 
 
 class SharedMcpSession:
@@ -231,6 +233,13 @@ class FocusTreeRecord:
         return f"{safe[:90]}.png"
 
     @property
+    def asset_country_tags(self) -> tuple[str, ...]:
+        if self.country_tags:
+            return self.country_tags[:4]
+        prefix = re.match(r"^([A-Z0-9]{3})(?:_|$)", self.tree_id)
+        return (prefix.group(1),) if prefix else ()
+
+    @property
     def searchable_text(self) -> str:
         return " ".join(
             (
@@ -244,9 +253,18 @@ class FocusTreeRecord:
 
 
 @dataclass(frozen=True)
+class FocusCountryAsset:
+    tag: str
+    kind: str
+    filename: str
+    png: bytes
+
+
+@dataclass(frozen=True)
 class FocusTreeGraph:
     record: FocusTreeRecord
     png: bytes
+    country_assets: tuple[FocusCountryAsset, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -355,6 +373,9 @@ class FocusTreeMcpClient:
         self.settings = settings
         self.session_pool = session_pool
         self._cache: dict[tuple[Any, ...], bytes] = {}
+        self._country_asset_cache: dict[
+            tuple[Any, ...], tuple[FocusCountryAsset, ...]
+        ] = {}
         self._disk_cache = VisualArtifactCache(
             "focus-trees", max_item_bytes=settings.focus_tree_max_attachment_bytes
         )
@@ -368,6 +389,7 @@ class FocusTreeMcpClient:
             return FocusTreeRenderBatch((), 0, 0)
         graphs: list[FocusTreeGraph] = []
         missing: list[FocusTreeRecord] = []
+        cached_pngs: dict[FocusTreeRecord, bytes] = {}
         for record in selected:
             key = self._cache_key(record)
             cached = self._cache.get(key)
@@ -377,30 +399,42 @@ class FocusTreeMcpClient:
                     self._cache[key] = cached
             if cached is None:
                 missing.append(record)
+                continue
+            country_assets = self._country_asset_cache.get(key)
+            if record.asset_country_tags and country_assets is None:
+                cached_pngs[record] = cached
+                missing.append(record)
             else:
-                graphs.append(FocusTreeGraph(record, cached))
+                graphs.append(FocusTreeGraph(record, cached, country_assets or ()))
         failed = 0
         if missing:
             try:
-                rendered, failed = await self._render_uncached(missing)
+                rendered, failed = await self._render_uncached(missing, cached_pngs)
             except Exception as exc:
                 raise FocusTreeError("HOI4 Agent Tools MCP rendering failed") from exc
             for graph in rendered:
                 key = self._cache_key(graph.record)
                 self._cache[key] = graph.png
                 self._disk_cache.put(key, graph.png)
+                self._country_asset_cache[key] = graph.country_assets
                 graphs.append(graph)
         graph_order = {record: index for index, record in enumerate(selected)}
         graphs.sort(key=lambda graph: graph_order[graph.record])
         return FocusTreeRenderBatch(tuple(graphs), len(selected), failed)
 
-    async def _render_uncached(self, records: Sequence[FocusTreeRecord]) -> tuple[list[FocusTreeGraph], int]:
+    async def _render_uncached(
+        self,
+        records: Sequence[FocusTreeRecord],
+        cached_pngs: dict[FocusTreeRecord, bytes] | None = None,
+    ) -> tuple[list[FocusTreeGraph], int]:
         timeout = self.settings.focus_mcp_timeout_seconds
         if self.session_pool is not None:
             async with asyncio.timeout(timeout):
                 async with self.session_pool.session() as session:
                     workspace_id = await self._workspace_id(session)
-                    return await self._render_records(session, workspace_id, records)
+                    return await self._render_records(
+                        session, workspace_id, records, cached_pngs or {}
+                    )
         async with asyncio.timeout(timeout):
             with isolated_mcp_server_parameters(self.settings) as params:
                 with open(os.devnull, "w", encoding="utf-8") as errlog:
@@ -412,23 +446,35 @@ class FocusTreeMcpClient:
                         ) as session:
                             await session.initialize()
                             workspace_id = await self._workspace_id(session)
-                            return await self._render_records(session, workspace_id, records)
+                            return await self._render_records(
+                                session, workspace_id, records, cached_pngs or {}
+                            )
 
     async def _render_records(
         self,
         session: ClientSession,
         workspace_id: str,
         records: Sequence[FocusTreeRecord],
+        cached_pngs: dict[FocusTreeRecord, bytes] | None = None,
     ) -> tuple[list[FocusTreeGraph], int]:
         rendered: list[FocusTreeGraph] = []
         failed = 0
+        cached_pngs = cached_pngs or {}
         for record in records:
             try:
-                png = await self._render_one(session, workspace_id, record)
+                png = cached_pngs.get(record)
+                if png is None:
+                    png = await self._render_one(session, workspace_id, record)
             except Exception:
                 failed += 1
                 continue
-            rendered.append(FocusTreeGraph(record, png))
+            try:
+                country_assets = await self._render_country_assets(
+                    session, workspace_id, record
+                )
+            except Exception:
+                country_assets = ()
+            rendered.append(FocusTreeGraph(record, png, country_assets))
         return rendered, failed
 
     async def _workspace_id(self, session: ClientSession) -> str:
@@ -477,6 +523,65 @@ class FocusTreeMcpClient:
             expected_mime="image/png",
         )
 
+    async def _render_country_assets(
+        self,
+        session: ClientSession,
+        workspace_id: str,
+        record: FocusTreeRecord,
+    ) -> tuple[FocusCountryAsset, ...]:
+        tags = record.asset_country_tags
+        if not tags:
+            return ()
+        result = await session.call_tool(
+            COUNTRY_ASSET_TOOL,
+            {
+                "workspaceId": workspace_id,
+                "countryTags": list(tags),
+                **({"eventId": record.event_id} if record.event_id is not None else {}),
+                "treeId": record.tree_id,
+            },
+        )
+        structured = _structured_content(result)
+        artifacts = {
+            str(artifact.get("name") or ""): artifact
+            for artifact in structured.get("artifacts") or []
+            if isinstance(artifact, dict) and artifact.get("mimeType") == "image/png"
+        }
+        countries = (structured.get("data") or {}).get("countries") or []
+        rendered: list[FocusCountryAsset] = []
+        for country in countries:
+            if not isinstance(country, dict):
+                continue
+            tag = str(country.get("tag") or "")
+            if tag not in tags:
+                continue
+            for kind, field in (
+                ("flag", "flagArtifactName"),
+                ("leader", "leaderPortraitArtifactName"),
+            ):
+                artifact_name = str(country.get(field) or "")
+                artifact = artifacts.get(artifact_name)
+                if not artifact or not artifact.get("uri"):
+                    continue
+                declared_size = int(artifact.get("size") or 0)
+                if declared_size > self.settings.focus_tree_max_attachment_bytes:
+                    continue
+                png = await read_resource_bytes(
+                    session,
+                    str(artifact["uri"]),
+                    max_bytes=self.settings.focus_tree_max_attachment_bytes,
+                    expected_mime="image/png",
+                )
+                rendered.append(
+                    FocusCountryAsset(
+                        tag=tag,
+                        kind=kind,
+                        filename=f"{tag.lower()}-{kind}.png",
+                        png=png,
+                    )
+                )
+        return tuple(rendered)
+
     def _cache_key(self, record: FocusTreeRecord) -> tuple[Any, ...]:
         return (
             record.relative_path,
@@ -517,10 +622,20 @@ async def read_resource_bytes(session: ClientSession, uri: str, *, max_bytes: in
         else:
             raise FocusTreeError("MCP artifact resource did not contain data")
         meta = content.get("_meta") or {}
-        range_meta = next((value for key, value in meta.items() if key.endswith("artifact-byte-range")), {})
+        range_meta = next(
+            (value for key, value in meta.items() if key.endswith("artifact-byte-range")),
+            {},
+        )
+        if not range_meta:
+            return bytes(chunks + chunk)
         returned = range_meta.get("returnedRange") or {}
-        if returned and int(returned.get("offset") or 0) != len(chunks):
+        offset = int(returned.get("offset") or 0)
+        returned_length = int(returned.get("length") or len(chunk))
+        end_exclusive = int(returned.get("endExclusive") or offset + returned_length)
+        if offset != len(chunks):
             raise FocusTreeError("Out-of-order MCP artifact chunk")
+        if returned_length != len(chunk) or end_exclusive != offset + returned_length:
+            raise FocusTreeError("Malformed MCP artifact byte range")
         total_size = int(range_meta.get("totalSize") or 0)
         if total_size and total_size > max_bytes:
             raise FocusTreeError("MCP artifact exceeds the Discord upload limit")
@@ -528,13 +643,19 @@ async def read_resource_bytes(session: ClientSession, uri: str, *, max_bytes: in
         if len(chunks) > max_bytes:
             raise FocusTreeError("MCP artifact exceeds the Discord upload limit")
         continuation = range_meta.get("continuationUri")
-        if range_meta.get("complete", continuation is None):
-            if continuation:
+        complete = bool(range_meta.get("complete"))
+        if complete:
+            if continuation or offset != 0 or (total_size and len(chunks) != total_size):
                 raise FocusTreeError("Malformed MCP artifact completion metadata")
             return bytes(chunks)
-        if not continuation:
-            raise FocusTreeError("Incomplete MCP artifact resource")
-        next_uri = str(continuation)
+        if continuation:
+            if total_size and end_exclusive >= total_size:
+                raise FocusTreeError("Malformed MCP artifact continuation metadata")
+            next_uri = str(continuation)
+            continue
+        if total_size and end_exclusive == total_size and len(chunks) == total_size:
+            return bytes(chunks)
+        raise FocusTreeError("Incomplete MCP artifact resource")
     raise FocusTreeError("Too many MCP artifact chunks")
 
 
