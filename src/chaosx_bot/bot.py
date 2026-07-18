@@ -143,6 +143,9 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
         return [text]
     chunks: list[str] = []
     while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
         cut = text.rfind("\n", 0, limit)
         if cut < 200:
             cut = limit
