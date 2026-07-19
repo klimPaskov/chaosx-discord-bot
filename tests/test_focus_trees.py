@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from PIL import Image
 
 from chaosx_bot.bot import ChaosXBot, register_commands, send_focus_tree_graphs
 from chaosx_bot.config import Settings
@@ -21,6 +23,7 @@ from chaosx_bot.focus_trees import (
     FocusTreeRecord,
     FocusTreeRenderBatch,
     SharedMcpSession,
+    _scale_country_asset_for_discord,
     _validate_mcp_node_runtime,
     isolated_mcp_server_parameters,
     read_resource_bytes,
@@ -30,6 +33,36 @@ from chaosx_bot.focus_trees import (
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def test_visual_quality_defaults_prioritize_readability() -> None:
+    settings = Settings(discord_token="dummy")
+
+    assert settings.focus_tree_review_scale == 1.0
+    assert settings.event_chain_graphviz_dpi == 192
+    assert (settings.scripted_gui_preview_width, settings.scripted_gui_preview_height) == (
+        1920,
+        1080,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "source_size", "expected_size"),
+    (("flag", (82, 52), (656, 416)), ("leader", (156, 210), (624, 840))),
+)
+def test_country_assets_are_upscaled_for_discord(
+    kind: str,
+    source_size: tuple[int, int],
+    expected_size: tuple[int, int],
+) -> None:
+    source = Image.new("RGBA", source_size, (20, 40, 60, 255))
+    raw = io.BytesIO()
+    source.save(raw, format="PNG")
+
+    scaled = _scale_country_asset_for_discord(raw.getvalue(), kind)
+
+    with Image.open(io.BytesIO(scaled)) as image:
+        assert image.size == expected_size
 
 
 def test_catalog_discovers_event_country_and_tree_queries(tmp_path: Path) -> None:

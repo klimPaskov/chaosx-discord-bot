@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator, Sequence
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from PIL import Image
 from pydantic import AnyUrl
 
 from .config import Settings
@@ -26,6 +28,7 @@ FOCUS_ROOT = Path("common/national_focus")
 COUNTRY_TAGS_ROOT = Path("common/country_tags")
 FOCUS_RASTER_TOOL = "hoi4.focus_raster"
 COUNTRY_ASSET_TOOL = "chaosx.focus_country_assets"
+COUNTRY_ASSET_DISPLAY_WIDTH = {"flag": 656, "leader": 624}
 EVENT_PREFIX_RE = re.compile(r"^(\d{3})(?:_|$)")
 ASSIGNMENT_VALUE_RE = r'(?:"([^"\n]+)"|([A-Za-z0-9_.:\-]+))'
 TREE_ID_RE = re.compile(rf"(?m)^\s*id\s*=\s*{ASSIGNMENT_VALUE_RE}")
@@ -603,6 +606,9 @@ class FocusTreeMcpClient:
                     max_bytes=self.settings.focus_tree_max_attachment_bytes,
                     expected_mime="image/png",
                 )
+                png = _scale_country_asset_for_discord(png, kind)
+                if len(png) > self.settings.focus_tree_max_attachment_bytes:
+                    continue
                 rendered.append(
                     FocusCountryAsset(
                         tag=tag,
@@ -623,6 +629,26 @@ class FocusTreeMcpClient:
             FOCUS_RASTER_TOOL,
             self._launcher_fingerprint,
         )
+
+
+def _scale_country_asset_for_discord(png: bytes, kind: str) -> bytes:
+    """Upscale source-native country art so Discord does not present it as a thumbnail."""
+
+    target_width = COUNTRY_ASSET_DISPLAY_WIDTH.get(kind)
+    if target_width is None:
+        return png
+    try:
+        with Image.open(io.BytesIO(png)) as source:
+            image = source.convert("RGBA")
+    except Exception:
+        return png
+    if image.width >= target_width:
+        return png
+    target_height = max(1, round(image.height * target_width / image.width))
+    scaled = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    scaled.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 async def read_resource_bytes(session: ClientSession, uri: str, *, max_bytes: int, expected_mime: str) -> bytes:

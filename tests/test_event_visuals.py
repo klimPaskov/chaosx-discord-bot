@@ -172,6 +172,25 @@ def test_scripted_gui_catalog_discovers_windows_and_event_matches(tmp_path: Path
     assert catalog.search("fury_panel_window") == [records[1]]
 
 
+def test_event_cache_key_changes_with_output_dpi() -> None:
+    record = EventChainRecord(
+        "events/007_fury.txt",
+        "Fury",
+        7,
+        ("chaosx.nr7.1",),
+        1,
+        2,
+    )
+    standard = EventVisualMcpClient(
+        Settings(discord_token="dummy", event_chain_graphviz_dpi=144)
+    )
+    readable = EventVisualMcpClient(
+        Settings(discord_token="dummy", event_chain_graphviz_dpi=192)
+    )
+
+    assert standard._event_key(record) != readable._event_key(record)
+
+
 @pytest.mark.asyncio
 async def test_event_chain_render_calls_mcp_and_builds_compact_png() -> None:
     graph = b'''{

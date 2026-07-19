@@ -466,6 +466,7 @@ class EventVisualMcpClient:
             graph,
             record,
             self.settings.event_chain_graphviz_command,
+            self.settings.event_chain_graphviz_dpi,
             self.settings.focus_tree_max_attachment_bytes,
         )
 
@@ -550,6 +551,7 @@ class EventVisualMcpClient:
             record.source_size,
             self.settings.event_chain_max_depth,
             self.settings.event_chain_max_nodes,
+            self.settings.event_chain_graphviz_dpi,
             self._launcher_fingerprint,
         )
 
@@ -570,6 +572,7 @@ def _render_compact_event_chain(
     graph: dict[str, Any],
     record: EventChainRecord,
     graphviz_command: str,
+    graphviz_dpi: int,
     max_bytes: int,
 ) -> bytes:
     raw_nodes = graph.get("nodes") or []
@@ -647,7 +650,7 @@ def _render_compact_event_chain(
         command = [graphviz_command]
         if use_force_layout:
             command.append("-Ksfdp")
-        command.extend(("-Tpng", "-Gdpi=144", "-Gsize=18,12"))
+        command.extend(("-Tpng", f"-Gdpi={graphviz_dpi}", "-Gsize=18,12"))
         completed = subprocess.run(
             command,
             input="\n".join(dot).encode("utf-8"),
