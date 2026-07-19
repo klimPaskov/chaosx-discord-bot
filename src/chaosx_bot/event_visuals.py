@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Sequence
+from typing import Any, AsyncIterator, Iterable, Mapping, Sequence
 
 import cairosvg
 from mcp import ClientSession
@@ -34,6 +34,7 @@ EVENT_ID_RE = re.compile(r"(?m)^\s*id\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_.:-]+))"
 ASSIGNMENT_RE = re.compile(r"([A-Za-z0-9_.:-]+)\s*=\s*\{")
 WINDOW_NAME_RE = re.compile(r"\bwindow_name\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_.:-]+))")
 CONTEXT_TYPE_RE = re.compile(r"\bcontext_type\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_.:-]+))")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class EventVisualError(RuntimeError):
@@ -301,19 +302,10 @@ class EventVisualMcpClient:
         selected = list(records[: self.settings.scripted_gui_max_previews])
         if not selected:
             return (), 0
-        cached = [self._cached_gui(self._gui_key(record)) for record in selected]
-        if all(png is not None for png in cached):
-            return (
-                tuple(
-                    ScriptedGuiPreview(record, png)
-                    for record, png in zip(selected, cached, strict=True)
-                    if png is not None
-                ),
-                0,
-            )
         try:
             async with self._session() as (session, workspace_id):
-                return await self._render_gui_records(session, workspace_id, selected)
+                revisions = await self._gui_revisions(session, workspace_id, selected)
+                return await self._render_gui_records(session, workspace_id, selected, revisions)
         except EventVisualError:
             raise
         except Exception as exc:
@@ -339,18 +331,13 @@ class EventVisualMcpClient:
                 needs_chain = True
             else:
                 graph = EventChainGraph(chain, cached)
-        guis_cached = all(
-            self._cached_gui(self._gui_key(record)) is not None for record in selected_guis
-        )
-        if not needs_chain and guis_cached:
-            previews = tuple(
-                ScriptedGuiPreview(record, self._cached_gui(self._gui_key(record)) or b"")
-                for record in selected_guis
-            )
-            return RelatedEventVisuals(graph, previews)
+        if not needs_chain and not selected_guis:
+            return RelatedEventVisuals(graph, ())
 
         try:
             async with self._session() as (session, workspace_id):
+                revisions = await self._gui_revisions(session, workspace_id, selected_guis)
+
                 async def render_chain() -> tuple[EventChainGraph | None, bool]:
                     if chain is None or not needs_chain:
                         return graph, False
@@ -363,7 +350,7 @@ class EventVisualMcpClient:
 
                 (rendered_graph, chain_failed), (previews, failed) = await asyncio.gather(
                     render_chain(),
-                    self._render_gui_records(session, workspace_id, selected_guis),
+                    self._render_gui_records(session, workspace_id, selected_guis, revisions),
                 )
                 return RelatedEventVisuals(rendered_graph, previews, chain_failed, failed)
         except EventVisualError:
@@ -475,11 +462,12 @@ class EventVisualMcpClient:
         session: ClientSession,
         workspace_id: str,
         records: Sequence[ScriptedGuiRecord],
+        revisions: Mapping[tuple[str, str], str],
     ) -> tuple[tuple[ScriptedGuiPreview, ...], int]:
         async def render_one(
             record: ScriptedGuiRecord,
         ) -> tuple[ScriptedGuiPreview | None, bool]:
-            key = self._gui_key(record)
+            key = self._gui_key(record, revisions[(record.window_name, record.gui_id)])
             png = self._cached_gui(key)
             if png is None:
                 try:
@@ -495,6 +483,45 @@ class EventVisualMcpClient:
         previews = tuple(preview for preview, _failed in results if preview is not None)
         failed = sum(1 for _preview, did_fail in results if did_fail)
         return previews, failed
+
+    async def _gui_revisions(
+        self,
+        session: ClientSession,
+        workspace_id: str,
+        records: Sequence[ScriptedGuiRecord],
+    ) -> dict[tuple[str, str], str]:
+        if not records:
+            return {}
+        requested = {(record.window_name, record.gui_id) for record in records}
+        payload = _structured_content(
+            await session.call_tool(
+                "chaosx.visual_revision",
+                {
+                    "workspaceId": workspace_id,
+                    "guiWindows": [
+                        {"windowName": window_name, "guiId": gui_id}
+                        for window_name, gui_id in sorted(requested)
+                    ],
+                },
+            )
+        )
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise EventVisualError("MCP scripted-GUI revision response is invalid")
+        entries = data.get("guiRevisions")
+        if not isinstance(entries, list):
+            raise EventVisualError("MCP scripted-GUI revisions are missing")
+        revisions: dict[tuple[str, str], str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            key = (str(entry.get("windowName") or ""), str(entry.get("guiId") or ""))
+            revision = str(entry.get("revision") or "")
+            if key in requested and SHA256_RE.fullmatch(revision):
+                revisions[key] = revision
+        if set(revisions) != requested:
+            raise EventVisualError("MCP scripted-GUI revisions are incomplete")
+        return revisions
 
     async def _render_gui(
         self,
@@ -555,13 +582,12 @@ class EventVisualMcpClient:
             self._launcher_fingerprint,
         )
 
-    def _gui_key(self, record: ScriptedGuiRecord) -> tuple[Any, ...]:
+    def _gui_key(self, record: ScriptedGuiRecord, revision: str) -> tuple[Any, ...]:
         return (
             record.relative_path,
             record.gui_id,
             record.window_name,
-            record.source_mtime_ns,
-            record.source_size,
+            revision,
             self.settings.scripted_gui_preview_width,
             self.settings.scripted_gui_preview_height,
             self._launcher_fingerprint,

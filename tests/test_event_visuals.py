@@ -266,6 +266,64 @@ async def test_scripted_gui_render_reads_svg_and_converts_to_png() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scripted_gui_cache_uses_mcp_dependency_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    settings = Settings(discord_token="dummy")
+    client = EventVisualMcpClient(settings)
+    record = ScriptedGuiRecord(
+        "common/scripted_guis/007_fury.txt",
+        "Fury",
+        "fury_gui",
+        "fury_window",
+        "player_context",
+        7,
+        1,
+        2,
+    )
+    current_revision = ["a" * 64]
+    renders = 0
+
+    @asynccontextmanager
+    async def fake_session():
+        yield cast(Any, object()), "workspace"
+
+    async def revisions(*_args: object) -> dict[tuple[str, str], str]:
+        return {(record.window_name, record.gui_id): current_revision[0]}
+
+    async def render(*_args: object) -> bytes:
+        nonlocal renders
+        renders += 1
+        return b"\x89PNG\r\n\x1a\n" + bytes([renders])
+
+    monkeypatch.setattr(client, "_session", fake_session)
+    monkeypatch.setattr(client, "_gui_revisions", revisions)
+    monkeypatch.setattr(client, "_render_gui", render)
+
+    first, _ = await client.render_scripted_guis((record,))
+    unchanged, _ = await client.render_scripted_guis((record,))
+    assert first[0].png == unchanged[0].png
+    assert renders == 1
+
+    current_revision[0] = "b" * 64
+    changed, _ = await client.render_scripted_guis((record,))
+    assert changed[0].png != first[0].png
+    assert renders == 2
+
+    fresh_client = EventVisualMcpClient(settings)
+    monkeypatch.setattr(fresh_client, "_session", fake_session)
+    monkeypatch.setattr(fresh_client, "_gui_revisions", revisions)
+
+    async def unexpected_render(*_args: object) -> bytes:
+        raise AssertionError("fresh client should reuse the revision-keyed disk cache")
+
+    monkeypatch.setattr(fresh_client, "_render_gui", unexpected_render)
+    disk_cached, _ = await fresh_client.render_scripted_guis((record,))
+    assert disk_cached[0].png == changed[0].png
+
+
+@pytest.mark.asyncio
 async def test_related_visuals_render_chain_and_useful_gui_concurrently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -318,6 +376,11 @@ async def test_related_visuals_render_chain_and_useful_gui_concurrently(
     monkeypatch.setattr(client, "_render_event_chain", render_chain)
     monkeypatch.setattr(client, "_render_gui", render_gui)
     monkeypatch.setattr(client, "_session", fake_session)
+
+    async def revisions(*_args: object) -> dict[tuple[str, str], str]:
+        return {(dashboard.window_name, dashboard.gui_id): "a" * 64}
+
+    monkeypatch.setattr(client, "_gui_revisions", revisions)
 
     result = await client.render_related(chain, (mapicon, dashboard))
 
