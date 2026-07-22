@@ -10,6 +10,7 @@ from chaosx_bot.event_note_ops import (
     build_admin_event_improvement_prompt,
     create_generated_event_note,
     next_available_event_id,
+    normalize_generated_event_note,
     normalize_improved_event_note,
     replace_event_note,
     resolve_event_note,
@@ -108,6 +109,15 @@ def test_generated_note_requires_clear_event_structure(tmp_path: Path):
         )
 
 
+def test_generated_note_rejects_excessive_non_catalog_list_items():
+    bloated = idea_draft() + "\n" + "\n".join(
+        f"- Obvious variation {index}" for index in range(13)
+    )
+
+    with pytest.raises(EventNoteError, match="too many list items outside Catalog entry"):
+        normalize_generated_event_note(bloated, event_id=168)
+
+
 def test_event_improvement_resolves_note_and_preserves_identity_and_footer(tmp_path: Path):
     folder = tmp_path / "Events/Event Specs"
     folder.mkdir(parents=True)
@@ -177,6 +187,26 @@ Change files and add tests.
         )
 
 
+def test_event_improvement_rejects_bloated_body():
+    bloated = """# Event
+
+## Catalog entry
+
+- Event ID: `7`
+- Event name: Event
+
+## Details
+
+""" + ("Repeated obvious detail. " * 400)
+
+    with pytest.raises(EventNoteError, match="rough event note is too long"):
+        normalize_improved_event_note(
+            bloated,
+            event_id=7,
+            existing_title="Event",
+        )
+
+
 def test_event_improvement_allows_implementation_status_and_persists(tmp_path: Path):
     path = tmp_path / "023 - SOV Nuclear Bombs.md"
     path.write_text("# SOV Nuclear Bombs\n\n## Catalog entry\n\n- Event ID: `23`\n", encoding="utf-8")
@@ -233,6 +263,10 @@ def test_admin_prompts_require_context_mining_and_forbid_unwanted_side_effects(t
     assert "Broadly inspect the live Chaos Redux repo" in idea_prompt
     assert "Events/Event Catalog Index.md" in idea_prompt
     assert "Search for duplicate ideas" in idea_prompt
+    assert "Follow the planning skill internally" in idea_prompt
+    assert "Target roughly 450-800 words" in idea_prompt
+    assert "no more than 12 list items total" in idea_prompt
+    assert "Research broadly but synthesize narrowly" in idea_prompt
     assert "## General description" in idea_prompt
     assert "## Baseline behaviour" in idea_prompt
     assert "## Evolution stages" in idea_prompt
@@ -249,10 +283,13 @@ def test_admin_prompts_require_context_mining_and_forbid_unwanted_side_effects(t
         vault_path=vault,
     )
     assert "No separate improvement instruction is supplied" in improvement_prompt
-    assert "identify thin or unclear idea sections" in improvement_prompt
-    assert "preserve every useful existing idea" in improvement_prompt
-    assert "Draw new connections only where they fit" in improvement_prompt
+    assert "identify thin or unclear sections" in improvement_prompt
+    assert "preserve the core useful ideas rather than every sentence" in improvement_prompt
+    assert "Improving a bloated note means shortening it" in improvement_prompt
+    assert "Follow the planning skill internally" in improvement_prompt
+    assert "Do not enumerate every obvious consequence" in improvement_prompt
+    assert "no more than 12 list items total" in improvement_prompt
     assert "rough idea note, not a full specification" in improvement_prompt
-    assert "do not add an implementation plan, coding guidance" in improvement_prompt
+    assert "Do not add an implementation plan, coding guidance" in improvement_prompt
     assert "Wrong footer" not in improvement_prompt
     assert "## Your Task" not in improvement_prompt.split("--- BEGIN EXISTING EVENT NOTE ---", 1)[1]
