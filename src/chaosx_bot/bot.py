@@ -28,6 +28,15 @@ from .event_visuals import (
     EventVisualMcpClient,
     ScriptedGuiCatalog,
 )
+from .event_note_ops import (
+    EventNoteError,
+    build_admin_event_idea_prompt,
+    build_admin_event_improvement_prompt,
+    create_generated_event_note,
+    next_available_event_id,
+    replace_event_note,
+    resolve_event_note,
+)
 from .focus_trees import (
     FocusTreeCatalog,
     FocusTreeError,
@@ -965,6 +974,10 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 ### Main command
 - `/admin ask request:<text>` — the command you will usually use. Ask it to check Chaos Redux, explain bot/server state, fetch and analyze recent channel/user messages, summarize tester reports, draft Codex handoffs, or decide what should be done next. It remembers recent owner/admin requests in this same channel/thread as broad follow-up context, not as per-reply chain memory. Say `reset context` to clear that follow-up memory. It uses the stronger private model path.
 
+### Event idea tools
+- `/admin event-idea` — use the stronger private model to mine the repo and Chaos Redux vault for connections, generate one structured event idea, assign the next available numeric event ID, and save `<id> - <event name>.md` under `Events/Event Specs/`. It refreshes vault indexes but does **not** post the idea to the public event-ideas forum.
+- `/admin event-improvement event_id:<id> improvement:<text>` — improve an existing event note while keeping it as a rough idea collection. It may expand or add idea sections and draw relevant connections, but it does not turn the note into a full specification or add planning/coding guidance.
+
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
 - `/admin restart` — safely restart the ChaosX systemd service. Flag and leader artwork refreshes automatically on each focus request, so this is only for restarting the bot itself.
@@ -1042,6 +1055,7 @@ class ChaosXBot(discord.Client):
         self._mcp_warm_task: asyncio.Task[None] | None = None
         self._playtest_synthesis_lock = asyncio.Lock()
         self._playtest_synthesis_requested = False
+        self._event_note_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
         await self.store.init()
@@ -2284,7 +2298,12 @@ async def run_hermes_command(
         ignore_rules = True
     else:
         ignore_rules = False
-    hermes_timeout = bot.settings.admin_ask_timeout_seconds if command_name == "admin ask" else bot.settings.hermes_timeout_seconds
+    no_timeout_commands = {"admin ask", "admin event-idea", "admin event-improvement"}
+    hermes_timeout = (
+        bot.settings.admin_ask_timeout_seconds
+        if command_name in no_timeout_commands
+        else bot.settings.hermes_timeout_seconds
+    )
     result = await run_hermes(
         hermes_bin=bot.settings.hermes_bin,
         profile=bot.settings.hermes_profile,
@@ -2825,6 +2844,184 @@ def register_commands(bot: ChaosXBot) -> None:
             )
             return
         await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_operator_model=True)
+
+    @admin.command(
+        name="event-idea",
+        description="Generate and save the next numbered Chaos Redux event idea.",
+    )
+    async def admin_event_idea(interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        async with bot._event_note_lock:
+            try:
+                event_id = next_available_event_id(
+                    settings.obsidian_vault_path,
+                    settings.community_event_specs_folder,
+                )
+            except Exception as exc:
+                await interaction.response.send_message(
+                    f"Could not allocate the next event ID (`{type(exc).__name__}`). No note or forum post was created.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+
+            result = await run_hermes_command(
+                bot,
+                interaction,
+                build_admin_event_idea_prompt(
+                    event_id=event_id,
+                    vault_path=settings.obsidian_vault_path,
+                    event_specs_folder=settings.community_event_specs_folder,
+                ),
+                command_name="admin event-idea",
+                public=False,
+                owner_only=True,
+                use_operator_model=True,
+            )
+            if not result or not result[0].ok:
+                return
+
+            try:
+                note = create_generated_event_note(
+                    vault_path=settings.obsidian_vault_path,
+                    event_specs_folder=settings.community_event_specs_folder,
+                    event_id=event_id,
+                    draft=result[1],
+                )
+            except Exception as exc:
+                await bot.store.audit(
+                    actor_id=interaction.user.id,
+                    guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                    command="admin event-idea vault error",
+                    summary=type(exc).__name__,
+                )
+                detail = str(exc) if isinstance(exc, EventNoteError) else type(exc).__name__
+                await interaction.followup.send(
+                    f"The generated idea was not saved: {detail}. No forum post was created.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+
+            index_warning = ""
+            try:
+                refresh_vault_indexes(
+                    vault_path=settings.obsidian_vault_path,
+                    event_specs_folder=settings.community_event_specs_folder,
+                    suggestions_folder=settings.community_suggestions_folder,
+                    reason=f"ChaosX generated owner event idea {event_id:03d}.",
+                    changed_path=note.path,
+                )
+            except Exception as exc:
+                index_warning = f" Vault index refresh failed (`{type(exc).__name__}`)."
+            relative_path = note.path.relative_to(settings.obsidian_vault_path.resolve()).as_posix()
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin event-idea vault",
+                summary=relative_path,
+            )
+            await interaction.followup.send(
+                f"Saved event `{event_id:03d}` as `{relative_path}`. No event-ideas forum post was created.{index_warning}",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+
+    @admin.command(
+        name="event-improvement",
+        description="Improve an existing rough event note without making a full spec.",
+    )
+    async def admin_event_improvement(
+        interaction: discord.Interaction,
+        event_id: str,
+        improvement: str,
+    ) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        async with bot._event_note_lock:
+            try:
+                note_path = resolve_event_note(
+                    settings.obsidian_vault_path,
+                    settings.community_event_specs_folder,
+                    event_id,
+                )
+                numeric_event_id = int(event_id.strip())
+                existing_note = note_path.read_text(encoding="utf-8")
+            except (EventNoteError, OSError, ValueError) as exc:
+                await interaction.response.send_message(
+                    str(exc),
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+
+            result = await run_hermes_command(
+                bot,
+                interaction,
+                build_admin_event_improvement_prompt(
+                    event_id=numeric_event_id,
+                    note_path=note_path,
+                    improvement=improvement,
+                    existing_note=existing_note,
+                    vault_path=settings.obsidian_vault_path,
+                ),
+                command_name="admin event-improvement",
+                public=False,
+                owner_only=True,
+                use_operator_model=True,
+            )
+            if not result or not result[0].ok:
+                return
+
+            try:
+                note = replace_event_note(
+                    path=note_path,
+                    event_id=numeric_event_id,
+                    draft=result[1],
+                )
+            except Exception as exc:
+                await bot.store.audit(
+                    actor_id=interaction.user.id,
+                    guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                    command="admin event-improvement vault error",
+                    summary=type(exc).__name__,
+                )
+                detail = str(exc) if isinstance(exc, EventNoteError) else type(exc).__name__
+                await interaction.followup.send(
+                    f"Event `{numeric_event_id:03d}` was not changed: {detail}",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+
+            index_warning = ""
+            try:
+                refresh_vault_indexes(
+                    vault_path=settings.obsidian_vault_path,
+                    event_specs_folder=settings.community_event_specs_folder,
+                    suggestions_folder=settings.community_suggestions_folder,
+                    reason=f"ChaosX improved owner event note {numeric_event_id:03d}.",
+                    changed_path=note.path,
+                )
+            except Exception as exc:
+                index_warning = f" Vault index refresh failed (`{type(exc).__name__}`)."
+            relative_path = note.path.relative_to(settings.obsidian_vault_path.resolve()).as_posix()
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin event-improvement vault",
+                summary=relative_path,
+            )
+            await interaction.followup.send(
+                f"Improved event `{numeric_event_id:03d}` in `{relative_path}` as a rough idea note.{index_warning}",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
 
     @admin.command(name="health", description="Check ChaosX runtime health.")
     async def admin_health(interaction: discord.Interaction) -> None:

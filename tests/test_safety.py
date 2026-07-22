@@ -118,6 +118,12 @@ def test_access_reaction_keys_use_custom_logo_and_unicode_computer():
 
 def test_operator_help_explains_when_to_use_admin_commands():
     help_text = operator_help_text(Settings(_env_file=None, discord_token="dummy"))
+    assert "/admin event-idea" in help_text
+    assert "next available numeric event ID" in help_text
+    assert "does **not** post the idea to the public event-ideas forum" in help_text
+    assert "/admin event-improvement event_id:<id> improvement:<text>" in help_text
+    assert "does not turn the note into a full specification" in help_text
+    assert "planning/coding guidance" in help_text
     assert "/admin health" in help_text
     assert "/admin restart" in help_text
     assert "Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale" in help_text
@@ -202,6 +208,34 @@ def test_playtest_schedule_slash_signature_has_only_request_field():
     arg_names = [arg.arg for arg in schedule_funcs[0].args.args]
     assert arg_names == ["interaction", "request"]
     assert {"target", "start", "duration", "voice", "build"}.isdisjoint(arg_names)
+
+
+def test_admin_event_note_command_signatures_and_side_effect_boundaries():
+    bot_source = Path(__file__).resolve().parents[1] / "src" / "chaosx_bot" / "bot.py"
+    source = bot_source.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name in {"admin_event_idea", "admin_event_improvement"}
+    }
+    assert set(functions) == {"admin_event_idea", "admin_event_improvement"}
+    assert [arg.arg for arg in functions["admin_event_idea"].args.args] == ["interaction"]
+    assert [arg.arg for arg in functions["admin_event_improvement"].args.args] == [
+        "interaction",
+        "event_id",
+        "improvement",
+    ]
+
+    idea_source = ast.get_source_segment(source, functions["admin_event_idea"]) or ""
+    improvement_source = ast.get_source_segment(source, functions["admin_event_improvement"]) or ""
+    assert "use_operator_model=True" in idea_source
+    assert "create_generated_event_note" in idea_source
+    assert "post_approved_event_idea" not in idea_source
+    assert "use_operator_model=True" in improvement_source
+    assert "replace_event_note" in improvement_source
+    assert "post_approved_event_idea" not in improvement_source
 
 
 def test_admin_context_helpers_extract_targets_and_sanitize_text():
