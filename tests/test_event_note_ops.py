@@ -109,13 +109,15 @@ def test_generated_note_requires_clear_event_structure(tmp_path: Path):
         )
 
 
-def test_generated_note_rejects_excessive_non_catalog_list_items():
-    bloated = idea_draft() + "\n" + "\n".join(
-        f"- Obvious variation {index}" for index in range(13)
+def test_generated_note_does_not_enforce_a_fixed_list_quota():
+    large_event = idea_draft() + "\n" + "\n".join(
+        f"- Distinct cross-system connection {index}" for index in range(20)
     )
 
-    with pytest.raises(EventNoteError, match="too many list items outside Catalog entry"):
-        normalize_generated_event_note(bloated, event_id=168)
+    title, normalized = normalize_generated_event_note(large_event, event_id=168)
+
+    assert title == "The Clockwork Armistice"
+    assert "Distinct cross-system connection 19" in normalized
 
 
 def test_event_improvement_resolves_note_and_preserves_identity_and_footer(tmp_path: Path):
@@ -187,8 +189,12 @@ Change files and add tests.
         )
 
 
-def test_event_improvement_rejects_bloated_body():
-    bloated = """# Event
+def test_event_improvement_does_not_enforce_a_fixed_length():
+    stages = "\n\n".join(
+        f"### Evolution {index}\n\nDistinct escalation {index} adds a necessary cross-system consequence."
+        for index in range(100)
+    )
+    large_event = f"""# Event
 
 ## Catalog entry
 
@@ -197,14 +203,19 @@ def test_event_improvement_rejects_bloated_body():
 
 ## Details
 
-""" + ("Repeated obvious detail. " * 400)
+A genuinely large event can justify a longer rough note.
 
-    with pytest.raises(EventNoteError, match="rough event note is too long"):
-        normalize_improved_event_note(
-            bloated,
-            event_id=7,
-            existing_title="Event",
-        )
+{stages}
+"""
+
+    normalized = normalize_improved_event_note(
+        large_event,
+        event_id=7,
+        existing_title="Event",
+    )
+
+    assert len(normalized) > 7_500
+    assert "Evolution 99" in normalized
 
 
 def test_event_improvement_allows_implementation_status_and_persists(tmp_path: Path):
@@ -264,8 +275,9 @@ def test_admin_prompts_require_context_mining_and_forbid_unwanted_side_effects(t
     assert "Events/Event Catalog Index.md" in idea_prompt
     assert "Search for duplicate ideas" in idea_prompt
     assert "Follow the planning skill internally" in idea_prompt
-    assert "Target roughly 450-800 words" in idea_prompt
-    assert "no more than 12 list items total" in idea_prompt
+    assert "Scale its length to the event's actual complexity" in idea_prompt
+    assert "Do not use a fixed word, character, section, evolution, or bullet quota" in idea_prompt
+    assert "Use bullets only when they make distinct alternatives or relationships clearer" in idea_prompt
     assert "Research broadly but synthesize narrowly" in idea_prompt
     assert "## General description" in idea_prompt
     assert "## Baseline behaviour" in idea_prompt
@@ -287,8 +299,10 @@ def test_admin_prompts_require_context_mining_and_forbid_unwanted_side_effects(t
     assert "preserve the core useful ideas rather than every sentence" in improvement_prompt
     assert "Improving a bloated note means shortening it" in improvement_prompt
     assert "Follow the planning skill internally" in improvement_prompt
+    assert "Scale length and section depth to the event's actual complexity" in improvement_prompt
+    assert "Do not use a fixed word, character, section, evolution, or bullet quota" in improvement_prompt
+    assert "use bullets only when they clarify distinct alternatives or relationships" in improvement_prompt
     assert "Do not enumerate every obvious consequence" in improvement_prompt
-    assert "no more than 12 list items total" in improvement_prompt
     assert "rough idea note, not a full specification" in improvement_prompt
     assert "Do not add an implementation plan, coding guidance" in improvement_prompt
     assert "Wrong footer" not in improvement_prompt
