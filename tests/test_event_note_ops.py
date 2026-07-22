@@ -177,6 +177,35 @@ Change files and add tests.
         )
 
 
+def test_event_improvement_allows_implementation_status_and_persists(tmp_path: Path):
+    path = tmp_path / "023 - SOV Nuclear Bombs.md"
+    path.write_text("# SOV Nuclear Bombs\n\n## Catalog entry\n\n- Event ID: `23`\n", encoding="utf-8")
+
+    result = replace_event_note(
+        path=path,
+        event_id=23,
+        draft="""# SOV Nuclear Bombs
+
+## Catalog entry
+
+- Event ID: `23`
+- Event name: SOV Nuclear Bombs
+
+## Details
+
+Keep this as a rough idea with enough material for validation and expansion.
+
+## Implementation status
+
+The event currently exists in rough implemented form, while the new escalation ideas remain draft material.
+""",
+    )
+
+    normalized = result.path.read_text(encoding="utf-8")
+    assert "## Implementation status" in normalized
+    assert normalized.endswith(YOUR_TASK_BLOCK + "\n")
+
+
 def test_resolve_event_note_rejects_missing_and_ambiguous_ids(tmp_path: Path):
     folder = tmp_path / "Events/Event Specs"
     folder.mkdir(parents=True)

@@ -20,7 +20,7 @@ _YOUR_TASK_RE = re.compile(r"(?im)^##\s+Your Task\s*$")
 _EVENT_ID_LINE_RE = re.compile(r"(?im)^-\s*Event ID:\s*.*$")
 _EVENT_NAME_LINE_RE = re.compile(r"(?im)^-\s*Event name:\s*.*$")
 _FORBIDDEN_IMPROVEMENT_HEADING_RE = re.compile(
-    r"(?im)^#{2,6}\s+.*(?:implementation|coding|code changes?|files? to change|testing plan|acceptance criteria|task list|delivery plan|implementation plan).*$"
+    r"(?im)^#{2,6}\s+(?:plan(?:ning)?|.*(?:coding|code changes?|files? to change|testing plan|acceptance criteria|task list|delivery plan|implementation\s+(?:plan|steps?|guidance|checklist)).*)\s*$"
 )
 _REQUIRED_IDEA_HEADINGS = (
     "Catalog entry",

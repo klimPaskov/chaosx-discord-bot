@@ -2220,6 +2220,7 @@ async def run_hermes_command(
     max_chars_override: int | None = None,
     qna_question: str = "",
     qna_mode: str = "slash",
+    send_output: bool = True,
 ) -> tuple[HermesResult, str] | None:
     rate = None
     source_paths_allowed = False
@@ -2361,20 +2362,21 @@ async def run_hermes_command(
     )
     header = "" if public else f"ChaosX `{status}` hash `{result.prompt_hash[:12]}`"
     first_sent = None
-    for i, part in enumerate(_chunk(output)):
-        send_kwargs = {
-            "ephemeral": not public,
-            "allowed_mentions": safe_allowed_mentions(),
-        }
-        if i == 0 and should_record_reply_memory:
-            send_kwargs["wait"] = True
-        prefix = f"{header}\n" if i == 0 and header else ""
-        sent = await interaction.followup.send(
-            prefix + part,
-            **send_kwargs,
-        )
-        if i == 0:
-            first_sent = sent
+    if send_output or not result.ok:
+        for i, part in enumerate(_chunk(output)):
+            send_kwargs = {
+                "ephemeral": not public,
+                "allowed_mentions": safe_allowed_mentions(),
+            }
+            if i == 0 and should_record_reply_memory:
+                send_kwargs["wait"] = True
+            prefix = f"{header}\n" if i == 0 and header else ""
+            sent = await interaction.followup.send(
+                prefix + part,
+                **send_kwargs,
+            )
+            if i == 0:
+                first_sent = sent
     first_sent_id = getattr(first_sent, "id", None)
     if should_record_reply_memory and first_sent_id is not None:
         await bot.store.record_message_ask_turn(
@@ -2878,6 +2880,7 @@ def register_commands(bot: ChaosXBot) -> None:
                 public=False,
                 owner_only=True,
                 use_operator_model=True,
+                send_output=False,
             )
             if not result or not result[0].ok:
                 return
@@ -2890,14 +2893,14 @@ def register_commands(bot: ChaosXBot) -> None:
                     draft=result[1],
                 )
             except Exception as exc:
+                detail = str(exc) if isinstance(exc, EventNoteError) else type(exc).__name__
                 await bot.store.audit(
                     actor_id=interaction.user.id,
                     guild_id=interaction.guild_id,
                     channel_id=interaction.channel_id,
                     command="admin event-idea vault error",
-                    summary=type(exc).__name__,
+                    summary=f"{type(exc).__name__}: {detail}",
                 )
-                detail = str(exc) if isinstance(exc, EventNoteError) else type(exc).__name__
                 await interaction.followup.send(
                     f"The generated idea was not saved: {detail}. No forum post was created.",
                     ephemeral=True,
@@ -2970,6 +2973,7 @@ def register_commands(bot: ChaosXBot) -> None:
                 public=False,
                 owner_only=True,
                 use_operator_model=True,
+                send_output=False,
             )
             if not result or not result[0].ok:
                 return
@@ -2981,14 +2985,14 @@ def register_commands(bot: ChaosXBot) -> None:
                     draft=result[1],
                 )
             except Exception as exc:
+                detail = str(exc) if isinstance(exc, EventNoteError) else type(exc).__name__
                 await bot.store.audit(
                     actor_id=interaction.user.id,
                     guild_id=interaction.guild_id,
                     channel_id=interaction.channel_id,
                     command="admin event-improvement vault error",
-                    summary=type(exc).__name__,
+                    summary=f"{type(exc).__name__}: {detail}",
                 )
-                detail = str(exc) if isinstance(exc, EventNoteError) else type(exc).__name__
                 await interaction.followup.send(
                     f"Event `{numeric_event_id:03d}` was not changed: {detail}",
                     ephemeral=True,

@@ -232,9 +232,11 @@ def test_admin_event_note_command_signatures_and_side_effect_boundaries():
     idea_source = ast.get_source_segment(source, functions["admin_event_idea"]) or ""
     improvement_source = ast.get_source_segment(source, functions["admin_event_improvement"]) or ""
     assert "use_operator_model=True" in idea_source
+    assert "send_output=False" in idea_source
     assert "create_generated_event_note" in idea_source
     assert "post_approved_event_idea" not in idea_source
     assert "use_operator_model=True" in improvement_source
+    assert "send_output=False" in improvement_source
     assert "replace_event_note" in improvement_source
     assert "post_approved_event_idea" not in improvement_source
 
