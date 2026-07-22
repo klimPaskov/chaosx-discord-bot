@@ -216,10 +216,11 @@ def test_admin_prompts_require_context_mining_and_forbid_unwanted_side_effects(t
     improvement_prompt = build_admin_event_improvement_prompt(
         event_id=20,
         note_path=note_path,
-        improvement="Connect this more deeply to the disease mapmode.",
         existing_note="# Black Plague\n\n## Details\n\nRough idea.\n\n" + YOUR_TASK_BLOCK,
         vault_path=vault,
     )
+    assert "No separate improvement instruction is supplied" in improvement_prompt
+    assert "identify thin or unclear idea sections" in improvement_prompt
     assert "preserve every useful existing idea" in improvement_prompt
     assert "Draw new connections only where they fit" in improvement_prompt
     assert "rough idea note, not a full specification" in improvement_prompt

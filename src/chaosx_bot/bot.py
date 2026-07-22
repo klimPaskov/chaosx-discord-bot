@@ -976,7 +976,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Event idea tools
 - `/admin event-idea` — use the stronger private model to mine the repo and Chaos Redux vault for connections, generate one structured event idea, assign the next available numeric event ID, and save `<id> - <event name>.md` under `Events/Event Specs/`. It refreshes vault indexes but does **not** post the idea to the public event-ideas forum.
-- `/admin event-improvement event_id:<id> improvement:<text>` — improve an existing event note while keeping it as a rough idea collection. It may expand or add idea sections and draw relevant connections, but it does not turn the note into a full specification or add planning/coding guidance.
+- `/admin event-improvement event_id:<id>` — autonomously improve an existing event note while keeping it as a rough idea collection. It mines the repo and vault to expand thin sections and draw relevant connections, but it does not turn the note into a full specification or add planning/coding guidance.
 
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
@@ -2937,7 +2937,6 @@ def register_commands(bot: ChaosXBot) -> None:
     async def admin_event_improvement(
         interaction: discord.Interaction,
         event_id: str,
-        improvement: str,
     ) -> None:
         if not await owner_gate(interaction, settings):
             return
@@ -2964,7 +2963,6 @@ def register_commands(bot: ChaosXBot) -> None:
                 build_admin_event_improvement_prompt(
                     event_id=numeric_event_id,
                     note_path=note_path,
-                    improvement=improvement,
                     existing_note=existing_note,
                     vault_path=settings.obsidian_vault_path,
                 ),

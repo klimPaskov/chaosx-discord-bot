@@ -273,16 +273,13 @@ def build_admin_event_improvement_prompt(
     *,
     event_id: int,
     note_path: Path,
-    improvement: str,
     existing_note: str,
     vault_path: Path,
 ) -> str:
     existing_without_task = strip_your_task(existing_note)
-    return f"""Improve the existing rough Chaos Redux event note for event ID {event_id} using this owner request:
+    return f"""Autonomously improve the existing rough Chaos Redux event note for event ID {event_id}.
 
-{improvement.strip()}
-
-The exact existing note is `{note_path.resolve()}`. Before drafting, inspect the standalone Chaos Redux vault at `{vault_path.resolve()}` and the live repo from the current working directory for relevant event/system context, overlap, and useful new connections. Read the exact note first, preserve every useful existing idea, and distinguish implemented canon from draft/community material. Draw new connections only where they fit the event.
+The exact existing note is `{note_path.resolve()}`. No separate improvement instruction is supplied: determine the useful improvements from the note and project context. Before drafting, inspect the standalone Chaos Redux vault at `{vault_path.resolve()}` and the live repo from the current working directory for relevant event/system context, overlap, and useful new connections. Read the exact note first, preserve every useful existing idea, identify thin or unclear idea sections, and distinguish implemented canon from draft/community material. Expand weak sections where warranted. Draw new connections only where they fit the event.
 
 Return only the complete replacement Markdown note body. Do not wrap it in a code fence. Keep the existing event name and event ID {event_id}. Do not write or modify files, indexes, issues, or Discord posts; the caller performs the one approved replacement.
 

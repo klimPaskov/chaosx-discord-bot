@@ -121,7 +121,9 @@ def test_operator_help_explains_when_to_use_admin_commands():
     assert "/admin event-idea" in help_text
     assert "next available numeric event ID" in help_text
     assert "does **not** post the idea to the public event-ideas forum" in help_text
-    assert "/admin event-improvement event_id:<id> improvement:<text>" in help_text
+    assert "/admin event-improvement event_id:<id>" in help_text
+    assert "autonomously improve" in help_text
+    assert "improvement:<text>" not in help_text
     assert "does not turn the note into a full specification" in help_text
     assert "planning/coding guidance" in help_text
     assert "/admin health" in help_text
@@ -225,7 +227,6 @@ def test_admin_event_note_command_signatures_and_side_effect_boundaries():
     assert [arg.arg for arg in functions["admin_event_improvement"].args.args] == [
         "interaction",
         "event_id",
-        "improvement",
     ]
 
     idea_source = ast.get_source_segment(source, functions["admin_event_idea"]) or ""
