@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8,7 +10,7 @@ from chaosx_bot.auto_scan import AutoScanDecision, classify_auto_answer, classif
 from chaosx_bot.bot import auto_scan_channel_excluded, format_auto_scan_events, format_auto_scan_notice, handle_auto_scan, parse_channel_id_set
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import HermesResult
-from chaosx_bot.indexer import rebuild_index
+from chaosx_bot.indexer import connect, rebuild_index
 from chaosx_bot.knowledge import Knowledge
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
 
@@ -102,6 +104,83 @@ def test_auto_scan_bot_topic_banter_gate_uses_no_canned_public_text():
 
     disabled = classify_bot_topic_banter("this bot is stupid", settings=Settings(discord_token="dummy", auto_scan_bot_topic_enabled=False))
     assert disabled.action == "none"
+
+
+def test_auto_scan_does_not_index_or_answer_ordinary_investment_chat():
+    settings = Settings(discord_token="dummy")
+
+    class UnexpectedCatalogLookup:
+        def ensure_index(self) -> None:
+            raise AssertionError("ordinary chat must not scan the Chaos Redux catalog")
+
+    knowledge = cast(Any, UnexpectedCatalogLookup())
+    for message in (
+        "Or is this in your mind an investment?",
+        "U said before about investment. Are you planning to sell your server?",
+        "Is this a good investment?",
+    ):
+        decision = classify_message(message, knowledge=knowledge, settings=settings)
+        assert decision.action == "none"
+    assert not has_domain_signal("Is modern investment advice reliable?")
+    assert has_domain_signal("What is the mod status?")
+
+
+def test_single_word_catalog_name_requires_explicit_entity_scope(tmp_path: Path):
+    db = tmp_path / "catalog.db"
+    with connect(db) as conn:
+        conn.execute(
+            "INSERT INTO catalog_events(row_key,event_id,name,details,indexed_at) VALUES (?,?,?,?,?)",
+            ("event:132", "132", "Investment", "Invest in industry.", 1.0),
+        )
+        conn.execute(
+            "INSERT INTO catalog_events(row_key,event_id,name,details,indexed_at) VALUES (?,?,?,?,?)",
+            ("event:2", "2", "Zombie Outbreak", "Zombies spread.", 1.0),
+        )
+
+    class CatalogKnowledge:
+        db_path = db
+
+        def ensure_index(self) -> None:
+            return None
+
+        def event(self, lookup: str) -> str:
+            return f"event {lookup}"
+
+        def scenario(self, lookup: str) -> str:
+            return f"scenario {lookup}"
+
+        def cluster(self, lookup: str) -> str:
+            return f"cluster {lookup}"
+
+    knowledge = cast(Any, CatalogKnowledge())
+    settings = Settings(discord_token="dummy")
+
+    ordinary = classify_message(
+        "Or is this in your mind an investment?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+    unrelated_followup = classify_message(
+        "The Zombie Outbreak event came up yesterday. Are you selling the server?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+    explicit = classify_message(
+        "What does the Investment event do?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+    distinctive = classify_message(
+        "How does Zombie Outbreak work?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+
+    assert ordinary.action == "none"
+    assert unrelated_followup.action == "none"
+    assert explicit.action == "answer"
+    assert explicit.reason == "exact event name match: Investment"
+    assert distinctive.action == "answer"
 
 
 def test_auto_scan_catalog_answers_exact_ids_and_names(tmp_path: Path):
@@ -240,6 +319,7 @@ class _FakeBot:
         self.knowledge = cast(Any, SimpleNamespace())
         self.rate_limiter = FixedWindowRateLimiter()
         self.store = _FakeStore()
+        self._auto_scan_classify_lock = asyncio.Lock()
 
     def get_channel(self, channel_id: int) -> None:
         return None
@@ -250,6 +330,26 @@ class _FakeBot:
 
 async def _fake_model_output(*args: Any, **kwargs: Any) -> tuple[HermesResult, str]:
     return HermesResult(prompt_hash="model-hash", returncode=0, stdout="Model-generated auto-scan reply", stderr=""), "Model-generated auto-scan reply"
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_runs_classifier_off_gateway_loop(monkeypatch):
+    bot = _FakeBot(Settings(discord_token="dummy"))
+    message = _FakeMessage("Is this a good investment?")
+    gateway_thread = threading.get_ident()
+    classifier_threads: list[int] = []
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        classifier_threads.append(threading.get_ident())
+        return AutoScanDecision("none")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is False
+    assert classifier_threads
+    assert classifier_threads[0] != gateway_thread
 
 
 @pytest.mark.asyncio

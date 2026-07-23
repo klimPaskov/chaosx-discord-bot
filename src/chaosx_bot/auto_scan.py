@@ -83,6 +83,20 @@ BUG_REPORT_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:report|submit)\s+(?:a\s+)?(?
 SUGGESTION_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:suggest|submit)\s+(?:an?\s+)?(?:idea|suggestion)|where\s+do\s+i\s+(?:post|submit)\s+(?:an?\s+)?(?:idea|suggestion))\b", re.I)
 EVENT_IDEA_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:suggest|submit)\s+(?:an?\s+)?event\s+idea|where\s+do\s+i\s+(?:post|submit)\s+(?:an?\s+)?event\s+idea)\b", re.I)
 ACCESS_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:get|gain)\s+access|where\s+do\s+i\s+get\s+access|reaction\s+role|join\s+the\s+community)\b", re.I)
+CATALOG_NAME_INTENT_RE = re.compile(
+    r"\b(?:event|scenario|cluster|mechanic|evolution|world[-\s]+end|implemented|implementation|trigger|effect|outcome)\b"
+    r"|\bhow\s+(?:does|do|did|can|would)\b.{0,120}\b(?:work|trigger|start|end|happen)\b",
+    re.I,
+)
+CATALOG_PROJECT_SCOPE_TERMS = {
+    "chaos redux",
+    "hoi4",
+    "hearts of iron",
+    "mod",
+    "the mod",
+    "this mod",
+    "our mod",
+}
 
 BOT_TOPIC_RE = re.compile(
     r"\b(?:chaosx|chaos\s*x|chaos\s*bot|chaosx\s*bot)\b",
@@ -137,9 +151,35 @@ def is_question_like(content: str) -> bool:
     return bool(QUESTION_PREFIX_RE.search(text))
 
 
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    normalized_phrase = normalize_scan_text(phrase)
+    return bool(normalized_phrase) and f" {normalized_phrase} " in f" {text} "
+
+
 def has_domain_signal(content: str) -> bool:
     text = normalize_scan_text(content)
-    return any(term in text for term in AUTO_SCAN_DOMAIN_TERMS)
+    return any(_contains_normalized_phrase(text, term) for term in AUTO_SCAN_DOMAIN_TERMS)
+
+
+def _catalog_name_lookup_allowed(question: str) -> bool:
+    text = normalize_scan_text(question)
+    if any(
+        _contains_normalized_phrase(text, term)
+        for term in CATALOG_PROJECT_SCOPE_TERMS
+    ):
+        return True
+    return bool(CATALOG_NAME_INTENT_RE.search(question))
+
+
+def _single_word_entity_is_scoped(question: str, *, needle: str, kind: str) -> bool:
+    text = normalize_scan_text(question)
+    if any(
+        _contains_normalized_phrase(text, term)
+        for term in CATALOG_PROJECT_SCOPE_TERMS
+    ):
+        return True
+    padded = f" {text} "
+    return f" {kind} {needle} " in padded or f" {needle} {kind} " in padded
 
 
 def is_blocked_for_auto_answer(content: str) -> bool:
@@ -194,9 +234,10 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     if server.acted:
         return server
 
-    exact = _exact_catalog_name_answer(question, knowledge=knowledge)
-    if exact.acted:
-        return exact
+    if _catalog_name_lookup_allowed(question):
+        exact = _exact_catalog_name_answer(question, knowledge=knowledge)
+        if exact.acted:
+            return exact
 
     if not has_domain_signal(question):
         return AutoScanDecision("none")
@@ -338,10 +379,19 @@ def _exact_catalog_name_answer(question: str, *, knowledge: Knowledge) -> AutoSc
     )
 
 
+def _entity_question_clause(question: str, needle: str) -> str | None:
+    for clause in re.findall(r"[^.!?\n]+[.!?]?", question):
+        normalized_clause = normalize_scan_text(clause)
+        if f" {needle} " not in f" {normalized_clause} ":
+            continue
+        if is_question_like(clause):
+            return clause
+    return None
+
+
 def _best_entity_name_match(question: str, *, knowledge: Knowledge, table: str, id_column: str) -> dict[str, object] | None:
     kind = {"catalog_events": "event", "catalog_scenarios": "scenario", "catalog_clusters": "cluster"}[table]
     knowledge.ensure_index()
-    normalized_question = f" {normalize_scan_text(question)} "
     best: dict[str, object] | None = None
     conn: sqlite3.Connection = connect(knowledge.db_path)
     try:
@@ -352,7 +402,14 @@ def _best_entity_name_match(question: str, *, knowledge: Knowledge, table: str, 
         needle = normalize_scan_text(str(name))
         if not _entity_name_is_precise_enough(needle):
             continue
-        if f" {needle} " not in normalized_question:
+        question_clause = _entity_question_clause(question, needle)
+        if question_clause is None:
+            continue
+        if len(needle.split()) == 1 and not _single_word_entity_is_scoped(
+            question_clause,
+            needle=needle,
+            kind=kind,
+        ):
             continue
         item = {"kind": kind, "id": entity_id, "name": str(name), "needle": needle}
         if best is None or len(needle) > len(str(best["needle"])):

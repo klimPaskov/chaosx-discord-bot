@@ -535,12 +535,14 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     if mentioned or referenced_message_id(message):
         return False
     try:
-        decision = classify_message(
-            content,
-            knowledge=bot.knowledge,
-            settings=bot.settings,
-            mention_count=len(getattr(message, "mentions", []) or []),
-        )
+        async with bot._auto_scan_classify_lock:
+            decision = await asyncio.to_thread(
+                classify_message,
+                content,
+                knowledge=bot.knowledge,
+                settings=bot.settings,
+                mention_count=len(getattr(message, "mentions", []) or []),
+            )
     except Exception as exc:
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan error", summary=type(exc).__name__)
         return False
@@ -1066,6 +1068,7 @@ class ChaosXBot(discord.Client):
         self._playtest_synthesis_task: asyncio.Task[None] | None = None
         self._mcp_warm_task: asyncio.Task[None] | None = None
         self._playtest_synthesis_lock = asyncio.Lock()
+        self._auto_scan_classify_lock = asyncio.Lock()
         self._playtest_synthesis_requested = False
         self._event_note_lock = asyncio.Lock()
 
