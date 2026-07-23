@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import os
 import shutil
 import signal
+import time
+import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import yaml
 
@@ -64,6 +68,62 @@ class HermesResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0 and not self.timed_out
+
+
+@dataclass(frozen=True)
+class HermesRunActivity:
+    run_id: str
+    prompt_hash: str
+    label: str
+    actor_id: int | None
+    profile: str
+    model: str
+    provider: str
+    reasoning_effort: str
+    stage: str
+    pid: int | None
+    elapsed_seconds: int
+
+
+@dataclass
+class _TrackedHermesRun:
+    activity: HermesRunActivity
+    started_monotonic: float
+
+
+ProgressCallback = Callable[
+    [HermesRunActivity], None | Awaitable[None]
+]
+_ACTIVE_HERMES_RUNS: dict[str, _TrackedHermesRun] = {}
+
+
+def _activity_snapshot(tracked: _TrackedHermesRun) -> HermesRunActivity:
+    return replace(
+        tracked.activity,
+        elapsed_seconds=max(0, int(time.monotonic() - tracked.started_monotonic)),
+    )
+
+
+def active_hermes_runs() -> tuple[HermesRunActivity, ...]:
+    """Return safe live model-process metadata without prompts or command lines."""
+
+    ordered = sorted(
+        _ACTIVE_HERMES_RUNS.values(), key=lambda tracked: tracked.started_monotonic
+    )
+    return tuple(_activity_snapshot(tracked) for tracked in ordered)
+
+
+async def _stop_process(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        proc.kill()
+    await proc.communicate()
 
 
 def build_owner_prompt(*, owner_request: str, guild_name: str | None, channel_name: str | None) -> str:
@@ -161,6 +221,9 @@ async def run_hermes(
     reasoning_effort: str | None = None,
     toolsets: str | None = None,
     ignore_rules: bool = False,
+    activity_label: str = "Hermes task",
+    actor_id: int | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> HermesResult:
     digest = prompt_hash(prompt)
     cmd = [str(hermes_bin), "--profile", profile, "chat", "-q", prompt, "--quiet"]
@@ -173,7 +236,43 @@ async def run_hermes(
     if toolsets:
         cmd.extend(["--toolsets", toolsets])
     config_path = Path.home() / ".hermes" / "profiles" / profile / "config.yaml"
+    run_id = uuid.uuid4().hex[:12]
+    tracked = _TrackedHermesRun(
+        activity=HermesRunActivity(
+            run_id=run_id,
+            prompt_hash=digest,
+            label=(activity_label.strip() or "Hermes task")[:80],
+            actor_id=actor_id,
+            profile=profile,
+            model=(model or "default")[:120],
+            provider=(provider or "default")[:120],
+            reasoning_effort=(reasoning_effort or "default")[:32],
+            stage="queued",
+            pid=None,
+            elapsed_seconds=0,
+        ),
+        started_monotonic=time.monotonic(),
+    )
+    _ACTIVE_HERMES_RUNS[run_id] = tracked
+
+    async def publish(stage: str, *, pid: int | None = None) -> None:
+        tracked.activity = replace(
+            tracked.activity,
+            stage=stage,
+            pid=pid if pid is not None else tracked.activity.pid,
+        )
+        if progress_callback is None:
+            return
+        try:
+            callback_result = progress_callback(_activity_snapshot(tracked))
+            if inspect.isawaitable(callback_result):
+                await callback_result
+        except Exception:
+            # A Discord progress update must never interrupt the underlying run.
+            pass
+
     proc: asyncio.subprocess.Process | None = None
+    await publish("queued")
     try:
         async with _temporary_reasoning_effort(config_path, reasoning_effort):
             proc = await asyncio.create_subprocess_exec(
@@ -183,25 +282,42 @@ async def run_hermes(
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=os.name != "nt",
             )
-            if timeout_seconds is None or timeout_seconds <= 0:
-                stdout_b, stderr_b = await proc.communicate()
-            else:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        if proc is not None and proc.returncode is None:
-            if os.name != "nt":
-                os.killpg(proc.pid, signal.SIGKILL)
-            else:
-                proc.kill()
-            await proc.communicate()
-        return HermesResult(prompt_hash=digest, returncode=124, stdout="", stderr="Hermes run timed out", timed_out=True)
-
-    if proc is None:
-        raise RuntimeError("Hermes subprocess was not started")
-
-    return HermesResult(
-        prompt_hash=digest,
-        returncode=proc.returncode or 0,
-        stdout=stdout_b.decode("utf-8", errors="replace"),
-        stderr=stderr_b.decode("utf-8", errors="replace"),
-    )
+            await publish("reasoning/tools", pid=proc.pid)
+            try:
+                if timeout_seconds is None or timeout_seconds <= 0:
+                    stdout_b, stderr_b = await proc.communicate()
+                else:
+                    stdout_b, stderr_b = await asyncio.wait_for(
+                        proc.communicate(), timeout=timeout_seconds
+                    )
+            except asyncio.TimeoutError:
+                await _stop_process(proc)
+                await publish("timed out")
+                return HermesResult(
+                    prompt_hash=digest,
+                    returncode=124,
+                    stdout="",
+                    stderr="Hermes run timed out",
+                    timed_out=True,
+                )
+        if proc is None:
+            raise RuntimeError("Hermes subprocess was not started")
+        await publish("completed" if proc.returncode == 0 else "failed")
+        return HermesResult(
+            prompt_hash=digest,
+            returncode=proc.returncode or 0,
+            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stderr=stderr_b.decode("utf-8", errors="replace"),
+        )
+    except asyncio.CancelledError:
+        if proc is not None:
+            await _stop_process(proc)
+        await publish("cancelled")
+        raise
+    except Exception:
+        if proc is not None:
+            await _stop_process(proc)
+        await publish("failed")
+        raise
+    finally:
+        _ACTIVE_HERMES_RUNS.pop(run_id, None)

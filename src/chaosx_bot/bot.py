@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, cast
@@ -47,6 +48,8 @@ from .focus_trees import (
 from .vault_index import refresh_vault_indexes
 from .hermes_bridge import (
     HermesResult,
+    HermesRunActivity,
+    active_hermes_runs,
     build_auto_scan_answer_prompt,
     build_auto_scan_banter_prompt,
     build_auto_scan_warning_prompt,
@@ -70,6 +73,11 @@ from .playtest_synthesis import (
     build_playtest_synthesis_prompt,
 )
 from .rate_limit import FixedWindowRateLimiter
+from .runtime_status import (
+    collect_process_tree,
+    format_hermes_progress,
+    format_process_panel,
+)
 from .storage import Store
 from .webhook_server import GitHubWebhookServer
 
@@ -484,6 +492,8 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             reasoning_effort=bot.settings.ask_reasoning_effort,
             toolsets="safe",
             ignore_rules=True,
+            activity_label=f"auto-scan {decision.action}",
+            actor_id=message.author.id,
         )
     output = ""
     if result.ok:
@@ -857,6 +867,7 @@ async def ai_review_issue_report(
         reasoning_effort=bot.settings.ask_reasoning_effort,
         toolsets="safe",
         ignore_rules=True,
+        activity_label="issue AI review",
     )
     text = (result.stdout or result.stderr).strip().splitlines()[0:1]
     line = text[0].strip() if text else ""
@@ -980,6 +991,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
+- `/admin processes` — show the live ChaosX launcher/bot/child process tree plus active Hermes model runs, PIDs, model, reasoning effort, phase, and elapsed time without exposing prompts or secrets.
 - `/admin restart` — safely restart the ChaosX systemd service. Flag and leader artwork refreshes automatically on each focus request, so this is only for restarting the bot itself.
 - `/admin validate-workbook` — validate the authoritative XLSX for duplicate/invalid IDs, missing required fields, evolution gaps, and broken event/cluster references.
 - `/admin reindex` — refresh ChaosX's local Chaos Redux catalog/search database. Use if `/event`, `/scenario`, `/cluster`, `/status`, or `/testing` looks stale after spreadsheet/docs changes.
@@ -1170,6 +1182,7 @@ class ChaosXBot(discord.Client):
                 reasoning_effort=self.settings.ask_reasoning_effort,
                 toolsets="safe",
                 ignore_rules=True,
+                activity_label="playtest result synthesis",
             )
             raw_output = result.stdout.strip()
             output = (
@@ -1508,6 +1521,8 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             reasoning_effort=bot.settings.operator_reasoning_effort,
             toolsets=None,
             ignore_rules=False,
+            activity_label="admin mention ask",
+            actor_id=message.author.id,
         )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
@@ -1618,6 +1633,8 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
             reasoning_effort=bot.settings.ask_reasoning_effort,
             toolsets="safe",
             ignore_rules=True,
+            activity_label=command_name,
+            actor_id=message.author.id,
         )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
@@ -2206,6 +2223,39 @@ async def fetch_admin_message_context(bot: ChaosXBot, interaction: discord.Inter
     return header + "\n" + "\n".join(kept[-80:])
 
 
+async def _owner_progress_loop(
+    interaction: discord.Interaction,
+    command_name: str,
+    activity_box: list[HermesRunActivity | None],
+    stop: asyncio.Event,
+) -> None:
+    """Keep one private interaction response updated with safe run metadata."""
+
+    while True:
+        activity = activity_box[0]
+        if activity is not None:
+            activity = next(
+                (
+                    live
+                    for live in active_hermes_runs()
+                    if live.run_id == activity.run_id
+                ),
+                activity,
+            )
+        try:
+            await interaction.edit_original_response(
+                content=format_hermes_progress(command_name, activity)
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+            return
+        if stop.is_set():
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=8)
+        except asyncio.TimeoutError:
+            continue
+
+
 async def run_hermes_command(
     bot: ChaosXBot,
     interaction: discord.Interaction,
@@ -2267,6 +2317,20 @@ async def run_hermes_command(
             return
 
     await interaction.response.defer(ephemeral=not public, thinking=True)
+    activity_box: list[HermesRunActivity | None] = [None]
+    progress_stop: asyncio.Event | None = None
+    progress_task: asyncio.Task[None] | None = None
+    if owner_only:
+        progress_stop = asyncio.Event()
+        progress_task = asyncio.create_task(
+            _owner_progress_loop(
+                interaction,
+                command_name,
+                activity_box,
+                progress_stop,
+            ),
+            name=f"chaosx-progress-{command_name.replace(' ', '-')}",
+        )
     guild_name, channel_name = _guild_channel(interaction)
     owner_context = ""
     if owner_only:
@@ -2305,18 +2369,30 @@ async def run_hermes_command(
         if command_name in no_timeout_commands
         else bot.settings.hermes_timeout_seconds
     )
-    result = await run_hermes(
-        hermes_bin=bot.settings.hermes_bin,
-        profile=bot.settings.hermes_profile,
-        repo=bot.settings.chaos_redux_repo,
-        prompt=prompt,
-        timeout_seconds=hermes_timeout,
-        model=model,
-        provider=provider,
-        reasoning_effort=reasoning_effort,
-        toolsets=toolsets,
-        ignore_rules=ignore_rules,
-    )
+    def progress_callback(activity: HermesRunActivity) -> None:
+        activity_box[0] = activity
+
+    try:
+        result = await run_hermes(
+            hermes_bin=bot.settings.hermes_bin,
+            profile=bot.settings.hermes_profile,
+            repo=bot.settings.chaos_redux_repo,
+            prompt=prompt,
+            timeout_seconds=hermes_timeout,
+            model=model,
+            provider=provider,
+            reasoning_effort=reasoning_effort,
+            toolsets=toolsets,
+            ignore_rules=ignore_rules,
+            activity_label=command_name,
+            actor_id=interaction.user.id,
+            progress_callback=progress_callback if owner_only else None,
+        )
+    finally:
+        if progress_stop is not None:
+            progress_stop.set()
+        if progress_task is not None:
+            await progress_task
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
         output = (
@@ -3041,6 +3117,34 @@ def register_commands(bot: ChaosXBot) -> None:
         )
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin health", summary="health check")
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(
+        name="processes",
+        description="Show live ChaosX and Hermes reasoning/tool processes.",
+    )
+    async def admin_processes(interaction: discord.Interaction) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        snapshot = await asyncio.to_thread(
+            collect_process_tree,
+            root_pid=os.getpid(),
+        )
+        activities = active_hermes_runs()
+        text = format_process_panel(snapshot, activities)
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin processes",
+            summary=f"{len(snapshot.descendants)} children; {len(activities)} model runs",
+        )
+        for part in _chunk(text):
+            await interaction.followup.send(
+                part,
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
 
     @admin.command(name="restart", description="Safely restart the ChaosX bot service.")
     async def admin_restart(interaction: discord.Interaction) -> None:
