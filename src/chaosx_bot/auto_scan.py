@@ -123,17 +123,6 @@ BOT_CAPABILITY_QUESTION_RE = re.compile(
     r"\b(?:can|could|does|do|will|would|how|what|why|is|are)\b",
     re.I,
 )
-BOT_IMPLICIT_CAPABILITY_QUESTION_RE = re.compile(
-    r"\b(?:can|could|do|will|would|are)\s+you\b.{0,120}"
-    r"\b(?:imagegen|image\s+generation|generate\s+images?|make\s+images?|"
-    r"use\s+tools?|browse\s+(?:the\s+)?web|search\s+(?:the\s+)?web)\b",
-    re.I,
-)
-DIRECT_GREETING_RE = re.compile(
-    r"^\s*(?:hi|hello|hey|yo|sup|hiya|howdy)[!.?]*\s*$",
-    re.I,
-)
-
 MASS_PING_RE = re.compile(r"@everyone|@here", re.I)
 DISCORD_INVITE_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[a-z0-9-]+", re.I)
 SCAM_LINK_RE = re.compile(r"\b(?:free\s+nitro|discord\s+nitro\s+free|steam\s+gift|airdrop|crypto\s+giveaway|wallet\s+verify|click\s+to\s+claim)\b", re.I)
@@ -314,14 +303,6 @@ def classify_bot_topic_banter(content: str, *, settings: Settings) -> AutoScanDe
         return AutoScanDecision("none")
     if is_blocked_for_auto_answer(text):
         return AutoScanDecision("none")
-    if DIRECT_GREETING_RE.fullmatch(text):
-        return AutoScanDecision(
-            action="banter",
-            confidence=100,
-            reason="direct greeting",
-            question=text,
-            source="bot_topic",
-        )
     explicit_topic = bool(BOT_TOPIC_RE.search(text))
     generic_topic = bool(GENERIC_BOT_TOPIC_RE.search(text))
     if not explicit_topic and not generic_topic:
@@ -381,10 +362,7 @@ def _server_answer(question: str, *, settings: Settings) -> AutoScanDecision:
         return AutoScanDecision("answer", confidence=100, reason="exact issue report question", question=question, source="issue_help", reference_context=context)
     if ACCESS_RE.search(question):
         return AutoScanDecision("answer", confidence=100, reason="exact server access question", question=question, source="access_help", reference_context=context)
-    if (
-        BOT_CAPABILITY_QUESTION_RE.search(question)
-        or BOT_IMPLICIT_CAPABILITY_QUESTION_RE.search(question)
-    ):
+    if BOT_CAPABILITY_QUESTION_RE.search(question):
         return AutoScanDecision("answer", confidence=100, reason="ChaosX capability question", question=question, source="server_help", reference_context=context)
     return AutoScanDecision("none")
 

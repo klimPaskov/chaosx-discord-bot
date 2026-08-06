@@ -85,16 +85,14 @@ def test_auto_scan_answers_bot_capability_and_grounded_mod_questions(tmp_path: P
         knowledge=cast(Any, SimpleNamespace()),
         settings=settings,
     )
-    assert implicit_capability.action == "answer"
-    assert implicit_capability.reason == "ChaosX capability question"
+    assert implicit_capability.action == "none"
 
     greeting = classify_message(
         "hi",
         knowledge=cast(Any, SimpleNamespace()),
         settings=settings,
     )
-    assert greeting.action == "banter"
-    assert greeting.reason == "direct greeting"
+    assert greeting.action == "none"
 
     db = tmp_path / "catalog.db"
     connect(db).close()
