@@ -80,6 +80,22 @@ def test_auto_scan_answers_bot_capability_and_grounded_mod_questions(tmp_path: P
     assert capability.reason == "ChaosX capability question"
     assert "/ask" in capability.reference_context
 
+    implicit_capability = classify_auto_answer(
+        "can you use imagegen?",
+        knowledge=cast(Any, SimpleNamespace()),
+        settings=settings,
+    )
+    assert implicit_capability.action == "answer"
+    assert implicit_capability.reason == "ChaosX capability question"
+
+    greeting = classify_message(
+        "hi",
+        knowledge=cast(Any, SimpleNamespace()),
+        settings=settings,
+    )
+    assert greeting.action == "banter"
+    assert greeting.reason == "direct greeting"
+
     db = tmp_path / "catalog.db"
     connect(db).close()
 
