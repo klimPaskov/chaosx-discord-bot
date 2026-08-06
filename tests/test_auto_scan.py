@@ -69,6 +69,40 @@ def test_auto_scan_server_answers_and_blocks_unsafe_prompts():
     assert credential_request.action == "none"
 
 
+def test_auto_scan_answers_bot_capability_and_grounded_mod_questions(tmp_path: Path):
+    settings = Settings(discord_token="dummy")
+    capability = classify_auto_answer(
+        "Can the bot use image generation?",
+        knowledge=cast(Any, SimpleNamespace()),
+        settings=settings,
+    )
+    assert capability.action == "answer"
+    assert capability.reason == "ChaosX capability question"
+    assert "/ask" in capability.reference_context
+
+    db = tmp_path / "catalog.db"
+    connect(db).close()
+
+    class RetrievedKnowledge:
+        db_path = db
+
+        def ensure_index(self) -> None:
+            return None
+
+        def public_ask_context(self, _question: str) -> str:
+            return "Chaos Redux is a Hearts of Iron IV chaos-event mod."
+
+    grounded = classify_auto_answer(
+        "What is the Chaos Redux mod about?",
+        knowledge=cast(Any, RetrievedKnowledge()),
+        settings=settings,
+    )
+    assert grounded.action == "answer"
+    assert grounded.reason == "grounded Chaos Redux question"
+    assert grounded.source == "project_context"
+    assert "chaos-event mod" in grounded.reference_context
+
+
 def test_auto_scan_bot_topic_banter_gate_uses_no_canned_public_text():
     settings = Settings(discord_token="dummy")
     knowledge = cast(Any, SimpleNamespace())

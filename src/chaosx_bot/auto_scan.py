@@ -50,6 +50,13 @@ AUTO_SCAN_DOMAIN_TERMS = {
     "reaction role",
     "community",
 }
+AUTO_SCAN_GROUNDED_CONTEXT_TERMS = {
+    "chaos redux",
+    "chaosx",
+    "hoi4",
+    "hearts of iron",
+    "mod",
+}
 AUTO_SCAN_BLOCK_TERMS = {
     "ignore previous",
     "ignore all instructions",
@@ -109,6 +116,13 @@ BOT_BROKEN_RE = re.compile(r"\b(?:broken|buggy|glitched|crashed|down|dead|offlin
 BOT_PRAISE_RE = re.compile(r"\b(?:smart|good|great|cool|based|useful|helpful|love|thanks|thank\s+you|nice\s+bot)\b", re.I)
 BOT_REPLACEMENT_RE = re.compile(r"\b(?:replace|replacement|another\s+bot|better\s+bot|new\s+bot|old\s+bot)\b", re.I)
 BOT_SLEEP_RE = re.compile(r"\b(?:wake\s+up|asleep|sleeping|alive|listening|hear\s+me|can\s+you\s+hear)\b", re.I)
+BOT_CAPABILITY_QUESTION_RE = re.compile(
+    r"\b(?:can|could|does|do|will|would|how|what|why|is|are)\b.{0,160}"
+    r"\b(?:chaosx|chaos\s*x|chaos\s*bot|chaosx\s*bot|this\s+bot|that\s+bot|the\s+bot|our\s+bot|your\s+bot)\b"
+    r"|\b(?:chaosx|chaos\s*x|chaos\s*bot|chaosx\s*bot|this\s+bot|that\s+bot|the\s+bot|our\s+bot|your\s+bot)\b.{0,160}"
+    r"\b(?:can|could|does|do|will|would|how|what|why|is|are)\b",
+    re.I,
+)
 
 MASS_PING_RE = re.compile(r"@everyone|@here", re.I)
 DISCORD_INVITE_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[a-z0-9-]+", re.I)
@@ -159,6 +173,14 @@ def _contains_normalized_phrase(text: str, phrase: str) -> bool:
 def has_domain_signal(content: str) -> bool:
     text = normalize_scan_text(content)
     return any(_contains_normalized_phrase(text, term) for term in AUTO_SCAN_DOMAIN_TERMS)
+
+
+def has_grounded_context_signal(content: str) -> bool:
+    text = normalize_scan_text(content)
+    return any(
+        _contains_normalized_phrase(text, term)
+        for term in AUTO_SCAN_GROUNDED_CONTEXT_TERMS
+    )
 
 
 def _catalog_name_lookup_allowed(question: str) -> bool:
@@ -247,6 +269,20 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     if TESTING_RE.search(question):
         return AutoScanDecision("answer", confidence=100, reason="exact testing queue question", question=question, source="testing", reference_context=knowledge.testing_queue())
 
+    if not has_grounded_context_signal(question):
+        return AutoScanDecision("none")
+
+    context = knowledge.public_ask_context(question)
+    if context.strip():
+        return AutoScanDecision(
+            "answer",
+            confidence=100,
+            reason="grounded Chaos Redux question",
+            question=question,
+            source="project_context",
+            reference_context=context,
+        )
+
     return AutoScanDecision("none")
 
 
@@ -327,6 +363,8 @@ def _server_answer(question: str, *, settings: Settings) -> AutoScanDecision:
         return AutoScanDecision("answer", confidence=100, reason="exact issue report question", question=question, source="issue_help", reference_context=context)
     if ACCESS_RE.search(question):
         return AutoScanDecision("answer", confidence=100, reason="exact server access question", question=question, source="access_help", reference_context=context)
+    if BOT_CAPABILITY_QUESTION_RE.search(question):
+        return AutoScanDecision("answer", confidence=100, reason="ChaosX capability question", question=question, source="server_help", reference_context=context)
     return AutoScanDecision("none")
 
 

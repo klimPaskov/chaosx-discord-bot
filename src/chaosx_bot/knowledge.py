@@ -9,6 +9,7 @@ from pathlib import Path
 from .indexer import (
     CatalogReadError,
     INDEX_SCHEMA_VERSION,
+    catalog_fingerprint,
     connect,
     index_commit,
     iter_indexable_files,
@@ -28,6 +29,7 @@ class Knowledge:
     repo: Path
     db_path: Path
     vault_path: Path | None = None
+    catalog_repo: Path | None = None
     _last_freshness_check: float = field(default=0.0, init=False, repr=False, compare=False)
 
     def ensure_index(self) -> None:
@@ -43,21 +45,29 @@ class Knowledge:
             conn.close()
         indexed_at = _float_meta(meta.get("indexed_at"))
         current_commit = index_commit(self.repo, self.vault_path)
+        catalog_root = self.catalog_repo or self.repo
+        current_catalog_fingerprint = catalog_fingerprint(catalog_root)
         latest_source_mtime = max(
             _latest_indexable_mtime(self.repo),
             _latest_vault_indexable_mtime(self.vault_path),
-            _latest_catalog_mtime(self.repo),
+            _latest_catalog_mtime(catalog_root),
         )
         needs_rebuild = (
             count == 0
             or scenarios == 0
             or meta.get("schema_version") != INDEX_SCHEMA_VERSION
             or meta.get("commit_sha") != current_commit
+            or meta.get("catalog_fingerprint") != current_catalog_fingerprint
             or latest_source_mtime > indexed_at
         )
         if needs_rebuild:
             try:
-                rebuild_index(self.repo, self.db_path, self.vault_path)
+                rebuild_index(
+                    self.repo,
+                    self.db_path,
+                    self.vault_path,
+                    catalog_repo=self.catalog_repo,
+                )
             except CatalogReadError:
                 if count == 0 or scenarios == 0:
                     raise

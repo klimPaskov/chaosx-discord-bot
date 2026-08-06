@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from chaosx_bot.indexer import CatalogReadError, _catalog_rows, is_vault_indexable, rebuild_index
+from chaosx_bot.indexer import CatalogReadError, _catalog_rows, catalog_fingerprint, is_vault_indexable, rebuild_index
 from chaosx_bot.knowledge import Knowledge
 
 
@@ -119,6 +119,48 @@ def test_knowledge_auto_refreshes_stale_index(tmp_path: Path):
     finally:
         conn.close()
     assert after > before
+
+
+def test_knowledge_uses_and_refreshes_from_live_catalog_repo(tmp_path: Path):
+    repo = tmp_path / "knowledge"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs/readme.md").write_text("Chaos Redux knowledge.", encoding="utf-8")
+    old_catalog = tmp_path / "old-catalog"
+    live_catalog = tmp_path / "live-catalog"
+    header = (
+        "ID,Event Name,Details,Evo I,Evo II,Evo III,Evo IV,Evo V,"
+        "World-End Scenario,Type,Cluster ID,Member Severity,Status\n"
+    )
+    rows = {
+        old_catalog: "18,Resources found,Old catalog,Stage 1,,,,,,Minor,,,Draft\n",
+        live_catalog: (
+            "18,A Rich Find,Live catalog,Stage 1,Stage 2,Stage 3,Stage 4,,"
+            ",Major,,,Playable\n"
+        ),
+    }
+    for root, row in rows.items():
+        spreadsheets = root / "docs/spreadsheets"
+        spreadsheets.mkdir(parents=True)
+        (spreadsheets / "chaos_redux_events_catalog.csv").write_text(
+            header + row,
+            encoding="utf-8",
+        )
+
+    db = tmp_path / "live-catalog.db"
+    rebuild_index(repo, db, catalog_repo=old_catalog)
+    stale = Knowledge(repo, db, catalog_repo=old_catalog).event("18")
+    assert "Resources found" in stale
+
+    refreshed = Knowledge(repo, db, catalog_repo=live_catalog).event("18")
+    assert "A Rich Find" in refreshed
+    assert "Evolution stages: `4`" in refreshed
+    assert "Status: `Playable`" in refreshed
+    conn = sqlite3.connect(db)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM index_meta"))
+    finally:
+        conn.close()
+    assert meta["catalog_fingerprint"] == catalog_fingerprint(live_catalog)
 
 
 def test_catalog_workbook_takes_precedence_over_stale_csv(tmp_path: Path):

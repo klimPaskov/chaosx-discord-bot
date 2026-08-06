@@ -276,10 +276,42 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def rebuild_index(repo: Path, db_path: Path, vault_path: Path | None = None) -> IndexStats:
+def catalog_fingerprint(repo: Path) -> str:
+    """Return a content fingerprint for the authoritative catalog source."""
+
+    spreadsheets = repo / "docs/spreadsheets"
+    workbook = spreadsheets / "chaos_redux_events_catalog.xlsx"
+    paths = [workbook] if workbook.exists() else [
+        spreadsheets / "chaos_redux_events_catalog.csv",
+        spreadsheets / "chaos_redux_scenarios_catalog.csv",
+        spreadsheets / "chaos_redux_clusters_catalog.csv",
+    ]
+    digest = hashlib.sha256()
+    found = False
+    for path in paths:
+        if not path.exists():
+            continue
+        found = True
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest() if found else "missing"
+
+
+def rebuild_index(
+    repo: Path,
+    db_path: Path,
+    vault_path: Path | None = None,
+    catalog_repo: Path | None = None,
+) -> IndexStats:
     repo = repo.resolve()
     vault = vault_path.resolve() if vault_path and vault_path.exists() else None
+    catalog_root = (
+        catalog_repo.resolve()
+        if catalog_repo and catalog_repo.exists()
+        else repo
+    )
     commit = index_commit(repo, vault)
+    catalog_hash = catalog_fingerprint(catalog_root)
     indexed_at = time()
     conn = connect(db_path)
     with conn:
@@ -317,11 +349,12 @@ def rebuild_index(repo: Path, db_path: Path, vault_path: Path | None = None) -> 
                 )
                 docs += 1
                 vault_docs += 1
-        events = _load_events(conn, repo, indexed_at)
-        scenarios = _load_scenarios(conn, repo, indexed_at)
-        clusters = _load_clusters(conn, repo, indexed_at)
+        events = _load_events(conn, catalog_root, indexed_at)
+        scenarios = _load_scenarios(conn, catalog_root, indexed_at)
+        clusters = _load_clusters(conn, catalog_root, indexed_at)
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('schema_version', ?)", (INDEX_SCHEMA_VERSION,))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('commit_sha', ?)", (commit,))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('catalog_fingerprint', ?)", (catalog_hash,))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('indexed_at', ?)", (str(indexed_at),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('doc_count', ?)", (str(docs),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('repo_doc_count', ?)", (str(repo_docs),))

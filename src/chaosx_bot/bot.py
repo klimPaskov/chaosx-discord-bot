@@ -1051,8 +1051,13 @@ class ChaosXBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.store = Store(settings.db_path)
         self.rate_limiter = FixedWindowRateLimiter()
-        self.knowledge = Knowledge(settings.chaos_redux_repo, settings.db_path, settings.obsidian_vault_path)
         visual_repo = settings.focus_tree_repo or settings.chaos_redux_repo
+        self.knowledge = Knowledge(
+            settings.chaos_redux_repo,
+            settings.db_path,
+            settings.obsidian_vault_path,
+            catalog_repo=visual_repo,
+        )
         self.mcp_session = SharedMcpSession(settings)
         self.focus_tree_catalog = FocusTreeCatalog(visual_repo)
         self.focus_tree_mcp = FocusTreeMcpClient(settings, self.mcp_session)
@@ -1714,7 +1719,7 @@ async def send_scripted_response(
         return
     await interaction.response.defer(ephemeral=not public, thinking=True)
     try:
-        output = render()
+        output = await asyncio.to_thread(render)
     except Exception as exc:
         output = f"ChaosX scripted command failed: `{type(exc).__name__}: {exc}`"
     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)
@@ -1731,10 +1736,9 @@ async def send_scripted_response(
                 command=f"{command_name} attachment error",
                 summary=type(exc).__name__,
             )
-            await interaction.followup.send("Related visual attachments are unavailable right now.", ephemeral=not public, allowed_mentions=safe_allowed_mentions())
     if owner_render and public and interaction.user.id == bot.settings.owner_id:
         try:
-            owner_output = owner_render()
+            owner_output = await asyncio.to_thread(owner_render)
         except Exception as exc:
             owner_output = f"Private details failed: `{type(exc).__name__}: {exc}`"
         if owner_output and owner_output != output:
@@ -1761,7 +1765,6 @@ async def send_focus_tree_graphs(
             command="focus tree render error",
             summary=type(exc.__cause__ or exc).__name__,
         )
-        await interaction.followup.send("Focus-tree graphs are unavailable right now.", ephemeral=not public, allowed_mentions=safe_allowed_mentions())
         return
 
     for graph in batch.graphs:
@@ -1788,10 +1791,12 @@ async def send_focus_tree_graphs(
             allowed_mentions=safe_allowed_mentions(),
         )
     if batch.failed:
-        await interaction.followup.send(
-            f"`{batch.failed}` focus-tree graph(s) could not be rendered.",
-            ephemeral=not public,
-            allowed_mentions=safe_allowed_mentions(),
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="focus tree partial render error",
+            summary=f"failed={batch.failed}",
         )
 
 
@@ -1840,22 +1845,11 @@ async def send_related_event_visuals(bot: ChaosXBot, interaction: discord.Intera
             command="related event visuals error",
             summary=type(exc.__cause__ or exc).__name__,
         )
-        await interaction.followup.send(
-            "Event-chain and scripted-GUI previews are unavailable right now.",
-            ephemeral=False,
-            allowed_mentions=safe_allowed_mentions(),
-        )
         return
     if visuals.chain is not None:
         await interaction.followup.send(
             f"### Event chain — {visuals.chain.record.label}",
             file=discord.File(io.BytesIO(visuals.chain.png), filename=visuals.chain.record.filename),
-            ephemeral=False,
-            allowed_mentions=safe_allowed_mentions(),
-        )
-    elif visuals.chain_failed:
-        await interaction.followup.send(
-            "The related event-chain graph could not be rendered.",
             ephemeral=False,
             allowed_mentions=safe_allowed_mentions(),
         )
@@ -1873,11 +1867,16 @@ async def send_related_event_visuals(bot: ChaosXBot, interaction: discord.Intera
             ephemeral=False,
             allowed_mentions=safe_allowed_mentions(),
         )
-    if visuals.failed_guis:
-        await interaction.followup.send(
-            f"`{visuals.failed_guis}` scripted-GUI preview(s) could not be rendered.",
-            ephemeral=False,
-            allowed_mentions=safe_allowed_mentions(),
+    if visuals.chain_failed or visuals.failed_guis:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="related event visuals partial render error",
+            summary=(
+                f"chain_failed={visuals.chain_failed}; "
+                f"failed_guis={visuals.failed_guis}"
+            ),
         )
 
 
