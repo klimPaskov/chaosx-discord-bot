@@ -1855,7 +1855,7 @@ async def send_related_event_visuals(bot: ChaosXBot, interaction: discord.Intera
         )
     for preview in visuals.guis:
         await interaction.followup.send(
-            f"### Scripted GUI — {preview.record.label}\n*Offline MCP preview; in-game rendering may differ.*",
+            f"### Scripted GUI — {preview.record.label}",
             file=discord.File(io.BytesIO(preview.png), filename=preview.record.filename),
             ephemeral=False,
             allowed_mentions=safe_allowed_mentions(),
@@ -1978,7 +1978,7 @@ async def send_scripted_gui_lookup(bot: ChaosXBot, interaction: discord.Interact
         )
     for preview in previews:
         await interaction.followup.send(
-            f"### Scripted GUI — {preview.record.label}\n`{preview.record.window_name}` · *Offline MCP preview; in-game rendering may differ.*",
+            f"### Scripted GUI — {preview.record.label}\n`{preview.record.window_name}`",
             file=discord.File(io.BytesIO(preview.png), filename=preview.record.filename),
             ephemeral=False,
             allowed_mentions=safe_allowed_mentions(),
