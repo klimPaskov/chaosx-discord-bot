@@ -76,7 +76,7 @@ def test_blank_optional_guild_ids_are_allowed():
     assert settings.command_guild_id is None
 
 
-def test_ask_model_defaults_to_openai_luna():
+def test_ask_model_defaults_to_deepseek_flash():
     settings = Settings(_env_file=None, discord_token="dummy")
     assert settings.allowed_guild_id == 1395459671598436533
     assert settings.command_guild_id == 1395459671598436533
@@ -94,12 +94,12 @@ def test_ask_model_defaults_to_openai_luna():
     assert settings.auto_scan_banter_limit_per_user_hour == 8
     assert settings.hermes_timeout_seconds == 900
     assert settings.admin_ask_timeout_seconds == 0
-    assert settings.ask_model == "gpt-5.6-luna"
-    assert settings.ask_provider == "openai-codex"
-    assert settings.ask_reasoning_effort == "medium"
-    assert settings.operator_model == "gpt-5.6-luna"
-    assert settings.operator_provider == "openai-codex"
-    assert settings.operator_reasoning_effort == "xhigh"
+    assert settings.ask_model == "deepseek-v4-flash"
+    assert settings.ask_provider == "deepseek"
+    assert settings.ask_reasoning_effort == "low"
+    assert settings.operator_model == "deepseek-v4-flash"
+    assert settings.operator_provider == "deepseek"
+    assert settings.operator_reasoning_effort == "high"
     assert settings.automation_reminder_channel_id == 1395464062367698977
     assert settings.content_dump_channel_id == 1516054706286235768
     assert settings.admin_context_message_limit == 120
