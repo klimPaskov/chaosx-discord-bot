@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from chaosx_bot.conversation_memory import (
+    KEEP_AFTER_COMPACT,
+    MAX_MESSAGES_PER_CHANNEL,
+    capture_message,
+    compact_if_due,
+    conversation_context_for,
+)
+
+GUILD = 1001
+CHANNEL = 2001
+ALLOWED = 1001
+
+
+def _iso(day: int) -> str:
+    return f"2026-08-{day:02d}T10:00:00+00:00"
+
+
+async def _capture(db: Path, *, n: int = 1, channel: int = CHANNEL, content: str | None = None, author: str = "Hoops") -> None:
+    for i in range(n):
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=channel,
+            author_id=3000 + i,
+            author_name=author,
+            content=content or f"message {i}",
+            created_at=_iso(i + 1),
+            is_bot_self=False,
+            allowed_guild_id=ALLOWED,
+        )
+
+
+def test_capture_skips_non_guild_slash_other_bots(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+    async def run() -> None:
+        await capture_message(db, guild_id=None, channel_id=1, author_id=1, author_name="x", content="hi", created_at=_iso(1), is_bot_self=False, allowed_guild_id=ALLOWED)
+        await capture_message(db, guild_id=GUILD, channel_id=2, author_id=1, author_name="x", content="hi", created_at=_iso(1), is_bot_self=False, allowed_guild_id=ALLOWED)
+        await capture_message(db, guild_id=9999, channel_id=3, author_id=1, author_name="x", content="hi", created_at=_iso(1), is_bot_self=False, allowed_guild_id=ALLOWED)
+        await capture_message(db, guild_id=GUILD, channel_id=4, author_id=1, author_name="x", content="/event 7", created_at=_iso(1), is_bot_self=False, allowed_guild_id=ALLOWED)
+        await capture_message(db, guild_id=GUILD, channel_id=5, author_id=1, author_name="OtherBot", content="hi", created_at=_iso(1), is_bot_self=True, allowed_guild_id=ALLOWED)
+        ctx = await conversation_context_for(db, CHANNEL)
+    asyncio.run(run())
+    ctx = asyncio.run(conversation_context_for(db, CHANNEL))
+    assert "message" not in ctx  # nothing from CHANNEL was captured
+
+
+def test_context_includes_summary_and_window_excludes_trigger(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+    asyncio.run(_capture(db, n=3))
+
+    async def run() -> None:
+        # Messages get ids 1,2,3; excluding id 2 drops the "message 1" row.
+        ctx = await conversation_context_for(db, CHANNEL, exclude_message_id=2)
+        assert "message 0" in ctx and "message 2" in ctx
+        assert "message 1" not in ctx
+        assert "Hoops" in ctx
+
+        # A stored summary is included as the compacted memory block.
+        from chaosx_bot.conversation_memory import _SCHEMA
+        import aiosqlite
+        async with aiosqlite.connect(db) as conn:
+            await conn.execute(
+                "INSERT INTO conversation_summaries (channel_id, summary, last_message_id, updated_at) VALUES (?, ?, ?, ?)",
+                (CHANNEL, "Hoops is testing conversation memory.", 3, _iso(4)),
+            )
+            await conn.commit()
+        ctx2 = await conversation_context_for(db, CHANNEL)
+        assert "Channel memory" in ctx2 and "testing conversation memory" in ctx2
+    asyncio.run(run())
+
+
+def test_capture_is_capped_per_channel(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+    asyncio.run(_capture(db, n=MAX_MESSAGES_PER_CHANNEL + 10))
+
+    async def run() -> None:
+        ctx = await conversation_context_for(db, CHANNEL)
+        lines = [l for l in ctx.splitlines() if l.startswith("- ")]
+        assert len(lines) == 14  # window, not the full cap
+        import aiosqlite
+        async with aiosqlite.connect(db) as conn:
+            row = await (await conn.execute("SELECT COUNT(*) FROM conversation_messages WHERE channel_id = ?", (CHANNEL,))).fetchone()
+        count = int(row[0]) if row is not None else 0
+        assert count == MAX_MESSAGES_PER_CHANNEL
+    asyncio.run(run())
+
+
+def test_compaction_runs_at_threshold_and_prunes(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+    asyncio.run(_capture(db, n=30))  # threshold is 30
+
+    calls: list[str] = []
+    async def summarize(prompt: str) -> str:
+        calls.append(prompt)
+        return "Compacted: 30 messages discussed event 7 and the zombie outbreak."
+    ran = asyncio.run(compact_if_due(db, CHANNEL, summarize=summarize))
+    assert ran is True
+    assert len(calls) == 1
+    assert "Compress this Discord conversation" in calls[0]
+
+    async def run() -> None:
+        import aiosqlite
+        async with aiosqlite.connect(db) as conn:
+            count_row = await (await conn.execute("SELECT COUNT(*) FROM conversation_messages WHERE channel_id = ?", (CHANNEL,))).fetchone()
+            summary_row = await (await conn.execute("SELECT summary FROM conversation_summaries WHERE channel_id = ?", (CHANNEL,))).fetchone()
+        count = int(count_row[0]) if count_row is not None else 0
+        summary = str(summary_row[0]) if summary_row is not None else ""
+        ctx = await conversation_context_for(db, CHANNEL)
+        assert count == KEEP_AFTER_COMPACT
+        assert "Compacted: 30 messages" in summary
+        assert "Channel memory" in ctx
+        # Below the new threshold again -> no second compaction.
+        ran2 = await compact_if_due(db, CHANNEL, summarize=summarize)
+        assert ran2 is False
+    asyncio.run(run())
+
+
+def test_prompt_builders_include_conversation_context(tmp_path: Path) -> None:
+    from chaosx_bot.hermes_bridge import (
+        build_auto_scan_answer_prompt,
+        build_auto_scan_banter_prompt,
+        build_public_prompt,
+    )
+
+    answer = build_auto_scan_answer_prompt(
+        user_message="hi chaos bot",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="event 7",
+        gate_reason="bot-topic conversation",
+        conversation_context="Recent conversation:\n- Hoops: hello",
+    )
+    assert "Recent channel conversation" in answer and "Hoops: hello" in answer
+
+    banter = build_auto_scan_banter_prompt(
+        user_message="chaosx?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        gate_reason="bot-topic conversation",
+        conversation_context="Recent conversation:\n- Hoops: hi",
+    )
+    assert "Hoops: hi" in banter
+
+    public = build_public_prompt(
+        user_request="how does event 7 work?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        conversation_context="Recent conversation:\n- Hoops: earlier we talked about zombies",
+    )
+    assert "earlier we talked about zombies" in public
+
+    empty = build_auto_scan_banter_prompt(
+        user_message="chaosx?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        gate_reason="bot-topic conversation",
+    )
+    assert "Recent channel conversation" not in empty

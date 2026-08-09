@@ -15,6 +15,11 @@ from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
 from .auto_scan import AutoScanDecision, classify_message
+from .conversation_memory import (
+    capture_message,
+    conversation_context_for,
+    schedule_compaction,
+)
 from .catalog_validation import format_workbook_validation, validate_workbook
 from .community_notes import (
     format_event_idea_post_body,
@@ -455,6 +460,11 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
     user_message = decision.question or message.content or ""
+    conversation_context = await conversation_context_for(
+        bot.settings.db_path,
+        channel_id=getattr(message.channel, "id", 0),
+        exclude_message_id=message.id,
+    )
     if decision.action == "answer":
         prompt = build_auto_scan_answer_prompt(
             user_message=user_message,
@@ -462,6 +472,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             channel_name=channel_name,
             reference_context=decision.reference_context,
             gate_reason=decision.reason,
+            conversation_context=conversation_context,
         )
     elif decision.action == "banter":
         prompt = build_auto_scan_banter_prompt(
@@ -469,6 +480,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             guild_name=guild_name,
             channel_name=channel_name,
             gate_reason=decision.reason,
+            conversation_context=conversation_context,
         )
     elif decision.action == "soft_warning":
         prompt = build_auto_scan_warning_prompt(
@@ -476,6 +488,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             guild_name=guild_name,
             channel_name=channel_name,
             gate_reason=decision.reason,
+            conversation_context=conversation_context,
         )
     else:
         raise ValueError(f"auto-scan action has no model response: {decision.action}")
@@ -604,6 +617,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
                 await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan reply memory error", summary=type(exc).__name__)
         await record_auto_scan_event(bot, decision, message, bot_message_id=first_sent.id if first_sent else None, response=model_output)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer", summary=decision.reason)
+        schedule_compaction(bot.settings, channel_id=channel_id)
         return True
 
     if decision.action == "banter":
@@ -634,6 +648,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             response=model_output,
         )
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan bot-topic banter", summary=decision.reason)
+        schedule_compaction(bot.settings, channel_id=channel_id)
         return True
 
     if decision.action == "soft_warning":
@@ -1262,6 +1277,17 @@ class ChaosXBot(discord.Client):
             await guild.leave()
 
     async def on_message(self, message: discord.Message) -> None:
+        await capture_message(
+            self.settings.db_path,
+            guild_id=message.guild.id if message.guild else None,
+            channel_id=getattr(message.channel, "id", 0),
+            author_id=message.author.id,
+            author_name=message.author.display_name or message.author.name,
+            content=message.content or "",
+            created_at=message.created_at.isoformat(timespec="seconds"),
+            is_bot_self=self.user is not None and message.author.id == self.user.id,
+            allowed_guild_id=self.settings.allowed_guild_id or self.settings.command_guild_id,
+        )
         if await handle_message_ask(self, message):
             return
         await handle_auto_scan(self, message)
@@ -1621,6 +1647,11 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
 
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
+    conversation_context = await conversation_context_for(
+        bot.settings.db_path,
+        channel_id=getattr(message.channel, "id", 0),
+        exclude_message_id=message.id,
+    )
     prompt = build_public_prompt(
         user_request=request,
         guild_name=guild_name,
@@ -1628,6 +1659,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         reference_context=reference_context,
         source_paths_allowed=source_paths_allowed,
         memory_context=memory_context,
+        conversation_context=conversation_context,
     )
     async with message.channel.typing():
         result = await run_hermes(
