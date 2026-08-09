@@ -9,6 +9,8 @@ import re
 import shlex
 import subprocess
 import tempfile
+import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -43,6 +45,68 @@ PACKAGE_COUNTRY_TAG_RE = re.compile(
 
 class FocusTreeError(RuntimeError):
     """Internal focus-tree failure whose details must not be posted publicly."""
+
+
+class _RefreshableCatalog:
+    """Thread-safe memoized discovery with periodic background re-scan.
+
+    Full-repo discovery over the live mod checkout (Windows/OneDrive-backed)
+    costs seconds to tens of seconds, so running it on every lookup makes
+    deterministic commands feel broken. This wrapper serves the last scanned
+    snapshot in O(1) and re-scans in a background thread after
+    ``refresh_seconds``, so catalog entries stay dynamic — new, edited, or
+    removed files appear automatically, without restarts or manual cache
+    clears — while command latency never pays for the scan.
+    """
+
+    def __init__(
+        self,
+        scan: Any,
+        *,
+        refresh_seconds: float = 120.0,
+        auto_warm: bool = True,
+    ) -> None:
+        self._scan = scan
+        self._refresh_seconds = refresh_seconds
+        self._cond = threading.Condition()
+        self._records: list[Any] | None = None
+        self._last_scan = 0.0
+        self._scanning = False
+        if auto_warm:
+            threading.Thread(
+                target=self.records, name="chaosx-catalog-warm", daemon=True
+            ).start()
+
+    def records(self) -> list[Any]:
+        with self._cond:
+            if (
+                self._records is not None
+                and time.monotonic() - self._last_scan < self._refresh_seconds
+            ):
+                return self._records
+            if self._scanning:
+                # Another thread is refreshing; wait for its result.
+                self._cond.wait()
+                return self._records if self._records is not None else []
+            self._scanning = True
+        try:
+            fresh = self._scan()
+        except Exception:
+            fresh = None
+        with self._cond:
+            if fresh is not None:
+                self._records = fresh
+                self._last_scan = time.monotonic()
+            self._scanning = False
+            self._cond.notify_all()
+            return self._records if self._records is not None else []
+
+    def invalidate(self) -> None:
+        """Force the next lookup to re-scan (used by tests and admin resets)."""
+
+        with self._cond:
+            self._last_scan = 0.0
+            self._cond.notify_all()
 
 
 @lru_cache(maxsize=16)
@@ -284,15 +348,17 @@ class FocusTreeRenderBatch:
 
 
 class FocusTreeCatalog:
-    def __init__(self, repo: Path) -> None:
+    def __init__(self, repo: Path, *, auto_warm: bool = True) -> None:
         self.repo = repo
+        self._cache = _RefreshableCatalog(self._scan, auto_warm=auto_warm)
 
-    def discover(self, *, include_empty: bool = False) -> list[FocusTreeRecord]:
+    def _scan(self) -> list[FocusTreeRecord]:
         root = self.repo / FOCUS_ROOT
         if not root.is_dir():
             return []
         country_names = self._country_names()
-        package_tags: dict[int, tuple[str, ...]] = {}
+        known_tags = set(country_names)
+        package_tags = self._package_tags_map(known_tags)
         records: list[FocusTreeRecord] = []
         for path in sorted(root.rglob("*.txt")):
             try:
@@ -303,16 +369,12 @@ class FocusTreeCatalog:
             relative_path = path.relative_to(self.repo).as_posix()
             event_match = EVENT_PREFIX_RE.match(path.stem)
             event_id = int(event_match.group(1)) if event_match else None
-            if event_id is not None and event_id not in package_tags:
-                package_tags[event_id] = self._package_country_tags(
-                    event_id, set(country_names)
-                )
             for block in _named_blocks(_without_comments(raw), "focus_tree"):
                 tree_id = _first_assignment_value(TREE_ID_RE, block)
                 if not tree_id:
                     continue
                 focus_count = len(FOCUS_RE.findall(block)) + len(SHARED_FOCUS_RE.findall(block))
-                if not include_empty and focus_count == 0:
+                if focus_count == 0:
                     continue
                 country_block = next(iter(_named_blocks(block, "country")), "")
                 tags = tuple(sorted(set(COUNTRY_TAG_RE.findall(country_block))))
@@ -335,6 +397,12 @@ class FocusTreeCatalog:
                     )
                 )
         return sorted(records, key=lambda item: (item.event_id is None, item.event_id or 0, item.relative_path, item.tree_id))
+
+    def discover(self, *, include_empty: bool = False) -> list[FocusTreeRecord]:
+        records = self._cache.records()
+        if include_empty:
+            return records
+        return [record for record in records if record.focus_count > 0]
 
     def for_event(self, event_id: int | str) -> list[FocusTreeRecord]:
         try:
@@ -382,16 +450,27 @@ class FocusTreeCatalog:
                 names.setdefault(tag, _humanize(source_name))
         return names
 
-    def _package_country_tags(
-        self, event_id: int, known_tags: set[str]
-    ) -> tuple[str, ...]:
-        prefix = f"{event_id:03d}_"
-        tags: set[str] = set()
+    def _package_tags_map(self, known_tags: set[str]) -> dict[int, tuple[str, ...]]:
+        """One-pass country-tag scan over event/common package files.
+
+        The previous per-event ``rglob`` implementation walked ``events/``
+        and ``common/`` once per focus-tree file, which took ~14s per catalog
+        scan on the Windows/OneDrive-backed checkout. A single recursive walk
+        collects tags for every ``NNN_``-prefixed package file at once.
+        """
+
+        tags_by_event: dict[int, set[str]] = {}
+        if not known_tags:
+            return {}
         for relative_root in ("events", "common"):
             root = self.repo / relative_root
             if not root.is_dir():
                 continue
-            for path in sorted(root.rglob(f"{prefix}*.txt")):
+            for path in root.rglob("*.txt"):
+                prefix_match = EVENT_PREFIX_RE.match(path.stem)
+                if not prefix_match:
+                    continue
+                event_id = int(prefix_match.group(1))
                 try:
                     raw = _without_comments(
                         path.read_text(encoding="utf-8-sig", errors="replace")
@@ -401,8 +480,10 @@ class FocusTreeCatalog:
                 for assignment_tag, scope_tag in PACKAGE_COUNTRY_TAG_RE.findall(raw):
                     tag = assignment_tag or scope_tag
                     if tag in known_tags:
-                        tags.add(tag)
-        return tuple(sorted(tags))
+                        tags_by_event.setdefault(event_id, set()).add(tag)
+        return {
+            event_id: tuple(sorted(tags)) for event_id, tags in tags_by_event.items()
+        }
 
 
 class FocusTreeMcpClient:

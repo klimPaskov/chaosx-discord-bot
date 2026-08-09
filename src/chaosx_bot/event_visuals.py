@@ -21,6 +21,7 @@ from PIL import Image, ImageChops
 from .config import Settings
 from .focus_trees import (
     SharedMcpSession,
+    _RefreshableCatalog,
     _structured_content,
     isolated_mcp_server_parameters,
     read_resource_bytes,
@@ -119,8 +120,9 @@ class RelatedEventVisuals:
 class EventChainCatalog:
     def __init__(self, repo: Path) -> None:
         self.repo = repo
+        self._cache = _RefreshableCatalog(self._scan)
 
-    def discover(self) -> list[EventChainRecord]:
+    def _scan(self) -> list[EventChainRecord]:
         root = self.repo / EVENTS_ROOT
         records: list[EventChainRecord] = []
         if not root.is_dir():
@@ -147,6 +149,9 @@ class EventChainCatalog:
                 )
             )
         return records
+
+    def discover(self) -> list[EventChainRecord]:
+        return self._cache.records()
 
     def for_event(self, event_id: int) -> EventChainRecord | None:
         return next((record for record in self.discover() if record.event_id == event_id), None)
@@ -180,8 +185,9 @@ class EventChainCatalog:
 class ScriptedGuiCatalog:
     def __init__(self, repo: Path) -> None:
         self.repo = repo
+        self._cache = _RefreshableCatalog(self._scan)
 
-    def discover(self) -> list[ScriptedGuiRecord]:
+    def _scan(self) -> list[ScriptedGuiRecord]:
         root = self.repo / SCRIPTED_GUI_ROOT
         records: list[ScriptedGuiRecord] = []
         if not root.is_dir():
@@ -216,6 +222,9 @@ class ScriptedGuiCatalog:
         for record in records:
             unique.setdefault((record.gui_id, record.window_name), record)
         return sorted(unique.values(), key=lambda record: (record.relative_path, record.gui_id))
+
+    def discover(self) -> list[ScriptedGuiRecord]:
+        return self._cache.records()
 
     def for_event(self, event_id: int) -> list[ScriptedGuiRecord]:
         return [record for record in self.discover() if record.event_id == event_id]

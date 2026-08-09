@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,15 @@ MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
 PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES = {"agent_skill_or_contract"}
 MAX_CONTEXT_CHARS = 3200
-INDEX_FRESHNESS_CHECK_SECONDS = 0.0
+# Freshness checks must never block a command: the check itself (git commit,
+# workbook hash) runs at most this often, and the expensive full-repo mtime
+# walk happens on a background thread (see FULL_FRESHNESS_CHECK_SECONDS).
+INDEX_FRESHNESS_CHECK_SECONDS = 60.0
+# How often the background freshness worker performs the full indexable-file
+# walk. Between full walks it relies on the much cheaper commit/workbook
+# fingerprint, so uncommitted working-tree edits appear within this window
+# while commands never pay for the walk.
+FULL_FRESHNESS_CHECK_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -31,11 +40,39 @@ class Knowledge:
     vault_path: Path | None = None
     catalog_repo: Path | None = None
     _last_freshness_check: float = field(default=0.0, init=False, repr=False, compare=False)
+    _last_full_freshness: float = field(default=0.0, init=False, repr=False, compare=False)
+    _refresh_in_flight: bool = field(default=False, init=False, repr=False, compare=False)
 
     def ensure_index(self) -> None:
         now = datetime.now(tz=timezone.utc).timestamp()
         if now - self._last_freshness_check < INDEX_FRESHNESS_CHECK_SECONDS:
             return
+        object.__setattr__(self, "_last_freshness_check", now)
+        conn = connect(self.db_path)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0]
+        finally:
+            conn.close()
+        if count == 0:
+            # Nothing to serve yet: the first build must complete before any
+            # lookup can return content.
+            self._ensure_index_sync()
+            return
+        if self._refresh_in_flight:
+            return
+        object.__setattr__(self, "_refresh_in_flight", True)
+        threading.Thread(
+            target=self._refresh_worker, name="chaosx-index-refresh", daemon=True
+        ).start()
+
+    def _refresh_worker(self) -> None:
+        try:
+            self._ensure_index_sync()
+        finally:
+            object.__setattr__(self, "_refresh_in_flight", False)
+
+    def _ensure_index_sync(self) -> None:
+        now = datetime.now(tz=timezone.utc).timestamp()
         conn = connect(self.db_path)
         try:
             meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
@@ -47,18 +84,21 @@ class Knowledge:
         current_commit = index_commit(self.repo, self.vault_path)
         catalog_root = self.catalog_repo or self.repo
         current_catalog_fingerprint = catalog_fingerprint(catalog_root)
-        latest_source_mtime = max(
-            _latest_indexable_mtime(self.repo),
-            _latest_vault_indexable_mtime(self.vault_path),
-            _latest_catalog_mtime(catalog_root),
-        )
+        latest_source_mtime = 0.0
+        if now - self._last_full_freshness >= FULL_FRESHNESS_CHECK_SECONDS:
+            latest_source_mtime = max(
+                _latest_indexable_mtime(self.repo),
+                _latest_vault_indexable_mtime(self.vault_path),
+                _latest_catalog_mtime(catalog_root),
+            )
+            object.__setattr__(self, "_last_full_freshness", now)
         needs_rebuild = (
             count == 0
             or scenarios == 0
             or meta.get("schema_version") != INDEX_SCHEMA_VERSION
             or meta.get("commit_sha") != current_commit
             or meta.get("catalog_fingerprint") != current_catalog_fingerprint
-            or latest_source_mtime > indexed_at
+            or (latest_source_mtime > indexed_at)
         )
         if needs_rebuild:
             try:

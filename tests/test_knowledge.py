@@ -1,6 +1,7 @@
 from pathlib import Path
 from shutil import copy2
 import sqlite3
+import time
 
 import pytest
 
@@ -113,11 +114,19 @@ def test_knowledge_auto_refreshes_stale_index(tmp_path: Path):
         conn.close()
     assert before == 0
     Knowledge(repo, db, vault if vault.exists() else None).status()
-    conn = sqlite3.connect(db)
-    try:
-        after = float(dict(conn.execute("SELECT key, value FROM index_meta"))["indexed_at"])
-    finally:
-        conn.close()
+    # The rebuild runs on a background freshness worker; commands never block
+    # on it, so wait for the refresh to land before asserting the new state.
+    deadline = time.monotonic() + 180
+    after = before
+    while time.monotonic() < deadline:
+        conn = sqlite3.connect(db)
+        try:
+            after = float(dict(conn.execute("SELECT key, value FROM index_meta"))["indexed_at"])
+        finally:
+            conn.close()
+        if after > before:
+            break
+        time.sleep(0.5)
     assert after > before
 
 
@@ -151,10 +160,22 @@ def test_knowledge_uses_and_refreshes_from_live_catalog_repo(tmp_path: Path):
     stale = Knowledge(repo, db, catalog_repo=old_catalog).event("18")
     assert "Resources found" in stale
 
-    refreshed = Knowledge(repo, db, catalog_repo=live_catalog).event("18")
-    assert "A Rich Find" in refreshed
-    assert "Evolution stages: `4`" in refreshed
-    assert "Status: `Playable`" in refreshed
+    refreshed = Knowledge(repo, db, catalog_repo=live_catalog)
+    refreshed.event("18")  # non-blocking: spawns the background refresh
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        conn = sqlite3.connect(db)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM index_meta"))
+        finally:
+            conn.close()
+        if meta.get("catalog_fingerprint") == catalog_fingerprint(live_catalog):
+            break
+        time.sleep(0.2)
+    out = refreshed.event("18")
+    assert "A Rich Find" in out
+    assert "Evolution stages: `4`" in out
+    assert "Status: `Playable`" in out
     conn = sqlite3.connect(db)
     try:
         meta = dict(conn.execute("SELECT key, value FROM index_meta"))
