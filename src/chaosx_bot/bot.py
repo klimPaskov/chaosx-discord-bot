@@ -547,6 +547,15 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     mentioned = any(user.id == bot.user.id for user in getattr(message, "mentions", []) or [])
     if mentioned or referenced_message_id(message):
         return False
+    # Only direct @ChaosX mentions/replies (handled by handle_message_ask) or
+    # zero-mention messages may engage auto-scan. Never respond to messages that
+    # ping @everyone/@here, roles, or other users.
+    if (
+        getattr(message, "mention_everyone", False)
+        or getattr(message, "role_mentions", None)
+        or getattr(message, "mentions", None)
+    ):
+        return False
     try:
         async with bot._auto_scan_classify_lock:
             decision = await asyncio.to_thread(
@@ -554,7 +563,6 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
                 content,
                 knowledge=bot.knowledge,
                 settings=bot.settings,
-                mention_count=len(getattr(message, "mentions", []) or []),
             )
     except Exception as exc:
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan error", summary=type(exc).__name__)

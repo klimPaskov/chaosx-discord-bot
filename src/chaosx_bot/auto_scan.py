@@ -123,12 +123,10 @@ BOT_CAPABILITY_QUESTION_RE = re.compile(
     r"\b(?:can|could|does|do|will|would|how|what|why|is|are)\b",
     re.I,
 )
-MASS_PING_RE = re.compile(r"@everyone|@here", re.I)
 DISCORD_INVITE_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[a-z0-9-]+", re.I)
 SCAM_LINK_RE = re.compile(r"\b(?:free\s+nitro|discord\s+nitro\s+free|steam\s+gift|airdrop|crypto\s+giveaway|wallet\s+verify|click\s+to\s+claim)\b", re.I)
 HARASSMENT_RE = re.compile(r"\b(?:kys|kill\s+yourself|go\s+die)\b", re.I)
 SEVERE_ABUSE_RE = re.compile(r"\b(?:fag(?:got)?|nigg(?:er|a)|retard(?:ed)?|trann(?:y|ie))s?\b", re.I)
-EXCESSIVE_MENTIONS_RE = re.compile(r"<@!?\d{15,25}>")
 RULE_QUESTION_RE = re.compile(r"\b(?:is|are|can|could|should)\b.+\b(?:allowed|against\s+the\s+rules|rule|rules)\b", re.I)
 
 
@@ -208,16 +206,12 @@ def is_blocked_for_auto_answer(content: str) -> bool:
     return any(term in text for term in AUTO_SCAN_BLOCK_TERMS)
 
 
-def classify_soft_warning(content: str, *, mention_count: int = 0) -> AutoScanDecision:
+def classify_soft_warning(content: str) -> AutoScanDecision:
     text = content or ""
     if not text.strip():
         return AutoScanDecision("none")
     if RULE_QUESTION_RE.search(text):
         return AutoScanDecision("none")
-    if MASS_PING_RE.search(text):
-        return _soft_warning("mass_ping", "mass ping usage")
-    if mention_count >= 6 or len(EXCESSIVE_MENTIONS_RE.findall(text)) >= 6:
-        return _soft_warning("excessive_mentions", "excessive user mentions")
     if DISCORD_INVITE_RE.search(text):
         return _soft_warning("discord_invite", "Discord invite link")
     if SCAM_LINK_RE.search(text):
@@ -285,8 +279,8 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     return AutoScanDecision("none")
 
 
-def classify_message(content: str, *, knowledge: Knowledge, settings: Settings, mention_count: int = 0) -> AutoScanDecision:
-    warning = classify_soft_warning(content, mention_count=mention_count)
+def classify_message(content: str, *, knowledge: Knowledge, settings: Settings) -> AutoScanDecision:
+    warning = classify_soft_warning(content)
     if warning.acted:
         return warning
     answer = classify_auto_answer(content, knowledge=knowledge, settings=settings)

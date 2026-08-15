@@ -22,10 +22,9 @@ def test_auto_scan_question_and_warning_gates_are_zero_token_rules():
     assert has_domain_signal("How many Chaos Redux events are there?")
 
     warning = classify_soft_warning("@everyone look here")
-    assert warning.action == "soft_warning"
-    assert warning.confidence == 100
-    assert warning.warning == ""
-    assert warning.reason == "mass ping usage"
+    assert warning.action == "none"
+    excessive = classify_soft_warning("<@111111111111111111> <@222222222222222222> <@333333333333333333> <@444444444444444444> <@555555555555555555> <@666666666666666666>")
+    assert excessive.action == "none"
 
     shadow = AutoScanDecision("shadow", confidence=100, reason="shadow auto-answer")
     assert shadow.acted
@@ -350,6 +349,8 @@ class _FakeMessage:
         self.guild = SimpleNamespace(id=1395459671598436533)
         self.channel = _FakeChannel()
         self.mentions: list[Any] = []
+        self.mention_everyone = False
+        self.role_mentions: list[Any] = []
         self.webhook_id = None
         self.reference = None
         self.jump_url = "https://discord.com/channels/1395459671598436533/456/1000"
@@ -542,10 +543,10 @@ async def test_handle_auto_scan_bot_topic_banter_is_rate_limited(monkeypatch):
 async def test_handle_auto_scan_soft_warning_uses_model_output(monkeypatch):
     settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
     bot = _FakeBot(settings)
-    message = _FakeMessage("@everyone look here")
+    message = _FakeMessage("join discord.gg/free-nitro")
 
     def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
-        return AutoScanDecision("soft_warning", confidence=100, reason="mass ping usage", source="mass_ping")
+        return AutoScanDecision("soft_warning", confidence=100, reason="possible scam/phishing wording", source="scam_pattern")
 
     monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
     monkeypatch.setattr("chaosx_bot.bot.generate_auto_scan_model_response", _fake_model_output)
@@ -556,3 +557,88 @@ async def test_handle_auto_scan_soft_warning_uses_model_output(monkeypatch):
     assert bot.store.events[0]["action"] == "soft_warning"
     assert bot.store.events[0]["response_excerpt"] == "Model-generated auto-scan reply"
     assert bot.store.audits[0]["command"] == "auto scan soft warning"
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_skips_mass_ping_messages(monkeypatch):
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
+    bot = _FakeBot(settings)
+    message = _FakeMessage("look at this https://youtu.be/abc123")
+    message.mention_everyone = True
+    classify_called = False
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        nonlocal classify_called
+        classify_called = True
+        return AutoScanDecision("answer", confidence=100, reason="test", source="event_id", reference_context="ctx")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is False
+    assert not classify_called
+    assert not message.replies
+    assert not message.channel.sent
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_skips_role_mention_messages(monkeypatch):
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
+    bot = _FakeBot(settings)
+    message = _FakeMessage("what is event 2?")
+    message.role_mentions = [SimpleNamespace(id=777, name="Tester")]
+    classify_called = False
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        nonlocal classify_called
+        classify_called = True
+        return AutoScanDecision("answer", confidence=100, reason="test", source="event_id", reference_context="ctx")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is False
+    assert not classify_called
+    assert not message.replies
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_skips_other_user_mention_messages(monkeypatch):
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
+    bot = _FakeBot(settings)
+    message = _FakeMessage("hey @someone what is event 2?")
+    message.mentions = [SimpleNamespace(id=555, name="Someone")]
+    classify_called = False
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        nonlocal classify_called
+        classify_called = True
+        return AutoScanDecision("answer", confidence=100, reason="test", source="event_id", reference_context="ctx")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is False
+    assert not classify_called
+    assert not message.replies
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_keeps_zero_mention_messages(monkeypatch):
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
+    bot = _FakeBot(settings)
+    message = _FakeMessage("What is event 2?")
+    classify_called = False
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        nonlocal classify_called
+        classify_called = True
+        return AutoScanDecision("answer", confidence=100, reason="explicit event id 2", question="What is event 2?", source="event_id", reference_context="## Event 2: Zombie Outbreak")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    monkeypatch.setattr("chaosx_bot.bot.generate_auto_scan_model_response", _fake_model_output)
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is True
+    assert classify_called
+    assert message.replies[0]["content"] == "Model-generated auto-scan reply"
