@@ -314,6 +314,75 @@ def format_popular_qna(rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
+# The Q&A store exists to accumulate reusable Chaos Redux knowledge, so only
+# real, on-topic questions with substantive answers belong in it. Banter,
+# flirt/relationship messages, bot self-meta chat, off-topic questions, pure
+# link/emoji/mention messages, and model non-answers (redirects, hedges,
+# refusals) are dropped before recording.
+QNA_REDIRECT_FRAGMENT = "can only answer chaos redux questions"
+QNA_SKIP_ANSWER_START_MARKERS = (
+    "i can only answer chaos redux questions",
+    "ask me about chaos redux events",
+    "appreciate the offer, but i'm just a help bot",
+    "i'm just a help bot",
+    "i am just a help bot",
+    "honestly not sure",
+    "i'm not sure",
+    "i am not sure",
+    "not sure on the exact",
+    "i don't have that data",
+    "i do not have that data",
+    "i don't have the data",
+    "i do not have the data",
+    "nothing in the event info mentions",
+)
+QNA_SKIP_QUESTION_MARKERS = (
+    "can we be together",
+    "be my girlfriend",
+    "be my boyfriend",
+    "are you single",
+    "do you love me",
+    "marry me",
+    "why does the bot harass",
+    "why do you harass",
+    "are you planning to sell your server",
+    "sell your server",
+    "are you human",
+    "are you real",
+)
+
+
+def qa_worth_saving(*, question: str, answer: str) -> bool:
+    """Return True only when a question/answer pair is real Chaos Redux Q&A.
+
+    Applies to every path that records into the Q&A store (auto scan answers,
+    mention/reply asks, and /ask) so junk never lands there.
+    """
+    q = (question or "").strip()
+    a = (answer or "").strip()
+    if not q or not a:
+        return False
+    if len(q) < 4 or len(a) < 8:
+        return False
+    # Strip mentions, channel refs, and links; require real text remains.
+    stripped = re.sub(r"<@!?\d+>", " ", q)
+    stripped = re.sub(r"<#\d+>", " ", stripped)
+    stripped = re.sub(r"https?://\S+", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    if len(stripped) < 4 or not re.search(r"[A-Za-zÀ-ž]", stripped):
+        return False
+    q_norm = q.casefold().replace("’", "'")
+    a_norm = a.casefold().replace("’", "'")
+    if any(marker in q_norm for marker in QNA_SKIP_QUESTION_MARKERS):
+        return False
+    if QNA_REDIRECT_FRAGMENT in a_norm:
+        return False
+    answer_head = a_norm[:160]
+    if any(marker in answer_head for marker in QNA_SKIP_ANSWER_START_MARKERS):
+        return False
+    return True
+
+
 async def record_public_question_answer(
     bot: ChaosXBot,
     *,
@@ -331,6 +400,8 @@ async def record_public_question_answer(
 ) -> None:
     try:
         if not await bot.store.automation_enabled(QNA_AUTOMATION_NAME):
+            return
+        if not qa_worth_saving(question=question, answer=answer):
             return
         await bot.store.record_question_answer(
             mode=mode,

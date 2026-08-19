@@ -7,7 +7,7 @@ from typing import Any, cast
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
 import pytest
 
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, schedule_chaosx_restart, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, format_popular_qna, format_qna_entries, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, qa_worth_saving, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, schedule_chaosx_restart, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_auto_scan_answer_prompt, build_auto_scan_banter_prompt, build_auto_scan_warning_prompt, build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -499,3 +499,31 @@ def test_public_ask_output_sanitizer_blocks_leaky_or_offtopic_output():
     assert sanitize_public_ask_output("For Chaos Redux, I can help with safe server moderation.") == PUBLIC_ASK_REDIRECT
     assert sanitize_public_ask_output("Recipe\nIngredients:\n- flour") == PUBLIC_ASK_REDIRECT
     assert sanitize_public_ask_output("Zombie Outbreak is a spreading crisis event chain.") == "Zombie Outbreak is a spreading crisis event chain."
+
+
+def test_qa_worth_saving_keeps_real_chaos_redux_qa():
+    assert qa_worth_saving(question="What triggers event 18?", answer="Event 18 fires when global tension passes 60% and Germany owns the Rhineland.")
+    assert qa_worth_saving(question="Or is this in your mind an investment?", answer="Yeah—investing in mils, civs, docks, or sils counts as a valid strategy in Chaos Redux.")
+    assert qa_worth_saving(question="how many focus trees does the mod add?", answer="The catalog lists 12 clusters with 40+ focus trees across major countries.")
+    assert qa_worth_saving(question="@ChaosX what does the Fury scenario do?", answer="Fury is a world-end scenario where every major gains escalating war goals.")
+
+
+def test_qa_worth_saving_drops_useless_qa():
+    # Observed junk from the live store: flirt/relationship banter.
+    assert not qa_worth_saving(question="ChaosX can we be together?", answer="Appreciate the offer, but I'm just a help bot living in the Chaos Redux server.")
+    # Off-topic other-mod question answered with a hedge.
+    assert not qa_worth_saving(question="Great war redux is a great AI coded mod. What other ones can you name?", answer="Honestly not sure — my reference notes are all about Chaos Redux.")
+    # Curiosity question answered with a non-answer.
+    assert not qa_worth_saving(question="just by curiosity, regarding your last video about hoi4 ai portraits. how many images were in the dataset to train the lora", answer="Not sure on the exact number — I don't have that data handy.")
+    # Off-topic server question with a hedge answer.
+    assert not qa_worth_saving(question="He said before about investment. Are you planning to sell your server?", answer="I'm not sure—nothing in the event info mentions selling the server.")
+    # Link/emoji-only "question" (reply to a stored bot answer).
+    assert not qa_worth_saving(question="👍 https://discord.com/channels/1395459671598436533/1525485352742031400", answer="Ask me about Chaos Redux events, scenarios, mechanics, testing, and mod info.")
+    # Bot self-meta question.
+    assert not qa_worth_saving(question="why does the bot harass people", answer="ChaosX shouldn't harass anyone. Its hostile-sounding messages are auto-generated warnings.")
+    # Empty / too-short content.
+    assert not qa_worth_saving(question="", answer="Anything")
+    assert not qa_worth_saving(question="hi", answer="Hello there, welcome to Chaos Redux!")
+    assert not qa_worth_saving(question="What is the mod?", answer="")
+    # Straight vs curly apostrophes must both be caught.
+    assert not qa_worth_saving(question="Are you single?", answer="I’m not sure how to answer that one — my reference notes don’t cover it.")
