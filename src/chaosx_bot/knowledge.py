@@ -14,6 +14,7 @@ from .indexer import (
     connect,
     index_commit,
     iter_indexable_files,
+    iter_qoder_indexable_files,
     iter_vault_indexable_files,
     rebuild_index,
 )
@@ -38,6 +39,7 @@ class Knowledge:
     repo: Path
     db_path: Path
     vault_path: Path | None = None
+    qoder_path: Path | None = None
     catalog_repo: Path | None = None
     _last_freshness_check: float = field(default=0.0, init=False, repr=False, compare=False)
     _last_full_freshness: float = field(default=0.0, init=False, repr=False, compare=False)
@@ -81,7 +83,7 @@ class Knowledge:
         finally:
             conn.close()
         indexed_at = _float_meta(meta.get("indexed_at"))
-        current_commit = index_commit(self.repo, self.vault_path)
+        current_commit = index_commit(self.repo, self.vault_path, self.qoder_path)
         catalog_root = self.catalog_repo or self.repo
         current_catalog_fingerprint = catalog_fingerprint(catalog_root)
         latest_source_mtime = 0.0
@@ -89,6 +91,7 @@ class Knowledge:
             latest_source_mtime = max(
                 _latest_indexable_mtime(self.repo),
                 _latest_vault_indexable_mtime(self.vault_path),
+                _latest_qoder_indexable_mtime(self.qoder_path),
                 _latest_catalog_mtime(catalog_root),
             )
             object.__setattr__(self, "_last_full_freshness", now)
@@ -107,6 +110,7 @@ class Knowledge:
                     self.db_path,
                     self.vault_path,
                     catalog_repo=self.catalog_repo,
+                    qoder_path=self.qoder_path,
                 )
             except CatalogReadError:
                 if count == 0 or scenarios == 0:
@@ -538,6 +542,18 @@ def _latest_vault_indexable_mtime(vault_path: Path | None) -> float:
         return 0.0
     latest = 0.0
     for path in iter_vault_indexable_files(vault_path):
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
+
+
+def _latest_qoder_indexable_mtime(qoder_path: Path | None) -> float:
+    if not qoder_path or not qoder_path.exists():
+        return 0.0
+    latest = 0.0
+    for path in iter_qoder_indexable_files(qoder_path):
         try:
             latest = max(latest, path.stat().st_mtime)
         except OSError:

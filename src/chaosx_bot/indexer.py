@@ -32,10 +32,12 @@ VAULT_ALLOWED_ROOTS = {
 VAULT_ALLOWED_PLANNING_SUBROOTS = {"Community Suggestions"}
 VAULT_SKIP_DIRS = {".git", ".obsidian", ".trash", "Archive", "Scratch", "raw", "__pycache__"}
 VAULT_SKIP_FILES = {"important tokens.md", "index.md", "log.md", "SCHEMA.md", "Temp.md"}
+QODER_TEXT_EXTENSIONS = {".md", ".txt"}
+QODER_SKIP_DIRS = {".git", "__pycache__", ".obsidian"}
 MAX_FILE_BYTES = 750_000
 SECRET_ASSIGNMENT_RE = re.compile(r"(?i)\b(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*[^\s`'\"]+")
 DISCORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}")
-INDEX_SCHEMA_VERSION = "2"
+INDEX_SCHEMA_VERSION = "3"
 
 
 class CatalogReadError(RuntimeError):
@@ -137,11 +139,30 @@ def repo_commit(repo: Path) -> str:
         return "unknown"
 
 
-def index_commit(repo: Path, vault_path: Path | None = None) -> str:
+def index_commit(repo: Path, vault_path: Path | None = None, qoder_path: Path | None = None) -> str:
     parts = [f"repo:{repo_commit(repo)}"]
     if vault_path and vault_path.exists():
         parts.append(f"vault:{repo_commit(vault_path)}")
+    if qoder_path and qoder_path.exists():
+        export_hash = qoder_path / ".export-hash"
+        if export_hash.exists():
+            try:
+                parts.append("qoder:" + export_hash.read_text(encoding="utf-8", errors="replace").strip())
+            except Exception:
+                parts.append("qoder:mtime:" + f"{_qoder_latest_mtime(qoder_path):.3f}")
+        else:
+            parts.append("qoder:mtime:" + f"{_qoder_latest_mtime(qoder_path):.3f}")
     return "|".join(parts)
+
+
+def _qoder_latest_mtime(qoder_path: Path) -> float:
+    latest = 0.0
+    for path in iter_qoder_indexable_files(qoder_path):
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
 
 
 def source_class_for(path: str) -> str:
@@ -184,6 +205,14 @@ def vault_source_class_for(path: str) -> str:
     if path.startswith("Assets/"):
         return "vault_asset_note"
     return "vault_project_note"
+
+
+def qoder_source_class_for(path: str) -> str:
+    if path.startswith("repo-knowledge/"):
+        return "qoder_repo_knowledge"
+    if path.startswith("codebase/"):
+        return "qoder_codebase"
+    return "qoder_doc"
 
 
 def is_indexable(repo: Path, path: Path) -> bool:
@@ -251,6 +280,37 @@ def iter_vault_indexable_files(vault: Path):
                 continue
 
 
+def is_qoder_indexable(qoder: Path, path: Path) -> bool:
+    rel = path.relative_to(qoder)
+    if set(rel.parts) & QODER_SKIP_DIRS:
+        return False
+    if path.is_dir():
+        return False
+    if path.suffix.lower() not in QODER_TEXT_EXTENSIONS:
+        return False
+    try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def iter_qoder_indexable_files(qoder: Path):
+    if not qoder.exists():
+        return
+    for root, dirs, files in os.walk(qoder):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in QODER_SKIP_DIRS]
+        for name in files:
+            path = root_path / name
+            try:
+                if is_qoder_indexable(qoder, path):
+                    yield path
+            except OSError:
+                continue
+
+
 def read_text(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -303,15 +363,17 @@ def rebuild_index(
     db_path: Path,
     vault_path: Path | None = None,
     catalog_repo: Path | None = None,
+    qoder_path: Path | None = None,
 ) -> IndexStats:
     repo = repo.resolve()
     vault = vault_path.resolve() if vault_path and vault_path.exists() else None
+    qoder = qoder_path.resolve() if qoder_path and qoder_path.exists() else None
     catalog_root = (
         catalog_repo.resolve()
         if catalog_repo and catalog_repo.exists()
         else repo
     )
-    commit = index_commit(repo, vault)
+    commit = index_commit(repo, vault, qoder)
     catalog_hash = catalog_fingerprint(catalog_root)
     indexed_at = time()
     conn = connect(db_path)
@@ -350,6 +412,23 @@ def rebuild_index(
                 )
                 docs += 1
                 vault_docs += 1
+        qoder_docs = 0
+        if qoder:
+            for path in iter_qoder_indexable_files(qoder):
+                text = read_text(path)
+                if not text:
+                    continue
+                rel = path.relative_to(qoder).as_posix()
+                public_path = f"qoder/{rel}"
+                conn.execute(
+                    """
+                    INSERT INTO source_docs(path, source_class, file_type, commit_sha, mtime, content_hash, indexed_at, content)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (public_path, qoder_source_class_for(rel), path.suffix.lower().lstrip("."), commit, path.stat().st_mtime, hash_text(text), indexed_at, text),
+                )
+                docs += 1
+                qoder_docs += 1
         events = _load_events(conn, catalog_root, indexed_at)
         scenarios = _load_scenarios(conn, catalog_root, indexed_at)
         clusters = _load_clusters(conn, catalog_root, indexed_at)
@@ -360,6 +439,7 @@ def rebuild_index(
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('doc_count', ?)", (str(docs),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('repo_doc_count', ?)", (str(repo_docs),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('vault_doc_count', ?)", (str(vault_docs),))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('qoder_doc_count', ?)", (str(qoder_docs),))
     conn.close()
     return IndexStats(docs=docs, events=events, scenarios=scenarios, clusters=clusters, commit_sha=commit)
 

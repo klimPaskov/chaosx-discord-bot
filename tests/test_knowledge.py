@@ -5,7 +5,15 @@ import time
 
 import pytest
 
-from chaosx_bot.indexer import CatalogReadError, _catalog_rows, catalog_fingerprint, is_vault_indexable, rebuild_index
+from chaosx_bot.indexer import (
+    CatalogReadError,
+    _catalog_rows,
+    catalog_fingerprint,
+    index_commit,
+    is_qoder_indexable,
+    is_vault_indexable,
+    rebuild_index,
+)
 from chaosx_bot.knowledge import Knowledge
 
 
@@ -240,3 +248,68 @@ def test_vault_index_whitelist_and_secret_exclusions(tmp_path: Path):
     assert not is_vault_indexable(vault, secret)
     assert not is_vault_indexable(vault, raw)
     assert not is_vault_indexable(vault, personalish)
+
+
+def test_qoder_repowiki_knowledge_root(tmp_path: Path):
+    repo = tmp_path / 'repo'
+    (repo / 'docs').mkdir(parents=True)
+    (repo / 'events').mkdir(parents=True)
+    (repo / 'README.md').write_text('# Fake repo\n', encoding='utf-8')
+    qoder = tmp_path / 'master__en-US'
+    (qoder / 'repo-knowledge').mkdir(parents=True)
+    (qoder / 'codebase').mkdir(parents=True)
+    (qoder / 'repo-knowledge' / 'build_system.md').write_text(
+        '# Build System\nGrumbleflarn pipeline notes for the mod build.\n',
+        encoding='utf-8',
+    )
+    (qoder / 'codebase' / 'index.md').write_text(
+        '# Codebase Index\nGrumbleflarn modules and entry points.\n',
+        encoding='utf-8',
+    )
+    (qoder / '.export-hash').write_text('abc123', encoding='utf-8')
+    (qoder / 'cache').mkdir(parents=True)
+    (qoder / 'cache' / 'noise.json').write_text('{"ignored": true}', encoding='utf-8')
+
+    assert is_qoder_indexable(qoder, qoder / 'repo-knowledge' / 'build_system.md')
+    assert not is_qoder_indexable(qoder, qoder / '.export-hash')
+    assert not is_qoder_indexable(qoder, qoder / 'cache' / 'noise.json')
+
+    db = tmp_path / 'qoder-test.db'
+    stats = rebuild_index(repo, db, qoder_path=qoder)
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT path, source_class FROM source_docs WHERE path LIKE 'qoder/%' ORDER BY path"
+        ).fetchall()
+        meta = dict(conn.execute("SELECT key, value FROM index_meta"))
+        assert meta['qoder_doc_count'] == '2'
+        assert ('qoder/repo-knowledge/build_system.md', 'qoder_repo_knowledge') in rows
+        assert ('qoder/codebase/index.md', 'qoder_codebase') in rows
+        assert conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE '%export-hash%'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE '%cache%'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0] == stats.docs
+        assert 'qoder:' in conn.execute("SELECT value FROM index_meta WHERE key = 'commit_sha'").fetchone()[0]
+    finally:
+        conn.close()
+
+    knowledge = Knowledge(repo, db, qoder_path=qoder)
+    search = knowledge.search('Grumbleflarn')
+    assert 'qoder/repo-knowledge/build_system.md' in search
+    ask_context = knowledge.public_ask_context('Grumbleflarn')
+    assert 'Grumbleflarn' in ask_context
+
+
+def test_qoder_fingerprint_tracks_export_hash(tmp_path: Path):
+    qoder = tmp_path / 'master__en-US'
+    (qoder / 'repo-knowledge').mkdir(parents=True)
+    (qoder / 'repo-knowledge' / 'build_system.md').write_text('# Build\nnotes\n', encoding='utf-8')
+    (qoder / '.export-hash').write_text('hash-v1', encoding='utf-8')
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+
+    fingerprint_v1 = index_commit(repo, qoder_path=qoder)
+    assert fingerprint_v1.endswith('qoder:hash-v1')
+    (qoder / '.export-hash').write_text('hash-v2', encoding='utf-8')
+    fingerprint_v2 = index_commit(repo, qoder_path=qoder)
+    assert fingerprint_v2.endswith('qoder:hash-v2')
+    assert fingerprint_v1 != fingerprint_v2

@@ -1079,6 +1079,7 @@ class ChaosXBot(discord.Client):
             settings.chaos_redux_repo,
             settings.db_path,
             settings.obsidian_vault_path,
+            settings.qoder_repowiki_path,
             catalog_repo=visual_repo,
         )
         self.mcp_session = SharedMcpSession(settings)
