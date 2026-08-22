@@ -1876,7 +1876,6 @@ async def send_scripted_response(
     command_name: str,
     summary: str,
     render,
-    owner_render=None,
     after_send=None,
     public: bool = True,
 ) -> None:
@@ -1907,14 +1906,6 @@ async def send_scripted_response(
                 command=f"{command_name} attachment error",
                 summary=type(exc).__name__,
             )
-    if owner_render and public and interaction.user.id == bot.settings.owner_id:
-        try:
-            owner_output = await asyncio.to_thread(owner_render)
-        except Exception as exc:
-            owner_output = f"Private details failed: `{type(exc).__name__}: {exc}`"
-        if owner_output and owner_output != output:
-            for part in _chunk("## Private details\n" + owner_output):
-                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
 
 async def send_focus_tree_graphs(
@@ -2848,7 +2839,6 @@ def register_commands(bot: ChaosXBot) -> None:
             command_name="chaosx event",
             summary=event,
             render=lambda: bot.knowledge.event(event, view),
-            owner_render=lambda: bot.knowledge.event(event, view, show_evidence=True),
             after_send=show_event_visuals,
         )
 
@@ -2872,20 +2862,19 @@ def register_commands(bot: ChaosXBot) -> None:
             command_name="chaosx scenario",
             summary=scenario,
             render=lambda: bot.knowledge.scenario(scenario),
-            owner_render=lambda: bot.knowledge.scenario(scenario, show_evidence=True),
         )
 
     @bot.tree.command(name="cluster", description="Look up an event cluster.")
     async def chaosx_cluster(interaction: discord.Interaction, cluster: str) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster), owner_render=lambda: bot.knowledge.cluster(cluster, show_evidence=True))
+        await send_scripted_response(bot, interaction, command_name="chaosx cluster", summary=cluster, render=lambda: bot.knowledge.cluster(cluster))
 
     @bot.tree.command(name="status", description="Show Chaos Redux catalog totals and breakdowns.")
     async def chaosx_status(interaction: discord.Interaction) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx status", summary="global", render=bot.knowledge.status, owner_render=bot.knowledge.status)
+        await send_scripted_response(bot, interaction, command_name="chaosx status", summary="global", render=bot.knowledge.status)
 
     @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
     async def chaosx_testing(interaction: discord.Interaction) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary="queue", render=bot.knowledge.testing_queue, owner_render=bot.knowledge.testing_queue)
+        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary="queue", render=bot.knowledge.testing_queue)
 
 
     @bot.tree.command(name="suggestion", description="Draft a clearer review note of your rough suggestion.")
