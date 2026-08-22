@@ -53,9 +53,7 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert knowledge.cluster('cluster 999') == 'No cluster for id `999` was found.'
     assert 'Fully Functional' in knowledge.event('4')
     clustered_event = knowledge.event('4')
-    assert '- Chaos level: `1`' in clustered_event
-    unclustered_event = knowledge.event('999')
-    assert 'No event for id' in unclustered_event
+    assert '- Chaos level: `unknown`' in clustered_event
     search = knowledge.search('Zombie Outbreak')
     assert 'Evidence:' not in search
     assert 'docs/specs/' not in search

@@ -279,17 +279,17 @@ class Knowledge:
             if requested_event_id:
                 return f"No event for id `{requested_event_id}` was found."
             return self.search(event, scope="all", limit=5, show_evidence=show_evidence) + "\n\nNo exact event match; showing search results instead."
-        keys = ["row_key", "event_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "status", "indexed_at"]
+        keys = ["row_key", "event_id", "name", "details", "evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v", "world_end", "type", "cluster_id", "member_severity", "chaos_level", "status", "indexed_at"]
         data = dict(zip(keys, row))
         event_label = f"Event {data['event_id']}: {data['name']}" if data["event_id"] else f"Unassigned event idea: {data['name']}"
         evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
         evolution_stage_count = sum(1 for _label, text in evos if text)
         has_world_end_scenario = bool((data["world_end"] or "").strip())
-        chaos_level = self._event_chaos_level(data["cluster_id"])
+        chaos_level = (data["chaos_level"] or "").strip()
         lines = [
             f"## {event_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
-            f"- Chaos level: `{chaos_level}`",
+            f"- Chaos level: `{chaos_level or 'unknown'}`",
             f"- Evolution stages: `{evolution_stage_count}`",
             f"- World-end scenario(s): `{'Yes' if has_world_end_scenario else 'No'}`",
             f"- Status: `{data['status'] or 'unknown'}`",
@@ -372,26 +372,6 @@ class Knowledge:
         if show_evidence:
             text += f"\n\n{self._footer('catalog workbook', 'docs/spreadsheets/chaos_redux_events_catalog.xlsx')}"
         return text
-
-    def _event_chaos_level(self, cluster_id: str | None) -> str:
-        """Resolve an event's chaos level dynamically from its cluster.
-
-        Chaos level is defined at the cluster level in the catalog, so the
-        event looks up its cluster's value; 'unknown' when unassigned.
-        """
-        if not cluster_id or not str(cluster_id).strip():
-            return "unknown"
-        conn = connect(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT chaos_level FROM catalog_clusters WHERE cluster_id = ?",
-                (str(cluster_id).strip(),),
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row or not (row[0] or "").strip():
-            return "unknown"
-        return row[0].strip()
 
     def _cluster_member_lines(self, members: str) -> list[str]:
         ids = re.findall(r"\d+", members or "")

@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS catalog_events (
     type TEXT,
     cluster_id TEXT,
     member_severity TEXT,
+    chaos_level TEXT,
     status TEXT,
     indexed_at REAL NOT NULL
 );
@@ -540,6 +541,7 @@ def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int
         type TEXT,
         cluster_id TEXT,
         member_severity TEXT,
+        chaos_level TEXT,
         status TEXT,
         indexed_at REAL NOT NULL
     )
@@ -553,14 +555,14 @@ def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int
         row_key = event_id if event_id else f"unassigned:{row_number}:{name}"
         conn.execute(
             """
-            INSERT OR REPLACE INTO catalog_events(row_key, event_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, status, indexed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO catalog_events(row_key, event_id, name, details, evo_i, evo_ii, evo_iii, evo_iv, evo_v, world_end, type, cluster_id, member_severity, chaos_level, status, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row_key, event_id, name, row.get("Details") or "", row.get("Evo I") or "", row.get("Evo II") or "",
                 row.get("Evo III") or "", row.get("Evo IV") or "", row.get("Evo V") or "",
                 row.get("World-End Scenario") or "", row.get("Type") or "", row.get("Cluster ID") or "",
-                row.get("Member Severity") or "", row.get("Status") or "", indexed_at,
+                row.get("Member Severity") or "", row.get("Chaos level") or "", row.get("Status") or "", indexed_at,
             ),
         )
         count += 1
