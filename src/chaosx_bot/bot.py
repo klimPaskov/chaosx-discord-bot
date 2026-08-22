@@ -2806,7 +2806,7 @@ def register_commands(bot: ChaosXBot) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx testing", summary="queue", render=bot.knowledge.testing_queue, owner_render=bot.knowledge.testing_queue)
 
 
-    @bot.tree.command(name="suggestion", description="Clean up a Chaos Redux suggestion and note likely overlap.")
+    @bot.tree.command(name="suggestion", description="Draft a clearer review note of your rough suggestion.")
     async def chaosx_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
         result = await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
         if result and result[0].ok and settings.community_notes_enabled:

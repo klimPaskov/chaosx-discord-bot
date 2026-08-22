@@ -372,7 +372,7 @@ def _server_reference_context(settings: Settings) -> str:
             "ChaosX public server/help context for dynamic model answers:",
             "- `/ask` answers Chaos Redux questions.",
             "- `/event`, `/scenario`, `/cluster`, `/status`, and `/testing` show project/catalog/testing info.",
-            "- `/suggestion suggestion:<idea>` captures general Chaos Redux suggestions.",
+            "- `/suggestion suggestion:<idea>` drafts a clearer review note of your rough suggestion.",
             f"- `/event-idea idea:<idea>` captures Chaos Redux event ideas; approved ideas can appear in {event_ideas_channel}.",
             "- `/issue` submits Chaos Redux bug, crash, balance, cosmetic, enhancement, or general reports after review/formatting.",
             "- Replies to ChaosX answers keep reply-chain context.",
