@@ -33,9 +33,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Zombie Outbreak' in event
     event_lines = event.splitlines()
     assert event_lines[1].startswith('- Type:')
-    assert event_lines[2] == '- Evolution stages: `3`'
-    assert event_lines[3] == '- Has world-end scenario: `Yes`'
-    assert event_lines[4].startswith('- Status:')
+    assert event_lines[2] == '- Chaos level: `unknown`'
+    assert event_lines[3] == '- Evolution stages: `3`'
+    assert event_lines[4] == '- World-end scenario(s): `Yes`'
+    assert event_lines[5].startswith('- Status:')
     assert '### Evolution stages' in event
     assert '### World-end scenario' in event
     assert 'Evolution tracks' not in event
@@ -51,6 +52,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert knowledge.cluster('999') == 'No cluster for id `999` was found.'
     assert knowledge.cluster('cluster 999') == 'No cluster for id `999` was found.'
     assert 'Fully Functional' in knowledge.event('4')
+    clustered_event = knowledge.event('4')
+    assert '- Chaos level: `1`' in clustered_event
+    unclustered_event = knowledge.event('999')
+    assert 'No event for id' in unclustered_event
     search = knowledge.search('Zombie Outbreak')
     assert 'Evidence:' not in search
     assert 'docs/specs/' not in search

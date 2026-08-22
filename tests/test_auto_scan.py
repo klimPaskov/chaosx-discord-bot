@@ -245,7 +245,7 @@ def test_auto_scan_catalog_answers_exact_ids_and_names(tmp_path: Path):
     assert event_id.confidence == 100
     assert event_id.answer == ""
     assert "Zombie Outbreak" in event_id.reference_context
-    assert "Has world-end scenario: `Yes`" in event_id.reference_context
+    assert "World-end scenario(s): `Yes`" in event_id.reference_context
 
     event_name = classify_message("How does Zombie Outbreak work?", knowledge=knowledge, settings=settings)
     assert event_name.action == "answer"

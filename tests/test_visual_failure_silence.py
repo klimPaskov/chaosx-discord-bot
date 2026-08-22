@@ -8,6 +8,7 @@ from chaosx_bot.bot import (
     send_focus_tree_graphs,
     send_related_event_visuals,
     send_scripted_response,
+    send_visuals_with_working_status,
 )
 from chaosx_bot.config import Settings
 from chaosx_bot.event_visuals import EventVisualError
@@ -29,6 +30,28 @@ class _Store:
 
     async def audit(self, **kwargs: Any) -> None:
         self.audits.append(kwargs)
+
+
+class _Status:
+    def __init__(self) -> None:
+        self.edits: list[str] = []
+        self.deleted = False
+
+    async def edit(self, *, content: str, **kwargs: Any) -> None:
+        self.edits.append(content)
+
+    async def delete(self, **kwargs: Any) -> None:
+        self.deleted = True
+
+
+class _WorkingFollowup:
+    def __init__(self, status: _Status) -> None:
+        self.status = status
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def send(self, content: str, **kwargs: Any) -> _Status:
+        self.calls.append((content, kwargs))
+        return self.status
 
 
 @pytest.mark.asyncio
@@ -137,3 +160,85 @@ async def test_scripted_render_runs_off_gateway_loop_and_attachment_error_is_sil
     assert render_threads and render_threads[0] != gateway_thread
     assert [content for content, _kwargs in followup.calls] == ["Current catalog output"]
     assert store.audits[-1]["command"] == "chaosx event attachment error"
+
+
+@pytest.mark.asyncio
+async def test_visual_working_status_shows_updates_and_cleans_up():
+    status = _Status()
+    followup = _WorkingFollowup(status)
+    store = _Store()
+
+    class FocusRenderer:
+        async def render(self, _records: list[Any]) -> SimpleNamespace:
+            return SimpleNamespace(
+                graphs=[],
+                attempted=0,
+                failed=0,
+            )
+
+    class RelatedRenderer:
+        async def render_related(self, _chain: Any, _guis: list[Any]) -> SimpleNamespace:
+            return SimpleNamespace(chain=None, guis=[], chain_failed=False, failed_guis=0)
+
+    bot = SimpleNamespace(
+        settings=Settings(
+            discord_token="dummy",
+            focus_tree_graphs_enabled=True,
+            event_chain_graphs_enabled=True,
+            scripted_gui_previews_enabled=True,
+        ),
+        focus_tree_mcp=FocusRenderer(),
+        event_visual_mcp=RelatedRenderer(),
+        event_chain_catalog=SimpleNamespace(for_event=lambda _event_id: None),
+        scripted_gui_catalog=SimpleNamespace(for_event=lambda _event_id: []),
+        store=store,
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1), guild_id=2, channel_id=3, followup=followup
+    )
+
+    await send_visuals_with_working_status(
+        cast(Any, bot),
+        cast(Any, interaction),
+        focus_records=[object()],
+        chain=object(),
+        guis=[object()],
+        event_id=18,
+    )
+
+    assert followup.calls[0][0] == "⏳ Still working — retrieving visual previews…"
+    assert followup.calls[0][1].get("ephemeral") is True
+    assert status.edits == [
+        "⏳ Retrieving focus tree previews…",
+        "⏳ Retrieving event chain & scripted GUIs…",
+    ]
+    assert status.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_visual_working_status_stays_silent_when_nothing_to_render():
+    followup = _WorkingFollowup(_Status())
+    store = _Store()
+    bot = SimpleNamespace(
+        settings=Settings(
+            discord_token="dummy",
+            focus_tree_graphs_enabled=True,
+            event_chain_graphs_enabled=True,
+            scripted_gui_previews_enabled=True,
+        ),
+        store=store,
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1), guild_id=2, channel_id=3, followup=followup
+    )
+
+    await send_visuals_with_working_status(
+        cast(Any, bot),
+        cast(Any, interaction),
+        focus_records=[],
+        chain=None,
+        guis=[],
+        event_id=18,
+    )
+
+    assert followup.calls == []

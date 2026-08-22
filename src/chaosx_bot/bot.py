@@ -7,7 +7,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable, cast
 
 import aiohttp
 import discord
@@ -1828,6 +1828,47 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         )
 
 
+async def send_visuals_with_working_status(
+    bot: ChaosXBot,
+    interaction: discord.Interaction,
+    *,
+    focus_records: list,
+    chain,
+    guis: list,
+    event_id: int,
+) -> None:
+    """Render related visuals behind an ephemeral 'still working' indicator.
+
+    The indicator is shown only when there is actually something to render
+    (absence stays silent), is updated between render phases, and is always
+    cleaned up afterwards.
+    """
+    if not focus_records and chain is None and not guis:
+        return
+    status = cast(Any, await interaction.followup.send(
+        "⏳ Still working — retrieving visual previews…",
+        ephemeral=True,
+        allowed_mentions=safe_allowed_mentions(),
+    ))
+    if status is None:
+        # Rarely None (only when wait=False); fall back to no indicator.
+        await send_focus_tree_graphs(bot, interaction, focus_records)
+        await send_related_event_visuals(bot, interaction, event_id)
+        return
+    try:
+        if focus_records:
+            await status.edit(content="⏳ Retrieving focus tree previews…")
+        await send_focus_tree_graphs(bot, interaction, focus_records)
+        if chain is not None or guis:
+            await status.edit(content="⏳ Retrieving event chain & scripted GUIs…")
+        await send_related_event_visuals(bot, interaction, event_id)
+    finally:
+        try:
+            await status.delete()
+        except discord.HTTPException:
+            pass
+
+
 async def send_scripted_response(
     bot: ChaosXBot,
     interaction: discord.Interaction,
@@ -2777,8 +2818,29 @@ def register_commands(bot: ChaosXBot) -> None:
             event_id = bot.knowledge.resolve_event_id(event)
             if event_id is None:
                 return
-            await send_focus_tree_graphs(bot, interaction, bot.focus_tree_catalog.for_event(event_id))
-            await send_related_event_visuals(bot, interaction, event_id)
+            focus_records = (
+                bot.focus_tree_catalog.for_event(event_id)
+                if bot.settings.focus_tree_graphs_enabled
+                else []
+            )
+            chain = (
+                bot.event_chain_catalog.for_event(event_id)
+                if bot.settings.event_chain_graphs_enabled
+                else None
+            )
+            guis = (
+                bot.scripted_gui_catalog.for_event(event_id)
+                if bot.settings.scripted_gui_previews_enabled
+                else []
+            )
+            await send_visuals_with_working_status(
+                bot,
+                interaction,
+                focus_records=focus_records,
+                chain=chain,
+                guis=guis,
+                event_id=event_id,
+            )
 
         await send_scripted_response(
             bot,

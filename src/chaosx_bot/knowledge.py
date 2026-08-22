@@ -285,11 +285,13 @@ class Knowledge:
         evos = [("Evo I", data["evo_i"]), ("Evo II", data["evo_ii"]), ("Evo III", data["evo_iii"]), ("Evo IV", data["evo_iv"]), ("Evo V", data["evo_v"])]
         evolution_stage_count = sum(1 for _label, text in evos if text)
         has_world_end_scenario = bool((data["world_end"] or "").strip())
+        chaos_level = self._event_chaos_level(data["cluster_id"])
         lines = [
             f"## {event_label}",
             f"- Type: `{data['type'] or 'unknown'}`",
+            f"- Chaos level: `{chaos_level}`",
             f"- Evolution stages: `{evolution_stage_count}`",
-            f"- Has world-end scenario: `{'Yes' if has_world_end_scenario else 'No'}`",
+            f"- World-end scenario(s): `{'Yes' if has_world_end_scenario else 'No'}`",
             f"- Status: `{data['status'] or 'unknown'}`",
             f"- Cluster: `{data['cluster_id'] or 'none'}`",
             f"- Member severity: `{data['member_severity'] or 'none'}`",
@@ -370,6 +372,26 @@ class Knowledge:
         if show_evidence:
             text += f"\n\n{self._footer('catalog workbook', 'docs/spreadsheets/chaos_redux_events_catalog.xlsx')}"
         return text
+
+    def _event_chaos_level(self, cluster_id: str | None) -> str:
+        """Resolve an event's chaos level dynamically from its cluster.
+
+        Chaos level is defined at the cluster level in the catalog, so the
+        event looks up its cluster's value; 'unknown' when unassigned.
+        """
+        if not cluster_id or not str(cluster_id).strip():
+            return "unknown"
+        conn = connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT chaos_level FROM catalog_clusters WHERE cluster_id = ?",
+                (str(cluster_id).strip(),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not (row[0] or "").strip():
+            return "unknown"
+        return row[0].strip()
 
     def _cluster_member_lines(self, members: str) -> list[str]:
         ids = re.findall(r"\d+", members or "")
