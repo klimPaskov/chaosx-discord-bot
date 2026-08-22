@@ -2732,7 +2732,9 @@ def register_commands(bot: ChaosXBot) -> None:
     async def root_help(interaction: discord.Interaction) -> None:
         if not await public_gate(interaction, settings):
             return
-        await interaction.response.send_message(community_help_text(), ephemeral=False, allowed_mentions=safe_allowed_mentions())
+        await interaction.response.defer(ephemeral=False, thinking=False)
+        for part in _chunk(community_help_text()):
+            await interaction.followup.send(part, allowed_mentions=safe_allowed_mentions())
 
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
