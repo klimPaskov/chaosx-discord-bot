@@ -218,6 +218,58 @@ async def test_auto_scan_event_log_is_scoped_and_listable(tmp_path):
     assert warnings[0][10] == "@everyone hello"
 
 
+async def test_warned_users_groups_soft_warnings_by_user(tmp_path):
+    store = Store(tmp_path / "chaosx-test.db")
+    await store.init()
+    for actor_id, reason in ((123, "mass ping usage"), (123, "excessive mentions"), (124, "mass ping usage")):
+        await store.record_auto_scan_event(
+            action="soft_warning",
+            reason=reason,
+            confidence=100,
+            actor_id=actor_id,
+            guild_id=456,
+            channel_id=789,
+            source_message_id=1000,
+            bot_message_id=2000,
+            content_excerpt="@everyone hello",
+            response_excerpt="soft warning",
+        )
+    # Non-warning actions must not be counted.
+    await store.record_auto_scan_event(
+        action="answer",
+        reason="explicit event id 2",
+        confidence=100,
+        actor_id=123,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=1001,
+        bot_message_id=2001,
+        content_excerpt="What is event 2?",
+        response_excerpt="Zombie Outbreak",
+    )
+
+    warned = await store.list_warned_users(guild_id=456, limit=10)
+    assert [(row[0], row[1]) for row in warned] == [(123, 2), (124, 1)]
+    assert warned[0][3] == "excessive mentions"
+    assert warned[1][3] == "mass ping usage"
+
+    # Other guild is filtered out.
+    await store.record_auto_scan_event(
+        action="soft_warning",
+        reason="other guild",
+        confidence=100,
+        actor_id=999,
+        guild_id=777,
+        channel_id=789,
+        source_message_id=1002,
+        bot_message_id=2002,
+        content_excerpt="bad",
+        response_excerpt="soft warning",
+    )
+    warned_again = await store.list_warned_users(guild_id=456, limit=10)
+    assert [row[0] for row in warned_again] == [123, 124]
+
+
 async def test_question_answer_log_lists_searches_and_counts_popular_questions(tmp_path):
     store = Store(tmp_path / "chaosx-test.db")
     await store.init()
@@ -235,6 +287,8 @@ async def test_question_answer_log_lists_searches_and_counts_popular_questions(t
         answer="Zombie Outbreak starts a spreading crisis.",
         prompt_hash="hash-1",
     )
+    # First occurrence of a question is NOT saved (repeat gate).
+    assert await store.list_question_answers(guild_id=456, limit=10) == []
     await store.record_question_answer(
         mode="mention ask",
         actor_id=101,
@@ -247,6 +301,7 @@ async def test_question_answer_log_lists_searches_and_counts_popular_questions(t
         answer="Zombie Outbreak spreads through infected states.",
         prompt_hash="hash-2",
     )
+    # Second occurrence (same normalized key) IS saved.
     await store.record_question_answer(
         mode="slash",
         actor_id=102,
@@ -259,6 +314,8 @@ async def test_question_answer_log_lists_searches_and_counts_popular_questions(t
         answer="Fury is an event concept when documented.",
         prompt_hash="hash-3",
     )
+    # Fury is a first occurrence -> not saved.
+    assert len(await store.list_question_answers(guild_id=456, limit=10)) == 1
     await store.record_question_answer(
         mode="slash",
         actor_id=103,
@@ -276,9 +333,44 @@ async def test_question_answer_log_lists_searches_and_counts_popular_questions(t
     search_rows = await store.list_question_answers(guild_id=456, limit=10, query="Fury")
     popular = await store.list_popular_question_answers(guild_id=456, limit=10)
 
-    assert [row[6] for row in rows] == ["What is Fury?", "how does zombie outbreak work", "How does Zombie Outbreak work?"]
-    assert len(search_rows) == 1
-    assert search_rows[0][6] == "What is Fury?"
-    assert popular[0][1] == 2
+    assert [row[6] for row in rows] == ["how does zombie outbreak work"]
+    assert len(search_rows) == 0
+    assert popular[0][1] == 1
     assert popular[0][3] == "how does zombie outbreak work"
     assert "infected states" in popular[0][4]
+
+
+async def test_question_answer_clear_wipes_saved_rows_and_counters(tmp_path):
+    store = Store(tmp_path / "chaosx-test.db")
+    await store.init()
+    for _ in range(2):
+        await store.record_question_answer(
+            mode="slash",
+            actor_id=100,
+            guild_id=456,
+            channel_id=789,
+            source_message_id=None,
+            bot_message_id=2000,
+            parent_bot_message_id=None,
+            question="How does Zombie Outbreak work?",
+            answer="Zombie Outbreak starts a spreading crisis.",
+            prompt_hash="hash-1",
+        )
+    assert len(await store.list_question_answers(guild_id=456, limit=10)) == 1
+    deleted = await store.clear_question_answers()
+    assert deleted == 1
+    assert await store.list_question_answers(guild_id=456, limit=10) == []
+    # Counters reset: the next occurrence is treated as a first ask again.
+    await store.record_question_answer(
+        mode="slash",
+        actor_id=100,
+        guild_id=456,
+        channel_id=789,
+        source_message_id=None,
+        bot_message_id=2000,
+        parent_bot_message_id=None,
+        question="How does Zombie Outbreak work?",
+        answer="Zombie Outbreak starts a spreading crisis.",
+        prompt_hash="hash-1",
+    )
+    assert await store.list_question_answers(guild_id=456, limit=10) == []

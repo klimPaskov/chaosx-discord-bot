@@ -89,6 +89,12 @@ ON question_answers(question_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_question_answers_scope
 ON question_answers(guild_id, channel_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS question_seen (
+    question_key TEXT PRIMARY KEY,
+    ask_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS auto_scan_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -492,7 +498,26 @@ class Store:
         status: str = "ok",
     ) -> None:
         question_key = normalize_question_key(question)
+        now = now_iso()
         async with aiosqlite.connect(self.db_path) as db:
+            # Repeat gate: only save a question after it has been asked at
+            # least twice. First occurrence just bumps the seen counter.
+            await db.execute(
+                """
+                INSERT INTO question_seen(question_key, ask_count, first_seen_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(question_key) DO UPDATE SET ask_count = ask_count + 1
+                """,
+                (question_key, now),
+            )
+            cur = await db.execute(
+                "SELECT ask_count FROM question_seen WHERE question_key = ?",
+                (question_key,),
+            )
+            row = await cur.fetchone()
+            if not row or row[0] < 2:
+                await db.commit()
+                return
             await db.execute(
                 """
                 INSERT INTO question_answers(
@@ -502,7 +527,7 @@ class Store:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    now_iso(),
+                    now,
                     mode[:40],
                     actor_id,
                     guild_id,
@@ -575,6 +600,44 @@ class Store:
             FROM grouped
             JOIN question_answers latest ON latest.id = grouped.latest_id
             ORDER BY grouped.ask_count DESC, grouped.last_asked_at DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(sql, tuple(params))
+            return [tuple(row) for row in await cur.fetchall()]
+
+    async def clear_question_answers(self) -> int:
+        """Delete all saved Q&A plus the repeat counters; return rows deleted."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("DELETE FROM question_answers")
+            deleted = cur.rowcount
+            await db.execute("DELETE FROM question_seen")
+            await db.commit()
+        return max(0, deleted)
+
+    async def list_warned_users(self, *, guild_id: int | None = None, limit: int = 25) -> list[tuple]:
+        """Group soft-warning events by user: actor_id, warning count, last warned at, latest reason."""
+        limit = max(1, min(limit, 100))
+        where: list[str] = ["action = 'soft_warning'"]
+        params: list[object] = []
+        if guild_id is not None:
+            where.append("guild_id IS ?")
+            params.append(guild_id)
+        sql = """
+            SELECT
+                actor_id,
+                COUNT(*) AS warning_count,
+                MAX(created_at) AS last_warned_at,
+                (SELECT reason FROM auto_scan_events w
+                  WHERE w.actor_id = e.actor_id AND w.action = 'soft_warning'
+                  ORDER BY w.id DESC LIMIT 1) AS latest_reason
+            FROM auto_scan_events e
+        """
+        sql += " WHERE " + " AND ".join(where)
+        sql += """
+            GROUP BY actor_id
+            ORDER BY warning_count DESC, last_warned_at DESC
             LIMIT ?
         """
         params.append(limit)

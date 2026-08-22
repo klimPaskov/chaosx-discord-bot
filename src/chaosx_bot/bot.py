@@ -464,6 +464,20 @@ def format_auto_scan_events(rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
+def format_warned_users(rows: list[tuple]) -> str:
+    lines = ["## ChaosX warned users"]
+    if not rows:
+        lines.append("No users have received soft warnings.")
+        return "\n".join(lines)
+    for actor_id, warning_count, last_warned_at, latest_reason in rows:
+        reason = sanitize_admin_context_text(str(latest_reason or ""), limit=220)
+        lines.append(
+            f"- `<@{actor_id}>` (`{actor_id}`) — **{warning_count} warning(s)** — last {last_warned_at}\n"
+            f"  - Latest reason: {reason or 'n/a'}"
+        )
+    return "\n".join(lines)
+
+
 def format_auto_scan_notice(decision: AutoScanDecision, message: discord.Message, *, bot_message_id: int | None) -> str:
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
@@ -605,6 +619,10 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.auto_scan_enabled or bot.user is None:
         return False
     if message.author.bot or getattr(message, "webhook_id", None):
+        return False
+    # Owner is never auto-scanned: no soft warnings, answers, or banter for the
+    # operator's own messages. The owner has dedicated mention/reply admin paths.
+    if message.author.id == bot.settings.owner_id:
         return False
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
@@ -3352,8 +3370,11 @@ def register_commands(bot: ChaosXBot) -> None:
         elif action in {"list", "search"}:
             rows = await bot.store.list_question_answers(guild_id=interaction.guild_id, limit=limit, query=query)
             text = format_qna_entries(rows)
+        elif action == "clear":
+            deleted = await bot.store.clear_question_answers()
+            text = f"Cleared the Q&A store: {deleted} saved Q&A rows removed (repeat counters also reset)."
         else:
-            text = "Unknown Q&A action. Use `list`, `search`, or `popular`."
+            text = "Unknown Q&A action. Use `list`, `search`, `popular`, or `clear`."
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin qna", summary=f"{action} {query}".strip())
         for part in _chunk(text):
             if interaction.response.is_done():
@@ -3379,6 +3400,19 @@ def register_commands(bot: ChaosXBot) -> None:
         rows = await bot.store.list_auto_scan_events(guild_id=interaction.guild_id, limit=limit, action=action_filter)
         text = format_auto_scan_events(rows)
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin autoscan", summary=action)
+        for part in _chunk(text):
+            if interaction.response.is_done():
+                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            else:
+                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="warned-users", description="List users who have received soft warnings.")
+    async def admin_warned_users(interaction: discord.Interaction, limit: int = 25) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        rows = await bot.store.list_warned_users(guild_id=interaction.guild_id, limit=limit)
+        text = format_warned_users(rows)
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin warned-users", summary=str(len(rows)))
         for part in _chunk(text):
             if interaction.response.is_done():
                 await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())

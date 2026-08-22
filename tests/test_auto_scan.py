@@ -402,6 +402,25 @@ async def test_handle_auto_scan_runs_classifier_off_gateway_loop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_auto_scan_never_engages_owner_messages(monkeypatch):
+    settings = Settings(discord_token="dummy")
+    bot = _FakeBot(settings)
+    message = _FakeMessage("@everyone free nitro here")
+    message.author = SimpleNamespace(id=settings.owner_id, bot=False)
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        raise AssertionError("classifier must not run for owner messages")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
+
+    assert handled is False
+    assert bot.store.events == []
+    assert message.replies == []
+
+
+@pytest.mark.asyncio
 async def test_handle_auto_scan_auto_answer_replies_and_records(monkeypatch):
     settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
     bot = _FakeBot(settings)
