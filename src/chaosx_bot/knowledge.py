@@ -23,6 +23,10 @@ MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
 PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES = {"agent_skill_or_contract"}
 MAX_CONTEXT_CHARS = 3200
+# Last-resort fallback for public asks: guaranteed-hit digest terms so the
+# answering model always gets real docs/notes/code ground truth from the index
+# instead of answering from memory.
+PUBLIC_ASK_DIGEST_QUERY = '"chaos redux" OR chaos_redux OR hoi4 OR event OR scenario OR mod OR mechanic OR focus'
 # Freshness checks must never block a command: the check itself (git commit,
 # workbook hash) runs at most this often, and the expensive full-repo mtime
 # walk happens on a background thread (see FULL_FRESHNESS_CHECK_SECONDS).
@@ -223,27 +227,16 @@ class Knowledge:
         Broad ask may use specs and planning docs for accuracy, but user-facing
         answers should not expose source paths/classes/commits by default. When
         the user explicitly asks for files/sources, include repo-relative paths.
+        Retrieval never returns empty on a healthy index: a precise AND query
+        falls back to the looser OR query, then to a fixed project digest, so
+        the answering model always has docs/notes/code ground truth to use.
         """
         self.ensure_index()
-        safe_query = _fts_query(query)
-        conn = connect(self.db_path)
-        try:
-            rows = conn.execute(
-                """
-                SELECT d.path, d.source_class,
-                       snippet(source_docs_fts, 2, '', '', ' … ', 35) AS snip,
-                       bm25(source_docs_fts) AS rank
-                FROM source_docs_fts
-                JOIN source_docs d ON d.id = source_docs_fts.rowid
-                WHERE source_docs_fts MATCH ?
-                  AND d.source_class NOT IN ({})
-                ORDER BY rank
-                LIMIT ?
-                """.format(",".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)),
-                (safe_query, *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES), limit),
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = (
+            self._public_ask_fts_rows(_fts_and_query(query), limit)
+            or self._public_ask_fts_rows(_fts_query(query), limit)
+            or self._public_ask_fts_rows(PUBLIC_ASK_DIGEST_QUERY, limit)
+        )
         snippets: list[str] = []
         total = 0
         for i, (path, source_class, snip, _rank) in enumerate(rows, 1):
@@ -258,6 +251,26 @@ class Knowledge:
             snippets.append(item)
             total += len(item)
         return "\n".join(snippets)
+
+    def _public_ask_fts_rows(self, safe_query: str, limit: int) -> list[tuple]:
+        conn = connect(self.db_path)
+        try:
+            return conn.execute(
+                """
+                SELECT d.path, d.source_class,
+                       snippet(source_docs_fts, 2, '', '', ' … ', 35) AS snip,
+                       bm25(source_docs_fts) AS rank
+                FROM source_docs_fts
+                JOIN source_docs d ON d.id = source_docs_fts.rowid
+                WHERE source_docs_fts MATCH ?
+                  AND d.source_class NOT IN ({})
+                ORDER BY rank
+                LIMIT ?
+                """.format(", ".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)),
+                (safe_query, *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES), limit),
+            ).fetchall()
+        finally:
+            conn.close()
 
     def resolve_event_id(self, event: str) -> int | None:
         """Resolve a public event ID/name query to its numeric catalog ID."""
@@ -582,6 +595,11 @@ def _explicit_numeric_lookup_id(value: str, *prefixes: str) -> str | None:
 def _fts_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-z0-9_\-]+", query)
     return " OR ".join(tokens[:8]) or '""'
+
+
+def _fts_and_query(query: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9_\-]+", query)
+    return " AND ".join(tokens[:8]) or '""'
 
 
 def _clean_snippet(value: str) -> str:

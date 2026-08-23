@@ -1686,7 +1686,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
 
     first_sent: discord.Message | None = None
     for i, part in enumerate(_chunk(output)):
-        content = ("ChaosX admin answer\n" if i == 0 else "") + part
+        content = part
         if i == 0:
             first_sent = await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
         else:
@@ -1792,7 +1792,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command=command_name, summary=request)
     first_sent: discord.Message | None = None
     for i, part in enumerate(_chunk(output)):
-        content = ("ChaosX answer\n" if i == 0 else "") + part
+        content = part
         if i == 0:
             first_sent = await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
         else:

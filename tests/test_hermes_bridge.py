@@ -66,6 +66,25 @@ def test_public_prompt_scopes_and_refuses_dangerous_requests():
     assert "Owner request" not in prompt
 
 
+def test_public_prompt_grounds_on_reference_and_never_encourages_guessing():
+    grounded = build_public_prompt(
+        user_request="what is event 2?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="Zombie Outbreak is event 2.",
+    )
+    assert "You must base your answer on the provided internal reference notes" in grounded
+    assert "none were available" not in grounded
+    empty = build_public_prompt(
+        user_request="what is event 2?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="",
+    )
+    assert "none were available" in empty
+    assert "Do not guess or invent Chaos Redux facts" in empty
+
+
 @pytest.mark.asyncio
 async def test_active_hermes_run_registry_tracks_only_live_processes(tmp_path: Path):
     fake_hermes = tmp_path / "fake-hermes"

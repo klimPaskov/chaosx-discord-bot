@@ -109,6 +109,28 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Event ' in testing
 
 
+def test_public_ask_context_never_empty_on_healthy_index(tmp_path: Path):
+    repo = Path('/home/klim/projects/chaos_redux')
+    if not repo.exists():
+        return
+    db = tmp_path / 'chaosx-fallback.db'
+    stats = rebuild_index(repo, db, None)
+    assert stats.docs > 0
+    knowledge = Knowledge(repo, db, None)
+    # Positive: tokens with no index hits fall back to the project digest, so
+    # the answering model always receives real docs/notes/code ground truth.
+    fallback = knowledge.public_ask_context('zzzzqqqq xxxxxyyyy')
+    assert fallback
+    assert any(
+        term in fallback.lower()
+        for term in ('redux', 'event', 'scenario', 'mod', 'hoi4', 'mechanic', 'focus', 'chaos')
+    )
+    # Negative: a real query still returns its own relevant snippets.
+    real = knowledge.public_ask_context('Zombie Outbreak')
+    assert real
+    assert 'zombie' in real.lower() or 'outbreak' in real.lower()
+
+
 def test_knowledge_auto_refreshes_stale_index(tmp_path: Path):
     repo = Path('/home/klim/projects/chaos_redux')
     if not repo.exists():
