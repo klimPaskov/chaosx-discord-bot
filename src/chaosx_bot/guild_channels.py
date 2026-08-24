@@ -32,7 +32,12 @@ TEXT_TYPE_NAMES = {
 
 
 def format_channel_reference(channels: list[dict[str, Any]]) -> str:
-    """Render a compact, category-grouped channel reference for prompts."""
+    """Render a compact, category-grouped channel reference for prompts.
+
+    Each channel is rendered as a real Discord mention (`<#channel_id>`),
+    which the model can copy verbatim into answers so channel citations are
+    clickable links, not plain text.
+    """
     if not channels:
         return ""
     categories: dict[Any, str] = {}
@@ -59,7 +64,7 @@ def format_channel_reference(channels: list[dict[str, Any]]) -> str:
         if topic:
             topic = topic[:TOPIC_MAX_CHARS]
         category = categories.get(channel.get("parent_id") or "")
-        label = f"- #{name}" + (f" — {topic}" if topic else "")
+        label = f"- <#{cid}>" + (f" — {topic}" if topic else "")
         if category:
             label = f"  {label}"
         lines.append(label)

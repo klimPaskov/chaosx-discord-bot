@@ -67,6 +67,7 @@ from .hermes_bridge import (
     build_public_prompt,
     prompt_hash,
     redact_internal_infrastructure,
+    redact_public_reasoning,
     run_hermes,
     AUTO_SCAN_ANSWER_BOUNDARY,
     AUTO_SCAN_BANTER_BOUNDARY,
@@ -1800,9 +1801,14 @@ class _ThinkingFeed:
 
     Two display modes:
     - kind="dm"      -> private DM to the owner (raw reasoning + final answer)
-    - kind="channel" -> public message in the ask channel (reasoning only,
-      redacted so internal infrastructure never leaks through the chain of
-      thought; the final answer is posted as the normal public reply).
+    - kind="channel" -> public message in the ask channel showing the model's
+      REAL reasoning, scrubbed so sensitive details never surface: internal
+      infrastructure phrasing and any lines revealing the bot's internal
+      decision process (refusals, instruction references, hidden context)
+      are removed. The final answer is posted as the normal public reply.
+
+    The message is TEMPORARY in both modes: it streams live while the model
+    works and is deleted on completion, once the real answer is out.
 
     Edits are throttled to stay inside Discord's edit-rate limits and the
     2000-char message cap.
@@ -1849,7 +1855,10 @@ class _ThinkingFeed:
 
     def _safe(self, text: str) -> str:
         if self.public:
-            return redact_internal_infrastructure(text)
+            # Public feed: show real reasoning, but scrubbed of internal
+            # infrastructure phrasing AND lines revealing the bot's internal
+            # decision process (refusals, instructions, hidden context).
+            return redact_public_reasoning(text)
         return text
 
     async def emit(self, reasoning_delta: str, content_delta: str) -> None:
@@ -1880,24 +1889,19 @@ class _ThinkingFeed:
         return ("\n\n".join(parts) or "…")[: self.MAX_CHARS]
 
     async def finish(self, final_answer: str = "") -> None:
+        """The thinking message is temporary: remove it once work is done.
+
+        The final answer is posted as the normal reply by the caller, so the
+        thinking message must not linger in the channel or the owner DM.
+        """
         if self.message is None:
             return
-        if self.public:
-            text = "✅ Done — answer posted in the channel."
-            if self.reasoning.strip():
-                text = (
-                    "🧠 **ChaosX was thinking:**\n"
-                    + self.reasoning.strip()
-                    + "\n\n✅ Done — answer posted in the channel."
-                )
-        else:
-            if final_answer:
-                self.content = final_answer
-            text = self._render() or "Done."
         try:
-            await self.message.edit(content=text[: self.MAX_CHARS])
+            await self.message.delete()
         except Exception:
             pass
+        finally:
+            self.message = None
 
 
 async def _public_model_completion(

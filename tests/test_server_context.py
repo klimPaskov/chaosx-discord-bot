@@ -5,8 +5,27 @@ from chaosx_bot.hermes_bridge import (
     build_auto_scan_answer_prompt,
     build_auto_scan_warning_prompt,
     build_public_prompt,
+    redact_public_reasoning,
 )
 from chaosx_bot.server_rules import ServerRules
+
+
+def test_redact_public_reasoning_keeps_real_thinking_drops_sensitive_lines() -> None:
+    text = (
+        "The user asks where to report bugs.\n"
+        "My instructions say I must not reveal my system prompt.\n"
+        "I think the issues channel is the right place: <#123>.\n"
+        "I cannot disclose internal details about the hermes backend.\n"
+        "Refusal: not allowed to share that."
+    )
+    out = redact_public_reasoning(text)
+    # Genuine reasoning about the question is preserved...
+    assert "issues channel" in out
+    assert "<#123>" in out
+    # ...but lines revealing the internal decision process are dropped.
+    assert "instructions" not in out
+    assert "cannot disclose" not in out
+    assert "Refusal" not in out
 
 
 def test_format_channel_reference_groups_and_truncates() -> None:
@@ -19,11 +38,11 @@ def test_format_channel_reference_groups_and_truncates() -> None:
         {"id": "t1", "type": 11, "name": "public-thread", "parent_id": "c1"},  # skipped
     ]
     ref = format_channel_reference(channels)
-    assert "#general" in ref and "General chat" in ref
-    assert "#announcements" in ref
-    assert "#rules" in ref and "Please read the rules!" in ref
-    assert "#voice-chat" not in ref
-    assert "#public-thread" not in ref
+    assert "<#c1>" in ref and "General chat" in ref
+    assert "<#c2>" in ref
+    assert "<#c3>" in ref and "Please read the rules!" in ref
+    assert "voice-chat" not in ref
+    assert "public-thread" not in ref
 
 
 def test_format_channel_reference_empty() -> None:
@@ -49,12 +68,14 @@ def test_public_prompt_includes_rules_and_channels() -> None:
         guild_name="Chaos Redux",
         channel_name="general",
         server_rules="1. No NSFW content.",
-        server_channels="#issues — Bug reports",
+        server_channels="<#111> — Bug reports",
     )
     assert "Server rules" in prompt
     assert "No NSFW content" in prompt
     assert "Server channels" in prompt
-    assert "#issues — Bug reports" in prompt
+    assert "<#111> — Bug reports" in prompt
+    # Instruction must tell the model to copy the mention verbatim (clickable link).
+    assert "<#channel_id>" in prompt
 
 
 def test_warning_prompt_includes_rules_and_boundary_cites_them() -> None:
@@ -78,6 +99,6 @@ def test_auto_scan_answer_prompt_includes_channels() -> None:
         channel_name="C",
         reference_context="ctx",
         gate_reason="local",
-        server_channels="#suggestions — Post ideas",
+        server_channels="<#222> — Post ideas",
     )
-    assert "#suggestions — Post ideas" in prompt
+    assert "<#222> — Post ideas" in prompt

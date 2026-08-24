@@ -84,6 +84,37 @@ def redact_internal_infrastructure(text: str) -> str:
         cleaned = pattern.sub(replacement, cleaned)
     return cleaned
 
+
+_PUBLIC_REASONING_SENSITIVE_LINES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"system prompt", re.IGNORECASE),
+    re.compile(r"\bmy instructions\b", re.IGNORECASE),
+    re.compile(r"\bmy (?:guidelines|rules|boundaries?)\b", re.IGNORECASE),
+    re.compile(r"\bhidden (?:context|details?|logic)\b", re.IGNORECASE),
+    re.compile(r"\binternal (?:rule|logic|details?|systems?|prompt|workings)\b", re.IGNORECASE),
+    re.compile(r"\b(must|cannot|can'?t|won'?t|should not|shouldn'?t|not able)\s+(?:not\s+)?(?:reveal|say|mention|disclose|leak|tell|expose)\b", re.IGNORECASE),
+    re.compile(r"\bnot (?:allowed|permitted)\s+to\b", re.IGNORECASE),
+    re.compile(r"\brefus\w*", re.IGNORECASE),
+    re.compile(r"\bprompt (?:hash|hashing)\b", re.IGNORECASE),
+)
+
+
+def redact_public_reasoning(text: str) -> str:
+    """Scrub reasoning for the public channel feed.
+
+    Applies the infrastructure redactions, then drops lines that reveal the
+    bot's internal decision process — refusals, instruction/system-prompt
+    references, hidden context, internal rules. Such reasoning must never
+    surface in a public channel, even redacted; genuine reasoning about the
+    question itself is preserved.
+    """
+    text = redact_internal_infrastructure(text)
+    kept: list[str] = []
+    for line in text.splitlines():
+        if any(pattern.search(line) for pattern in _PUBLIC_REASONING_SENSITIVE_LINES):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
 _CONFIG_LOCK = asyncio.Lock()
 
 
@@ -187,8 +218,10 @@ def _channels_block(server_channels: str) -> str:
         return ""
     return (
         "\nServer channels (for reference). When a user asks where to find, report, "
-        "post, or discuss something, point them to the relevant channel by name from "
-        "this list. Do not claim channels exist that are not listed.\n"
+        "post, or discuss something, point them to the relevant channel using the "
+        "exact channel link `<#channel_id>` shown in this list — copy the mention "
+        "verbatim so it renders as a clickable channel link. Never invent channel "
+        "ids that are not in this list.\n"
         f"{server_channels.strip()}\n"
     )
 
