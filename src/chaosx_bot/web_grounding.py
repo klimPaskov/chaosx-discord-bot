@@ -8,11 +8,14 @@ public path still has zero tool surface, and results are trimmed and capped.
 
 Search is best-effort: any failure (network, block, parse) returns "" and the
 answer proceeds without web context. Results are untrusted external content.
+Primary backend is Bing HTML (works from datacenter IPs); DuckDuckGo HTML is
+the fallback (often serves a captcha challenge to VPS IPs).
 """
 
 from __future__ import annotations
 
 import html as html_lib
+import json
 import re
 import time
 from urllib.parse import parse_qs, unquote, urlparse
@@ -25,9 +28,14 @@ WEB_SEARCH_MAX_RESULTS = 5
 WEB_SEARCH_MAX_CHARS = 2500
 WEB_SEARCH_TIMEOUT_S = 8.0
 WEB_SEARCH_CACHE_TTL_S = 120.0
-WEB_SEARCH_URL = "https://html.duckduckgo.com/html/"
-_RESULT_ANCHOR_RE = re.compile(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
-_SNIPPET_RE = re.compile(r'class="result__snippet"[^>]*>(.*?)</a>', re.S)
+BING_URL = "https://www.bing.com/search"
+DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+DDG_IA_URL = "https://api.duckduckgo.com/"
+_DDG_ANCHOR_RE = re.compile(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+_DDG_SNIPPET_RE = re.compile(r'class="result__snippet"[^>]*>(.*?)</a>', re.S)
+_BING_ALGO_RE = re.compile(r'<li class="b_algo".*?</li>', re.S)
+_BING_H2_RE = re.compile(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+_BING_P_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
 _RESULT_MAX_CHARS = 300
 
@@ -53,8 +61,8 @@ def _real_url(href: str) -> str:
 
 def parse_search_results(page: str, *, limit: int = WEB_SEARCH_MAX_RESULTS) -> list[dict[str, str]]:
     """Parse DuckDuckGo lite HTML into (title, url, snippet) dicts."""
-    anchors = _RESULT_ANCHOR_RE.findall(page or "")
-    snippets = _SNIPPET_RE.findall(page or "")
+    anchors = _DDG_ANCHOR_RE.findall(page or "")
+    snippets = _DDG_SNIPPET_RE.findall(page or "")
     results: list[dict[str, str]] = []
     for index, (href, title) in enumerate(anchors[:limit]):
         title = _clean(title)
@@ -63,6 +71,43 @@ def parse_search_results(page: str, *, limit: int = WEB_SEARCH_MAX_RESULTS) -> l
             continue
         snippet = _clean(snippets[index]) if index < len(snippets) else ""
         results.append({"title": title, "url": url, "snippet": snippet})
+    return results
+
+
+def parse_bing_results(page: str, *, limit: int = WEB_SEARCH_MAX_RESULTS) -> list[dict[str, str]]:
+    """Parse Bing HTML search results (li.b_algo blocks)."""
+    results: list[dict[str, str]] = []
+    for block in _BING_ALGO_RE.findall(page or ""):
+        match = _BING_H2_RE.search(block)
+        if not match:
+            continue
+        href, title = match.group(1), _clean(match.group(2))
+        url = _real_url(href)
+        if not title or not url:
+            continue
+        snippet_match = _BING_P_RE.search(block)
+        snippet = _clean(snippet_match.group(1)) if snippet_match else ""
+        results.append({"title": title, "url": url, "snippet": snippet})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def parse_instant_answer(page: str) -> list[dict[str, str]]:
+    """Parse the DuckDuckGo Instant Answer JSON (very sparse fallback)."""
+    try:
+        data = json.loads(page or "{}")
+    except Exception:
+        return []
+    results: list[dict[str, str]] = []
+    abstract = (data.get("AbstractText") or "").strip()
+    if abstract and (data.get("AbstractURL") or ""):
+        results.append({"title": data.get("Heading") or "Answer", "url": data["AbstractURL"], "snippet": abstract[: _RESULT_MAX_CHARS]})
+    for topic in (data.get("RelatedTopics") or []):
+        if isinstance(topic, dict) and (topic.get("Text") or "") and (topic.get("FirstURL") or ""):
+            results.append({"title": topic.get("Text", "")[:80], "url": topic["FirstURL"], "snippet": topic.get("Text", "")[: _RESULT_MAX_CHARS]})
+        if len(results) >= WEB_SEARCH_MAX_RESULTS:
+            break
     return results
 
 
@@ -111,19 +156,28 @@ class WebGrounder:
             return cached[1]
         block = ""
         try:
-            page = await self._fetch(query)
-            results = parse_search_results(page)
+            # Bing first (reliable from VPS/datacenter IPs), then DDG fallbacks.
+            results = await self._search_bing(query)
+            if not results:
+                page = await self._get(DDG_HTML_URL, {"q": query})
+                results = parse_search_results(page)
+            if not results:
+                page = await self._get(DDG_IA_URL, {"q": query, "format": "json", "no_html": "1"})
+                results = parse_instant_answer(page)
             block = format_web_context(results)
         except Exception:
             block = ""
         self._cache[query] = (time.monotonic(), block)
         return block
 
-    async def _fetch(self, query: str) -> str:
-        params = {"q": query}
+    async def _search_bing(self, query: str) -> list[dict[str, str]]:
+        page = await self._get(BING_URL, {"q": query})
+        return parse_bing_results(page)
+
+    async def _get(self, url: str, params: dict[str, str]) -> str:
         headers = {"User-Agent": DISCORD_BOT_UA}
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
-            async with session.get(WEB_SEARCH_URL, params=params, headers=headers) as response:
+            async with session.get(url, params=params, headers=headers) as response:
                 if response.status != 200:
                     return ""
                 return await response.text()

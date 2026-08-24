@@ -15,7 +15,11 @@ from chaosx_bot.hermes_bridge import (
     redact_public_reasoning,
 )
 from chaosx_bot.server_rules import ServerRules
-from chaosx_bot.web_grounding import format_web_context, parse_search_results
+from chaosx_bot.web_grounding import (
+    format_web_context,
+    parse_bing_results,
+    parse_search_results,
+)
 
 
 def test_channel_ids_from_text() -> None:
@@ -51,6 +55,20 @@ def test_public_prompt_includes_channel_context() -> None:
     assert "Recent messages in this channel" in prompt
     assert "- Alice: hello" in prompt
     assert "read-only" in prompt
+
+
+def test_parse_bing_results() -> None:
+    page = (
+        '<li class="b_algo"><h2><a href="https://hoi4.wiki">Hearts of Iron 4 Wiki</a></h2>'
+        "<p>The <strong>HOI4</strong> reference site.</p></li>"
+        '<li class="b_algo"><h2><a href="https://example.org/x">Second Result</a></h2><p>More.</p></li>'
+    )
+    results = parse_bing_results(page)
+    assert len(results) == 2
+    assert results[0]["title"] == "Hearts of Iron 4 Wiki"
+    assert results[0]["url"] == "https://hoi4.wiki"
+    assert "HOI4" in results[0]["snippet"]
+    assert results[1]["url"] == "https://example.org/x"
 
 
 def test_parse_search_results_and_format_web_context() -> None:
