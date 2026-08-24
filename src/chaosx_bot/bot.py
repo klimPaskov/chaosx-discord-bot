@@ -90,7 +90,7 @@ from .playtest_synthesis import (
     MAX_SYNTHESIS_OUTPUT_CHARS,
     build_playtest_synthesis_prompt,
 )
-from .rate_limit import FixedWindowRateLimiter
+from .rate_limit import FixedWindowRateLimiter, RateLimitResult
 from .runtime_status import (
     collect_process_tree,
     format_hermes_progress,
@@ -2003,18 +2003,20 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         )
         return
     limit = bot.settings.public_ask_limit_per_hour
-    if limit <= 0:
+    rate: RateLimitResult | None = None
+    if limit == 0:
         await message.reply("Public ChaosX asks are currently disabled.", mention_author=False, allowed_mentions=safe_allowed_mentions())
         return
-    rate = bot.rate_limiter.check(bucket="ask", user_id=message.author.id, limit=limit, window_seconds=3600)
-    if not rate.allowed:
-        minutes = max(1, rate.retry_after_seconds // 60)
-        await message.reply(
-            f"Rate limit hit for ChaosX `ask` commands. Try again in about {minutes} minute(s).",
-            mention_author=False,
-            allowed_mentions=safe_allowed_mentions(),
-        )
-        return
+    if limit > 0:
+        rate = bot.rate_limiter.check(bucket="ask", user_id=message.author.id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            minutes = max(1, rate.retry_after_seconds // 60)
+            await message.reply(
+                f"Rate limit hit for ChaosX `ask` commands. Try again in about {minutes} minute(s).",
+                mention_author=False,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
 
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
@@ -2068,7 +2070,8 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         output = f"Hermes run timed out after {bot.settings.hermes_timeout_seconds}s. Try a narrower Chaos Redux question."
     output = sanitize_public_ask_output(output)
     memory_output = output
-    output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
+    if rate is not None:
+        output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
         actor_id=message.author.id,
@@ -2756,18 +2759,19 @@ async def run_hermes_command(
             limit = bot.settings.public_ask_limit_per_hour
         else:
             limit = bot.settings.public_scripted_limit_per_hour
-        if limit <= 0:
+        if limit == 0:
             await interaction.response.send_message("This public command is currently disabled.", ephemeral=True)
             return
-        rate = bot.rate_limiter.check(bucket=rate_bucket, user_id=interaction.user.id, limit=limit, window_seconds=3600)
-        if not rate.allowed:
-            minutes = max(1, rate.retry_after_seconds // 60)
-            await interaction.response.send_message(
-                f"Rate limit hit for ChaosX `{rate_bucket}` commands. Try again in about {minutes} minute(s).",
-                ephemeral=True,
-                allowed_mentions=safe_allowed_mentions(),
-            )
-            return
+        if limit > 0:
+            rate = bot.rate_limiter.check(bucket=rate_bucket, user_id=interaction.user.id, limit=limit, window_seconds=3600)
+            if not rate.allowed:
+                minutes = max(1, rate.retry_after_seconds // 60)
+                await interaction.response.send_message(
+                    f"Rate limit hit for ChaosX `{rate_bucket}` commands. Try again in about {minutes} minute(s).",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
 
     await interaction.response.defer(ephemeral=not public, thinking=True)
     activity_box: list[HermesRunActivity | None] = [None]

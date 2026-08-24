@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     owner_id: int = Field(default=789502982122373150, description="Discord user ID with admin/automation access")
     allowed_guild_id: Optional[int] = Field(default=1395459671598436533)
     command_guild_id: Optional[int] = Field(default=1395459671598436533)
-    public_ask_limit_per_hour: int = Field(default=10, ge=0, le=100)
+    public_ask_limit_per_hour: int = Field(default=-1, ge=-1, le=100, description="Public ask rate limit per user per hour; -1 = unlimited (no check), 0 = disabled")
     public_scripted_limit_per_hour: int = Field(default=20, ge=0, le=500)
     public_prompt_max_chars: int = Field(default=600, ge=100, le=4000)
     mention_ask_enabled: bool = Field(default=True, description="Allow direct @ChaosX mentions to act like public /ask; requires Discord Message Content Intent")

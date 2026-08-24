@@ -81,7 +81,7 @@ def test_ask_model_defaults_to_deepseek_flash():
     assert settings.allowed_guild_id == 1395459671598436533
     assert settings.command_guild_id == 1395459671598436533
     assert settings.github_repo == "klimPaskov/Chaos-Redux"
-    assert settings.public_ask_limit_per_hour == 10
+    assert settings.public_ask_limit_per_hour == -1  # -1 = unlimited, 0 = disabled, >0 = enforced
     assert settings.mention_ask_enabled is True
     assert settings.auto_scan_enabled is True
     assert settings.auto_scan_auto_answer_enabled is True
