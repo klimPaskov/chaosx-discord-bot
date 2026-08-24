@@ -54,6 +54,7 @@ from .focus_trees import (
     SharedMcpSession,
 )
 from .guild_channels import GuildChannels
+from .channel_context import ChannelReader
 from .vault_index import refresh_vault_indexes
 from .ask_api import DirectAskError, direct_chat_completion, direct_chat_completion_stream
 from .hermes_bridge import (
@@ -1218,6 +1219,9 @@ class ChaosXBot(discord.Client):
             guild_id=settings.allowed_guild_id or settings.command_guild_id or 0,
         )
         self._channels_refresh_inflight = False
+        # Read-only channel message context for public asks (GET only; the
+        # public path structurally has no Discord mutation calls).
+        self.channel_reader = ChannelReader(bot_token=settings.discord_token)
 
     async def _refresh_rules_background(self) -> None:
         try:
@@ -2020,6 +2024,15 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         exclude_message_id=message.id,
         scope="public",
     )
+    # Read-only channel context: recent messages from the ask channel plus any
+    # channels the user explicitly linked (<#id>). GET-only; never modifies.
+    channel_context = ""
+    try:
+        main_context = await bot.channel_reader.recent_context(getattr(message.channel, "id", None))
+        linked_context = await bot.channel_reader.referenced_channels_context(request)
+        channel_context = "\n".join(part for part in (main_context, linked_context) if part)
+    except Exception:
+        channel_context = ""
     prompt = build_public_prompt(
         user_request=request,
         guild_name=guild_name,
@@ -2030,6 +2043,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         conversation_context=conversation_context,
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
+        channel_context=channel_context,
     )
     feed: _ThinkingFeed | None = None
     if message.author.id == bot.settings.owner_id:
@@ -2785,6 +2799,15 @@ async def run_hermes_command(
             channel_id=interaction.channel_id or 0,
             scope="admin",
         )
+    # Read-only channel context for public /ask (GET-only; never modifies).
+    channel_context = ""
+    if not owner_only:
+        try:
+            main_context = await bot.channel_reader.recent_context(interaction.channel_id)
+            linked_context = await bot.channel_reader.referenced_channels_context(request)
+            channel_context = "\n".join(part for part in (main_context, linked_context) if part)
+        except Exception:
+            channel_context = ""
     prompt = (
         build_owner_prompt(
             owner_request=owner_request,
@@ -2804,6 +2827,7 @@ async def run_hermes_command(
             memory_context=memory_context if rate_bucket == "ask" else "",
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
+            channel_context=channel_context,
         )
     )
     model = provider = reasoning_effort = toolsets = None

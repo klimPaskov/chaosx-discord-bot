@@ -355,7 +355,8 @@ def test_auto_scan_prompts_require_dynamic_model_generated_text():
         assert "Do not use @everyone" in prompt
     assert "Reference context for the model-generated answer" in answer_prompt
     assert "Event 2: Zombie Outbreak" in answer_prompt
-    assert "Write one short playful response" in banter_prompt
+    assert "playful" in banter_prompt
+    assert "never state facts" in banter_prompt
     assert "soft warning" in warning_prompt
 
 
