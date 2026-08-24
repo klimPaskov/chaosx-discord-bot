@@ -61,14 +61,15 @@ def test_parse_bing_results() -> None:
     page = (
         '<li class="b_algo"><h2><a href="https://hoi4.wiki">Hearts of Iron 4 Wiki</a></h2>'
         "<p>The <strong>HOI4</strong> reference site.</p></li>"
-        '<li class="b_algo"><h2><a href="https://example.org/x">Second Result</a></h2><p>More.</p></li>'
+        '<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=abc&amp;u=a1aHR0cHM6Ly9jYXJkZ2FtZXMuaW8vaGVhcnRzLw&amp;ntb=1">Second Result</a></h2><p>More.</p></li>'
     )
     results = parse_bing_results(page)
     assert len(results) == 2
     assert results[0]["title"] == "Hearts of Iron 4 Wiki"
     assert results[0]["url"] == "https://hoi4.wiki"
     assert "HOI4" in results[0]["snippet"]
-    assert results[1]["url"] == "https://example.org/x"
+    # Bing redirect URLs are decoded back to the real target.
+    assert results[1]["url"] == "https://cardgames.io/hearts/"
 
 
 def test_parse_search_results_and_format_web_context() -> None:

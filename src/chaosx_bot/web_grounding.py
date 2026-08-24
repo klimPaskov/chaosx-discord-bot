@@ -14,6 +14,7 @@ the fallback (often serves a captcha challenge to VPS IPs).
 
 from __future__ import annotations
 
+import base64
 import html as html_lib
 import json
 import re
@@ -49,13 +50,26 @@ def _clean(value: str) -> str:
 def _real_url(href: str) -> str:
     if not href:
         return ""
+    href = html_lib.unescape(href)  # HTML-escaped &amp; in query strings
     if href.startswith("//"):
         href = "https:" + href
     parsed = urlparse(href)
-    if "duckduckgo.com" in (parsed.netloc or "") and parsed.path.startswith("/l/"):
+    netloc = parsed.netloc or ""
+    if "duckduckgo.com" in netloc and parsed.path.startswith("/l/"):
         target = parse_qs(parsed.query).get("uddg", [""])[0]
         if target:
             return unquote(target)
+    if "bing.com" in netloc and parsed.path.startswith("/ck/"):
+        # Bing wraps result URLs: ?u=a1<base64url> (a1 is a marker, not base64).
+        encoded = parse_qs(parsed.query).get("u", [""])[0]
+        if encoded.startswith("a1"):
+            encoded = encoded[2:]
+        if encoded:
+            try:
+                padded = encoded + "=" * (-len(encoded) % 4)
+                return base64.urlsafe_b64decode(padded).decode("utf-8", "replace")
+            except Exception:
+                pass
     return href
 
 
