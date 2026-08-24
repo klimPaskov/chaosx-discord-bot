@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")
     community_event_ideas_channel_id: Optional[int] = Field(default=1395464994639839356, description="Discord forum/text channel for approved /event-idea posts; blank disables auto-posting")
     automation_reminder_channel_id: Optional[int] = Field(default=1395464062367698977, description="Discord channel for automation reminders/digests")
+    rules_channel_id: Optional[int] = Field(default=1395464062367698974, description="Discord #rules channel whose announcements the bot learns for rule questions and soft warnings")
     content_dump_channel_id: Optional[int] = Field(default=1516054706286235768, description="Discord channel for weekly image-led content dumps")
     access_reaction_channel_id: Optional[int] = Field(default=1396027815786188890, description="Info channel for the access reaction-role message")
     access_reaction_message_id: Optional[int] = Field(default=1526508030886154331, description="Message whose reactions control community access roles")

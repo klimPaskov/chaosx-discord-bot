@@ -49,6 +49,89 @@ def test_capture_skips_non_guild_slash_other_bots(tmp_path: Path) -> None:
     assert "message" not in ctx  # nothing from CHANNEL was captured
 
 
+def test_visibility_partitions_public_and_admin_history(tmp_path: Path) -> None:
+    """Public context never shows admin-task messages; admin sees everything."""
+    db = tmp_path / "mem.db"
+
+    async def run() -> None:
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=4001,
+            author_name="Regular",
+            content="What is the Fury event?",
+            created_at=_iso(1),
+            is_bot_self=False,
+            allowed_guild_id=ALLOWED,
+            message_id=111,
+            visibility="public",
+        )
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=3001,
+            author_name="Hoops",
+            content="admin: delete those messages",
+            created_at=_iso(2),
+            is_bot_self=False,
+            allowed_guild_id=ALLOWED,
+            message_id=222,
+            visibility="admin",
+        )
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=7777,
+            author_name="ChaosX",
+            content="Done, removed 3 messages.",
+            created_at=_iso(3),
+            is_bot_self=True,
+            allowed_guild_id=ALLOWED,
+            message_id=333,
+            visibility="admin",
+        )
+        public_ctx = await conversation_context_for(db, CHANNEL, scope="public")
+        admin_ctx = await conversation_context_for(db, CHANNEL, scope="admin")
+        assert "Fury event" in public_ctx
+        assert "delete those messages" not in public_ctx
+        assert "removed 3 messages" not in public_ctx
+        assert "Fury event" in admin_ctx
+        assert "delete those messages" in admin_ctx
+        assert "removed 3 messages" in admin_ctx
+
+    asyncio.run(run())
+
+
+def test_mark_messages_admin_moves_rows_out_of_public_scope(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+
+    async def run() -> None:
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=4002,
+            author_name="Hoops",
+            content="@ChaosX check the deleted messages",
+            created_at=_iso(1),
+            is_bot_self=False,
+            allowed_guild_id=ALLOWED,
+            message_id=444,
+            visibility="public",  # captured as public, upgraded later like the admin path does
+        )
+        from chaosx_bot.conversation_memory import mark_messages_admin
+        await mark_messages_admin(db, [444])
+        public_ctx = await conversation_context_for(db, CHANNEL, scope="public")
+        admin_ctx = await conversation_context_for(db, CHANNEL, scope="admin")
+        assert "deleted messages" not in public_ctx
+        assert "deleted messages" in admin_ctx
+
+    asyncio.run(run())
+
+
 def test_context_includes_summary_and_window_excludes_trigger(tmp_path: Path) -> None:
     db = tmp_path / "mem.db"
     asyncio.run(_capture(db, n=3))
@@ -70,7 +153,9 @@ def test_context_includes_summary_and_window_excludes_trigger(tmp_path: Path) ->
             )
             await conn.commit()
         ctx2 = await conversation_context_for(db, CHANNEL)
-        assert "Channel memory" in ctx2 and "testing conversation memory" in ctx2
+        # Internal-infrastructure phrasing is redacted even inside stored context.
+        assert "Channel memory" in ctx2 and "testing prior context" in ctx2
+        assert "conversation memory" not in ctx2
     asyncio.run(run())
 
 

@@ -6,6 +6,8 @@ import io
 import json
 import os
 import re
+import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, cast
 
@@ -18,6 +20,7 @@ from .auto_scan import AutoScanDecision, classify_message
 from .conversation_memory import (
     capture_message,
     conversation_context_for,
+    mark_messages_admin,
     schedule_compaction,
 )
 from .catalog_validation import format_workbook_validation, validate_workbook
@@ -50,7 +53,9 @@ from .focus_trees import (
     FocusTreeRecord,
     SharedMcpSession,
 )
+from .guild_channels import GuildChannels
 from .vault_index import refresh_vault_indexes
+from .ask_api import DirectAskError, direct_chat_completion, direct_chat_completion_stream
 from .hermes_bridge import (
     HermesResult,
     HermesRunActivity,
@@ -60,7 +65,13 @@ from .hermes_bridge import (
     build_auto_scan_warning_prompt,
     build_owner_prompt,
     build_public_prompt,
+    prompt_hash,
+    redact_internal_infrastructure,
     run_hermes,
+    AUTO_SCAN_ANSWER_BOUNDARY,
+    AUTO_SCAN_BANTER_BOUNDARY,
+    AUTO_SCAN_WARNING_BOUNDARY,
+    PUBLIC_ASK_BOUNDARY,
 )
 from .knowledge import Knowledge
 from .issue_duplicates import (
@@ -83,6 +94,7 @@ from .runtime_status import (
     format_hermes_progress,
     format_process_panel,
 )
+from .server_rules import ServerRules
 from .storage import Store
 from .webhook_server import GitHubWebhookServer
 
@@ -223,7 +235,7 @@ def sanitize_public_ask_output(output: str) -> str:
     text = cleaned.casefold()
     if any(term in text for term in PUBLIC_OUTPUT_FORBIDDEN_TERMS):
         return PUBLIC_ASK_REDIRECT
-    return cleaned
+    return redact_internal_infrastructure(cleaned)
 
 
 def public_ask_wants_sources(request: str) -> bool:
@@ -257,8 +269,8 @@ def format_message_ask_chain_context(rows: list[tuple]) -> str:
     ]
     for index, (created_at, mode, actor_id, prompt_hash_value, status, request, output_excerpt, bot_message_id, parent_bot_message_id) in enumerate(rows, start=1):
         safe_mode = sanitize_admin_context_text(str(mode), limit=40)
-        safe_request = sanitize_admin_context_text(str(request), limit=700)
-        safe_output = sanitize_admin_context_text(str(output_excerpt), limit=1000)
+        safe_request = redact_internal_infrastructure(sanitize_admin_context_text(str(request), limit=700))
+        safe_output = redact_internal_infrastructure(sanitize_admin_context_text(str(output_excerpt), limit=1000))
         safe_status = sanitize_admin_context_text(str(status), limit=40)
         lines.append(
             f"### Chain turn {index} — {created_at} mode={safe_mode} status={safe_status}\n"
@@ -268,7 +280,7 @@ def format_message_ask_chain_context(rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
-async def fetch_message_ask_chain_context(bot: ChaosXBot, *, bot_message_id: int | None, guild_id: int | None, channel_id: int | None) -> str:
+async def fetch_message_ask_chain_context(bot: ChaosXBot, *, bot_message_id: int | None, guild_id: int | None, channel_id: int | None, public_only: bool = False) -> str:
     if bot.settings.reply_context_turns <= 0 or not bot_message_id:
         return ""
     rows = await bot.store.list_message_ask_chain(
@@ -277,6 +289,9 @@ async def fetch_message_ask_chain_context(bot: ChaosXBot, *, bot_message_id: int
         channel_id=channel_id,
         limit=bot.settings.reply_context_turns,
     )
+    if public_only:
+        # Public replies never see owner/admin task turns in the chain.
+        rows = [row for row in rows if row[1] != "admin"]
     return format_message_ask_chain_context(rows)
 
 
@@ -558,6 +573,8 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             reference_context=decision.reference_context,
             gate_reason=decision.reason,
             conversation_context=conversation_context,
+            server_rules=bot.rules_block(),
+            server_channels=bot.channels_block(),
         )
     elif decision.action == "banter":
         prompt = build_auto_scan_banter_prompt(
@@ -578,18 +595,19 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
     else:
         raise ValueError(f"auto-scan action has no model response: {decision.action}")
 
+    system_boundary = {
+        "answer": AUTO_SCAN_ANSWER_BOUNDARY,
+        "banter": AUTO_SCAN_BANTER_BOUNDARY,
+        "soft_warning": AUTO_SCAN_WARNING_BOUNDARY,
+    }.get(decision.action, AUTO_SCAN_ANSWER_BOUNDARY)
     async with message.channel.typing():
-        result = await run_hermes(
-            hermes_bin=bot.settings.hermes_bin,
-            profile=bot.settings.hermes_profile,
-            repo=bot.settings.chaos_redux_repo,
+        result = await _public_model_completion(
+            bot=bot,
+            system=system_boundary,
             prompt=prompt,
-            timeout_seconds=bot.settings.hermes_timeout_seconds,
             model=bot.settings.ask_model,
-            provider=bot.settings.ask_provider,
             reasoning_effort=bot.settings.ask_reasoning_effort,
-            toolsets="safe",
-            ignore_rules=True,
+            timeout_seconds=bot.settings.hermes_timeout_seconds,
             activity_label=f"auto-scan {decision.action}",
             actor_id=message.author.id,
         )
@@ -1189,9 +1207,47 @@ class ChaosXBot(discord.Client):
         self._auto_scan_classify_lock = asyncio.Lock()
         self._playtest_synthesis_requested = False
         self._event_note_lock = asyncio.Lock()
+        self.rules = ServerRules(
+            bot_token=settings.discord_token,
+            channel_id=settings.rules_channel_id or 0,
+        )
+        self._rules_refresh_inflight = False
+        self.guild_channels = GuildChannels(
+            bot_token=settings.discord_token,
+            guild_id=settings.allowed_guild_id or settings.command_guild_id or 0,
+        )
+        self._channels_refresh_inflight = False
+
+    async def _refresh_rules_background(self) -> None:
+        try:
+            await self.rules.refresh()
+        finally:
+            self._rules_refresh_inflight = False
+
+    async def _refresh_channels_background(self) -> None:
+        try:
+            await self.guild_channels.refresh()
+        finally:
+            self._channels_refresh_inflight = False
+
+    def rules_block(self) -> str:
+        """Prompt-ready server-rules block; kicks a background refresh when stale."""
+        if self.rules.needs_refresh() and not self._rules_refresh_inflight:
+            self._rules_refresh_inflight = True
+            asyncio.create_task(self._refresh_rules_background())
+        return self.rules.rules_block()
+
+    def channels_block(self) -> str:
+        """Prompt-ready server-channel reference; kicks a background refresh when stale."""
+        if self.guild_channels.needs_refresh() and not self._channels_refresh_inflight:
+            self._channels_refresh_inflight = True
+            asyncio.create_task(self._refresh_channels_background())
+        return self.guild_channels.channels_block()
 
     async def setup_hook(self) -> None:
         await self.store.init()
+        asyncio.create_task(self._refresh_rules_background())
+        asyncio.create_task(self._refresh_channels_background())
         await self.store.set_automation_destination(["auto_question_answering", "auto_bot_topic_banter"], "source channel")
         auto_scan_notice_channel = self.settings.auto_scan_notify_channel_id or self.settings.automation_reminder_channel_id
         if auto_scan_notice_channel:
@@ -1385,6 +1441,7 @@ class ChaosXBot(discord.Client):
             created_at=message.created_at.isoformat(timespec="seconds"),
             is_bot_self=self.user is not None and message.author.id == self.user.id,
             allowed_guild_id=self.settings.allowed_guild_id or self.settings.command_guild_id,
+            message_id=message.id,
         )
         if await handle_message_ask(self, message):
             return
@@ -1639,8 +1696,31 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
     if chain_context:
         owner_context += "\n\n" + chain_context
     owner_request = request + owner_context
-    prompt = build_owner_prompt(owner_request=owner_request, guild_name=guild_name, channel_name=channel_name)
+    admin_conversation_context = await conversation_context_for(
+        bot.settings.db_path,
+        channel_id=channel_id or 0,
+        scope="admin",
+    )
+    prompt = build_owner_prompt(
+        owner_request=owner_request,
+        guild_name=guild_name,
+        channel_name=channel_name,
+        conversation_context=admin_conversation_context,
+        server_rules=bot.rules_block(),
+        server_channels=bot.channels_block(),
+    )
+    # Admin task messages stay in the admin memory partition (public asks never see them).
+    await mark_messages_admin(bot.settings.db_path, [message.id])
     hermes_timeout = bot.settings.admin_ask_timeout_seconds
+    feed: _ThinkingFeed | None = None
+    if message.author.id == bot.settings.owner_id:
+        feed = _ThinkingFeed(bot, kind="dm", label="admin mention ask", owner_id=bot.settings.owner_id)
+        await feed.start()
+
+    async def feed_progress(activity: HermesRunActivity) -> None:
+        if feed is not None:
+            await feed.emit(f"\n[{activity.stage}]", "")
+
     async with message.channel.typing():
         result = await run_hermes(
             hermes_bin=bot.settings.hermes_bin,
@@ -1655,13 +1735,17 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             ignore_rules=False,
             activity_label="admin mention ask",
             actor_id=message.author.id,
+            progress_callback=feed_progress if feed is not None else None,
         )
+    if feed is not None:
+        await feed.finish(result.stdout.strip() or result.stderr.strip() or "No output.")
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
         output = (
             f"Hermes run timed out after {hermes_timeout}s. "
             "For very broad server actions, ask for a preview/scope first, then confirm execution."
         )
+    output = redact_internal_infrastructure(output)
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
         actor_id=message.author.id,
@@ -1691,6 +1775,9 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             first_sent = await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
         else:
             await message.channel.send(content, allowed_mentions=safe_allowed_mentions())
+    if first_sent:
+        await mark_messages_admin(bot.settings.db_path, [first_sent.id])
+        schedule_compaction(bot.settings, channel_id=channel_id, scope="admin")
     if first_sent and result.ok:
         await bot.store.record_message_ask_turn(
             mode="admin",
@@ -1708,13 +1795,191 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         )
 
 
+class _ThinkingFeed:
+    """Live thinking feed: streams the model's reasoning while it works.
+
+    Two display modes:
+    - kind="dm"      -> private DM to the owner (raw reasoning + final answer)
+    - kind="channel" -> public message in the ask channel (reasoning only,
+      redacted so internal infrastructure never leaks through the chain of
+      thought; the final answer is posted as the normal public reply).
+
+    Edits are throttled to stay inside Discord's edit-rate limits and the
+    2000-char message cap.
+    """
+
+    EDIT_THROTTLE_S = 1.2
+    MAX_CHARS = 1800
+
+    def __init__(
+        self,
+        bot: "ChaosXBot",
+        *,
+        kind: str,
+        label: str,
+        owner_id: int | None = None,
+        channel: discord.abc.Messageable | None = None,
+    ) -> None:
+        self.bot = bot
+        self.kind = kind
+        self.public = kind == "channel"
+        self.label = label
+        self.owner_id = owner_id
+        self.channel = channel
+        self.message: discord.Message | None = None
+        self.reasoning = ""
+        self.content = ""
+        self._last_edit = 0.0
+
+    async def start(self) -> bool:
+        try:
+            if self.public:
+                if self.channel is None:
+                    return False
+                self.message = await self.channel.send("🧠 **ChaosX is thinking…**")
+            else:
+                assert self.owner_id is not None  # dm feeds always target the owner
+                owner = await self.bot.fetch_user(self.owner_id)
+                channel = await owner.create_dm()
+                self.message = await channel.send(f"🧠 **Thinking…** (`{self.label}`)")
+            self._last_edit = time.monotonic()
+            return True
+        except Exception:
+            return False
+
+    def _safe(self, text: str) -> str:
+        if self.public:
+            return redact_internal_infrastructure(text)
+        return text
+
+    async def emit(self, reasoning_delta: str, content_delta: str) -> None:
+        if self.message is None:
+            return
+        if reasoning_delta:
+            self.reasoning += self._safe(reasoning_delta)
+        if not self.public and content_delta:
+            self.content += content_delta
+        if time.monotonic() - self._last_edit < self.EDIT_THROTTLE_S:
+            return
+        self._last_edit = time.monotonic()
+        try:
+            await self.message.edit(content=self._render())
+        except Exception:
+            pass
+
+    def _render(self) -> str:
+        if self.public:
+            if not self.reasoning.strip():
+                return "🧠 **ChaosX is thinking…**"
+            return ("🧠 **ChaosX is thinking:**\n" + self.reasoning.strip())[: self.MAX_CHARS]
+        parts: list[str] = []
+        if self.reasoning.strip():
+            parts.append(f"**Thinking:**\n{self.reasoning.strip()}")
+        if self.content.strip():
+            parts.append(f"**Answer:**\n{self.content.strip()}")
+        return ("\n\n".join(parts) or "…")[: self.MAX_CHARS]
+
+    async def finish(self, final_answer: str = "") -> None:
+        if self.message is None:
+            return
+        if self.public:
+            text = "✅ Done — answer posted in the channel."
+            if self.reasoning.strip():
+                text = (
+                    "🧠 **ChaosX was thinking:**\n"
+                    + self.reasoning.strip()
+                    + "\n\n✅ Done — answer posted in the channel."
+                )
+        else:
+            if final_answer:
+                self.content = final_answer
+            text = self._render() or "Done."
+        try:
+            await self.message.edit(content=text[: self.MAX_CHARS])
+        except Exception:
+            pass
+
+
+async def _public_model_completion(
+    *,
+    bot: "ChaosXBot",
+    system: str,
+    prompt: str,
+    model: str,
+    reasoning_effort: str,
+    timeout_seconds: int,
+    activity_label: str,
+    actor_id: int | None = None,
+    feed: _ThinkingFeed | None = None,
+) -> HermesResult:
+    """Run a public (no-tools) model completion: direct API fast path first.
+
+    Public asks never need tools, so a raw chat completion is both faster
+    (~1-3s vs ~5-9s through a Hermes CLI subprocess) and safer (no code
+    execution surface). Falls back to the Hermes subprocess on any direct
+    path failure so a transient API issue never breaks answering. When a
+    feed is provided, the model's reasoning is streamed live (DM for the
+    owner, redacted channel message for everyone else).
+    """
+    digest = prompt_hash(prompt)
+    user_part = prompt[len(system):].strip() if prompt.startswith(system) else prompt.strip()
+    try:
+        answer_chunks: list[str] = []
+        async for reasoning_delta, content_delta in direct_chat_completion_stream(
+            system=system,
+            user=user_part,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        ):
+            if content_delta:
+                answer_chunks.append(content_delta)
+            if feed is not None:
+                await feed.emit(reasoning_delta, content_delta)
+        answer = "".join(answer_chunks).strip()
+        if not answer:
+            raise DirectAskError("direct stream returned an empty answer")
+        if feed is not None:
+            await feed.finish(answer)
+        return HermesResult(prompt_hash=digest, returncode=0, stdout=answer, stderr="")
+    except Exception as exc:  # noqa: BLE001 - fall back for any direct-path failure
+        if feed is not None:
+            await feed.emit(f"\n[direct path failed: {exc!r} — switching to Hermes subprocess]", "")
+        try:
+            print(f"[chaosx-bot] direct completion failed ({exc!r}); falling back to Hermes subprocess", file=sys.stderr)
+        except Exception:
+            pass
+
+        async def feed_progress(activity: HermesRunActivity) -> None:
+            if feed is not None:
+                await feed.emit(f"\n[{activity.stage}]", "")
+
+        result = await run_hermes(
+            hermes_bin=bot.settings.hermes_bin,
+            profile=bot.settings.hermes_profile,
+            repo=bot.settings.chaos_redux_repo,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            model=model,
+            provider=bot.settings.ask_provider,
+            reasoning_effort=reasoning_effort,
+            toolsets="safe",
+            ignore_rules=True,
+            activity_label=activity_label,
+            actor_id=actor_id,
+            progress_callback=feed_progress if feed is not None else None,
+        )
+        if feed is not None:
+            await feed.finish(result.stdout.strip() or result.stderr.strip() or "No output.")
+        return result
+
+
 async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, request: str, *, parent_bot_message_id: int | None = None) -> None:
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
     command_name = "reply ask" if parent_bot_message_id else "mention ask"
     source_paths_allowed = public_ask_wants_sources(request)
     reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
-    memory_context = await fetch_message_ask_chain_context(bot, bot_message_id=parent_bot_message_id, guild_id=guild_id, channel_id=channel_id)
+    memory_context = await fetch_message_ask_chain_context(bot, bot_message_id=parent_bot_message_id, guild_id=guild_id, channel_id=channel_id, public_only=True)
     domain_context = reference_context or memory_context
     rejection = public_ask_rejection_reason(request, reference_context=domain_context)
     if rejection:
@@ -1749,6 +2014,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         bot.settings.db_path,
         channel_id=getattr(message.channel, "id", 0),
         exclude_message_id=message.id,
+        scope="public",
     )
     prompt = build_public_prompt(
         user_request=request,
@@ -1758,21 +2024,26 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         source_paths_allowed=source_paths_allowed,
         memory_context=memory_context,
         conversation_context=conversation_context,
+        server_rules=bot.rules_block(),
+        server_channels=bot.channels_block(),
     )
+    feed: _ThinkingFeed | None = None
+    if message.author.id == bot.settings.owner_id:
+        feed = _ThinkingFeed(bot, kind="dm", label=command_name, owner_id=bot.settings.owner_id)
+    else:
+        feed = _ThinkingFeed(bot, kind="channel", label=command_name, channel=message.channel)
+    await feed.start()
     async with message.channel.typing():
-        result = await run_hermes(
-            hermes_bin=bot.settings.hermes_bin,
-            profile=bot.settings.hermes_profile,
-            repo=bot.settings.chaos_redux_repo,
+        result = await _public_model_completion(
+            bot=bot,
+            system=PUBLIC_ASK_BOUNDARY,
             prompt=prompt,
-            timeout_seconds=bot.settings.hermes_timeout_seconds,
             model=bot.settings.ask_model,
-            provider=bot.settings.ask_provider,
             reasoning_effort=bot.settings.ask_reasoning_effort,
-            toolsets="safe",
-            ignore_rules=True,
+            timeout_seconds=bot.settings.hermes_timeout_seconds,
             activity_label=command_name,
             actor_id=message.author.id,
+            feed=feed,
         )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
@@ -2503,8 +2774,22 @@ async def run_hermes_command(
         owner_context += await fetch_admin_member_context(bot, interaction, request)
         owner_context += await fetch_admin_message_context(bot, interaction, request)
     owner_request = request + owner_context
+    admin_conversation_context = ""
+    if owner_only:
+        admin_conversation_context = await conversation_context_for(
+            bot.settings.db_path,
+            channel_id=interaction.channel_id or 0,
+            scope="admin",
+        )
     prompt = (
-        build_owner_prompt(owner_request=owner_request, guild_name=guild_name, channel_name=channel_name)
+        build_owner_prompt(
+            owner_request=owner_request,
+            guild_name=guild_name,
+            channel_name=channel_name,
+            conversation_context=admin_conversation_context,
+            server_rules=bot.rules_block(),
+            server_channels=bot.channels_block(),
+        )
         if owner_only
         else build_public_prompt(
             user_request=request,
@@ -2513,6 +2798,8 @@ async def run_hermes_command(
             reference_context=reference_context if rate_bucket == "ask" else "",
             source_paths_allowed=source_paths_allowed,
             memory_context=memory_context if rate_bucket == "ask" else "",
+            server_rules=bot.rules_block(),
+            server_channels=bot.channels_block(),
         )
     )
     model = provider = reasoning_effort = toolsets = None
@@ -2537,21 +2824,42 @@ async def run_hermes_command(
         activity_box[0] = activity
 
     try:
-        result = await run_hermes(
-            hermes_bin=bot.settings.hermes_bin,
-            profile=bot.settings.hermes_profile,
-            repo=bot.settings.chaos_redux_repo,
-            prompt=prompt,
-            timeout_seconds=hermes_timeout,
-            model=model,
-            provider=provider,
-            reasoning_effort=reasoning_effort,
-            toolsets=toolsets,
-            ignore_rules=ignore_rules,
-            activity_label=command_name,
-            actor_id=interaction.user.id,
-            progress_callback=progress_callback if owner_only else None,
-        )
+        if not owner_only and use_ask_model:
+            assert model is not None and reasoning_effort is not None  # set by use_ask_model branch
+            feed: _ThinkingFeed | None = None
+            if interaction.user.id == bot.settings.owner_id:
+                feed = _ThinkingFeed(bot, kind="dm", label=command_name, owner_id=bot.settings.owner_id)
+            elif interaction.channel is not None:
+                feed = _ThinkingFeed(bot, kind="channel", label=command_name, channel=cast(discord.abc.Messageable, interaction.channel))
+            if feed is not None:
+                await feed.start()
+            result = await _public_model_completion(
+                bot=bot,
+                system=PUBLIC_ASK_BOUNDARY,
+                prompt=prompt,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=hermes_timeout,
+                activity_label=command_name,
+                actor_id=interaction.user.id,
+                feed=feed,
+            )
+        else:
+            result = await run_hermes(
+                hermes_bin=bot.settings.hermes_bin,
+                profile=bot.settings.hermes_profile,
+                repo=bot.settings.chaos_redux_repo,
+                prompt=prompt,
+                timeout_seconds=hermes_timeout,
+                model=model,
+                provider=provider,
+                reasoning_effort=reasoning_effort,
+                toolsets=toolsets,
+                ignore_rules=ignore_rules,
+                activity_label=command_name,
+                actor_id=interaction.user.id,
+                progress_callback=progress_callback if owner_only else None,
+            )
     finally:
         if progress_stop is not None:
             progress_stop.set()
@@ -2569,6 +2877,7 @@ async def run_hermes_command(
         if rate:
             output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
     else:
+        output = redact_internal_infrastructure(output)
         memory_output = ""
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
@@ -2618,6 +2927,10 @@ async def run_hermes_command(
             if i == 0:
                 first_sent = sent
     first_sent_id = getattr(first_sent, "id", None)
+    if owner_only and first_sent_id is not None:
+        # Admin task output stays in the admin memory partition only.
+        await mark_messages_admin(bot.settings.db_path, [first_sent_id])
+        schedule_compaction(bot.settings, channel_id=interaction.channel_id, scope="admin")
     if should_record_reply_memory and first_sent_id is not None:
         await bot.store.record_message_ask_turn(
             mode="public",

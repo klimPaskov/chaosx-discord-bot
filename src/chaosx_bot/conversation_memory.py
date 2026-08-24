@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable
 
 import aiosqlite
 
-from .hermes_bridge import run_hermes
+from .hermes_bridge import redact_internal_infrastructure, run_hermes
 
 # Recent raw messages included in the prompt context.
 WINDOW_SIZE = 14
@@ -42,14 +42,19 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     author_id INTEGER NOT NULL,
     author_name TEXT NOT NULL,
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    message_id INTEGER NOT NULL DEFAULT 0,
+    visibility TEXT NOT NULL DEFAULT 'public'
 );
 CREATE INDEX IF NOT EXISTS idx_conv_messages_channel ON conversation_messages(channel_id, id);
+CREATE INDEX IF NOT EXISTS idx_conv_messages_visibility ON conversation_messages(channel_id, visibility, id);
 CREATE TABLE IF NOT EXISTS conversation_summaries (
-    channel_id INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'public',
     summary TEXT NOT NULL,
     last_message_id INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel_id, scope)
 );
 """
 
@@ -62,9 +67,32 @@ _COMPACT_PROMPT = (
 )
 
 
+async def _migrate_schema(db: aiosqlite.Connection) -> None:
+    """Add visibility/message_id columns and scope-aware summaries in place.
+
+    Existing rows default to 'public' visibility and legacy summaries are
+    preserved as the admin scope (they were compacted from all messages).
+    """
+    cols = {row[1] for row in await (await db.execute("PRAGMA table_info(conversation_messages)")).fetchall()}
+    if "visibility" not in cols:
+        await db.execute("ALTER TABLE conversation_messages ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'")
+    if "message_id" not in cols:
+        await db.execute("ALTER TABLE conversation_messages ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0")
+    summary_cols = {row[1] for row in await (await db.execute("PRAGMA table_info(conversation_summaries)")).fetchall()}
+    if "scope" not in summary_cols:
+        await db.execute("ALTER TABLE conversation_summaries RENAME TO conversation_summaries_legacy")
+        await db.executescript(_SCHEMA)
+        await db.execute(
+            "INSERT INTO conversation_summaries (channel_id, scope, summary, last_message_id, updated_at) "
+            "SELECT channel_id, 'admin', summary, last_message_id, updated_at FROM conversation_summaries_legacy"
+        )
+        await db.execute("DROP TABLE conversation_summaries_legacy")
+
+
 async def _ensure_schema(db_path: Path) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(_SCHEMA)
+        await _migrate_schema(db)
         await db.commit()
 
 
@@ -84,12 +112,16 @@ async def capture_message(
     created_at: str,
     is_bot_self: bool,
     allowed_guild_id: int | None,
+    message_id: int = 0,
+    visibility: str = "public",
 ) -> None:
     """Store one guild message for conversation context.
 
     Skips DMs, other bots, slash commands, empty content, and any guild the
     bot is not allowed in. The bot's own replies are captured (they are part
-    of the conversation).
+    of the conversation). ``visibility`` separates public channel history
+    from owner/admin task history: public asks read only 'public' rows,
+    while the admin path reads everything.
     """
     if guild_id is None or (allowed_guild_id and guild_id != allowed_guild_id):
         return
@@ -102,8 +134,8 @@ async def capture_message(
         await _ensure_schema(db_path)
         async with aiosqlite.connect(db_path) as db:
             await db.execute(
-                "INSERT INTO conversation_messages (channel_id, author_id, author_name, content, created_at) VALUES (?, ?, ?, ?, ?)",
-                (channel_id, author_id, author_name[:64], text, created_at),
+                "INSERT INTO conversation_messages (channel_id, author_id, author_name, content, created_at, message_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (channel_id, author_id, author_name[:64], text, created_at, message_id, visibility),
             )
             await db.execute(
                 "DELETE FROM conversation_messages WHERE channel_id = ? AND id NOT IN ("
@@ -117,28 +149,52 @@ async def capture_message(
         return
 
 
+async def mark_messages_admin(db_path: Path, message_ids: list[int]) -> None:
+    """Upgrade captured rows to admin visibility so they stay out of public history."""
+    ids = [int(mid) for mid in message_ids if mid]
+    if not ids:
+        return
+    try:
+        await _ensure_schema(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            for mid in ids:
+                await db.execute(
+                    "UPDATE conversation_messages SET visibility = 'admin' WHERE message_id = ?",
+                    (mid,),
+                )
+            await db.commit()
+    except Exception:
+        return
+
+
 async def conversation_context_for(
     db_path: Path,
     channel_id: int,
     *,
     exclude_message_id: int | None = None,
     window: int = WINDOW_SIZE,
+    scope: str = "public",
 ) -> str:
-    """Build the continuity block: compacted summary + recent raw messages."""
+    """Build the continuity block: compacted summary + recent raw messages.
+
+    ``scope`` selects the memory partition: 'public' reads only public
+    history (no owner/admin task messages), 'admin' reads everything.
+    """
+    visibility_filter = "" if scope == "admin" else "AND visibility = 'public'"
     try:
         await _ensure_schema(db_path)
         async with aiosqlite.connect(db_path) as db:
             db.row_factory = aiosqlite.Row
             summary_row = await (
                 await db.execute(
-                    "SELECT summary FROM conversation_summaries WHERE channel_id = ?",
-                    (channel_id,),
+                    "SELECT summary FROM conversation_summaries WHERE channel_id = ? AND scope = ?",
+                    (channel_id, scope),
                 )
             ).fetchone()
             rows = await (
                 await db.execute(
-                    "SELECT id, author_name, content FROM conversation_messages "
-                    "WHERE channel_id = ? ORDER BY id DESC LIMIT ?",
+                    f"SELECT id, author_name, content FROM conversation_messages "
+                    f"WHERE channel_id = ? {visibility_filter} ORDER BY id DESC LIMIT ?",
                     (channel_id, window + 1),
                 )
             ).fetchall()
@@ -147,10 +203,16 @@ async def conversation_context_for(
 
     parts: list[str] = []
     if summary_row is not None and str(summary_row["summary"]).strip():
-        parts.append(f"Channel memory (compacted summary):\n{summary_row['summary'].strip()}")
+        parts.append(
+            "Channel memory (compacted summary):\n"
+            + redact_internal_infrastructure(str(summary_row["summary"]).strip())
+        )
     kept = [row for row in reversed(rows) if row["id"] != exclude_message_id]
     if kept:
-        lines = [f"- {row['author_name']}: {_excerpt(row['content'])}" for row in kept[:window]]
+        lines = [
+            f"- {row['author_name']}: {redact_internal_infrastructure(_excerpt(row['content']))}"
+            for row in kept[:window]
+        ]
         parts.append("Recent conversation:\n" + "\n".join(lines))
     return "\n\n".join(parts)
 
@@ -162,26 +224,29 @@ async def compact_if_due(
     summarize: Callable[[str], Awaitable[str]],
     threshold: int = COMPACT_THRESHOLD,
     keep_after_compact: int = KEEP_AFTER_COMPACT,
+    scope: str = "public",
 ) -> bool:
     """Compress a channel's conversation once enough new messages arrived.
 
     ``summarize`` receives the full compact prompt and must return the new
     summary text (or "" on failure). Returns True when compaction ran.
+    ``scope`` compacts the matching memory partition ('public' or 'admin').
     """
+    visibility_filter = "" if scope == "admin" else "AND visibility = 'public'"
     try:
         await _ensure_schema(db_path)
         async with aiosqlite.connect(db_path) as db:
             db.row_factory = aiosqlite.Row
             summary_row = await (
                 await db.execute(
-                    "SELECT summary, last_message_id FROM conversation_summaries WHERE channel_id = ?",
-                    (channel_id,),
+                    "SELECT summary, last_message_id FROM conversation_summaries WHERE channel_id = ? AND scope = ?",
+                    (channel_id, scope),
                 )
             ).fetchone()
             since = summary_row["last_message_id"] if summary_row else 0
             count_row = await (
                 await db.execute(
-                    "SELECT COUNT(*) AS n FROM conversation_messages WHERE channel_id = ? AND id > ?",
+                    f"SELECT COUNT(*) AS n FROM conversation_messages WHERE channel_id = ? AND id > ? {visibility_filter}",
                     (channel_id, since),
                 )
             ).fetchone()
@@ -189,8 +254,8 @@ async def compact_if_due(
                 return False
             rows = await (
                 await db.execute(
-                    "SELECT author_name, content FROM conversation_messages "
-                    "WHERE channel_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+                    f"SELECT author_name, content FROM conversation_messages "
+                    f"WHERE channel_id = ? AND id > ? {visibility_filter} ORDER BY id ASC LIMIT ?",
                     (channel_id, since, 60),
                 )
             ).fetchall()
@@ -221,25 +286,33 @@ async def compact_if_due(
     try:
         async with aiosqlite.connect(db_path) as db:
             await db.execute(
-                "INSERT INTO conversation_summaries (channel_id, summary, last_message_id, updated_at) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(channel_id) DO UPDATE SET summary = excluded.summary, "
+                "INSERT INTO conversation_summaries (channel_id, scope, summary, last_message_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(channel_id, scope) DO UPDATE SET summary = excluded.summary, "
                 "last_message_id = excluded.last_message_id, updated_at = excluded.updated_at",
-                (channel_id, new_summary[:SUMMARY_MAX_CHARS], last_id, now),
+                (channel_id, scope, new_summary[:SUMMARY_MAX_CHARS], last_id, now),
             )
-            await db.execute(
-                "DELETE FROM conversation_messages WHERE channel_id = ? AND id NOT IN ("
-                "SELECT id FROM conversation_messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?"
-                ")",
-                (channel_id, channel_id, keep_after_compact),
-            )
+            if scope == "admin":
+                await db.execute(
+                    "DELETE FROM conversation_messages WHERE channel_id = ? AND id NOT IN ("
+                    "SELECT id FROM conversation_messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?"
+                    ")",
+                    (channel_id, channel_id, keep_after_compact),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM conversation_messages WHERE channel_id = ? AND visibility = 'public' AND id NOT IN ("
+                    "SELECT id FROM conversation_messages WHERE channel_id = ? AND visibility = 'public' ORDER BY id DESC LIMIT ?"
+                    ")",
+                    (channel_id, channel_id, keep_after_compact),
+                )
             await db.commit()
     except Exception:
         return False
     return True
 
 
-async def run_compaction_if_due(settings: Any, channel_id: int | None) -> bool:
+async def run_compaction_if_due(settings: Any, channel_id: int | None, scope: str = "public") -> bool:
     """Background compaction glue: summarize via the same public Hermes bridge."""
     if channel_id is None:
         return False
@@ -258,22 +331,22 @@ async def run_compaction_if_due(settings: Any, channel_id: int | None) -> bool:
             reasoning_effort=getattr(settings, "ask_reasoning_effort", None),
             toolsets="safe",
             ignore_rules=True,
-            activity_label="conversation compact",
+            activity_label=f"conversation compact ({scope})",
             actor_id=0,
         )
         if not result.ok:
             return ""
         return sanitize_public_ask_output(result.stdout.strip())
 
-    return await compact_if_due(settings.db_path, channel_id, summarize=_summarize)
+    return await compact_if_due(settings.db_path, channel_id, summarize=_summarize, scope=scope)
 
 
-def schedule_compaction(settings: Any, channel_id: int | None) -> None:
+def schedule_compaction(settings: Any, channel_id: int | None, scope: str = "public") -> None:
     """Fire-and-forget compaction; never raises into the event loop."""
 
     async def _run() -> None:
         try:
-            await run_compaction_if_due(settings, channel_id)
+            await run_compaction_if_due(settings, channel_id, scope=scope)
         except Exception:
             return
 
