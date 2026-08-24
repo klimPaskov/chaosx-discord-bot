@@ -90,6 +90,11 @@ BUG_REPORT_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:report|submit)\s+(?:a\s+)?(?
 SUGGESTION_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:suggest|submit)\s+(?:an?\s+)?(?:idea|suggestion)|where\s+do\s+i\s+(?:post|submit)\s+(?:an?\s+)?(?:idea|suggestion))\b", re.I)
 EVENT_IDEA_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:suggest|submit)\s+(?:an?\s+)?event\s+idea|where\s+do\s+i\s+(?:post|submit)\s+(?:an?\s+)?event\s+idea)\b", re.I)
 ACCESS_RE = re.compile(r"\b(?:how\s+do\s+i\s+(?:get|gain)\s+access|where\s+do\s+i\s+get\s+access|reaction\s+role|join\s+the\s+community)\b", re.I)
+COMMUNITY_SERVER_RE = re.compile(
+    r"\b(?:who|whos|whose)\b.{0,140}\b(?:troll(?:er|ing)?|meme(?:r|s)?|clown|funniest|most\s+active|biggest|top|best)\b"
+    r"|\b(?:who|whos|whose)\b.{0,120}\b(?:on|in|of)\s+(?:the\s+)?(?:server|community|here|guild)\b",
+    re.I,
+)
 CATALOG_NAME_INTENT_RE = re.compile(
     r"\b(?:event|scenario|cluster|mechanic|evolution|world[-\s]+end|implemented|implementation|trigger|effect|outcome)\b"
     r"|\bhow\s+(?:does|do|did|can|would)\b.{0,120}\b(?:work|trigger|start|end|happen)\b",
@@ -262,6 +267,10 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     if server.acted:
         return server
 
+    community = _community_server_answer(question, settings=settings)
+    if community.acted:
+        return community
+
     if _catalog_name_lookup_allowed(question):
         exact = _exact_catalog_name_answer(question, knowledge=knowledge)
         if exact.acted:
@@ -320,7 +329,11 @@ def classify_bot_topic_banter(content: str, *, settings: Settings, knowledge: Kn
             return AutoScanDecision("none")
     # Banter gets the same grounding as normal asks (mod files) so it can
     # mention real facts without hallucinating; empty when nothing matches.
-    reference_context = knowledge.public_ask_context(text) if knowledge is not None else ""
+    reference_context: str = ""
+    if knowledge is not None:
+        lookup = getattr(knowledge, "public_ask_context", None)
+        if callable(lookup):
+            reference_context = str(lookup(text) or "")
     return AutoScanDecision(
         action="banter",
         confidence=100,
@@ -376,6 +389,23 @@ def _server_answer(question: str, *, settings: Settings) -> AutoScanDecision:
     if BOT_CAPABILITY_QUESTION_RE.search(question):
         return AutoScanDecision("answer", confidence=100, reason="ChaosX capability question", question=question, source="server_help", reference_context=context)
     return AutoScanDecision("none")
+
+
+def _community_server_answer(question: str, *, settings: Settings) -> AutoScanDecision:
+    """Questions about the community/server itself (members, culture, who's
+    who) are Chaos Redux-relevant and answerable: they get the server rules
+    + channels reference and the channel's recent conversation as grounding,
+    with the usual light personality. No mod-file grounding required."""
+    if not COMMUNITY_SERVER_RE.search(question):
+        return AutoScanDecision("none")
+    return AutoScanDecision(
+        "answer",
+        confidence=90,
+        reason="community/server question",
+        question=question,
+        source="server_community",
+        reference_context=_server_reference_context(settings),
+    )
 
 
 def _server_reference_context(settings: Settings) -> str:

@@ -1199,6 +1199,9 @@ class ChaosXBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.store = Store(settings.db_path)
         self.rate_limiter = FixedWindowRateLimiter()
+        # Thinking-feed messages stay visible until dismissed (🗑️ reaction),
+        # per owner preference: never deleted automatically after the answer.
+        self.thinking_feed_messages: set[int] = set()
         visual_repo = settings.focus_tree_repo or settings.chaos_redux_repo
         self.knowledge = Knowledge(
             settings.chaos_redux_repo,
@@ -1472,9 +1475,35 @@ class ChaosXBot(discord.Client):
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         await self.handle_access_reaction(payload, added=True)
+        await self.handle_thinking_dismiss(payload)
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
         await self.handle_access_reaction(payload, added=False)
+
+    async def handle_thinking_dismiss(self, payload: discord.RawReactionActionEvent) -> None:
+        """🗑️ on a thinking-feed message dismisses it (deletes the message)."""
+        if self.user is None or payload.user_id == self.user.id:
+            return
+        if payload.message_id not in self.thinking_feed_messages:
+            return
+        emoji = getattr(payload.emoji, "name", "")
+        if emoji != _ThinkingFeed.DISMISS_EMOJI:
+            return
+        channel = self.get_channel(payload.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            try:
+                channel = await self.fetch_channel(payload.channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+        if not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+        finally:
+            self.thinking_feed_messages.discard(payload.message_id)
 
     async def handle_access_reaction(self, payload: discord.RawReactionActionEvent, *, added: bool) -> None:
         if self.user is None or payload.user_id == self.user.id:
@@ -1829,8 +1858,9 @@ class _ThinkingFeed:
       decision process (refusals, instruction references, hidden context)
       are removed. The final answer is posted as the normal public reply.
 
-    The message is TEMPORARY in both modes: it streams live while the model
-    works and is deleted on completion, once the real answer is out.
+    The message PERSISTS after the answer (both modes) — it is not deleted.
+    Public channel feeds get a 🗑️ reaction so anyone can dismiss the
+    thinking message when they're done reading it.
 
     Edits are throttled to stay inside Discord's edit-rate limits and the
     2000-char message cap.
@@ -1838,6 +1868,8 @@ class _ThinkingFeed:
 
     EDIT_THROTTLE_S = 1.2
     MAX_CHARS = 1800
+    DISMISS_EMOJI = "🗑️"
+    MAX_TRACKED_MESSAGES = 500
 
     def __init__(
         self,
@@ -1865,6 +1897,15 @@ class _ThinkingFeed:
                 if self.channel is None:
                     return False
                 self.message = await self.channel.send("🧠 **ChaosX is thinking…**")
+                # Keep the message registered so a 🗑️ reaction can dismiss it.
+                feed_id = self.message.id
+                if len(self.bot.thinking_feed_messages) >= self.MAX_TRACKED_MESSAGES:
+                    self.bot.thinking_feed_messages.clear()
+                self.bot.thinking_feed_messages.add(feed_id)
+                try:
+                    await self.message.add_reaction(self.DISMISS_EMOJI)
+                except Exception:
+                    pass
             else:
                 assert self.owner_id is not None  # dm feeds always target the owner
                 owner = await self.bot.fetch_user(self.owner_id)
@@ -1911,19 +1952,19 @@ class _ThinkingFeed:
         return ("\n\n".join(parts) or "…")[: self.MAX_CHARS]
 
     async def finish(self, final_answer: str = "") -> None:
-        """The thinking message is temporary: remove it once work is done.
+        """Leave the thinking message visible — do NOT delete it.
 
-        The final answer is posted as the normal reply by the caller, so the
-        thinking message must not linger in the channel or the owner DM.
+        The thinking feed persists until the user dismisses it (public feeds
+        carry a 🗑️ reaction; the owner can delete the DM). The final answer
+        is posted as the normal reply by the caller.
         """
-        if self.message is None:
-            return
-        try:
-            await self.message.delete()
-        except Exception:
-            pass
-        finally:
-            self.message = None
+        if self.message is not None and not self.public:
+            # DM feeds embed the final answer; keep them as the owner's record.
+            try:
+                await self.message.edit(content=self._render() or "…")
+            except Exception:
+                pass
+        self.message = None
 
 
 async def _public_model_completion(

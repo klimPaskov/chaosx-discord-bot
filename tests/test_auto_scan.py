@@ -68,6 +68,45 @@ def test_auto_scan_server_answers_and_blocks_unsafe_prompts():
     assert credential_request.action == "none"
 
 
+def test_auto_scan_answers_community_server_questions():
+    """Server/community questions (members, culture, who's who) are Chaos
+    Redux-relevant and must be answered, not dropped by the grounding gate."""
+    settings = Settings(discord_token="dummy")
+    knowledge = cast(Any, SimpleNamespace())
+
+    troller = classify_auto_answer(
+        "who is the top troller of the server?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+    assert troller.action == "answer"
+    assert troller.source == "server_community"
+    assert troller.confidence == 90
+
+    active = classify_auto_answer(
+        "who's the most active here?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+    assert active.action == "answer"
+    assert active.source == "server_community"
+
+    member = classify_auto_answer(
+        "who is the best hoi4 player on the server?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+    assert member.action == "answer"
+
+    # Unrelated questions without a server/community anchor stay ignored.
+    unrelated = classify_auto_answer(
+        "who won the world cup?",
+        knowledge=knowledge,
+        settings=settings,
+    )
+    assert unrelated.action == "none"
+
+
 def test_auto_scan_answers_bot_capability_and_grounded_mod_questions(tmp_path: Path):
     settings = Settings(discord_token="dummy")
     capability = classify_auto_answer(

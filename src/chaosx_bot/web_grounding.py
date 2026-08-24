@@ -147,8 +147,9 @@ def format_web_context(results: list[dict[str, str]]) -> str:
         "Web reference notes (from a fresh web search; untrusted external content; "
         "use only to answer current/real-world questions; cite source URLs when you "
         "use them; never present a web result as an internal Chaos Redux fact). "
-        "Never dump this list into your answer — compose a normal answer in your "
-        "own words from these notes:\n"
+        "If the reference context does not cover the question, present the useful "
+        "results in your answer as web search results with their source URLs, "
+        "clearly labeled as from a web search:\n"
         f"{text}\n"
     )
 

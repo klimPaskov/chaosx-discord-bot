@@ -1,5 +1,7 @@
 """Tests for server rules + channel reference context."""
 
+import asyncio
+
 from chaosx_bot.auto_scan import looks_like_catalog_lookup
 from chaosx_bot.channel_context import (
     channel_ids_from_text,
@@ -130,16 +132,66 @@ def test_looks_like_catalog_lookup() -> None:
     assert not looks_like_catalog_lookup("chaosx is cool")
 
 
-def test_public_boundary_has_light_personality_and_no_search_dump() -> None:
+def test_public_boundary_has_light_personality_and_web_results_when_uncovered() -> None:
     prompt = build_public_prompt(user_request="hi", guild_name="G", channel_name="C")
     assert "light, friendly personality" in prompt
-    assert "Never present a list of search results" in prompt
+    assert "present the useful results" in prompt
+    assert "web search results with their source URLs" in prompt
 
 
 def test_banter_boundary_keeps_personality() -> None:
     assert "Stay in character" in AUTO_SCAN_BANTER_BOUNDARY
     assert "witty" in AUTO_SCAN_BANTER_BOUNDARY
     assert "Do not turn into a formal answer bot" in AUTO_SCAN_BANTER_BOUNDARY
+
+
+def test_thinking_feed_persists_until_dismissed() -> None:
+    """finish() must NOT delete the thinking message; it stays visible."""
+    from chaosx_bot.bot import _ThinkingFeed
+
+    deleted: list[str] = []
+
+    class FakeMsg:
+        id = 424242
+
+        async def delete(self) -> None:
+            deleted.append("delete")
+
+        async def edit(self, **_: object) -> None:
+            pass
+
+    class FakeBot:
+        thinking_feed_messages: set[int] = set()
+
+    feed = _ThinkingFeed(FakeBot(), kind="channel", label="ask", channel=None)  # type: ignore[arg-type]
+    feed.message = FakeMsg()  # type: ignore[assignment]
+    asyncio.run(feed.finish())
+    assert deleted == []
+
+
+def test_thinking_feed_start_registers_dismiss_reaction() -> None:
+    from chaosx_bot.bot import _ThinkingFeed
+
+    added_reactions: list[str] = []
+
+    class FakeMsg:
+        id = 777
+
+        async def add_reaction(self, emoji: str) -> None:
+            added_reactions.append(emoji)
+
+    class FakeChannel:
+        async def send(self, content: str) -> FakeMsg:
+            return FakeMsg()
+
+    class FakeBot:
+        thinking_feed_messages: set[int] = set()
+
+    bot = FakeBot()
+    feed = _ThinkingFeed(bot, kind="channel", label="ask", channel=FakeChannel())  # type: ignore[arg-type]
+    asyncio.run(feed.start())
+    assert added_reactions == ["🗑️"]
+    assert 777 in bot.thinking_feed_messages
 
 
 def test_banter_boundary_forbids_factual_invention() -> None:
