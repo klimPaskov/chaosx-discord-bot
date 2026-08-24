@@ -1,5 +1,6 @@
 """Tests for server rules + channel reference context."""
 
+from chaosx_bot.auto_scan import looks_like_catalog_lookup
 from chaosx_bot.channel_context import (
     channel_ids_from_text,
     format_message_context,
@@ -8,11 +9,13 @@ from chaosx_bot.guild_channels import GuildChannels, format_channel_reference
 from chaosx_bot.hermes_bridge import (
     AUTO_SCAN_BANTER_BOUNDARY,
     build_auto_scan_answer_prompt,
+    build_auto_scan_banter_prompt,
     build_auto_scan_warning_prompt,
     build_public_prompt,
     redact_public_reasoning,
 )
 from chaosx_bot.server_rules import ServerRules
+from chaosx_bot.web_grounding import format_web_context, parse_search_results
 
 
 def test_channel_ids_from_text() -> None:
@@ -50,13 +53,81 @@ def test_public_prompt_includes_channel_context() -> None:
     assert "read-only" in prompt
 
 
+def test_parse_search_results_and_format_web_context() -> None:
+    page = (
+        '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fhoi4&amp;rut=x">Hearts of Iron 4 Wiki</a>'
+        '<a class="result__snippet">The best <b>HOI4</b> resource site.</a>'
+        '<a class="result__a" href="https://other.example">Second</a>'
+        '<a class="result__snippet">Second result snippet.</a>'
+    )
+    results = parse_search_results(page)
+    assert len(results) == 2
+    assert results[0]["title"] == "Hearts of Iron 4 Wiki"
+    assert results[0]["url"] == "https://example.com/hoi4"
+    assert "HOI4" in results[0]["snippet"]
+    block = format_web_context(results)
+    assert "Web reference notes" in block
+    assert "https://example.com/hoi4" in block
+    assert "untrusted" in block
+
+
+def test_public_prompt_includes_web_context() -> None:
+    prompt = build_public_prompt(
+        user_request="What is the current HOI4 version?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        web_context="Web reference notes (from a fresh web search; untrusted external content; "
+        "use only to answer current/real-world questions; cite source URLs when you "
+        "use them; never present a web result as an internal Chaos Redux fact):\n"
+        "- HOI4 Wiki\n  https://example.com\n",
+    )
+    assert "Web reference notes" in prompt
+    assert "https://example.com" in prompt
+    assert "cite source URLs" in prompt
+
+
+def test_banter_prompt_includes_reference_and_web_context() -> None:
+    prompt = build_auto_scan_banter_prompt(
+        user_message="chaosx is cool",
+        guild_name="G",
+        channel_name="C",
+        gate_reason="bot-topic praise",
+        reference_context="Event 2: Zombie Outbreak (event 2).",
+        web_context="Web reference notes: - Something\n",
+    )
+    assert "Event 2: Zombie Outbreak" in prompt
+    assert "Web reference notes" in prompt
+    assert "playful" in prompt
+
+
+def test_looks_like_catalog_lookup() -> None:
+    # Event/scenario/cluster/mechanic intent -> web search must NOT run.
+    assert looks_like_catalog_lookup("civil war event chaos redux")
+    assert looks_like_catalog_lookup("event 42")
+    assert looks_like_catalog_lookup("scenario 7")
+    assert looks_like_catalog_lookup("how does the moon landing event work")
+    # General/current questions -> web search is allowed.
+    assert not looks_like_catalog_lookup("what is the current hoi4 version")
+    assert not looks_like_catalog_lookup("chaosx is cool")
+
+
+def test_public_boundary_has_light_personality_and_no_search_dump() -> None:
+    prompt = build_public_prompt(user_request="hi", guild_name="G", channel_name="C")
+    assert "light, friendly personality" in prompt
+    assert "Never present a list of search results" in prompt
+
+
+def test_banter_boundary_keeps_personality() -> None:
+    assert "Stay in character" in AUTO_SCAN_BANTER_BOUNDARY
+    assert "witty" in AUTO_SCAN_BANTER_BOUNDARY
+    assert "Do not turn into a formal answer bot" in AUTO_SCAN_BANTER_BOUNDARY
+
+
 def test_banter_boundary_forbids_factual_invention() -> None:
-    """Random 'chaosx'/bot mentions may get playful banter, but the boundary
-    must forbid stating facts about the mod or the bot (that is what caused
-    hallucinations vs the grounded mention path)."""
+    """Random 'chaosx'/bot mentions may get playful banter with the same
+    reference context as asks, but must never invent facts outside it."""
     assert "playful" in AUTO_SCAN_BANTER_BOUNDARY
-    assert "never state facts" in AUTO_SCAN_BANTER_BOUNDARY
-    assert "invented" in AUTO_SCAN_BANTER_BOUNDARY
+    assert "Never invent facts" in AUTO_SCAN_BANTER_BOUNDARY
     assert "reference context" in AUTO_SCAN_BANTER_BOUNDARY
 
 

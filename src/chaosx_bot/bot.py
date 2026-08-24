@@ -16,7 +16,7 @@ import discord
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
-from .auto_scan import AutoScanDecision, classify_message
+from .auto_scan import AutoScanDecision, classify_message, looks_like_catalog_lookup
 from .conversation_memory import (
     capture_message,
     conversation_context_for,
@@ -55,6 +55,7 @@ from .focus_trees import (
 )
 from .guild_channels import GuildChannels
 from .channel_context import ChannelReader
+from .web_grounding import WebGrounder
 from .vault_index import refresh_vault_indexes
 from .ask_api import DirectAskError, direct_chat_completion, direct_chat_completion_stream
 from .hermes_bridge import (
@@ -567,6 +568,16 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
         channel_id=getattr(message.channel, "id", 0),
         exclude_message_id=message.id,
     )
+    # Web grounding when local notes have nothing (public asks AND banter).
+    # Never for catalog lookups (event/scenario/cluster/mechanic): a miss
+    # there must be a plain "not found", never a web-search dump.
+    web_context = ""
+    if (
+        bot.settings.web_search_enabled
+        and not (decision.reference_context or "").strip()
+        and not looks_like_catalog_lookup(user_message)
+    ):
+        web_context = await bot.web.search_context(user_message)
     if decision.action == "answer":
         prompt = build_auto_scan_answer_prompt(
             user_message=user_message,
@@ -577,6 +588,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             conversation_context=conversation_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
+            web_context=web_context,
         )
     elif decision.action == "banter":
         prompt = build_auto_scan_banter_prompt(
@@ -585,6 +597,10 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             channel_name=channel_name,
             gate_reason=decision.reason,
             conversation_context=conversation_context,
+            reference_context=decision.reference_context,
+            server_rules=bot.rules_block(),
+            server_channels=bot.channels_block(),
+            web_context=web_context,
         )
     elif decision.action == "soft_warning":
         prompt = build_auto_scan_warning_prompt(
@@ -1222,6 +1238,8 @@ class ChaosXBot(discord.Client):
         # Read-only channel message context for public asks (GET only; the
         # public path structurally has no Discord mutation calls).
         self.channel_reader = ChannelReader(bot_token=settings.discord_token)
+        # Server-side web-search grounding for public asks/banter.
+        self.web = WebGrounder()
 
     async def _refresh_rules_background(self) -> None:
         try:
@@ -2035,6 +2053,15 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         channel_context = "\n".join(part for part in (main_context, linked_context) if part)
     except Exception:
         channel_context = ""
+    # Web grounding when the local notes have no answer (never for catalog
+    # lookups — a miss must be a plain "not found", not a search dump).
+    web_context = ""
+    if (
+        bot.settings.web_search_enabled
+        and not reference_context.strip()
+        and not looks_like_catalog_lookup(request)
+    ):
+        web_context = await bot.web.search_context(request)
     prompt = build_public_prompt(
         user_request=request,
         guild_name=guild_name,
@@ -2046,6 +2073,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
         channel_context=channel_context,
+        web_context=web_context,
     )
     feed: _ThinkingFeed | None = None
     if message.author.id == bot.settings.owner_id:
@@ -2812,6 +2840,16 @@ async def run_hermes_command(
             channel_context = "\n".join(part for part in (main_context, linked_context) if part)
         except Exception:
             channel_context = ""
+    # Web grounding when local notes have no answer (public asks only; never
+    # for catalog lookups — a miss must be a plain "not found", not a dump).
+    web_context = ""
+    if (
+        not owner_only
+        and bot.settings.web_search_enabled
+        and not reference_context.strip()
+        and not looks_like_catalog_lookup(request)
+    ):
+        web_context = await bot.web.search_context(request)
     prompt = (
         build_owner_prompt(
             owner_request=owner_request,

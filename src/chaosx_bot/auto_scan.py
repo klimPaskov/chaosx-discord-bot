@@ -206,6 +206,19 @@ def is_blocked_for_auto_answer(content: str) -> bool:
     return any(term in text for term in AUTO_SCAN_BLOCK_TERMS)
 
 
+def looks_like_catalog_lookup(content: str) -> bool:
+    """True when the text targets a specific catalog item (event/scenario/
+    cluster/mechanic). Web search must never be used for these — only the
+    knowledge index may answer, and a miss means 'not found', not a web dump."""
+    text = content or ""
+    return bool(
+        EVENT_ID_RE.search(text)
+        or SCENARIO_ID_RE.search(text)
+        or CLUSTER_ID_RE.search(text)
+        or CATALOG_NAME_INTENT_RE.search(text)
+    )
+
+
 def classify_soft_warning(content: str) -> AutoScanDecision:
     text = content or ""
     if not text.strip():
@@ -286,10 +299,10 @@ def classify_message(content: str, *, knowledge: Knowledge, settings: Settings) 
     answer = classify_auto_answer(content, knowledge=knowledge, settings=settings)
     if answer.acted:
         return answer
-    return classify_bot_topic_banter(content, settings=settings)
+    return classify_bot_topic_banter(content, settings=settings, knowledge=knowledge)
 
 
-def classify_bot_topic_banter(content: str, *, settings: Settings) -> AutoScanDecision:
+def classify_bot_topic_banter(content: str, *, settings: Settings, knowledge: Knowledge | None = None) -> AutoScanDecision:
     text = (content or "").strip()
     if not settings.auto_scan_bot_topic_enabled:
         return AutoScanDecision("none")
@@ -305,12 +318,16 @@ def classify_bot_topic_banter(content: str, *, settings: Settings) -> AutoScanDe
     if generic_topic and not explicit_topic:
         if OTHER_BOT_CONTEXT_RE.search(text) or reason == "bot-topic conversation":
             return AutoScanDecision("none")
+    # Banter gets the same grounding as normal asks (mod files) so it can
+    # mention real facts without hallucinating; empty when nothing matches.
+    reference_context = knowledge.public_ask_context(text) if knowledge is not None else ""
     return AutoScanDecision(
         action="banter",
         confidence=100,
         reason=reason,
         question=text,
         source="bot_topic",
+        reference_context=reference_context,
     )
 
 

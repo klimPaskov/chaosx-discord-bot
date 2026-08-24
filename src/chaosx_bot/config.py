@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     allowed_guild_id: Optional[int] = Field(default=1395459671598436533)
     command_guild_id: Optional[int] = Field(default=1395459671598436533)
     public_ask_limit_per_hour: int = Field(default=-1, ge=-1, le=100, description="Public ask rate limit per user per hour; -1 = unlimited (no check), 0 = disabled")
+    web_search_enabled: bool = Field(default=True, description="Allow server-side web-search grounding for public asks when local notes have no answer")
     public_scripted_limit_per_hour: int = Field(default=20, ge=0, le=500)
     public_prompt_max_chars: int = Field(default=600, ge=100, le=4000)
     mention_ask_enabled: bool = Field(default=True, description="Allow direct @ChaosX mentions to act like public /ask; requires Discord Message Content Intent")
