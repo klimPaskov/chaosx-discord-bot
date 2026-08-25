@@ -437,22 +437,40 @@ async def test_handle_auto_scan_runs_classifier_off_gateway_loop(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_auto_scan_never_engages_owner_messages(monkeypatch):
+async def test_handle_auto_scan_owner_gets_answers_but_no_warnings(monkeypatch):
+    """Owner is auto-scanned for answers/banter (bot/mod-related messages are
+    noticed without a mention) but never receives soft rule warnings."""
     settings = Settings(discord_token="dummy")
     bot = _FakeBot(settings)
-    message = _FakeMessage("@everyone free nitro here")
-    message.author = SimpleNamespace(id=settings.owner_id, bot=False)
 
-    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
-        raise AssertionError("classifier must not run for owner messages")
+    # Owner message that would be a soft warning -> must NOT engage.
+    warning_message = _FakeMessage("@everyone free nitro here")
+    warning_message.author = SimpleNamespace(id=settings.owner_id, bot=False)
+    warning_calls: list[Any] = []
 
-    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    def fake_warning_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        warning_calls.append(args)
+        return AutoScanDecision("soft_warning", confidence=100, reason="spam ping", question="", source="rules")
 
-    handled = await handle_auto_scan(cast(Any, bot), cast(Any, message))
-
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_warning_classify)
+    handled = await handle_auto_scan(cast(Any, bot), cast(Any, warning_message))
     assert handled is False
     assert bot.store.events == []
-    assert message.replies == []
+    assert warning_message.replies == []
+
+    # Owner mod-related question -> auto-scan ANSWER is delivered.
+    bot2 = _FakeBot(settings)
+    answer_message = _FakeMessage("What is this zombie event id?")
+    answer_message.author = SimpleNamespace(id=settings.owner_id, bot=False)
+
+    def fake_answer_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        return AutoScanDecision("answer", confidence=100, reason="grounded Chaos Redux question", question=args[0], source="project_context", reference_context="Zombie Outbreak is a Chaos Redux event.")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_answer_classify)
+    monkeypatch.setattr("chaosx_bot.bot.generate_auto_scan_model_response", _fake_model_output)
+    handled2 = await handle_auto_scan(cast(Any, bot2), cast(Any, answer_message))
+    assert handled2 is True
+    assert any("Model-generated auto-scan reply" in r["content"] for r in answer_message.replies)
 
 
 @pytest.mark.asyncio

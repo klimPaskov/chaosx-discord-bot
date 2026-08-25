@@ -16,7 +16,7 @@ import discord
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
-from .auto_scan import AutoScanDecision, classify_message, looks_like_catalog_lookup
+from .auto_scan import BOT_TOPIC_RE, AutoScanDecision, classify_message, looks_like_catalog_lookup
 from .conversation_memory import (
     backfill_capture,
     capture_message,
@@ -127,9 +127,9 @@ PUBLIC_ASK_BLOCK_TERMS = {
     "@everyone", "@here", "ban everyone", "delete channel", "delete role", "manage server", "moderation",
 }
 PUBLIC_ASK_OFFTOPIC_TERMS = {
-    "recipe", "ingredients", "measurements", "exact measurements", "cooking", "baking", "capital of",
+    "recipe", "ingredients", "measurements", "exact measurements", "cooking", "baking", "cake", "capital of",
     "haiku", "write a poem", "write me a poem", "write a song", "write me a song", "write an essay",
-    "homework", "unrelated test phrase",
+    "homework", "unrelated test phrase", "vacation", "get married", "wedding",
     "medical advice", "legal advice", "financial advice", "relationship advice",
 }
 PUBLIC_ASK_INJECTION_PATTERNS = {
@@ -221,8 +221,6 @@ def public_ask_rejection_reason(request: str, *, reference_context: str = "") ->
     if _contains_guard_term(text, PUBLIC_ASK_OFFTOPIC_TERMS):
         return PUBLIC_ASK_REDIRECT
     if _contains_guard_term(text, PUBLIC_ASK_INJECTION_PATTERNS):
-        return PUBLIC_ASK_REDIRECT
-    if not _contains_guard_term(text, PUBLIC_ASK_DOMAIN_TERMS) and not reference_context.strip():
         return PUBLIC_ASK_REDIRECT
     return None
 
@@ -528,10 +526,10 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         return False
     if message.author.bot or getattr(message, "webhook_id", None):
         return False
-    # Owner is never auto-scanned: no soft warnings, answers, or banter for the
-    # operator's own messages. The owner has dedicated mention/reply admin paths.
-    if message.author.id == bot.settings.owner_id:
-        return False
+    is_owner = message.author.id == bot.settings.owner_id
+    # The owner is auto-scanned for ANSWERS and BANTER like everyone else (so
+    # bot/server/mod-related messages are noticed without a mention), but never
+    # receives soft rule warnings — the owner runs the server.
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
     if public_deny_reason(guild_id, bot.settings.allowed_guild_id):
@@ -643,6 +641,8 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         return True
 
     if decision.action == "soft_warning":
+        if is_owner:
+            return False
         if not bot.settings.auto_scan_soft_warning_enabled or not await bot.store.automation_enabled(AUTO_WARNING_AUTOMATION_NAME):
             return False
         limit = bot.settings.auto_scan_warning_limit_per_user_hour
@@ -696,18 +696,28 @@ def extract_mention_ask_request(content: str, bot_user_id: int | None) -> str | 
     return request
 
 
-def extract_message_ask_request(content: str, bot_user_id: int | None, *, mentioned: bool, replies_to_bot: bool) -> str:
-    """Extract the intended ask from a mention/reply message.
+def extract_message_ask_request(content: str, bot_user_id: int | None, *, mentioned: bool, replies_to_bot: bool, name_addressed: bool = False) -> str:
+    """Extract the intended ask from a mention/reply/name-addressed message.
 
     Discord reply notifications can include the replied-to bot in ``message.mentions``
     without putting a literal ``<@bot>`` token in message content. In that case,
     preserve the typed reply text instead of treating the request as empty.
+    ``name_addressed`` covers messages that refer to the bot by name (e.g.
+    "chaosx hello") without an actual mention; the name is stripped so the
+    rest of the message becomes the request.
     """
 
     if mentioned:
         explicit_request = extract_mention_ask_request(content, bot_user_id)
         if explicit_request is not None:
             return explicit_request
+    if name_addressed:
+        stripped = BOT_TOPIC_RE.sub(" ", content or "")
+        stripped = re.sub(r"\s+([,.;:!?])", r"\1", stripped)
+        stripped = re.sub(r"^[\s,;:!\-—–]+", "", stripped)
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+        if stripped:
+            return stripped
     if replies_to_bot:
         return " ".join((content or "").split())
     return ""
@@ -1747,6 +1757,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
         return False
 
     mentioned = any(user.id == bot.user.id for user in getattr(message, "mentions", []) or [])
+    name_addressed = bool(BOT_TOPIC_RE.search(message.content or "")) and not mentioned
     parent_bot_message_id = referenced_message_id(message)
     known_parent_turn = await bot.store.get_message_ask_turn(
         bot_message_id=parent_bot_message_id,
@@ -1755,7 +1766,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
     )
     replies_to_known_chain = known_parent_turn is not None
     replies_to_bot = replies_to_known_chain or reply_resolved_to_bot(message, bot.user.id)
-    if not mentioned and not replies_to_bot:
+    if not mentioned and not name_addressed and not replies_to_bot:
         return False
 
     request = extract_message_ask_request(
@@ -1763,6 +1774,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
         bot.user.id,
         mentioned=mentioned,
         replies_to_bot=replies_to_bot,
+        name_addressed=name_addressed,
     )
 
     if not request:
@@ -1782,7 +1794,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
         )
         return True
 
-    if not mentioned and not replies_to_known_chain:
+    if not mentioned and not name_addressed and not replies_to_known_chain:
         return False
     await run_public_ask_message(
         bot,

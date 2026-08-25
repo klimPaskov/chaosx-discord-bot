@@ -284,10 +284,13 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     if TESTING_RE.search(question):
         return AutoScanDecision("answer", confidence=100, reason="exact testing queue question", question=question, source="testing", reference_context=knowledge.testing_queue())
 
-    if not has_grounded_context_signal(question):
-        return AutoScanDecision("none")
-
-    context = knowledge.public_ask_context(question)
+    # No pre-gate on explicit "mod/chaosx" wording: any question with a
+    # domain signal is looked up, and the lookup itself is the gate — if
+    # the knowledge base returns relevant context, answer; otherwise stay
+    # silent. This lets mod-related questions like "What is this zombie
+    # event id?" be answered even when they never literally say "mod".
+    context_lookup = getattr(knowledge, "public_ask_context", None)
+    context = str(context_lookup(question)) if callable(context_lookup) else ""
     if context.strip():
         return AutoScanDecision(
             "answer",
