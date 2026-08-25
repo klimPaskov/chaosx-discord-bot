@@ -207,6 +207,23 @@ def test_thinking_feed_ephemeral_posts_only_you_can_see_message() -> None:
     assert sent_ephemeral == [True]
 
 
+def test_thinking_feed_active_rules() -> None:
+    """The ephemeral feed must force an ephemeral defer for public /ask —
+    otherwise Discord posts the feed as a normal visible message (Hoops
+    report 2026-08-25)."""
+    from chaosx_bot.bot import thinking_feed_active
+
+    owner = 789502982122373150
+    # Owner always gets the feed on slash asks, even when disabled for others.
+    assert thinking_feed_active(owner_only=False, use_ask_model=True, user_id=owner, owner_id=owner, enabled=False)
+    # Non-owner only when enabled.
+    assert not thinking_feed_active(owner_only=False, use_ask_model=True, user_id=123, owner_id=owner, enabled=False)
+    assert thinking_feed_active(owner_only=False, use_ask_model=True, user_id=123, owner_id=owner, enabled=True)
+    # Owner/admin command runs and non-ask scripted commands never feed.
+    assert not thinking_feed_active(owner_only=True, use_ask_model=False, user_id=owner, owner_id=owner, enabled=True)
+    assert not thinking_feed_active(owner_only=False, use_ask_model=False, user_id=owner, owner_id=owner, enabled=True)
+
+
 def test_public_prompt_includes_user_context_block() -> None:
     prompt = build_public_prompt(
         user_request="who am i?",

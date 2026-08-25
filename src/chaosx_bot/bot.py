@@ -1904,6 +1904,24 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         )
 
 
+def thinking_feed_active(
+    *,
+    owner_only: bool,
+    use_ask_model: bool,
+    user_id: int,
+    owner_id: int,
+    enabled: bool,
+) -> bool:
+    """Whether the ephemeral thinking feed shows for this slash ask.
+
+    Owner always sees it (raw); everyone else only when the feed is enabled.
+    Only slash asks (public model path) can carry an ephemeral feed — plain
+    `@ChaosX` mention asks have no interaction, and owner/admin command runs
+    use their own progress reporting.
+    """
+    return (not owner_only) and use_ask_model and (user_id == owner_id or enabled)
+
+
 class _ThinkingFeed:
     """Live thinking feed: streams the model's reasoning while it works.
 
@@ -2850,7 +2868,19 @@ async def run_hermes_command(
                 )
                 return
 
-    await interaction.response.defer(ephemeral=not public, thinking=True)
+    # The thinking feed is only possible for slash asks (owner raw, everyone
+    # else only when enabled). Ephemeral followups require the initial defer
+    # to be ephemeral — otherwise Discord posts them as normal visible
+    # messages. So when a feed is active we defer ephemeral and post the
+    # final answer as a normal channel message to keep it public.
+    feed_active = thinking_feed_active(
+        owner_only=owner_only,
+        use_ask_model=use_ask_model,
+        user_id=interaction.user.id,
+        owner_id=bot.settings.owner_id,
+        enabled=bot.settings.thinking_feed_enabled,
+    )
+    await interaction.response.defer(ephemeral=not public or feed_active, thinking=True)
     activity_box: list[HermesRunActivity | None] = [None]
     progress_stop: asyncio.Event | None = None
     progress_task: asyncio.Task[None] | None = None
@@ -2952,7 +2982,7 @@ async def run_hermes_command(
         if not owner_only and use_ask_model:
             assert model is not None and reasoning_effort is not None  # set by use_ask_model branch
             feed: _ThinkingFeed | None = None
-            if interaction.user.id == bot.settings.owner_id or bot.settings.thinking_feed_enabled:
+            if feed_active:
                 # Ephemeral: posted in the SAME channel, "Only you can see this
                 # message", dismissible by the user with Discord's built-in ✕.
                 # Owner's feed is raw; everyone else gets scrubbed reasoning.
@@ -3044,17 +3074,27 @@ async def run_hermes_command(
     first_sent = None
     if send_output or not result.ok:
         for i, part in enumerate(_chunk(output)):
-            send_kwargs = {
-                "ephemeral": not public,
-                "allowed_mentions": safe_allowed_mentions(),
-            }
-            if i == 0 and should_record_reply_memory:
-                send_kwargs["wait"] = True
             prefix = f"{header}\n" if i == 0 and header else ""
-            sent = await interaction.followup.send(
-                prefix + part,
-                **send_kwargs,
-            )
+            if feed_active and public:
+                # The interaction deferred ephemeral for the thinking feed, so
+                # followups would stay ephemeral. The final answer is posted
+                # as a normal channel message so everyone sees it, while the
+                # feed remains "only you can see this".
+                sent = await interaction.channel.send(  # type: ignore[union-attr]
+                    prefix + part,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+            else:
+                followup_kwargs: dict[str, Any] = {
+                    "ephemeral": not public,
+                    "allowed_mentions": safe_allowed_mentions(),
+                }
+                if i == 0 and should_record_reply_memory:
+                    followup_kwargs["wait"] = True
+                sent = await interaction.followup.send(
+                    prefix + part,
+                    **followup_kwargs,
+                )
             if i == 0:
                 first_sent = sent
     first_sent_id = getattr(first_sent, "id", None)
@@ -3898,6 +3938,38 @@ def register_commands(bot: ChaosXBot) -> None:
         rows = await bot.store.list_warned_users(guild_id=interaction.guild_id, limit=limit)
         text = format_warned_users(rows)
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin warned-users", summary=str(len(rows)))
+        for part in _chunk(text):
+            if interaction.response.is_done():
+                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            else:
+                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="user-memory", description="Show saved memory (profile + recent history) about a user.")
+    async def admin_user_memory(interaction: discord.Interaction, user: str, limit: int = 10) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        # Resolve by numeric ID first, then by display name from captured history.
+        author_id: int | None = None
+        match = re.fullmatch(r"\d{15,25}", user.strip())
+        if match:
+            author_id = int(match.group(0))
+        if author_id is None:
+            known = await known_authors_for(bot.settings.db_path, limit=200, scope="public")
+            needle = user.strip().casefold()
+            for uid, name in known.items():
+                if name.casefold() == needle:
+                    author_id = uid
+                    break
+        if author_id is None:
+            text = f"No saved memory found for `{user.strip()}`. The bot only remembers users who have talked to it (display names from captured history)."
+            await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"not found: {user.strip()}")
+            return
+        profile = await user_profile_for(bot.settings.db_path, author_id, scope="public")
+        history = await user_history_for(bot.settings.db_path, author_id, scope="public", limit=limit)
+        parts = [part for part in (profile, history) if part]
+        text = "\n\n".join(parts) if parts else f"No saved memory yet for user id `{author_id}` (profile builds after enough captured messages)."
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"user id {author_id} limit {limit}")
         for part in _chunk(text):
             if interaction.response.is_done():
                 await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
