@@ -20,6 +20,7 @@ from .auto_scan import AutoScanDecision, classify_message, looks_like_catalog_lo
 from .conversation_memory import (
     capture_message,
     conversation_context_for,
+    known_authors_for,
     mark_messages_admin,
     schedule_compaction,
     user_history_for,
@@ -591,6 +592,8 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
+            server_facts=bot.server_facts_block(),
+            known_users=await bot.known_users_block(),
             web_context=web_context,
         )
     elif decision.action == "banter":
@@ -604,6 +607,8 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             reference_context=decision.reference_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
+            server_facts=bot.server_facts_block(),
+            known_users=await bot.known_users_block(),
             web_context=web_context,
         )
     elif decision.action == "soft_warning":
@@ -1203,9 +1208,6 @@ class ChaosXBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.store = Store(settings.db_path)
         self.rate_limiter = FixedWindowRateLimiter()
-        # Thinking-feed messages stay visible until dismissed (🗑️ reaction),
-        # per owner preference: never deleted automatically after the answer.
-        self.thinking_feed_messages: set[int] = set()
         visual_repo = settings.focus_tree_repo or settings.chaos_redux_repo
         self.knowledge = Knowledge(
             settings.chaos_redux_repo,
@@ -1273,6 +1275,53 @@ class ChaosXBot(discord.Client):
             self._channels_refresh_inflight = True
             asyncio.create_task(self._refresh_channels_background())
         return self.guild_channels.channels_block()
+
+    def server_facts_block(self) -> str:
+        """Prompt-ready server/bot identity facts (owner, bot maker, main dev)."""
+        s = self.settings
+        parts = [
+            "Server facts:",
+            f"- Server owner: {s.server_owner_name}",
+            f"- ChaosX bot maker: {s.bot_maker_name}",
+            f"- Main Chaos Redux developer: {s.main_dev_name}",
+        ]
+        return "\n".join(parts)
+
+    async def known_users_block(self, *, limit: int = 60) -> str:
+        """Prompt-ready user directory: display names for users the bot knows.
+
+        Built from captured public conversation history (author_id ->
+        latest author_name), plus any guild member cache entries. Lets the
+        bot name users directly without pinging them.
+        """
+        mapping: dict[int, str] = {}
+        try:
+            mapping = await known_authors_for(
+                self.settings.db_path,
+                limit=limit,
+                scope="public",
+            )
+        except Exception:
+            mapping = {}
+        for guild in self.guilds:
+            if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
+                continue
+            for member in guild.members:
+                if member.id in mapping:
+                    continue
+                name = getattr(member, "display_name", None) or getattr(member, "name", None)
+                if name:
+                    mapping[member.id] = name
+                if len(mapping) >= limit:
+                    break
+            if len(mapping) >= limit:
+                break
+        if not mapping:
+            return ""
+        lines = ["User directory (display names; refer to users by these names, never ping/mention them):"]
+        for uid in sorted(mapping, key=lambda i: mapping[i].casefold())[:limit]:
+            lines.append(f"- {mapping[uid]} (id {uid})")
+        return "\n".join(lines)
 
     async def user_context_for(self, user_id: int, *, exclude_message_id: int | None = None) -> str:
         """Prompt-ready info about the asking user: display name, top role, and
@@ -1514,35 +1563,9 @@ class ChaosXBot(discord.Client):
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         await self.handle_access_reaction(payload, added=True)
-        await self.handle_thinking_dismiss(payload)
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
         await self.handle_access_reaction(payload, added=False)
-
-    async def handle_thinking_dismiss(self, payload: discord.RawReactionActionEvent) -> None:
-        """🗑️ on a thinking-feed message dismisses it (deletes the message)."""
-        if self.user is None or payload.user_id == self.user.id:
-            return
-        if payload.message_id not in self.thinking_feed_messages:
-            return
-        emoji = getattr(payload.emoji, "name", "")
-        if emoji != _ThinkingFeed.DISMISS_EMOJI:
-            return
-        channel = self.get_channel(payload.channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            try:
-                channel = await self.fetch_channel(payload.channel_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                return
-        if not isinstance(channel, discord.TextChannel):
-            return
-        try:
-            message = await channel.fetch_message(payload.message_id)
-            await message.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-        finally:
-            self.thinking_feed_messages.discard(payload.message_id)
 
     async def handle_access_reaction(self, payload: discord.RawReactionActionEvent, *, added: bool) -> None:
         if self.user is None or payload.user_id == self.user.id:
@@ -1803,14 +1826,8 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
     # Admin task messages stay in the admin memory partition (public asks never see them).
     await mark_messages_admin(bot.settings.db_path, [message.id])
     hermes_timeout = bot.settings.admin_ask_timeout_seconds
-    feed: _ThinkingFeed | None = None
-    if message.author.id == bot.settings.owner_id:
-        feed = _ThinkingFeed(bot, kind="dm", label="admin mention ask", owner_id=bot.settings.owner_id)
-        await feed.start()
-
-    async def feed_progress(activity: HermesRunActivity) -> None:
-        if feed is not None:
-            await feed.emit(f"\n[{activity.stage}]", "")
+    # No thinking feed for mention asks: only slash commands can carry an
+    # ephemeral ("only you can see this") message, and DMs are not used.
 
     async with message.channel.typing():
         result = await run_hermes(
@@ -1826,10 +1843,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             ignore_rules=False,
             activity_label="admin mention ask",
             actor_id=message.author.id,
-            progress_callback=feed_progress if feed is not None else None,
         )
-    if feed is not None:
-        await feed.finish(result.stdout.strip() or result.stderr.strip() or "No output.")
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
         output = (
@@ -1889,21 +1903,18 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
 class _ThinkingFeed:
     """Live thinking feed: streams the model's reasoning while it works.
 
-    Two display modes:
-    - kind="dm"      -> private DM to the owner (raw reasoning + final answer)
-    - kind="ephemeral" -> slash-command feed: posted as an EPHEMERAL
-      interaction message ("Only you can see this message") so only the
-      asking user sees it and can dismiss it with Discord's built-in ✕.
-      Reasoning is scrubbed like the public channel feed.
-    - kind="channel" -> public message in the ask channel (mention asks,
-      which cannot be ephemeral) showing the model's REAL reasoning,
-      scrubbed so sensitive details never surface: internal infrastructure
-      phrasing, decision-process lines, and persona/tone self-talk are
-      removed. The final answer is posted as the normal public reply.
+    Single display mode: an EPHEMERAL interaction message in the SAME
+    channel as the command ("Only you can see this message"), so only the
+    user who invoked the command sees it and can dismiss it with Discord's
+    built-in ✕. Never a DM, never a public channel broadcast, and no
+    basket-emoji dismissal.
 
-    The message PERSISTS after the answer (all modes) — it is not deleted.
-    Channel feeds get a 🗑️ reaction so anyone can dismiss the thinking
-    message; ephemeral feeds carry Discord's built-in dismiss control.
+    Reasoning is scrubbed for regular users; the owner's ephemeral feed is
+    raw (only they can see it either way). The final answer is always posted
+    as the normal public reply.
+
+    Only slash/context commands can carry an ephemeral feed — plain
+    `@ChaosX` mention asks have no interaction, so they get no thinking feed.
 
     Edits are throttled to stay inside Discord's edit-rate limits and the
     2000-char message cap.
@@ -1911,27 +1922,19 @@ class _ThinkingFeed:
 
     EDIT_THROTTLE_S = 1.2
     MAX_CHARS = 1800
-    DISMISS_EMOJI = "🗑️"
-    MAX_TRACKED_MESSAGES = 500
 
     def __init__(
         self,
         bot: "ChaosXBot",
         *,
-        kind: str,
         label: str,
-        owner_id: int | None = None,
-        channel: discord.abc.Messageable | None = None,
-        interaction: discord.Interaction | None = None,
+        interaction: discord.Interaction,
+        raw: bool = False,
     ) -> None:
         self.bot = bot
-        self.kind = kind
-        self.public = kind in ("channel", "ephemeral")
-        self.ephemeral = kind == "ephemeral"
         self.label = label
-        self.owner_id = owner_id
-        self.channel = channel
         self.interaction = interaction
+        self.raw = raw
         self.message: discord.Message | None = None
         self.reasoning = ""
         self.content = ""
@@ -1939,51 +1942,28 @@ class _ThinkingFeed:
 
     async def start(self) -> bool:
         try:
-            if self.ephemeral:
-                if self.interaction is None:
-                    return False
-                self.message = await self.interaction.followup.send(
-                    "🧠 **ChaosX is thinking…**",
-                    ephemeral=True,
-                )
-            elif self.public:
-                if self.channel is None:
-                    return False
-                self.message = await self.channel.send("🧠 **ChaosX is thinking…**")
-                # Keep the message registered so a 🗑️ reaction can dismiss it.
-                feed_id = self.message.id
-                if len(self.bot.thinking_feed_messages) >= self.MAX_TRACKED_MESSAGES:
-                    self.bot.thinking_feed_messages.clear()
-                self.bot.thinking_feed_messages.add(feed_id)
-                try:
-                    await self.message.add_reaction(self.DISMISS_EMOJI)
-                except Exception:
-                    pass
-            else:
-                assert self.owner_id is not None  # dm feeds always target the owner
-                owner = await self.bot.fetch_user(self.owner_id)
-                channel = await owner.create_dm()
-                self.message = await channel.send(f"🧠 **Thinking…** (`{self.label}`)")
+            self.message = await self.interaction.followup.send(
+                "🧠 **ChaosX is thinking…**",
+                ephemeral=True,
+            )
             self._last_edit = time.monotonic()
             return True
         except Exception:
             return False
 
     def _safe(self, text: str) -> str:
-        if self.public:
-            # Public feed: show real reasoning, but scrubbed of internal
-            # infrastructure phrasing AND lines revealing the bot's internal
-            # decision process (refusals, instructions, hidden context).
-            return redact_public_reasoning(text)
-        return text
+        if self.raw:
+            return text
+        # Regular-user ephemeral feed: show real reasoning, but scrubbed of
+        # internal infrastructure phrasing AND lines revealing the bot's
+        # internal decision process (refusals, instructions, hidden context).
+        return redact_public_reasoning(text)
 
     async def emit(self, reasoning_delta: str, content_delta: str) -> None:
         if self.message is None:
             return
         if reasoning_delta:
             self.reasoning += self._safe(reasoning_delta)
-        if not self.public and content_delta:
-            self.content += content_delta
         if time.monotonic() - self._last_edit < self.EDIT_THROTTLE_S:
             return
         self._last_edit = time.monotonic()
@@ -1993,30 +1973,17 @@ class _ThinkingFeed:
             pass
 
     def _render(self) -> str:
-        if self.public:
-            if not self.reasoning.strip():
-                return "🧠 **ChaosX is thinking…**"
-            return ("🧠 **ChaosX is thinking:**\n" + self.reasoning.strip())[: self.MAX_CHARS]
-        parts: list[str] = []
-        if self.reasoning.strip():
-            parts.append(f"**Thinking:**\n{self.reasoning.strip()}")
-        if self.content.strip():
-            parts.append(f"**Answer:**\n{self.content.strip()}")
-        return ("\n\n".join(parts) or "…")[: self.MAX_CHARS]
+        if not self.reasoning.strip():
+            return "🧠 **ChaosX is thinking…**"
+        return ("🧠 **ChaosX is thinking:**\n" + self.reasoning.strip())[: self.MAX_CHARS]
 
     async def finish(self, final_answer: str = "") -> None:
         """Leave the thinking message visible — do NOT delete it.
 
-        The thinking feed persists until the user dismisses it (public feeds
-        carry a 🗑️ reaction; the owner can delete the DM). The final answer
-        is posted as the normal reply by the caller.
+        The ephemeral feed persists until the user dismisses it with
+        Discord's built-in ✕. The final answer is posted as the normal reply
+        by the caller.
         """
-        if self.message is not None and not self.public:
-            # DM feeds embed the final answer; keep them as the owner's record.
-            try:
-                await self.message.edit(content=self._render() or "…")
-            except Exception:
-                pass
         self.message = None
 
 
@@ -2038,8 +2005,8 @@ async def _public_model_completion(
     (~1-3s vs ~5-9s through a Hermes CLI subprocess) and safer (no code
     execution surface). Falls back to the Hermes subprocess on any direct
     path failure so a transient API issue never breaks answering. When a
-    feed is provided, the model's reasoning is streamed live (DM for the
-    owner, redacted channel message for everyone else).
+    feed is provided, the model's reasoning is streamed live (raw DM for the
+    owner, scrubbed per-user DM or ephemeral feed for the asking user).
     """
     digest = prompt_hash(prompt)
     user_part = prompt[len(system):].strip() if prompt.startswith(system) else prompt.strip()
@@ -2167,15 +2134,13 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
+        server_facts=bot.server_facts_block(),
+        known_users=await bot.known_users_block(),
         channel_context=channel_context,
         web_context=web_context,
     )
-    feed: _ThinkingFeed | None = None
-    if message.author.id == bot.settings.owner_id:
-        feed = _ThinkingFeed(bot, kind="dm", label=command_name, owner_id=bot.settings.owner_id)
-    else:
-        feed = _ThinkingFeed(bot, kind="channel", label=command_name, channel=message.channel)
-    await feed.start()
+    # No thinking feed for mention asks: only slash commands can carry an
+    # ephemeral ("only you can see this") message, and DMs are not used.
     async with message.channel.typing():
         result = await _public_model_completion(
             bot=bot,
@@ -2186,7 +2151,6 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
             timeout_seconds=bot.settings.hermes_timeout_seconds,
             activity_label=command_name,
             actor_id=message.author.id,
-            feed=feed,
         )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
@@ -2953,6 +2917,7 @@ async def run_hermes_command(
             conversation_context=admin_conversation_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
+            server_facts=bot.server_facts_block(),
         )
         if owner_only
         else build_public_prompt(
@@ -2965,6 +2930,8 @@ async def run_hermes_command(
             user_context=await bot.user_context_for(interaction.user.id),
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
+            server_facts=bot.server_facts_block(),
+            known_users=await bot.known_users_block(),
             channel_context=channel_context,
         )
     )
@@ -2993,13 +2960,16 @@ async def run_hermes_command(
         if not owner_only and use_ask_model:
             assert model is not None and reasoning_effort is not None  # set by use_ask_model branch
             feed: _ThinkingFeed | None = None
-            if interaction.user.id == bot.settings.owner_id:
-                feed = _ThinkingFeed(bot, kind="dm", label=command_name, owner_id=bot.settings.owner_id)
-            elif interaction.channel is not None:
-                # Ephemeral: "Only you can see this message", dismissible by the
-                # asking user with Discord's built-in ✕ (mention asks use the
-                # channel feed instead, since they cannot be ephemeral).
-                feed = _ThinkingFeed(bot, kind="ephemeral", label=command_name, interaction=interaction)
+            if interaction.user.id == bot.settings.owner_id or bot.settings.thinking_feed_enabled:
+                # Ephemeral: posted in the SAME channel, "Only you can see this
+                # message", dismissible by the user with Discord's built-in ✕.
+                # Owner's feed is raw; everyone else gets scrubbed reasoning.
+                feed = _ThinkingFeed(
+                    bot,
+                    label=command_name,
+                    interaction=interaction,
+                    raw=(interaction.user.id == bot.settings.owner_id),
+                )
             if feed is not None:
                 await feed.start()
             result = await _public_model_completion(

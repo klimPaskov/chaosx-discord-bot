@@ -9,6 +9,7 @@ from chaosx_bot.conversation_memory import (
     capture_message,
     compact_if_due,
     conversation_context_for,
+    known_authors_for,
     user_history_for,
 )
 
@@ -63,6 +64,43 @@ def test_user_history_for_returns_public_messages_newest_first(tmp_path: Path) -
         other = await user_history_for(db, author_id=3002, scope="public")
         assert "message 2" in other
         assert "admin task" not in other
+
+    asyncio.run(run())
+
+
+def test_known_authors_for_maps_latest_display_names(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+
+    async def run() -> None:
+        await _capture(db, n=2, author="Holly")
+        # A different user in another channel is included too.
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL + 1,
+            author_id=4001,
+            author_name="Maverick",
+            content="hi",
+            created_at=_iso(1),
+            is_bot_self=False,
+            allowed_guild_id=ALLOWED,
+        )
+        # Admin-scope rows must not leak into the public directory.
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=5000,
+            author_name="zin",
+            content="admin task",
+            created_at=_iso(2),
+            is_bot_self=False,
+            allowed_guild_id=ALLOWED,
+            visibility="admin",
+        )
+        mapping = await known_authors_for(db, scope="public")
+        assert 4001 in mapping and mapping[4001] == "Maverick"
+        assert 5000 not in mapping  # admin rows stay out of the public directory
 
     asyncio.run(run())
 

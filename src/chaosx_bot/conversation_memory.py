@@ -263,6 +263,35 @@ async def user_history_for(
     return "This user's recent messages (captured history):\n" + "\n".join(lines)
 
 
+async def known_authors_for(db_path: Path, *, limit: int = 60, scope: str = "public") -> dict[int, str]:
+    """Map user IDs to their latest display names from captured messages.
+
+    Public scope reads only public history. Used to build the user directory
+    so the bot can name users (never ping them) when asked who said something.
+    """
+    visibility_filter = "" if scope == "admin" else "AND visibility = 'public'"
+    mapping: dict[int, str] = {}
+    try:
+        await _ensure_schema(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (
+                await db.execute(
+                    f"SELECT author_id, author_name, MAX(id) AS last_id FROM conversation_messages "
+                    f"WHERE author_id != 0 {visibility_filter} GROUP BY author_id "
+                    f"ORDER BY last_id DESC LIMIT ?",
+                    (limit,),
+                )
+            ).fetchall()
+        for row in rows:
+            name = str(row["author_name"] or "").strip()
+            if name:
+                mapping[int(row["author_id"])] = name
+    except Exception:
+        return {}
+    return mapping
+
+
 async def compact_if_due(
     db_path: Path,
     channel_id: int,

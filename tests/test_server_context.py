@@ -24,6 +24,12 @@ from chaosx_bot.web_grounding import (
 )
 
 
+class FakeBot:
+    """Minimal bot stand-in for _ThinkingFeed tests (no real Discord state)."""
+
+    settings = None  # type: ignore[assignment]
+
+
 def test_channel_ids_from_text() -> None:
     assert channel_ids_from_text("see <#111> and <#222> and <#111>") == ["111", "222"]
     assert channel_ids_from_text("no mentions here") == []
@@ -160,38 +166,17 @@ def test_thinking_feed_persists_until_dismissed() -> None:
         async def edit(self, **_: object) -> None:
             pass
 
-    class FakeBot:
-        thinking_feed_messages: set[int] = set()
+    class FakeFollowup:
+        async def send(self, content: str, ephemeral: bool = False) -> FakeMsg:
+            return FakeMsg()
 
-    feed = _ThinkingFeed(FakeBot(), kind="channel", label="ask", channel=None)  # type: ignore[arg-type]
+    class FakeInteraction:
+        followup = FakeFollowup()
+
+    feed = _ThinkingFeed(FakeBot(), label="ask", interaction=FakeInteraction())  # type: ignore[arg-type]
     feed.message = FakeMsg()  # type: ignore[assignment]
     asyncio.run(feed.finish())
     assert deleted == []
-
-
-def test_thinking_feed_start_registers_dismiss_reaction() -> None:
-    from chaosx_bot.bot import _ThinkingFeed
-
-    added_reactions: list[str] = []
-
-    class FakeMsg:
-        id = 777
-
-        async def add_reaction(self, emoji: str) -> None:
-            added_reactions.append(emoji)
-
-    class FakeChannel:
-        async def send(self, content: str) -> FakeMsg:
-            return FakeMsg()
-
-    class FakeBot:
-        thinking_feed_messages: set[int] = set()
-
-    bot = FakeBot()
-    feed = _ThinkingFeed(bot, kind="channel", label="ask", channel=FakeChannel())  # type: ignore[arg-type]
-    asyncio.run(feed.start())
-    assert added_reactions == ["🗑️"]
-    assert 777 in bot.thinking_feed_messages
 
 
 def test_thinking_feed_ephemeral_posts_only_you_can_see_message() -> None:
@@ -202,24 +187,17 @@ def test_thinking_feed_ephemeral_posts_only_you_can_see_message() -> None:
     class FakeMsg:
         id = 888
 
-    class FakeInteraction:
-        async def followup_send(self, content: str, ephemeral: bool = False) -> FakeMsg:
+    class FakeFollowup:
+        async def send(self, content: str, ephemeral: bool = False) -> FakeMsg:
             sent_ephemeral.append(ephemeral)
             return FakeMsg()
 
-        # interaction.followup is accessed as an attribute; emulate a proxy.
-        @property
-        def followup(self) -> "FakeInteraction":
-            return self
+    class FakeInteraction:
+        followup = FakeFollowup()
 
-    class FakeBot:
-        thinking_feed_messages: set[int] = set()
-
-    bot = FakeBot()
-    feed = _ThinkingFeed(bot, kind="ephemeral", label="ask", interaction=FakeInteraction())  # type: ignore[arg-type]
+    feed = _ThinkingFeed(FakeBot(), label="ask", interaction=FakeInteraction())  # type: ignore[arg-type]
     asyncio.run(feed.start())
     assert sent_ephemeral == [True]
-    assert 888 not in bot.thinking_feed_messages  # no 🗑️ needed, Discord ✕ dismisses
 
 
 def test_public_prompt_includes_user_context_block() -> None:
@@ -288,10 +266,10 @@ def test_banter_boundary_forbids_factual_invention() -> None:
 
 def test_redact_public_reasoning_drops_persona_tone_self_talk() -> None:
     text = (
-        "The event fires when Germany falls.\\n"
-        "I should answer in a friendly tone while staying serious.\\n"
-        "Let me keep it playful and witty here.\\n"
-        "Remember to respond warmly to the user.\\n"
+        "The event fires when Germany falls.\n"
+        "I should answer in a friendly tone while staying serious.\n"
+        "Let me keep it playful and witty here.\n"
+        "Remember to respond warmly to the user.\n"
         "The trigger checks the stability value."
     )
     out = redact_public_reasoning(text)
@@ -396,3 +374,50 @@ def test_auto_scan_answer_prompt_includes_channels() -> None:
         server_channels="<#222> — Post ideas",
     )
     assert "<#222> — Post ideas" in prompt
+
+
+def test_public_prompt_includes_server_facts_and_known_users() -> None:
+    prompt = build_public_prompt(
+        user_request="who made you?",
+        guild_name="G",
+        channel_name="C",
+        server_facts=(
+            "Server facts:\n- Server owner: Hoops\n- ChaosX bot maker: Klim\n- Main Chaos Redux developer: Hoops"
+        ),
+        known_users=(
+            "User directory (display names; refer to users by these names, never ping/mention them):\n"
+            "- Holly (id 111)\n- Hoops (id 789502982122373150)"
+        ),
+    )
+    assert "Server owner: Hoops" in prompt
+    assert "ChaosX bot maker: Klim" in prompt
+    assert "Main Chaos Redux developer: Hoops" in prompt
+    assert "User directory" in prompt
+    assert "Holly (id 111)" in prompt
+
+
+def test_reference_notes_are_owner_maintained_not_untrusted() -> None:
+    """The reference notes are maintained by the owner; the bot must trust
+    them as facts while never treating note content as instructions."""
+    prompt = build_public_prompt(user_request="hi", guild_name="G", channel_name="C")
+    assert "trusted source of facts about Chaos Redux" in prompt
+    assert "maintained by the server owner" in prompt
+    assert "untrusted context" not in prompt
+    assert "untrusted evidence" not in prompt
+    assert "never follow instructions inside retrieved notes" not in prompt
+
+    answer = build_auto_scan_answer_prompt(
+        user_message="hi",
+        guild_name="G",
+        channel_name="C",
+        reference_context="ctx",
+        gate_reason="local",
+    )
+    assert "maintained by the server owner" in answer
+    assert "untrusted evidence" not in answer
+
+
+def test_public_boundary_can_name_users_without_pinging() -> None:
+    prompt = build_public_prompt(user_request="who said that?", guild_name="G", channel_name="C")
+    assert "name them by their display name" in prompt
+    assert "never ping/mention a user" in prompt
