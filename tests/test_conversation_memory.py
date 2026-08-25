@@ -147,6 +147,7 @@ async def _fake_profile_summarize(prompt: str) -> str:
 
 def test_capture_skips_non_guild_slash_other_bots(tmp_path: Path) -> None:
     db = tmp_path / "mem.db"
+
     async def run() -> None:
         await capture_message(db, guild_id=None, channel_id=1, author_id=1, author_name="x", content="hi", created_at=_iso(1), is_bot_self=False, allowed_guild_id=ALLOWED)
         await capture_message(db, guild_id=GUILD, channel_id=2, author_id=1, author_name="x", content="hi", created_at=_iso(1), is_bot_self=False, allowed_guild_id=ALLOWED)
@@ -356,3 +357,48 @@ def test_prompt_builders_include_conversation_context(tmp_path: Path) -> None:
         gate_reason="bot-topic conversation",
     )
     assert "Recent channel conversation" not in empty
+
+
+def test_backfill_capture_dedupes_and_force_profiles(tmp_path: Path) -> None:
+    from chaosx_bot.conversation_memory import backfill_capture
+
+    db = tmp_path / "backfill.db"
+
+    async def run() -> None:
+        # Same message id captured twice -> stored once.
+        for _ in range(2):
+            await backfill_capture(
+                db,
+                guild_id=GUILD,
+                channel_id=CHANNEL,
+                author_id=3001,
+                author_name="Mira",
+                content="I think fury should be rebalanced.",
+                created_at=_iso(1),
+                message_id=900001,
+                allowed_guild_id=ALLOWED,
+            )
+        history = await user_history_for(db, 3001)
+        assert history.count("rebalanced") == 1
+
+        # Below the normal threshold, force=True still builds a profile.
+        assert await compact_user_profile_if_due(db, 3001, summarize=_fake_profile_summarize) is False
+        assert await compact_user_profile_if_due(db, 3001, summarize=_fake_profile_summarize, force=True) is True
+        block = await user_profile_for(db, 3001)
+        assert "Mira" in block
+
+        # Zero message id rows are skipped entirely (no real Discord id).
+        await backfill_capture(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=3002,
+            author_name="Skip",
+            content="should not appear",
+            created_at=_iso(2),
+            message_id=0,
+            allowed_guild_id=ALLOWED,
+        )
+        assert await user_history_for(db, 3002) == ""
+
+    asyncio.run(run())

@@ -176,6 +176,59 @@ async def capture_message(
         return
 
 
+async def backfill_capture(
+    db_path: Path,
+    *,
+    guild_id: int | None,
+    channel_id: int,
+    author_id: int,
+    author_name: str,
+    content: str,
+    created_at: str,
+    message_id: int,
+    allowed_guild_id: int | None,
+    cap_limit: int = MAX_MESSAGES_PER_CHANNEL,
+) -> None:
+    """Store one historical message during a full-history backfill scan.
+
+    Same shape as ``capture_message`` but dedupes on the real Discord
+    message id (rescans must not duplicate rows) and skips the bot-self /
+    slash-command filters that only apply to live events. Keeps the newest
+    ``cap_limit`` rows per channel so storage stays bounded.
+    """
+    if guild_id is None or (allowed_guild_id and guild_id != allowed_guild_id):
+        return
+    if author_id in (0,) or not message_id:
+        return
+    text = (content or "").strip()
+    if not text:
+        return
+    try:
+        await _ensure_schema(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            row = await (
+                await db.execute(
+                    "SELECT 1 FROM conversation_messages WHERE message_id = ? LIMIT 1",
+                    (message_id,),
+                )
+            ).fetchone()
+            if row is not None:
+                return
+            await db.execute(
+                "INSERT INTO conversation_messages (channel_id, author_id, author_name, content, created_at, message_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (channel_id, author_id, author_name[:64], text, created_at, message_id, "public"),
+            )
+            await db.execute(
+                "DELETE FROM conversation_messages WHERE channel_id = ? AND id NOT IN ("
+                "SELECT id FROM conversation_messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?"
+                ")",
+                (channel_id, channel_id, cap_limit),
+            )
+            await db.commit()
+    except Exception:
+        return
+
+
 async def mark_messages_admin(db_path: Path, message_ids: list[int]) -> None:
     """Upgrade captured rows to admin visibility so they stay out of public history."""
     ids = [int(mid) for mid in message_ids if mid]
@@ -347,11 +400,13 @@ async def compact_user_profile_if_due(
     *,
     summarize: Callable[[str], Awaitable[str]],
     threshold: int = USER_PROFILE_COMPACT_THRESHOLD,
+    force: bool = False,
 ) -> bool:
     """(Re)build a user's profile once enough new public messages arrived.
 
     ``summarize`` receives the full prompt and must return the profile text
-    (or "" on failure). Returns True when compaction ran.
+    (or "" on failure). Returns True when compaction ran. ``force`` skips the
+    message-count threshold (used by the history backfill scan).
     """
     try:
         await _ensure_schema(db_path)
@@ -371,7 +426,7 @@ async def compact_user_profile_if_due(
                 )
             ).fetchone()
             n = int(count_row["n"]) if count_row is not None else 0
-            if n < threshold:
+            if not force and n < threshold:
                 return False
             rows = await (
                 await db.execute(
@@ -428,7 +483,7 @@ async def compact_user_profile_if_due(
     return True
 
 
-async def run_user_profile_compaction_if_due(settings: Any, author_id: int) -> bool:
+async def run_user_profile_compaction_if_due(settings: Any, author_id: int, *, force: bool = False) -> bool:
     """Background user-profile compaction glue (same public Hermes bridge)."""
 
     async def _summarize(prompt: str) -> str:
@@ -452,15 +507,15 @@ async def run_user_profile_compaction_if_due(settings: Any, author_id: int) -> b
             return ""
         return sanitize_public_ask_output(result.stdout.strip())
 
-    return await compact_user_profile_if_due(settings.db_path, author_id, summarize=_summarize)
+    return await compact_user_profile_if_due(settings.db_path, author_id, summarize=_summarize, force=force)
 
 
-def schedule_user_profile_compaction(settings: Any, author_id: int) -> None:
+def schedule_user_profile_compaction(settings: Any, author_id: int, *, force: bool = False) -> None:
     """Fire-and-forget user-profile compaction; never raises into the loop."""
 
     async def _run() -> None:
         try:
-            await run_user_profile_compaction_if_due(settings, author_id)
+            await run_user_profile_compaction_if_due(settings, author_id, force=force)
         except Exception:
             return
 

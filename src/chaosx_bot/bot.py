@@ -18,6 +18,7 @@ from discord import app_commands
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
 from .auto_scan import AutoScanDecision, classify_message, looks_like_catalog_lookup
 from .conversation_memory import (
+    backfill_capture,
     capture_message,
     conversation_context_for,
     known_authors_for,
@@ -1013,6 +1014,8 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
 - `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for model-generated auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
+- `/admin user-memory [user:<name or ID>]` — owner-only viewer for saved per-user memory (profile + recent history). With no user, dumps memory for every user the bot has something saved on (empty users skipped).
+- `/admin scan-history [limit:<n>]` — owner-only backfill: reads all readable channel/thread history in the server, captures it into conversation memory, and force-builds user profiles in the background (deduped, so it is safe to rerun). Results are posted to the command channel when finished.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
 
@@ -2080,6 +2083,102 @@ async def _public_model_completion(
         if feed is not None:
             await feed.finish(result.stdout.strip() or result.stderr.strip() or "No output.")
         return result
+
+
+async def _scan_history_background(
+    bot: "ChaosXBot",
+    interaction: discord.Interaction,
+    *,
+    per_channel_limit: int = 0,
+) -> None:
+    """Backfill-scan all readable channel history and build user memory.
+
+    Iterates every text channel + thread the bot can read in the allowed
+    guild, backfill-captures each message (deduped by message id), then
+    force-builds a user profile for every author that appeared. Runs in a
+    background task because a full-history scan can take minutes; results
+    are posted back into the channel where the command was invoked.
+    """
+    try:
+        guild = interaction.guild
+        if guild is None or not bot.settings.allowed_guild_id or guild.id != bot.settings.allowed_guild_id:
+            await interaction.followup.send("Scan aborted: could not resolve the allowed guild.", ephemeral=True)
+            return
+        channels: list[discord.abc.Messageable] = []
+        seen: set[int] = set()
+        for channel in guild.channels:
+            if channel.id in seen:
+                continue
+            if isinstance(channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+                channels.append(channel)  # type: ignore[arg-type]
+                seen.add(channel.id)
+            for thread in getattr(channel, "threads", []):
+                if thread.id not in seen:
+                    channels.append(thread)  # type: ignore[arg-type]
+                    seen.add(thread.id)
+        if not channels:
+            await interaction.followup.send("No readable channels found.", ephemeral=True)
+            return
+
+        scanned = 0
+        captured = 0
+        skipped = 0
+        errored: list[str] = []
+        authors: dict[int, str] = {}
+        me_id = bot.user.id if bot.user is not None else None
+
+        for channel in channels:
+            try:
+                if isinstance(channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+                    async for message in channel.history(limit=per_channel_limit or None):
+                        scanned += 1
+                        author_id = message.author.id if message.author else 0
+                        if author_id == me_id or getattr(message.author, "bot", False):
+                            skipped += 1
+                            continue
+                        name = (message.author.display_name if message.author else "") or (message.author.name if message.author else "") or "unknown"
+                        await backfill_capture(
+                            bot.settings.db_path,
+                            guild_id=guild.id,
+                            channel_id=channel.id,  # type: ignore[arg-type]
+                            author_id=author_id,
+                            author_name=name,
+                            content=message.content or "",
+                            created_at=message.created_at.isoformat(timespec="seconds"),
+                            message_id=message.id,
+                            allowed_guild_id=bot.settings.allowed_guild_id,
+                        )
+                        captured += 1
+                        authors.setdefault(author_id, name)
+            except Exception as exc:
+                errored.append(f"{getattr(channel, 'name', channel.id)} ({type(exc).__name__})")
+
+        profile_count = 0
+        for author_id in authors:
+            schedule_user_profile_compaction(bot.settings, author_id, force=True)
+            profile_count += 1
+
+        report = (
+            f"## History backfill complete\n"
+            f"- Channels read: `{len(channels)}`\n"
+            f"- Messages scanned: `{scanned}`\n"
+            f"- New messages captured: `{captured}`\n"
+            f"- Skipped (bot/system): `{skipped}`\n"
+            f"- Users profiled: `{profile_count}`\n"
+        )
+        if errored:
+            report += f"- Unreadable channels: `{len(errored)}` — {', '.join(errored[:5])}\n"
+        report += "\nUser profiles are building in the background from the captured history; check them with `/admin user-memory`."
+        channel = bot.get_channel(interaction.channel_id) or interaction.channel
+        if channel is not None:
+            for part in _chunk(report):
+                await channel.send(part, allowed_mentions=safe_allowed_mentions())
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=guild.id, channel_id=interaction.channel_id, command="admin scan-history", summary=f"scanned={scanned} captured={captured} users={profile_count}")
+    except Exception as exc:
+        try:
+            await interaction.followup.send(f"History scan failed: `{type(exc).__name__}: {exc}`", ephemeral=True)
+        except Exception:
+            pass
 
 
 async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, request: str, *, parent_bot_message_id: int | None = None) -> None:
@@ -3994,6 +4093,21 @@ def register_commands(bot: ChaosXBot) -> None:
                 await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
             else:
                 await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="scan-history", description="Backfill-scan all server message history and build user memory from it.")
+    async def admin_scan_history(interaction: discord.Interaction, limit: int = 0) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(
+            f"Backfill scan started in the background (limit per channel: `{limit or 'all available'}`). I'll report the results in this channel when it finishes.",
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        asyncio.create_task(
+            _scan_history_background(bot, interaction, per_channel_limit=limit),
+            name="chaosx-history-backfill",
+        )
 
     @admin.command(name="permissions-audit", description="Audit Discord/GitHub permissions.")
     async def admin_permissions_audit(interaction: discord.Interaction) -> None:
