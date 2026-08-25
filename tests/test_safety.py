@@ -32,7 +32,7 @@ def test_prompt_boundary_contains_untrusted_content_warning():
     prompt = build_owner_prompt(owner_request="summarize #issues", guild_name="Chaos Redux", channel_name="bot-spam")
     assert "untrusted data" in prompt
     assert "never print or reveal" in prompt
-    assert "ChaosX bot repo" in prompt
+    assert "owner-maintained facts" in prompt or "server owner" in prompt
     assert "summarize #issues" in prompt
     assert "current owner request as authorized admin direction" in prompt
 

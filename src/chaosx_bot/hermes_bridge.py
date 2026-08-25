@@ -207,7 +207,7 @@ async def _stop_process(proc: asyncio.subprocess.Process) -> None:
 
 
 def build_owner_prompt(*, owner_request: str, guild_name: str | None, channel_name: str | None, conversation_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "") -> str:
-    context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; ChaosX bot repo=/mnt/c/Users/klimp/Documents/Projects/chaosx-discord-bot; Chaos Redux guild id=1395459671598436533"
+    context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; Chaos Redux guild id=1395459671598436533"
     return f"{SYSTEM_BOUNDARY}\n{context}{_conversation_block(conversation_context)}{_rules_block(server_rules)}{_channels_block(server_channels)}{_server_facts_block(server_facts)}\n\nOwner request:\n{owner_request.strip()}\n"
 
 

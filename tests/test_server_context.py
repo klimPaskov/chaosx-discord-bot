@@ -382,16 +382,16 @@ def test_public_prompt_includes_server_facts_and_known_users() -> None:
         guild_name="G",
         channel_name="C",
         server_facts=(
-            "Server facts:\n- Server owner: Hoops\n- ChaosX bot maker: Klim\n- Main Chaos Redux developer: Hoops"
+            "Server facts:\n- Server owner: Hoops McCann\n- ChaosX bot maker: Hoops McCann\n- Main Chaos Redux developer: Hoops McCann"
         ),
         known_users=(
             "User directory (display names; refer to users by these names, never ping/mention them):\n"
-            "- Holly (id 111)\n- Hoops (id 789502982122373150)"
+            "- Holly (id 111)\n- Hoops McCann (id 789502982122373150)"
         ),
     )
-    assert "Server owner: Hoops" in prompt
-    assert "ChaosX bot maker: Klim" in prompt
-    assert "Main Chaos Redux developer: Hoops" in prompt
+    assert "Server owner: Hoops McCann" in prompt
+    assert "ChaosX bot maker: Hoops McCann" in prompt
+    assert "Main Chaos Redux developer: Hoops McCann" in prompt
     assert "User directory" in prompt
     assert "Holly (id 111)" in prompt
 
@@ -415,6 +415,21 @@ def test_reference_notes_are_owner_maintained_not_untrusted() -> None:
     )
     assert "maintained by the server owner" in answer
     assert "untrusted evidence" not in answer
+
+
+def test_server_facts_never_use_real_name() -> None:
+    """The owner's real name must never appear in bot instructions."""
+    from chaosx_bot.config import Settings
+
+    s = Settings()
+    facts = (
+        f"Server owner: {s.server_owner_name}\n"
+        f"ChaosX bot maker: {s.bot_maker_name}\n"
+        f"Main Chaos Redux developer: {s.main_dev_name}"
+    )
+    assert "Klim" not in facts
+    assert "klimp" not in facts
+    assert s.server_owner_name == s.bot_maker_name == s.main_dev_name == "Hoops McCann"
 
 
 def test_public_boundary_can_name_users_without_pinging() -> None:
