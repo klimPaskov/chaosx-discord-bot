@@ -34,6 +34,10 @@ KEEP_AFTER_COMPACT = 8
 SUMMARY_MAX_CHARS = 1200
 # Max chars of a single stored message excerpt.
 MESSAGE_EXCERPT_CHARS = 300
+# Max number of a user's recent messages in the per-user history block.
+USER_HISTORY_LIMIT = 12
+# Total chars cap for the per-user history block.
+USER_HISTORY_MAX_CHARS = 1600
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -215,6 +219,48 @@ async def conversation_context_for(
         ]
         parts.append("Recent conversation:\n" + "\n".join(lines))
     return "\n\n".join(parts)
+
+
+async def user_history_for(
+    db_path: Path,
+    author_id: int,
+    *,
+    exclude_message_id: int | None = None,
+    limit: int = USER_HISTORY_LIMIT,
+    scope: str = "public",
+) -> str:
+    """Build a per-user history block: the author's recent captured messages.
+
+    Public scope reads only public history (no owner/admin task messages).
+    Returns a prompt-ready reference block ('' when nothing is available).
+    """
+    visibility_filter = "" if scope == "admin" else "AND visibility = 'public'"
+    try:
+        await _ensure_schema(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (
+                await db.execute(
+                    f"SELECT id, author_name, content FROM conversation_messages "
+                    f"WHERE author_id = ? {visibility_filter} ORDER BY id DESC LIMIT ?",
+                    (author_id, limit + 1),
+                )
+            ).fetchall()
+    except Exception:
+        return ""
+    kept = [row for row in list(rows)[::-1] if row["id"] != exclude_message_id]
+    if not kept:
+        return ""
+    lines: list[str] = []
+    total = 0
+    for row in kept[:limit]:
+        excerpt = redact_internal_infrastructure(_excerpt(row["content"]))
+        line = f"- {row['author_name']}: {excerpt}"
+        total += len(line) + 1
+        if total > USER_HISTORY_MAX_CHARS:
+            break
+        lines.append(line)
+    return "This user's recent messages (captured history):\n" + "\n".join(lines)
 
 
 async def compact_if_due(

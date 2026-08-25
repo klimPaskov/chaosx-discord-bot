@@ -76,6 +76,34 @@ def should_write_approved_note(raw: str, draft: str) -> bool:
     return not any(marker in lowered for marker in DISALLOWED_OUTPUT_MARKERS)
 
 
+_VAGUE_TOPIC_RE = re.compile(
+    r"^events?\s+(?:relating|related|about|regarding|concerning|involving|for|with|to|based\s+on)\s+\S.{0,60}$"
+    r"|^event\s+ideas?\s+(?:relating|related|about|regarding|concerning|involving|for|with|to|based\s+on)\s+\S.{0,60}$",
+    re.I,
+)
+_VAGUE_FILLER_RE = re.compile(
+    r"^(?:idk|i\s+don'?t\s+know|dunno|whatever|anything|something|nothing\s+in\s+particular|"
+    r"any\s+ideas?|just\s+an?\s+ideas?|maybe\s+an?\s+event|what\s+about\s+an?\s+event|event\s+ideas?)$",
+    re.I,
+)
+
+
+def is_vague_event_idea(text: str) -> bool:
+    """True when an /event-idea submission is too vague to become an event.
+
+    Catches topic-only submissions ('events relating to namibia'), filler
+    strings, and very short inputs. The model adds a second, semantic
+    vagueness check during formatting; this is the cheap deterministic gate
+    that runs before any model call.
+    """
+    value = (text or "").strip()
+    if not value:
+        return True
+    if len(value) < 20:
+        return True
+    return bool(_VAGUE_TOPIC_RE.search(value) or _VAGUE_FILLER_RE.search(value))
+
+
 def fenced(text: str, *, limit: int = 4000) -> str:
     text = sanitize_text(text, limit=limit)
     if "```" in text:

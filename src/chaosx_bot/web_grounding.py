@@ -154,22 +154,46 @@ def format_web_context(results: list[dict[str, str]]) -> str:
     )
 
 
+def format_web_results_for_display(
+    results: list[dict[str, str]], *, limit: int = WEB_SEARCH_MAX_RESULTS
+) -> str:
+    """Render search results for direct display to a user (scripted commands).
+
+    Unlike the prompt block, this is user-facing: markdown titles, snippets,
+    and clickable URLs. Empty when there are no usable results.
+    """
+    lines: list[str] = []
+    for result in results[:limit]:
+        title = result.get("title", "")
+        url = result.get("url", "")
+        snippet = result.get("snippet", "")
+        if not title and not url:
+            continue
+        line = f"**{title or url}**"
+        if snippet:
+            line += f"\n{snippet[: _RESULT_MAX_CHARS]}"
+        if url:
+            line += f"\n<{url}>"
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
 class WebGrounder:
     """Server-side web search grounding with a short TTL cache."""
 
     def __init__(self, *, timeout_s: float = WEB_SEARCH_TIMEOUT_S) -> None:
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
-        self._cache: dict[str, tuple[float, str]] = {}
+        self._cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
 
-    async def search_context(self, query: str) -> str:
-        """Run a web search and return the formatted context block ('' on failure)."""
+    async def search_results(self, query: str) -> list[dict[str, str]]:
+        """Run a web search and return parsed results ([] on failure)."""
         query = (query or "").strip()
         if not query:
-            return ""
+            return []
         cached = self._cache.get(query)
         if cached and time.monotonic() - cached[0] < WEB_SEARCH_CACHE_TTL_S:
             return cached[1]
-        block = ""
+        results: list[dict[str, str]] = []
         try:
             # Bing first (reliable from VPS/datacenter IPs), then DDG fallbacks.
             results = await self._search_bing(query)
@@ -179,11 +203,14 @@ class WebGrounder:
             if not results:
                 page = await self._get(DDG_IA_URL, {"q": query, "format": "json", "no_html": "1"})
                 results = parse_instant_answer(page)
-            block = format_web_context(results)
         except Exception:
-            block = ""
-        self._cache[query] = (time.monotonic(), block)
-        return block
+            results = []
+        self._cache[query] = (time.monotonic(), results)
+        return results
+
+    async def search_context(self, query: str) -> str:
+        """Formatted prompt-ready web reference block ('' on failure)."""
+        return format_web_context(await self.search_results(query))
 
     async def _search_bing(self, query: str) -> list[dict[str, str]]:
         page = await self._get(BING_URL, {"q": query})

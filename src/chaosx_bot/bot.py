@@ -22,11 +22,13 @@ from .conversation_memory import (
     conversation_context_for,
     mark_messages_admin,
     schedule_compaction,
+    user_history_for,
 )
 from .catalog_validation import format_workbook_validation, validate_workbook
 from .community_notes import (
     format_event_idea_post_body,
     format_event_idea_post_title,
+    is_vague_event_idea,
     write_event_idea_note,
     write_suggestion_note,
 )
@@ -55,7 +57,7 @@ from .focus_trees import (
 )
 from .guild_channels import GuildChannels
 from .channel_context import ChannelReader
-from .web_grounding import WebGrounder
+from .web_grounding import WebGrounder, format_web_results_for_display
 from .vault_index import refresh_vault_indexes
 from .ask_api import DirectAskError, direct_chat_completion, direct_chat_completion_stream
 from .hermes_bridge import (
@@ -586,6 +588,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             reference_context=decision.reference_context,
             gate_reason=decision.reason,
             conversation_context=conversation_context,
+            user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
             web_context=web_context,
@@ -597,6 +600,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             channel_name=channel_name,
             gate_reason=decision.reason,
             conversation_context=conversation_context,
+            user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
             reference_context=decision.reference_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
@@ -1270,6 +1274,41 @@ class ChaosXBot(discord.Client):
             asyncio.create_task(self._refresh_channels_background())
         return self.guild_channels.channels_block()
 
+    async def user_context_for(self, user_id: int, *, exclude_message_id: int | None = None) -> str:
+        """Prompt-ready info about the asking user: display name, top role, and
+        their recent captured messages (public scope only). Best-effort; any
+        failure returns an empty string so answering never breaks."""
+        try:
+            history = await user_history_for(
+                self.settings.db_path,
+                user_id,
+                exclude_message_id=exclude_message_id,
+                scope="public",
+            )
+        except Exception:
+            history = ""
+        display: str | None = None
+        role: str | None = None
+        for guild in self.guilds:
+            if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
+                continue
+            member = guild.get_member(user_id)
+            if member is not None:
+                display = member.display_name
+                top_role = getattr(member, "top_role", None)
+                if top_role is not None and top_role.name not in ("@everyone", ""):
+                    role = top_role.name
+                break
+        parts: list[str] = []
+        who = f"Asking user: {display}" if display else ""
+        if role:
+            who += f" (top role: {role})"
+        if who:
+            parts.append(who)
+        if history:
+            parts.append(history)
+        return "\n".join(parts)
+
     async def setup_hook(self) -> None:
         await self.store.init()
         asyncio.create_task(self._refresh_rules_background())
@@ -1852,15 +1891,19 @@ class _ThinkingFeed:
 
     Two display modes:
     - kind="dm"      -> private DM to the owner (raw reasoning + final answer)
-    - kind="channel" -> public message in the ask channel showing the model's
-      REAL reasoning, scrubbed so sensitive details never surface: internal
-      infrastructure phrasing and any lines revealing the bot's internal
-      decision process (refusals, instruction references, hidden context)
-      are removed. The final answer is posted as the normal public reply.
+    - kind="ephemeral" -> slash-command feed: posted as an EPHEMERAL
+      interaction message ("Only you can see this message") so only the
+      asking user sees it and can dismiss it with Discord's built-in ✕.
+      Reasoning is scrubbed like the public channel feed.
+    - kind="channel" -> public message in the ask channel (mention asks,
+      which cannot be ephemeral) showing the model's REAL reasoning,
+      scrubbed so sensitive details never surface: internal infrastructure
+      phrasing, decision-process lines, and persona/tone self-talk are
+      removed. The final answer is posted as the normal public reply.
 
-    The message PERSISTS after the answer (both modes) — it is not deleted.
-    Public channel feeds get a 🗑️ reaction so anyone can dismiss the
-    thinking message when they're done reading it.
+    The message PERSISTS after the answer (all modes) — it is not deleted.
+    Channel feeds get a 🗑️ reaction so anyone can dismiss the thinking
+    message; ephemeral feeds carry Discord's built-in dismiss control.
 
     Edits are throttled to stay inside Discord's edit-rate limits and the
     2000-char message cap.
@@ -1879,13 +1922,16 @@ class _ThinkingFeed:
         label: str,
         owner_id: int | None = None,
         channel: discord.abc.Messageable | None = None,
+        interaction: discord.Interaction | None = None,
     ) -> None:
         self.bot = bot
         self.kind = kind
-        self.public = kind == "channel"
+        self.public = kind in ("channel", "ephemeral")
+        self.ephemeral = kind == "ephemeral"
         self.label = label
         self.owner_id = owner_id
         self.channel = channel
+        self.interaction = interaction
         self.message: discord.Message | None = None
         self.reasoning = ""
         self.content = ""
@@ -1893,7 +1939,14 @@ class _ThinkingFeed:
 
     async def start(self) -> bool:
         try:
-            if self.public:
+            if self.ephemeral:
+                if self.interaction is None:
+                    return False
+                self.message = await self.interaction.followup.send(
+                    "🧠 **ChaosX is thinking…**",
+                    ephemeral=True,
+                )
+            elif self.public:
                 if self.channel is None:
                     return False
                 self.message = await self.channel.send("🧠 **ChaosX is thinking…**")
@@ -2111,6 +2164,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         source_paths_allowed=source_paths_allowed,
         memory_context=memory_context,
         conversation_context=conversation_context,
+        user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
         channel_context=channel_context,
@@ -2908,6 +2962,7 @@ async def run_hermes_command(
             reference_context=reference_context if rate_bucket == "ask" else "",
             source_paths_allowed=source_paths_allowed,
             memory_context=memory_context if rate_bucket == "ask" else "",
+            user_context=await bot.user_context_for(interaction.user.id),
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
             channel_context=channel_context,
@@ -2941,7 +2996,10 @@ async def run_hermes_command(
             if interaction.user.id == bot.settings.owner_id:
                 feed = _ThinkingFeed(bot, kind="dm", label=command_name, owner_id=bot.settings.owner_id)
             elif interaction.channel is not None:
-                feed = _ThinkingFeed(bot, kind="channel", label=command_name, channel=cast(discord.abc.Messageable, interaction.channel))
+                # Ephemeral: "Only you can see this message", dismissible by the
+                # asking user with Discord's built-in ✕ (mention asks use the
+                # channel feed instead, since they cannot be ephemeral).
+                feed = _ThinkingFeed(bot, kind="ephemeral", label=command_name, interaction=interaction)
             if feed is not None:
                 await feed.start()
             result = await _public_model_completion(
@@ -3227,7 +3285,7 @@ def register_commands(bot: ChaosXBot) -> None:
             qna_mode="slash",
         )
 
-    @bot.tree.command(name="event", description="Look up an event and show its chain, focus trees, and scripted GUIs.")
+    @bot.tree.command(name="event", description="Look up an event by ID or name and show its chain, focus trees, and scripted GUIs.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
         async def show_event_visuals() -> None:
             event_id = bot.knowledge.resolve_event_id(event)
@@ -3257,12 +3315,26 @@ def register_commands(bot: ChaosXBot) -> None:
                 event_id=event_id,
             )
 
+        async def render_event() -> str:
+            # Names work like IDs: exact id first, then name match, then fuzzy
+            # word-overlap reasoning over the catalog (see knowledge._fuzzy_name_row).
+            content = await asyncio.to_thread(bot.knowledge.event, event, view)
+            if bot.settings.web_search_enabled and (
+                "No exact event match" in content or "No event for id" in content
+            ):
+                # Last resort: only search results, clearly labeled as external.
+                results = await bot.web.search_results(f"Chaos Redux Hearts of Iron 4 mod event {event}")
+                display = format_web_results_for_display(results)
+                if display:
+                    content += "\n\n**No catalog match — web search results (external, unverified):**\n\n" + display
+            return content
+
         await send_scripted_response(
             bot,
             interaction,
             command_name="chaosx event",
             summary=event,
-            render=lambda: bot.knowledge.event(event, view),
+            render=render_event,
             after_send=show_event_visuals,
         )
 
@@ -3355,7 +3427,18 @@ def register_commands(bot: ChaosXBot) -> None:
             "triggerable_scenario": triggerable_scenario,
             "easter_egg": easter_egg,
         }
-        request = f"/event-idea idea={idea!r} fields={extra!r}. Format a Chaos Redux event idea draft with name, TBD ID, type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use placeholders for missing parts. Do not assign a real ID or claim acceptance."
+        request = f"/event-idea idea={idea!r} fields={extra!r}. First decide whether this idea is specific enough to become a real event: it needs a concrete concept (what happens, when or how it triggers, what it affects, and a gameplay effect). If it is too vague — just a topic, country, or theme with no real event concept — reply with exactly `VAGUE: <one short sentence saying what is missing and what to add>`. Otherwise format a Chaos Redux event idea draft with name, TBD ID, type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use placeholders for missing parts. Do not assign a real ID or claim acceptance."
+        if is_vague_event_idea(idea):
+            await interaction.response.send_message(
+                "⚠️ That submission is too vague for an event idea, so I didn't format or post it. "
+                "Give me a concrete concept: what happens, when or how it triggers, what it affects, and the gameplay effect. "
+                'Example: "A military coup in Namibia after the civil war ends — if the country is in the western bloc, '
+                'it triggers a stability collapse, removes the old leader, and spawns a new warlord state."',
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea", summary="rejected as too vague (pre-check)")
+            return
         result = await run_hermes_command(
             bot,
             interaction,
@@ -3363,53 +3446,58 @@ def register_commands(bot: ChaosXBot) -> None:
             command_name="event-idea",
             max_chars_override=2200,
         )
-        if result and result[0].ok and settings.community_notes_enabled:
-            try:
-                note = write_event_idea_note(
-                    vault_path=settings.obsidian_vault_path,
-                    event_specs_folder=settings.community_event_specs_folder,
-                    raw_idea=idea,
-                    draft=result[1],
-                    actor_id=interaction.user.id,
-                    guild_id=interaction.guild_id,
-                    channel_id=interaction.channel_id,
-                    event_type=event_type,
-                    cluster=cluster,
-                    evo_i=evo_i,
-                    evo_ii=evo_ii,
-                    evo_iii=evo_iii,
-                    evo_iv=evo_iv,
-                    evo_v=evo_v,
-                    world_end=world_end,
-                    triggerable_scenario=triggerable_scenario,
-                    easter_egg=easter_egg,
-                )
-                if note:
-                    if note.created:
-                        refresh_vault_indexes(
-                            vault_path=settings.obsidian_vault_path,
-                            event_specs_folder=settings.community_event_specs_folder,
-                            suggestions_folder=settings.community_suggestions_folder,
-                            reason="ChaosX approved community event idea captured.",
-                            changed_path=note.path,
-                        )
-                        try:
-                            post_url = await post_approved_event_idea(
-                                bot,
-                                actor_id=interaction.user.id,
-                                raw_idea=idea,
-                                draft=result[1],
-                                event_type=event_type,
-                                cluster=cluster,
-                                world_end=world_end,
+        if result and result[0].ok:
+            if result[1].strip().upper().startswith("VAGUE"):
+                # Model judged the idea too vague: reject without saving or posting.
+                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea", summary="rejected as too vague (model)")
+                return
+            if settings.community_notes_enabled:
+                try:
+                    note = write_event_idea_note(
+                        vault_path=settings.obsidian_vault_path,
+                        event_specs_folder=settings.community_event_specs_folder,
+                        raw_idea=idea,
+                        draft=result[1],
+                        actor_id=interaction.user.id,
+                        guild_id=interaction.guild_id,
+                        channel_id=interaction.channel_id,
+                        event_type=event_type,
+                        cluster=cluster,
+                        evo_i=evo_i,
+                        evo_ii=evo_ii,
+                        evo_iii=evo_iii,
+                        evo_iv=evo_iv,
+                        evo_v=evo_v,
+                        world_end=world_end,
+                        triggerable_scenario=triggerable_scenario,
+                        easter_egg=easter_egg,
+                    )
+                    if note:
+                        if note.created:
+                            refresh_vault_indexes(
+                                vault_path=settings.obsidian_vault_path,
+                                event_specs_folder=settings.community_event_specs_folder,
+                                suggestions_folder=settings.community_suggestions_folder,
+                                reason="ChaosX approved community event idea captured.",
+                                changed_path=note.path,
                             )
-                            if post_url:
-                                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post", summary=post_url)
-                        except Exception as exc:
-                            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post error", summary=type(exc).__name__)
-                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
-            except Exception as exc:
-                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)
+                            try:
+                                post_url = await post_approved_event_idea(
+                                    bot,
+                                    actor_id=interaction.user.id,
+                                    raw_idea=idea,
+                                    draft=result[1],
+                                    event_type=event_type,
+                                    cluster=cluster,
+                                    world_end=world_end,
+                                )
+                                if post_url:
+                                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post", summary=post_url)
+                            except Exception as exc:
+                                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post error", summary=type(exc).__name__)
+                        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
+                except Exception as exc:
+                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)
 
     @bot.tree.command(name="issue", description="AI-review a report form, then create a GitHub issue if approved.")
     @app_commands.choices(issue_type=[

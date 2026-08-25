@@ -194,12 +194,114 @@ def test_thinking_feed_start_registers_dismiss_reaction() -> None:
     assert 777 in bot.thinking_feed_messages
 
 
+def test_thinking_feed_ephemeral_posts_only_you_can_see_message() -> None:
+    from chaosx_bot.bot import _ThinkingFeed
+
+    sent_ephemeral: list[bool] = []
+
+    class FakeMsg:
+        id = 888
+
+    class FakeInteraction:
+        async def followup_send(self, content: str, ephemeral: bool = False) -> FakeMsg:
+            sent_ephemeral.append(ephemeral)
+            return FakeMsg()
+
+        # interaction.followup is accessed as an attribute; emulate a proxy.
+        @property
+        def followup(self) -> "FakeInteraction":
+            return self
+
+    class FakeBot:
+        thinking_feed_messages: set[int] = set()
+
+    bot = FakeBot()
+    feed = _ThinkingFeed(bot, kind="ephemeral", label="ask", interaction=FakeInteraction())  # type: ignore[arg-type]
+    asyncio.run(feed.start())
+    assert sent_ephemeral == [True]
+    assert 888 not in bot.thinking_feed_messages  # no 🗑️ needed, Discord ✕ dismisses
+
+
+def test_public_prompt_includes_user_context_block() -> None:
+    prompt = build_public_prompt(
+        user_request="who am i?",
+        guild_name="G",
+        channel_name="C",
+        user_context="Asking user: zin (top role: Mods)\nThis user's recent messages (captured history):\n- zin: nice event",
+    )
+    assert "Asking user: zin (top role: Mods)" in prompt
+    assert "This user's recent messages (captured history):" in prompt
+    assert "information about the asking user" in prompt
+
+
+def test_format_web_results_for_display() -> None:
+    from chaosx_bot.web_grounding import format_web_results_for_display
+
+    results = [
+        {"title": "HOI4 Wiki", "url": "https://hoi4.wiki", "snippet": "The reference site."},
+        {"title": "", "url": "", "snippet": "skip me"},
+        {"title": "Steam", "url": "https://store.steampowered.com/app/394360/", "snippet": ""},
+    ]
+    display = format_web_results_for_display(results)
+    assert "**HOI4 Wiki**" in display
+    assert "https://hoi4.wiki" in display
+    assert "skip me" not in display
+    assert "**Steam**" in display
+
+
+def test_fuzzy_name_row_matches_multi_word_names(tmp_path) -> None:
+    import sqlite3
+
+    from chaosx_bot.knowledge import _fuzzy_name_row
+
+    db = tmp_path / "fuzzy.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE catalog_events (row_key TEXT, event_id TEXT, name TEXT)")
+    conn.executemany(
+        "INSERT INTO catalog_events VALUES (?, ?, ?)",
+        [
+            ("a", "1", "The Namibian Civil War"),
+            ("b", "2", "Comet Capital Swap"),
+            ("c", "3", "Zombie Outbreak"),
+        ],
+    )
+    conn.commit()
+    try:
+        row = _fuzzy_name_row(conn, "catalog_events", "civil war namibia")
+        assert row is not None
+        assert row[2] == "The Namibian Civil War"
+        # No overlap -> no match.
+        assert _fuzzy_name_row(conn, "catalog_events", "banana republic elections") is None
+        # Single word: handled by the LIKE path, fuzzy helper declines.
+        assert _fuzzy_name_row(conn, "catalog_events", "comet") is None
+    finally:
+        conn.close()
+
+
 def test_banter_boundary_forbids_factual_invention() -> None:
     """Random 'chaosx'/bot mentions may get playful banter with the same
     reference context as asks, but must never invent facts outside it."""
     assert "playful" in AUTO_SCAN_BANTER_BOUNDARY
     assert "Never invent facts" in AUTO_SCAN_BANTER_BOUNDARY
     assert "reference context" in AUTO_SCAN_BANTER_BOUNDARY
+
+
+def test_redact_public_reasoning_drops_persona_tone_self_talk() -> None:
+    text = (
+        "The event fires when Germany falls.\\n"
+        "I should answer in a friendly tone while staying serious.\\n"
+        "Let me keep it playful and witty here.\\n"
+        "Remember to respond warmly to the user.\\n"
+        "The trigger checks the stability value."
+    )
+    out = redact_public_reasoning(text)
+    # Real reasoning about the question is preserved...
+    assert "The event fires when Germany falls" in out
+    assert "The trigger checks the stability value" in out
+    # ...persona/tone self-talk never surfaces.
+    assert "friendly tone" not in out
+    assert "playful" not in out
+    assert "warmly" not in out
 
 
 def test_redact_public_reasoning_keeps_real_thinking_drops_sensitive_lines() -> None:

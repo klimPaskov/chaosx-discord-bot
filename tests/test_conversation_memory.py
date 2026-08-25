@@ -9,6 +9,7 @@ from chaosx_bot.conversation_memory import (
     capture_message,
     compact_if_due,
     conversation_context_for,
+    user_history_for,
 )
 
 GUILD = 1001
@@ -33,6 +34,37 @@ async def _capture(db: Path, *, n: int = 1, channel: int = CHANNEL, content: str
             is_bot_self=False,
             allowed_guild_id=ALLOWED,
         )
+
+
+def test_user_history_for_returns_public_messages_newest_first(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+
+    async def run() -> None:
+        await _capture(db, n=3, author="zin")
+        # An admin-scope (owner task) message must NOT leak into public history.
+        await capture_message(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=3000,
+            author_name="zin",
+            content="admin task: rebuild index",
+            created_at=_iso(9),
+            is_bot_self=False,
+            allowed_guild_id=ALLOWED,
+            visibility="admin",
+        )
+        block = await user_history_for(db, author_id=3000, scope="public")
+        assert "This user's recent messages (captured history):" in block
+        assert "message 0" in block
+        assert "message 2" not in block  # message 2 belongs to author 3002
+        assert "admin task" not in block
+        # exclude_message_id drops the current message from the block.
+        other = await user_history_for(db, author_id=3002, scope="public")
+        assert "message 2" in other
+        assert "admin task" not in other
+
+    asyncio.run(run())
 
 
 def test_capture_skips_non_guild_slash_other_bots(tmp_path: Path) -> None:

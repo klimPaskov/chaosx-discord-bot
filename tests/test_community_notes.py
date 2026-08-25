@@ -1,6 +1,7 @@
 from chaosx_bot.community_notes import (
     format_event_idea_post_body,
     format_event_idea_post_title,
+    is_vague_event_idea,
     should_write_approved_note,
     write_event_idea_note,
     write_suggestion_note,
@@ -15,6 +16,18 @@ def test_community_note_settings_defaults():
     assert settings.community_event_specs_folder == "Events/Event Specs"
     assert settings.community_suggestions_folder == "Planning/Community Suggestions"
     assert settings.community_event_ideas_channel_id == 1395464994639839356
+
+
+def test_is_vague_event_idea_rejects_topic_only_and_filler():
+    # Topic-only phrasing like 'events relating to namibia' must be rejected.
+    assert is_vague_event_idea("events relating to namibia")
+    assert is_vague_event_idea("events about the cold war")
+    assert is_vague_event_idea("event ideas involving germany")
+    assert is_vague_event_idea("idk")
+    assert is_vague_event_idea("namibia")  # too short / no concept
+    # Concrete concepts pass the deterministic gate (model still reviews them).
+    assert not is_vague_event_idea("A military coup in Namibia after the civil war ends, if the country is in the western bloc, triggers a stability collapse")
+    assert not is_vague_event_idea("A comet strikes Berlin in 1942, destroying the Reichstag and forcing a regime change")
 
 
 def test_event_idea_channel_post_format_is_safe_and_readable():

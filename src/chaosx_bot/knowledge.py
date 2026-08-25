@@ -38,6 +38,29 @@ INDEX_FRESHNESS_CHECK_SECONDS = 60.0
 FULL_FRESHNESS_CHECK_SECONDS = 300.0
 
 
+def _fuzzy_name_row(conn, table: str, value: str):
+    """Find the best catalog row by word-overlap on the name column (index 2).
+
+    Handles multi-word name queries that fail the substring LIKE (e.g.
+    "civil war namibia" -> "Namibian Civil War"). Matches when at least half
+    the query words (min 2) appear in a row's name; returns the best-scoring
+    row or None.
+    """
+    words = [w for w in re.split(r"\W+", (value or "").casefold()) if len(w) > 1]
+    if len(words) < 2:
+        return None
+    rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+    best = None
+    best_score = 0
+    for row in rows:
+        name = str(row[2] or "").casefold()
+        score = sum(1 for word in words if word in name)
+        if score > best_score:
+            best, best_score = row, score
+    threshold = max(2, (len(words) + 1) // 2)
+    return best if best_score >= threshold else None
+
+
 @dataclass(frozen=True)
 class Knowledge:
     repo: Path
@@ -444,7 +467,10 @@ class Knowledge:
                 row = conn.execute("SELECT * FROM catalog_events WHERE event_id = ?", (str(int(number)),)).fetchone()
                 if row:
                     return row
-            return conn.execute("SELECT * FROM catalog_events WHERE lower(name) LIKE ? ORDER BY CAST(event_id AS INTEGER) LIMIT 1", (f"%{value.lower()}%",)).fetchone()
+            row = conn.execute("SELECT * FROM catalog_events WHERE lower(name) LIKE ? ORDER BY CAST(event_id AS INTEGER) LIMIT 1", (f"%{value.lower()}%",)).fetchone()
+            if row:
+                return row
+            return _fuzzy_name_row(conn, "catalog_events", value)
         finally:
             conn.close()
 
@@ -464,7 +490,10 @@ class Knowledge:
                 row = conn.execute("SELECT * FROM catalog_scenarios WHERE scenario_id = ?", (str(int(number)),)).fetchone()
                 if row:
                     return row
-            return conn.execute("SELECT * FROM catalog_scenarios WHERE lower(name) LIKE ? ORDER BY CAST(scenario_id AS INTEGER) LIMIT 1", (f"%{value.lower()}%",)).fetchone()
+            row = conn.execute("SELECT * FROM catalog_scenarios WHERE lower(name) LIKE ? ORDER BY CAST(scenario_id AS INTEGER) LIMIT 1", (f"%{value.lower()}%",)).fetchone()
+            if row:
+                return row
+            return _fuzzy_name_row(conn, "catalog_scenarios", value)
         finally:
             conn.close()
 
