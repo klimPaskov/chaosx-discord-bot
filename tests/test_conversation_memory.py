@@ -7,6 +7,7 @@ from chaosx_bot.conversation_memory import (
     KEEP_AFTER_COMPACT,
     MAX_MESSAGES_PER_CHANNEL,
     USER_PROFILE_COMPACT_THRESHOLD,
+    backfill_capture,
     capture_message,
     compact_if_due,
     compact_user_profile_if_due,
@@ -360,8 +361,6 @@ def test_prompt_builders_include_conversation_context(tmp_path: Path) -> None:
 
 
 def test_backfill_capture_dedupes_and_force_profiles(tmp_path: Path) -> None:
-    from chaosx_bot.conversation_memory import backfill_capture
-
     db = tmp_path / "backfill.db"
 
     async def run() -> None:
@@ -400,5 +399,51 @@ def test_backfill_capture_dedupes_and_force_profiles(tmp_path: Path) -> None:
             allowed_guild_id=ALLOWED,
         )
         assert await user_history_for(db, 3002) == ""
+
+    asyncio.run(run())
+
+
+def test_old_schema_db_migrates_on_capture(tmp_path: Path) -> None:
+    """DBs created before the visibility/message_id columns must still capture.
+
+    Regression for the live failure where the schema script's index on
+    ``visibility`` raised ``no such column`` on legacy DBs, so every
+    capture silently dropped and user profiles were never built.
+    """
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            author_name TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            message_id INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX idx_conv_messages_channel ON conversation_messages(channel_id, id);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    async def run() -> None:
+        await backfill_capture(
+            db,
+            guild_id=GUILD,
+            channel_id=CHANNEL,
+            author_id=3003,
+            author_name="Legacy",
+            content="captured despite old schema",
+            created_at=_iso(3),
+            message_id=900002,
+            allowed_guild_id=ALLOWED,
+        )
+        assert "captured despite old schema" in await user_history_for(db, 3003)
+        assert await compact_user_profile_if_due(db, 3003, summarize=_fake_profile_summarize, force=True) is True
 
     asyncio.run(run())

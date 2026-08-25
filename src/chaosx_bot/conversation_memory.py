@@ -99,12 +99,23 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
 
     Existing rows default to 'public' visibility and legacy summaries are
     preserved as the admin scope (they were compacted from all messages).
+    Table-existence guards keep this safe on fresh DBs (no tables yet).
     """
+    tables = {
+        row[0]
+        for row in await (
+            await db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        ).fetchall()
+    }
+    if "conversation_messages" not in tables:
+        return
     cols = {row[1] for row in await (await db.execute("PRAGMA table_info(conversation_messages)")).fetchall()}
     if "visibility" not in cols:
         await db.execute("ALTER TABLE conversation_messages ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'")
     if "message_id" not in cols:
         await db.execute("ALTER TABLE conversation_messages ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0")
+    if "conversation_summaries" not in tables:
+        return
     summary_cols = {row[1] for row in await (await db.execute("PRAGMA table_info(conversation_summaries)")).fetchall()}
     if "scope" not in summary_cols:
         await db.execute("ALTER TABLE conversation_summaries RENAME TO conversation_summaries_legacy")
@@ -118,8 +129,12 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
 
 async def _ensure_schema(db_path: Path) -> None:
     async with aiosqlite.connect(db_path) as db:
-        await db.executescript(_SCHEMA)
+        # Migrate first: the schema script creates an index on the
+        # visibility column, which fails on DBs created before that column
+        # existed. Adding the column via migration before running the
+        # script lets both old and fresh DBs converge.
         await _migrate_schema(db)
+        await db.executescript(_SCHEMA)
         await db.commit()
 
 
@@ -188,21 +203,22 @@ async def backfill_capture(
     message_id: int,
     allowed_guild_id: int | None,
     cap_limit: int = MAX_MESSAGES_PER_CHANNEL,
-) -> None:
+) -> bool:
     """Store one historical message during a full-history backfill scan.
 
     Same shape as ``capture_message`` but dedupes on the real Discord
     message id (rescans must not duplicate rows) and skips the bot-self /
     slash-command filters that only apply to live events. Keeps the newest
-    ``cap_limit`` rows per channel so storage stays bounded.
+    ``cap_limit`` rows per channel so storage stays bounded. Returns True
+    when the message was actually inserted (dedupe skips return False).
     """
     if guild_id is None or (allowed_guild_id and guild_id != allowed_guild_id):
-        return
+        return False
     if author_id in (0,) or not message_id:
-        return
+        return False
     text = (content or "").strip()
     if not text:
-        return
+        return False
     try:
         await _ensure_schema(db_path)
         async with aiosqlite.connect(db_path) as db:
@@ -213,7 +229,7 @@ async def backfill_capture(
                 )
             ).fetchone()
             if row is not None:
-                return
+                return False
             await db.execute(
                 "INSERT INTO conversation_messages (channel_id, author_id, author_name, content, created_at, message_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (channel_id, author_id, author_name[:64], text, created_at, message_id, "public"),
@@ -225,8 +241,9 @@ async def backfill_capture(
                 (channel_id, channel_id, cap_limit),
             )
             await db.commit()
+        return True
     except Exception:
-        return
+        return False
 
 
 async def mark_messages_admin(db_path: Path, message_ids: list[int]) -> None:

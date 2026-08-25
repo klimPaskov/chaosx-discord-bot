@@ -2132,12 +2132,17 @@ async def _scan_history_background(
                 if isinstance(channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
                     async for message in channel.history(limit=per_channel_limit or None):
                         scanned += 1
-                        author_id = message.author.id if message.author else 0
-                        if author_id == me_id or getattr(message.author, "bot", False):
+                        author = message.author
+                        author_id = author.id if author is not None else 0
+                        if author_id == me_id or getattr(author, "bot", False):
                             skipped += 1
                             continue
-                        name = (message.author.display_name if message.author else "") or (message.author.name if message.author else "") or "unknown"
-                        await backfill_capture(
+                        name = (
+                            (getattr(author, "display_name", "") or getattr(author, "name", "") or "unknown")
+                            if author is not None
+                            else "unknown"
+                        )
+                        ok = await backfill_capture(
                             bot.settings.db_path,
                             guild_id=guild.id,
                             channel_id=channel.id,  # type: ignore[arg-type]
@@ -2149,7 +2154,8 @@ async def _scan_history_background(
                             allowed_guild_id=bot.settings.allowed_guild_id,
                         )
                         captured += 1
-                        authors.setdefault(author_id, name)
+                        if ok:
+                            authors.setdefault(author_id, name)
             except Exception as exc:
                 errored.append(f"{getattr(channel, 'name', channel.id)} ({type(exc).__name__})")
 
