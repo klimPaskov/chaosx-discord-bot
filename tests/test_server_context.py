@@ -1,6 +1,8 @@
 """Tests for server rules + channel reference context."""
 
 import asyncio
+from types import SimpleNamespace
+from typing import Any, cast
 
 from chaosx_bot.auto_scan import looks_like_catalog_lookup
 from chaosx_bot.channel_context import (
@@ -8,6 +10,11 @@ from chaosx_bot.channel_context import (
     format_message_context,
 )
 from chaosx_bot.guild_channels import GuildChannels, format_channel_reference
+from chaosx_bot.guild_members import (
+    GuildMembers,
+    format_member_directory,
+    MEMBER_DIRECTORY_LIMIT,
+)
 from chaosx_bot.hermes_bridge import (
     AUTO_SCAN_BANTER_BOUNDARY,
     build_auto_scan_answer_prompt,
@@ -321,6 +328,33 @@ def test_format_channel_reference_empty() -> None:
     assert format_channel_reference([]) == ""
 
 
+def test_format_member_directory_uses_display_names_no_bots() -> None:
+    members = [
+        {"id": "1", "user": {"id": "1", "username": "zin1496", "global_name": "Hoops McCann"}},
+        {"id": "2", "nick": "Holly", "user": {"id": "2", "username": "holly_dev", "global_name": "holly_dev"}},
+        {"id": "3", "user": {"id": "3", "username": "chaosbot", "global_name": "ChaosBot", "bot": True}},
+        {"id": "4", "user": {"id": "4", "username": "solo", "global_name": None}},
+    ]
+    ref = format_member_directory(members)
+    assert "- Hoops McCann (1)" in ref
+    assert "- Holly (2)" in ref
+    assert "ChaosBot" not in ref  # bots excluded
+    assert "- solo (4)" in ref
+    assert ref.index("Holly") < ref.index("Hoops McCann")  # sorted by name
+    # Names only, never mentions/pings.
+    assert "<@" not in ref
+
+
+def test_format_member_directory_empty() -> None:
+    assert format_member_directory([]) == ""
+
+
+def test_guild_members_block_needs_guild_id() -> None:
+    gm = GuildMembers(bot_token="x", guild_id=0)
+    assert gm.needs_refresh() is False
+    assert gm.members_block() == ""
+
+
 def test_guild_channels_block_needs_guild_id() -> None:
     gc = GuildChannels(bot_token="x", guild_id=0)
     assert gc.needs_refresh() is False
@@ -388,12 +422,21 @@ def test_public_prompt_includes_server_facts_and_known_users() -> None:
             "User directory (display names; refer to users by these names, never ping/mention them):\n"
             "- Holly (id 111)\n- Hoops McCann (id 789502982122373150)"
         ),
+        server_members=(
+            "Server member directory (display names; refer to users by these names, never ping/mention them):\n"
+            "- Holly (id 111)\n- Hoops McCann (id 789502982122373150)"
+        ),
+        referenced_users=(
+            "Saved memory about Holly (user id 111):\nUser profile for Holly (from their earlier messages; use it to personalize):\nPrefers penguin states."
+        ),
     )
     assert "Server owner: Hoops McCann" in prompt
     assert "ChaosX bot maker: Hoops McCann" in prompt
     assert "Main Chaos Redux developer: Hoops McCann" in prompt
     assert "User directory" in prompt
     assert "Holly (id 111)" in prompt
+    assert "Server member directory" in prompt
+    assert "Saved memory about Holly" in prompt
 
 
 def test_reference_notes_are_owner_maintained_not_untrusted() -> None:
@@ -436,3 +479,29 @@ def test_public_boundary_can_name_users_without_pinging() -> None:
     prompt = build_public_prompt(user_request="who said that?", guild_name="G", channel_name="C")
     assert "name them by their display name" in prompt
     assert "never ping/mention a user" in prompt
+
+
+def test_public_boundary_knows_members_and_can_use_referenced_memory() -> None:
+    prompt = build_public_prompt(user_request="what has Holly suggested?", guild_name="G", channel_name="C")
+    assert "You know who is in this server" in prompt
+    assert "say yes" in prompt
+    assert "user directory" in prompt
+
+
+def test_server_facts_lookup_terms_trigger_facts_block() -> None:
+    """Server facts must be lookup-style: present only when the ask concerns
+    bot/server identity, not in the main context window otherwise."""
+    from chaosx_bot.bot import ChaosXBot
+
+    settings = SimpleNamespace(
+        discord_token="dummy",
+        server_owner_name="Hoops McCann",
+        bot_maker_name="Hoops McCann",
+        main_dev_name="Hoops McCann",
+    )
+    bot = cast(Any, object.__new__(ChaosXBot))
+    bot.settings = settings
+    assert "Server owner" in bot.server_facts_for_request("who made you?")
+    assert "Server owner" in bot.server_facts_for_request("who is the main developer?")
+    assert "Server owner" in bot.server_facts_for_request("who owns this server?")
+    assert bot.server_facts_for_request("how does the zombie event work?") == ""

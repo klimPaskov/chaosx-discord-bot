@@ -66,35 +66,6 @@ ON message_ask_memory(guild_id, channel_id, id);
 CREATE INDEX IF NOT EXISTS idx_message_ask_memory_bot_message
 ON message_ask_memory(bot_message_id);
 
-CREATE TABLE IF NOT EXISTS question_answers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at TEXT NOT NULL,
-    mode TEXT NOT NULL,
-    actor_id INTEGER NOT NULL,
-    guild_id INTEGER,
-    channel_id INTEGER,
-    source_message_id INTEGER,
-    bot_message_id INTEGER,
-    parent_bot_message_id INTEGER,
-    question_key TEXT NOT NULL,
-    question TEXT NOT NULL,
-    answer TEXT NOT NULL,
-    prompt_hash TEXT NOT NULL,
-    status TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_question_answers_key
-ON question_answers(question_key, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_question_answers_scope
-ON question_answers(guild_id, channel_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS question_seen (
-    question_key TEXT PRIMARY KEY,
-    ask_count INTEGER NOT NULL DEFAULT 0,
-    first_seen_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS auto_scan_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -115,26 +86,6 @@ ON auto_scan_events(guild_id, channel_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_auto_scan_events_action
 ON auto_scan_events(action, created_at DESC);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS question_answers_fts USING fts5(
-    question,
-    answer,
-    content='question_answers',
-    content_rowid='id'
-);
-
-CREATE TRIGGER IF NOT EXISTS question_answers_ai AFTER INSERT ON question_answers BEGIN
-    INSERT INTO question_answers_fts(rowid, question, answer) VALUES (new.id, new.question, new.answer);
-END;
-
-CREATE TRIGGER IF NOT EXISTS question_answers_ad AFTER DELETE ON question_answers BEGIN
-    INSERT INTO question_answers_fts(question_answers_fts, rowid, question, answer) VALUES ('delete', old.id, old.question, old.answer);
-END;
-
-CREATE TRIGGER IF NOT EXISTS question_answers_au AFTER UPDATE ON question_answers BEGIN
-    INSERT INTO question_answers_fts(question_answers_fts, rowid, question, answer) VALUES ('delete', old.id, old.question, old.answer);
-    INSERT INTO question_answers_fts(rowid, question, answer) VALUES (new.id, new.question, new.answer);
-END;
 
 CREATE TABLE IF NOT EXISTS github_deliveries (
     delivery_id TEXT PRIMARY KEY,
@@ -207,7 +158,6 @@ CREATE TABLE IF NOT EXISTS automation_config (
 
 DEFAULT_AUTOMATIONS = {
     "repository_index_refresh": 1,
-    "question_answer_tracking": 1,
     "auto_question_answering": 1,
     "auto_soft_rule_warnings": 1,
     "auto_bot_topic_banter": 1,
@@ -221,8 +171,7 @@ DEFAULT_AUTOMATIONS = {
 
 AUTOMATION_DESCRIPTIONS = {
     "repository_index_refresh": "Refreshes ChaosX's local event/scenario/cluster/search index from the Chaos Redux repo.",
-    "question_answer_tracking": "Stores successful public ChaosX Q&A pairs and supports /admin qna list/search/popular.",
-    "auto_question_answering": "Scanner gates clear Chaos Redux/server questions, then uses the public model to answer from exact local/catalog context and saves Q&A.",
+    "auto_question_answering": "Scanner gates clear Chaos Redux/server questions, then uses the public model to answer from exact local/catalog context.",
     "auto_soft_rule_warnings": "Scanner gates obvious rule problems, then uses the public model to write a short soft warning and reports it to the automations channel.",
     "auto_bot_topic_banter": "Scanner gates explicit conversations about ChaosX/the bot, then uses the public model to write short dynamic banter.",
     "skill_subagent_change_summary": "Would summarize changes made by agent/skill-driven work.",
@@ -232,18 +181,6 @@ AUTOMATION_DESCRIPTIONS = {
     "weekly_content_dump": "Image-led weekly content-dump post. Posts only when enough fresh visuals/assets exist.",
     "release_announcement_posting": "Reserved for release announcement posting; should stay off until explicitly used.",
 }
-
-
-QUESTION_KEY_PATTERN = re.compile(r"[^\w\s'-]+")
-WHITESPACE_PATTERN = re.compile(r"\s+")
-
-
-def normalize_question_key(question: str) -> str:
-    text = (question or "").casefold()
-    text = re.sub(r"<@!?\d+>", " ", text)
-    text = QUESTION_KEY_PATTERN.sub(" ", text)
-    text = WHITESPACE_PATTERN.sub(" ", text).strip(" ?!.:,;\t\n\r")
-    return text[:500] or "empty-question"
 
 
 def now_iso() -> str:
@@ -481,140 +418,6 @@ class Store:
             cur = await db.execute("SELECT enabled FROM automation_config WHERE name = ?", (name,))
             row = await cur.fetchone()
         return bool(row and row[0])
-
-    async def record_question_answer(
-        self,
-        *,
-        mode: str,
-        actor_id: int,
-        guild_id: int | None,
-        channel_id: int | None,
-        source_message_id: int | None,
-        bot_message_id: int | None,
-        parent_bot_message_id: int | None,
-        question: str,
-        answer: str,
-        prompt_hash: str,
-        status: str = "ok",
-    ) -> None:
-        question_key = normalize_question_key(question)
-        now = now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
-            # Repeat gate: only save a question after it has been asked at
-            # least twice. First occurrence just bumps the seen counter.
-            await db.execute(
-                """
-                INSERT INTO question_seen(question_key, ask_count, first_seen_at)
-                VALUES (?, 1, ?)
-                ON CONFLICT(question_key) DO UPDATE SET ask_count = ask_count + 1
-                """,
-                (question_key, now),
-            )
-            cur = await db.execute(
-                "SELECT ask_count FROM question_seen WHERE question_key = ?",
-                (question_key,),
-            )
-            row = await cur.fetchone()
-            if not row or row[0] < 2:
-                await db.commit()
-                return
-            await db.execute(
-                """
-                INSERT INTO question_answers(
-                    created_at, mode, actor_id, guild_id, channel_id, source_message_id,
-                    bot_message_id, parent_bot_message_id, question_key, question, answer, prompt_hash, status
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    now,
-                    mode[:40],
-                    actor_id,
-                    guild_id,
-                    channel_id,
-                    source_message_id,
-                    bot_message_id,
-                    parent_bot_message_id,
-                    question_key,
-                    question[:1600],
-                    answer[:4000],
-                    prompt_hash,
-                    status[:40],
-                ),
-            )
-            await db.commit()
-
-    async def list_question_answers(self, *, guild_id: int | None = None, limit: int = 10, query: str = "") -> list[tuple]:
-        limit = max(1, min(limit, 50))
-        where: list[str] = []
-        params: list[object] = []
-        if guild_id is not None:
-            where.append("guild_id IS ?")
-            params.append(guild_id)
-        if query.strip():
-            needle = f"%{query.strip()}%"
-            where.append("(question LIKE ? OR answer LIKE ?)")
-            params.extend([needle, needle])
-        sql = """
-            SELECT id, created_at, mode, actor_id, guild_id, channel_id, question, answer, bot_message_id, prompt_hash, status
-            FROM question_answers
-        """
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(sql, tuple(params))
-            return [tuple(row) for row in await cur.fetchall()]
-
-    async def list_popular_question_answers(self, *, guild_id: int | None = None, limit: int = 10, query: str = "") -> list[tuple]:
-        limit = max(1, min(limit, 50))
-        where: list[str] = []
-        params: list[object] = []
-        if guild_id is not None:
-            where.append("guild_id IS ?")
-            params.append(guild_id)
-        if query.strip():
-            needle = f"%{query.strip()}%"
-            where.append("(question LIKE ? OR answer LIKE ?)")
-            params.extend([needle, needle])
-        sql = """
-            WITH filtered AS (
-                SELECT *
-                FROM question_answers
-        """
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += """
-            ), grouped AS (
-                SELECT question_key, COUNT(*) AS ask_count, MAX(created_at) AS last_asked_at, MAX(id) AS latest_id
-                FROM filtered
-                GROUP BY question_key
-            )
-            SELECT
-                grouped.question_key,
-                grouped.ask_count,
-                grouped.last_asked_at,
-                latest.question AS latest_question,
-                latest.answer AS latest_answer
-            FROM grouped
-            JOIN question_answers latest ON latest.id = grouped.latest_id
-            ORDER BY grouped.ask_count DESC, grouped.last_asked_at DESC
-            LIMIT ?
-        """
-        params.append(limit)
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(sql, tuple(params))
-            return [tuple(row) for row in await cur.fetchall()]
-
-    async def clear_question_answers(self) -> int:
-        """Delete all saved Q&A plus the repeat counters; return rows deleted."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("DELETE FROM question_answers")
-            deleted = cur.rowcount
-            await db.execute("DELETE FROM question_seen")
-            await db.commit()
-        return max(0, deleted)
 
     async def list_warned_users(self, *, guild_id: int | None = None, limit: int = 25) -> list[tuple]:
         """Group soft-warning events by user: actor_id, warning count, last warned at, latest reason."""

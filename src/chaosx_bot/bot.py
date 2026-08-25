@@ -23,7 +23,9 @@ from .conversation_memory import (
     known_authors_for,
     mark_messages_admin,
     schedule_compaction,
+    schedule_user_profile_compaction,
     user_history_for,
+    user_profile_for,
 )
 from .catalog_validation import format_workbook_validation, validate_workbook
 from .community_notes import (
@@ -57,6 +59,7 @@ from .focus_trees import (
     SharedMcpSession,
 )
 from .guild_channels import GuildChannels
+from .guild_members import GuildMembers
 from .channel_context import ChannelReader
 from .web_grounding import WebGrounder, format_web_results_for_display
 from .vault_index import refresh_vault_indexes
@@ -105,7 +108,6 @@ from .storage import Store
 from .webhook_server import GitHubWebhookServer
 
 BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
-QNA_AUTOMATION_NAME = "question_answer_tracking"
 AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
 AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
 AUTO_BANTER_AUTOMATION_NAME = "auto_bot_topic_banter"
@@ -301,149 +303,6 @@ async def fetch_message_ask_chain_context(bot: ChaosXBot, *, bot_message_id: int
     return format_message_ask_chain_context(rows)
 
 
-def format_qna_entries(rows: list[tuple]) -> str:
-    lines = ["## Saved ChaosX Q&A"]
-    if not rows:
-        lines.append("No saved Q&A yet.")
-        return "\n".join(lines)
-    for entry_id, created_at, mode, actor_id, guild_id, channel_id, question, answer, bot_message_id, prompt_hash_value, status in rows:
-        safe_question = sanitize_admin_context_text(str(question), limit=500)
-        safe_answer = sanitize_admin_context_text(str(answer), limit=700)
-        safe_mode = sanitize_admin_context_text(str(mode), limit=40)
-        safe_status = sanitize_admin_context_text(str(status), limit=40)
-        lines.append(
-            f"- `#{entry_id}` — {created_at} — mode `{safe_mode}` — status `{safe_status}` — asked by `{actor_id}`"
-            + (f" — bot msg `{bot_message_id}`" if bot_message_id else "")
-            + f"\n  - Q: {safe_question}\n  - A: {safe_answer}"
-        )
-    return "\n".join(lines)
-
-
-def format_popular_qna(rows: list[tuple]) -> str:
-    lines = ["## Most-asked ChaosX Q&A"]
-    if not rows:
-        lines.append("No saved Q&A yet.")
-        return "\n".join(lines)
-    for question_key, ask_count, last_asked_at, question, answer in rows:
-        safe_question = sanitize_admin_context_text(str(question), limit=500)
-        safe_answer = sanitize_admin_context_text(str(answer), limit=650)
-        lines.append(
-            f"- `{ask_count}` ask(s) — last asked `{last_asked_at}`\n"
-            f"  - Q: {safe_question}\n"
-            f"  - Latest A: {safe_answer}"
-        )
-    return "\n".join(lines)
-
-
-# The Q&A store exists to accumulate reusable Chaos Redux knowledge, so only
-# real, on-topic questions with substantive answers belong in it. Banter,
-# flirt/relationship messages, bot self-meta chat, off-topic questions, pure
-# link/emoji/mention messages, and model non-answers (redirects, hedges,
-# refusals) are dropped before recording.
-QNA_REDIRECT_FRAGMENT = "can only answer chaos redux questions"
-QNA_SKIP_ANSWER_START_MARKERS = (
-    "i can only answer chaos redux questions",
-    "ask me about chaos redux events",
-    "appreciate the offer, but i'm just a help bot",
-    "i'm just a help bot",
-    "i am just a help bot",
-    "honestly not sure",
-    "i'm not sure",
-    "i am not sure",
-    "not sure on the exact",
-    "i don't have that data",
-    "i do not have that data",
-    "i don't have the data",
-    "i do not have the data",
-    "nothing in the event info mentions",
-)
-QNA_SKIP_QUESTION_MARKERS = (
-    "can we be together",
-    "be my girlfriend",
-    "be my boyfriend",
-    "are you single",
-    "do you love me",
-    "marry me",
-    "why does the bot harass",
-    "why do you harass",
-    "are you planning to sell your server",
-    "sell your server",
-    "are you human",
-    "are you real",
-)
-
-
-def qa_worth_saving(*, question: str, answer: str) -> bool:
-    """Return True only when a question/answer pair is real Chaos Redux Q&A.
-
-    Applies to every path that records into the Q&A store (auto scan answers,
-    mention/reply asks, and /ask) so junk never lands there.
-    """
-    q = (question or "").strip()
-    a = (answer or "").strip()
-    if not q or not a:
-        return False
-    if len(q) < 4 or len(a) < 8:
-        return False
-    # Strip mentions, channel refs, and links; require real text remains.
-    stripped = re.sub(r"<@!?\d+>", " ", q)
-    stripped = re.sub(r"<#\d+>", " ", stripped)
-    stripped = re.sub(r"https?://\S+", " ", stripped)
-    stripped = re.sub(r"\s+", " ", stripped).strip()
-    if len(stripped) < 4 or not re.search(r"[A-Za-zÀ-ž]", stripped):
-        return False
-    q_norm = q.casefold().replace("’", "'")
-    a_norm = a.casefold().replace("’", "'")
-    if any(marker in q_norm for marker in QNA_SKIP_QUESTION_MARKERS):
-        return False
-    if QNA_REDIRECT_FRAGMENT in a_norm:
-        return False
-    answer_head = a_norm[:160]
-    if any(marker in answer_head for marker in QNA_SKIP_ANSWER_START_MARKERS):
-        return False
-    return True
-
-
-async def record_public_question_answer(
-    bot: ChaosXBot,
-    *,
-    mode: str,
-    actor_id: int,
-    guild_id: int | None,
-    channel_id: int | None,
-    source_message_id: int | None,
-    bot_message_id: int | None,
-    parent_bot_message_id: int | None,
-    question: str,
-    answer: str,
-    prompt_hash: str,
-    status: str = "ok",
-) -> None:
-    try:
-        if not await bot.store.automation_enabled(QNA_AUTOMATION_NAME):
-            return
-        if not qa_worth_saving(question=question, answer=answer):
-            return
-        await bot.store.record_question_answer(
-            mode=mode,
-            actor_id=actor_id,
-            guild_id=guild_id,
-            channel_id=channel_id,
-            source_message_id=source_message_id,
-            bot_message_id=bot_message_id,
-            parent_bot_message_id=parent_bot_message_id,
-            question=sanitize_admin_context_text(question, limit=1600),
-            answer=sanitize_admin_context_text(answer, limit=4000),
-            prompt_hash=prompt_hash,
-            status=status,
-        )
-    except Exception as exc:
-        try:
-            await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="qna tracking error", summary=type(exc).__name__)
-        except Exception:
-            pass
-
-
 def parse_channel_id_set(value: str) -> set[int]:
     ids: set[int] = set()
     for chunk in re.split(r"[,\s]+", value or ""):
@@ -571,13 +430,13 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
         channel_id=getattr(message.channel, "id", 0),
         exclude_message_id=message.id,
     )
-    # Web grounding when local notes have nothing (public asks AND banter).
-    # Never for catalog lookups (event/scenario/cluster/mechanic): a miss
-    # there must be a plain "not found", never a web-search dump.
+    # Web grounding: always available (public asks AND banter) so the model
+    # can reach the web when it needs it. Never for catalog lookups
+    # (event/scenario/cluster/mechanic): a miss there must be a plain
+    # "not found", never a web-search dump.
     web_context = ""
     if (
         bot.settings.web_search_enabled
-        and not (decision.reference_context or "").strip()
         and not looks_like_catalog_lookup(user_message)
     ):
         web_context = await bot.web.search_context(user_message)
@@ -592,8 +451,10 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
-            server_facts=bot.server_facts_block(),
+            server_facts=bot.server_facts_for_request(user_message),
             known_users=await bot.known_users_block(),
+            server_members=bot.members_block(),
+            referenced_users=await bot.referenced_user_contexts_block(user_message),
             web_context=web_context,
         )
     elif decision.action == "banter":
@@ -607,8 +468,9 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             reference_context=decision.reference_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
-            server_facts=bot.server_facts_block(),
+            server_facts=bot.server_facts_for_request(user_message),
             known_users=await bot.known_users_block(),
+            server_members=bot.members_block(),
             web_context=web_context,
         )
     elif decision.action == "soft_warning":
@@ -725,20 +587,6 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             return False
         first_sent = await reply_with_chunks(message, model_output)
         prompt_hash_value = result.prompt_hash
-        await record_public_question_answer(
-            bot,
-            mode="auto scan",
-            actor_id=message.author.id,
-            guild_id=guild_id,
-            channel_id=channel_id,
-            source_message_id=message.id,
-            bot_message_id=first_sent.id if first_sent else None,
-            parent_bot_message_id=None,
-            question=decision.question or message.content or "",
-            answer=model_output,
-            prompt_hash=prompt_hash_value,
-            status="ok",
-        )
         if first_sent:
             try:
                 await bot.store.record_message_ask_turn(
@@ -1164,7 +1012,6 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
-- `/admin qna action:list|search|popular [query:<text>] [limit:<n>]` — owner-only Q&A manager for successful public `/ask`, `@ChaosX`, reply-chain, and auto-scan questions/answers. Use `popular` to see which questions are asked most.
 - `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for model-generated auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
@@ -1244,6 +1091,11 @@ class ChaosXBot(discord.Client):
             guild_id=settings.allowed_guild_id or settings.command_guild_id or 0,
         )
         self._channels_refresh_inflight = False
+        self.guild_members = GuildMembers(
+            bot_token=settings.discord_token,
+            guild_id=settings.allowed_guild_id or settings.command_guild_id or 0,
+        )
+        self._members_refresh_inflight = False
         # Read-only channel message context for public asks (GET only; the
         # public path structurally has no Discord mutation calls).
         self.channel_reader = ChannelReader(bot_token=settings.discord_token)
@@ -1261,6 +1113,12 @@ class ChaosXBot(discord.Client):
             await self.guild_channels.refresh()
         finally:
             self._channels_refresh_inflight = False
+
+    async def _refresh_members_background(self) -> None:
+        try:
+            await self.guild_members.refresh()
+        finally:
+            self._members_refresh_inflight = False
 
     def rules_block(self) -> str:
         """Prompt-ready server-rules block; kicks a background refresh when stale."""
@@ -1287,31 +1145,95 @@ class ChaosXBot(discord.Client):
         ]
         return "\n".join(parts)
 
+    # Terms that signal the ask actually concerns bot/server identity. These
+    # stay OUT of the main context window (per Hoops) and are only fetched
+    # when a question explicitly asks about them.
+    _SERVER_FACTS_LOOKUP_TERMS = (
+        "server owner",
+        "owns this server",
+        "owns the server",
+        "who runs the server",
+        "who runs this server",
+        "who made you",
+        "who created you",
+        "who built you",
+        "who programmed you",
+        "bot maker",
+        "bot creator",
+        "main developer",
+        "main dev",
+        "chaos redux developer",
+        "chaos redux dev",
+        "who develops",
+        "who maintains",
+        "who is the developer",
+        "who is the dev",
+        "made the bot",
+        "created the bot",
+        "built the bot",
+        "developer of chaos",
+        "dev of chaos",
+    )
+
+    def server_facts_for_request(self, request: str) -> str:
+        """Server-facts block ONLY when the ask concerns bot/server identity.
+
+        Kept lookup-style (like user saved memory) so identity facts are not
+        in the main context window unless actually relevant.
+        """
+        text = (request or "").casefold()
+        if any(term in text for term in self._SERVER_FACTS_LOOKUP_TERMS):
+            return self.server_facts_block()
+        return ""
+
+    def members_block(self) -> str:
+        """Prompt-ready member directory; kicks a background refresh when stale."""
+        if self.guild_members.needs_refresh() and not self._members_refresh_inflight:
+            self._members_refresh_inflight = True
+            asyncio.create_task(self._refresh_members_background())
+        return self.guild_members.members_block()
+
     async def known_users_block(self, *, limit: int = 60) -> str:
         """Prompt-ready user directory: display names for users the bot knows.
 
-        Built from captured public conversation history (author_id ->
-        latest author_name), plus any guild member cache entries. Lets the
-        bot name users directly without pinging them.
+        Built from the REST member directory (all server members) plus
+        captured public conversation history (author_id -> latest
+        author_name), plus any guild member cache entries. Lets the bot name
+        users directly without pinging them.
         """
         mapping: dict[int, str] = {}
+        # REST member directory first (complete member list, bots excluded).
+        for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+            uid = member.get("id")
+            if uid is None:
+                continue
+            display = (
+                (member.get("nick") or "")
+                or (member.get("user") or {}).get("global_name")
+                or (member.get("user") or {}).get("username")
+                or ""
+            )
+            if display:
+                mapping[int(uid)] = str(display).strip()
+        # Captured history (may include members who changed names).
         try:
-            mapping = await known_authors_for(
+            history = await known_authors_for(
                 self.settings.db_path,
                 limit=limit,
                 scope="public",
             )
         except Exception:
-            mapping = {}
+            history = {}
+        for uid, name in history.items():
+            mapping.setdefault(uid, name)
+        # Guild member cache fallback.
         for guild in self.guilds:
             if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
                 continue
             for member in guild.members:
-                if member.id in mapping:
-                    continue
                 name = getattr(member, "display_name", None) or getattr(member, "name", None)
                 if name:
-                    mapping[member.id] = name
+                    mapping.setdefault(member.id, name)
                 if len(mapping) >= limit:
                     break
             if len(mapping) >= limit:
@@ -1323,10 +1245,70 @@ class ChaosXBot(discord.Client):
             lines.append(f"- {mapping[uid]} (id {uid})")
         return "\n".join(lines)
 
+    async def referenced_user_contexts_block(self, request: str) -> str:
+        """Saved memory (profile + recent messages) for users named in the ask.
+
+        Matches display names from the member/user directory against the
+        request text, then loads each matched user's stored public profile
+        and history — so the bot can answer "what has X said/suggested?"
+        about ANY user, not just the asking one. Public scope only (admin
+        rows never leak). Returns '' when nothing matches or nothing stored.
+        """
+        text = (request or "").strip()
+        if not text:
+            return ""
+        # Reuse the directory mapping (display name -> id).
+        mapping: dict[int, str] = {}
+        for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+            uid = member.get("id")
+            if uid is None:
+                continue
+            display = (
+                (member.get("nick") or "")
+                or (member.get("user") or {}).get("global_name")
+                or (member.get("user") or {}).get("username")
+                or ""
+            )
+            if display:
+                mapping[int(uid)] = str(display).strip()
+        try:
+            history = await known_authors_for(self.settings.db_path, limit=80, scope="public")
+        except Exception:
+            history = {}
+        for uid, name in history.items():
+            mapping.setdefault(uid, name)
+        if not mapping:
+            return ""
+        lowered = text.casefold()
+        matched: list[tuple[int, str]] = []
+        for uid, name in mapping.items():
+            key = name.casefold()
+            if len(key) >= 2 and key in lowered and uid not in {m[0] for m in matched}:
+                matched.append((uid, name))
+        if not matched:
+            return ""
+        blocks: list[str] = []
+        for uid, name in matched[:5]:
+            try:
+                profile = await user_profile_for(self.settings.db_path, uid)
+            except Exception:
+                profile = ""
+            try:
+                recent = await user_history_for(self.settings.db_path, uid, scope="public")
+            except Exception:
+                recent = ""
+            parts = [p for p in (profile, recent) if p]
+            if parts:
+                blocks.append(f"Saved memory about {name} (user id {uid}):\n" + "\n".join(parts))
+        if not blocks:
+            return ""
+        return "\n\n".join(blocks)
+
     async def user_context_for(self, user_id: int, *, exclude_message_id: int | None = None) -> str:
-        """Prompt-ready info about the asking user: display name, top role, and
-        their recent captured messages (public scope only). Best-effort; any
-        failure returns an empty string so answering never breaks."""
+        """Prompt-ready info about the asking user: display name, top role,
+        their stored profile (preferences/suggestions from earlier messages),
+        and their recent captured messages (public scope only). Best-effort;
+        any failure returns an empty string so answering never breaks."""
         try:
             history = await user_history_for(
                 self.settings.db_path,
@@ -1336,6 +1318,10 @@ class ChaosXBot(discord.Client):
             )
         except Exception:
             history = ""
+        try:
+            profile = await user_profile_for(self.settings.db_path, user_id)
+        except Exception:
+            profile = ""
         display: str | None = None
         role: str | None = None
         for guild in self.guilds:
@@ -1348,12 +1334,25 @@ class ChaosXBot(discord.Client):
                 if top_role is not None and top_role.name not in ("@everyone", ""):
                     role = top_role.name
                 break
+        if display is None:
+            # REST member directory may know the user before the cache does.
+            for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+                if str(member.get("id")) == str(user_id):
+                    display = (
+                        (member.get("nick") or "")
+                        or (member.get("user") or {}).get("global_name")
+                        or (member.get("user") or {}).get("username")
+                        or None
+                    )
+                    break
         parts: list[str] = []
         who = f"Asking user: {display}" if display else ""
         if role:
             who += f" (top role: {role})"
         if who:
             parts.append(who)
+        if profile:
+            parts.append(profile)
         if history:
             parts.append(history)
         return "\n".join(parts)
@@ -1557,6 +1556,11 @@ class ChaosXBot(discord.Client):
             allowed_guild_id=self.settings.allowed_guild_id or self.settings.command_guild_id,
             message_id=message.id,
         )
+        # Background per-user profile compaction (preferences, suggestions,
+        # feedback) once the user has enough new captured messages. Cheap
+        # count gate; runs via the public model.
+        if not (self.user is not None and message.author.id == self.user.id):
+            schedule_user_profile_compaction(self.settings, message.author.id)
         if await handle_message_ask(self, message):
             return
         await handle_auto_scan(self, message)
@@ -2114,12 +2118,12 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         channel_context = "\n".join(part for part in (main_context, linked_context) if part)
     except Exception:
         channel_context = ""
-    # Web grounding when the local notes have no answer (never for catalog
-    # lookups — a miss must be a plain "not found", not a search dump).
+    # Web grounding: always available so the model can reach the web when it
+    # needs it (never for catalog lookups — a miss must be a plain "not
+    # found", not a search dump).
     web_context = ""
     if (
         bot.settings.web_search_enabled
-        and not reference_context.strip()
         and not looks_like_catalog_lookup(request)
     ):
         web_context = await bot.web.search_context(request)
@@ -2134,8 +2138,10 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
-        server_facts=bot.server_facts_block(),
+        server_facts=bot.server_facts_for_request(request),
         known_users=await bot.known_users_block(),
+        server_members=bot.members_block(),
+        referenced_users=await bot.referenced_user_contexts_block(request),
         channel_context=channel_context,
         web_context=web_context,
     )
@@ -2190,20 +2196,6 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
             request=sanitize_admin_context_text(request, limit=1200),
             output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
             keep_last=bot.settings.reply_memory_keep_last,
-        )
-        await record_public_question_answer(
-            bot,
-            mode=command_name,
-            actor_id=message.author.id,
-            guild_id=guild_id,
-            channel_id=channel_id,
-            source_message_id=message.id,
-            bot_message_id=first_sent.id,
-            parent_bot_message_id=parent_bot_message_id,
-            question=request,
-            answer=memory_output,
-            prompt_hash=result.prompt_hash,
-            status=status,
         )
 
 
@@ -2811,8 +2803,6 @@ async def run_hermes_command(
     use_ask_model: bool = False,
     use_operator_model: bool = False,
     max_chars_override: int | None = None,
-    qna_question: str = "",
-    qna_mode: str = "slash",
     send_output: bool = True,
 ) -> tuple[HermesResult, str] | None:
     rate = None
@@ -2899,13 +2889,13 @@ async def run_hermes_command(
             channel_context = "\n".join(part for part in (main_context, linked_context) if part)
         except Exception:
             channel_context = ""
-    # Web grounding when local notes have no answer (public asks only; never
-    # for catalog lookups — a miss must be a plain "not found", not a dump).
+    # Web grounding: always available so the model can reach the web when it
+    # needs it (public asks only; never for catalog lookups — a miss must be
+    # a plain "not found", not a dump).
     web_context = ""
     if (
         not owner_only
         and bot.settings.web_search_enabled
-        and not reference_context.strip()
         and not looks_like_catalog_lookup(request)
     ):
         web_context = await bot.web.search_context(request)
@@ -2930,8 +2920,10 @@ async def run_hermes_command(
             user_context=await bot.user_context_for(interaction.user.id),
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
-            server_facts=bot.server_facts_block(),
+            server_facts=bot.server_facts_for_request(request),
             known_users=await bot.known_users_block(),
+            server_members=bot.members_block(),
+            referenced_users=await bot.referenced_user_contexts_block(request),
             channel_context=channel_context,
         )
     )
@@ -3085,20 +3077,6 @@ async def run_hermes_command(
             output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
             keep_last=bot.settings.reply_memory_keep_last,
         )
-        await record_public_question_answer(
-            bot,
-            mode=qna_mode,
-            actor_id=interaction.user.id,
-            guild_id=interaction.guild_id,
-            channel_id=interaction.channel_id,
-            source_message_id=None,
-            bot_message_id=first_sent_id,
-            parent_bot_message_id=None,
-            question=qna_question or request,
-            answer=memory_output,
-            prompt_hash=result.prompt_hash,
-            status=status,
-        )
     return result, output
 
 
@@ -3251,8 +3229,6 @@ def register_commands(bot: ChaosXBot) -> None:
             public=visibility != "private",
             rate_bucket="ask",
             use_ask_model=True,
-            qna_question=question,
-            qna_mode="slash",
         )
 
     @bot.tree.command(name="event", description="Look up an event by ID or name and show its chain, focus trees, and scripted GUIs.")
@@ -3890,30 +3866,6 @@ def register_commands(bot: ChaosXBot) -> None:
             lines.append(f"- `{name}` — enabled=`{bool(enabled)}` — destination=`{destination or 'unset'}`\n  - {description}")
         text = "\n".join(lines)
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
-    @admin.command(name="qna", description="List/search popular saved ChaosX Q&A.")
-    async def admin_qna(interaction: discord.Interaction, action: str = "list", query: str = "", limit: int = 10) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        action = action.lower().strip() or "list"
-        limit = max(1, min(limit, 25))
-        if action == "popular":
-            rows = await bot.store.list_popular_question_answers(guild_id=interaction.guild_id, limit=limit, query=query)
-            text = format_popular_qna(rows)
-        elif action in {"list", "search"}:
-            rows = await bot.store.list_question_answers(guild_id=interaction.guild_id, limit=limit, query=query)
-            text = format_qna_entries(rows)
-        elif action == "clear":
-            deleted = await bot.store.clear_question_answers()
-            text = f"Cleared the Q&A store: {deleted} saved Q&A rows removed (repeat counters also reset)."
-        else:
-            text = "Unknown Q&A action. Use `list`, `search`, `popular`, or `clear`."
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin qna", summary=f"{action} {query}".strip())
-        for part in _chunk(text):
-            if interaction.response.is_done():
-                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-            else:
-                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="autoscan", description="List recent ChaosX auto-scan actions.")
     async def admin_autoscan(interaction: discord.Interaction, action: str = "list", limit: int = 10) -> None:

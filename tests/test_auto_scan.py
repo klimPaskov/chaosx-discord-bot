@@ -347,16 +347,12 @@ def test_auto_scan_formatters_and_channel_exclusion_are_sanitized():
 
 class _FakeStore:
     def __init__(self) -> None:
-        self.qnas: list[dict[str, Any]] = []
         self.turns: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
         self.audits: list[dict[str, Any]] = []
 
     async def automation_enabled(self, name: str) -> bool:
         return True
-
-    async def record_question_answer(self, **kwargs: Any) -> None:
-        self.qnas.append(kwargs)
 
     async def record_message_ask_turn(self, **kwargs: Any) -> None:
         self.turns.append(kwargs)
@@ -474,8 +470,6 @@ async def test_handle_auto_scan_auto_answer_replies_and_records(monkeypatch):
 
     assert handled is True
     assert message.replies[0]["content"] == "Model-generated auto-scan reply"
-    assert bot.store.qnas[0]["mode"] == "auto scan"
-    assert bot.store.qnas[0]["answer"] == "Model-generated auto-scan reply"
     assert bot.store.turns[0]["bot_message_id"] == 9001
     assert bot.store.turns[0]["prompt_hash"] == "model-hash"
     assert bot.store.events[0]["action"] == "answer"
@@ -531,7 +525,6 @@ async def test_handle_auto_scan_shadow_mode_records_without_reply(monkeypatch):
 
     assert handled is True
     assert message.replies == []
-    assert bot.store.qnas == []
     assert bot.store.events[0]["action"] == "shadow"
     assert bot.store.events[0]["reason"] == "shadow auto-answer: explicit event id 2"
 
@@ -551,7 +544,6 @@ async def test_handle_auto_scan_bot_topic_banter_replies_and_logs(monkeypatch):
 
     assert handled is True
     assert message.replies[0]["content"] == "Model-generated auto-scan reply"
-    assert bot.store.qnas == []
     assert bot.store.turns == []
     assert bot.store.events[0]["action"] == "banter"
     assert bot.store.events[0]["reason"] == "bot-topic insult/roast"

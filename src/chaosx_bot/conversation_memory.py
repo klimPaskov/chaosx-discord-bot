@@ -38,6 +38,12 @@ MESSAGE_EXCERPT_CHARS = 300
 USER_HISTORY_LIMIT = 12
 # Total chars cap for the per-user history block.
 USER_HISTORY_MAX_CHARS = 1600
+# New public messages since the last user-profile compaction before one is due.
+USER_PROFILE_COMPACT_THRESHOLD = 25
+# Max chars of a stored per-user profile summary.
+USER_PROFILE_MAX_CHARS = 1200
+# Messages inspected when (re)building a user profile.
+USER_PROFILE_INSPECT_LIMIT = 60
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -60,6 +66,14 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (channel_id, scope)
 );
+CREATE TABLE IF NOT EXISTS user_profiles (
+    author_id INTEGER PRIMARY KEY,
+    author_name TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT '',
+    last_message_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_name ON user_profiles(author_name);
 """
 
 _COMPACT_PROMPT = (
@@ -68,6 +82,15 @@ _COMPACT_PROMPT = (
     "project/mod, user preferences, requests, and named entities. Drop: greetings, "
     "banter, repetition, and trivia. If an existing summary is provided, merge it in "
     "and keep only what still matters. Output ONLY the new summary text."
+)
+
+_USER_PROFILE_PROMPT = (
+    "Build a compact user profile from this Discord user's public messages "
+    "(maximum 90 words). Keep: what they like/dislike about the mod, their "
+    "preferences, earlier suggestions/event ideas, playtest feedback, and "
+    "notable facts about them. Drop: greetings, banter, repetition, and trivia. "
+    "If an existing profile is provided, merge it in and keep only what still "
+    "matters. Output ONLY the new profile text."
 )
 
 
@@ -290,6 +313,161 @@ async def known_authors_for(db_path: Path, *, limit: int = 60, scope: str = "pub
     except Exception:
         return {}
     return mapping
+
+
+async def user_profile_for(db_path: Path, author_id: int, *, scope: str = "public") -> str:
+    """Return the stored per-user profile block ('' when none exists).
+
+    Profiles are built in the background from the user's public messages
+    (preferences, suggestions, feedback, notable facts). Returns a
+    prompt-ready block.
+    """
+    try:
+        await _ensure_schema(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (
+                await db.execute(
+                    "SELECT author_name, profile FROM user_profiles WHERE author_id = ?",
+                    (author_id,),
+                )
+            ).fetchone()
+    except Exception:
+        return ""
+    if row is None or not str(row["profile"] or "").strip():
+        return ""
+    name = str(row["author_name"] or "").strip()
+    header = f"User profile for {name} (from their earlier messages; use it to personalize):" if name else "User profile (from their earlier messages; use it to personalize):"
+    return header + "\n" + redact_internal_infrastructure(str(row["profile"]).strip())
+
+
+async def compact_user_profile_if_due(
+    db_path: Path,
+    author_id: int,
+    *,
+    summarize: Callable[[str], Awaitable[str]],
+    threshold: int = USER_PROFILE_COMPACT_THRESHOLD,
+) -> bool:
+    """(Re)build a user's profile once enough new public messages arrived.
+
+    ``summarize`` receives the full prompt and must return the profile text
+    (or "" on failure). Returns True when compaction ran.
+    """
+    try:
+        await _ensure_schema(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            profile_row = await (
+                await db.execute(
+                    "SELECT author_name, profile, last_message_id FROM user_profiles WHERE author_id = ?",
+                    (author_id,),
+                )
+            ).fetchone()
+            since = int(profile_row["last_message_id"]) if profile_row is not None else 0
+            count_row = await (
+                await db.execute(
+                    "SELECT COUNT(*) AS n FROM conversation_messages WHERE author_id = ? AND id > ? AND visibility = 'public'",
+                    (author_id, since),
+                )
+            ).fetchone()
+            n = int(count_row["n"]) if count_row is not None else 0
+            if n < threshold:
+                return False
+            rows = await (
+                await db.execute(
+                    "SELECT author_name, content FROM conversation_messages "
+                    "WHERE author_id = ? AND id > ? AND visibility = 'public' ORDER BY id ASC LIMIT ?",
+                    (author_id, since, USER_PROFILE_INSPECT_LIMIT),
+                )
+            ).fetchall()
+            last_row = await (
+                await db.execute(
+                    "SELECT MAX(id) AS m FROM conversation_messages WHERE author_id = ? AND visibility = 'public'",
+                    (author_id,),
+                )
+            ).fetchone()
+            last_id = int(last_row["m"] or 0) if last_row is not None else 0
+            name = str(profile_row["author_name"]) if profile_row is not None else ""
+            old_profile = str(profile_row["profile"]) if profile_row is not None else ""
+    except Exception:
+        return False
+    if not rows:
+        return False
+
+    # Use the author's latest display name when no profile row exists yet.
+    if not name.strip():
+        last_author = ""
+        for r in rows:
+            last_author = str(r["author_name"] or "")
+        name = last_author.strip()
+
+    transcript = "\n".join(f"- {r['author_name']}: {_excerpt(r['content'])}" for r in rows)
+    existing = f"\nExisting profile:\n{old_profile[:USER_PROFILE_MAX_CHARS]}" if old_profile else ""
+    prompt = f"{_USER_PROFILE_PROMPT}{existing}\n\nUser messages:\n{transcript[:4000]}"
+    try:
+        new_profile = (await summarize(prompt)).strip()
+    except Exception:
+        return False
+    if not new_profile:
+        return False
+
+    now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "INSERT INTO user_profiles (author_id, author_name, profile, last_message_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(author_id) DO UPDATE SET author_name = excluded.author_name, "
+                "profile = excluded.profile, last_message_id = excluded.last_message_id, "
+                "updated_at = excluded.updated_at",
+                (author_id, (name or "user")[:64], new_profile[:USER_PROFILE_MAX_CHARS], last_id, now),
+            )
+            await db.commit()
+    except Exception:
+        return False
+    return True
+
+
+async def run_user_profile_compaction_if_due(settings: Any, author_id: int) -> bool:
+    """Background user-profile compaction glue (same public Hermes bridge)."""
+
+    async def _summarize(prompt: str) -> str:
+        from .bot import sanitize_public_ask_output  # lazy: bot imports this module
+
+        result = await run_hermes(
+            hermes_bin=settings.hermes_bin,
+            profile=settings.hermes_profile,
+            repo=settings.chaos_redux_repo,
+            prompt=prompt,
+            timeout_seconds=getattr(settings, "hermes_timeout_seconds", 300),
+            model=getattr(settings, "ask_model", None),
+            provider=getattr(settings, "ask_provider", None),
+            reasoning_effort=getattr(settings, "ask_reasoning_effort", None),
+            toolsets="safe",
+            ignore_rules=True,
+            activity_label="user profile compact",
+            actor_id=author_id,
+        )
+        if not result.ok:
+            return ""
+        return sanitize_public_ask_output(result.stdout.strip())
+
+    return await compact_user_profile_if_due(settings.db_path, author_id, summarize=_summarize)
+
+
+def schedule_user_profile_compaction(settings: Any, author_id: int) -> None:
+    """Fire-and-forget user-profile compaction; never raises into the loop."""
+
+    async def _run() -> None:
+        try:
+            await run_user_profile_compaction_if_due(settings, author_id)
+        except Exception:
+            return
+
+    try:
+        asyncio.create_task(_run(), name="chaosx-user-profile-compact")
+    except RuntimeError:
+        return
 
 
 async def compact_if_due(

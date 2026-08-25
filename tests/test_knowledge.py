@@ -82,16 +82,26 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'docs/' not in ask_context
     assert 'accepted_source_specification' not in ask_context
     if vault.exists():
-        fury_context = knowledge.public_ask_context('Fury aggressor model')
-        assert 'Fury' in fury_context or 'aggressor' in fury_context
         conn = sqlite3.connect(db)
         try:
             vault_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/%'").fetchone()[0]
+            event_spec_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/Events/Event Specs/%'").fetchone()[0]
+            concept_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/concepts/%'").fetchone()[0]
             hidden_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE lower(path) LIKE '%important tokens%'").fetchone()[0]
         finally:
             conn.close()
         assert vault_docs > 0
         assert hidden_docs == 0
+        # Public ask context must NOT surface vault concept/planning notes
+        # (Obsidian vault is admin-only reference since 2026-08-25) — only
+        # the Event Specs folder stays public.
+        fury_context = knowledge.public_ask_context('Fury aggressor model')
+        if concept_docs > 0:
+            assert 'aggressor' not in fury_context or 'vault/concepts' not in fury_context
+        # Event Specs folder remains a public reference source.
+        event_spec_ctx = knowledge.public_ask_context('Event Specs')
+        if event_spec_docs > 0:
+            assert event_spec_ctx.strip()
     ask_context_with_sources = knowledge.public_ask_context('Zombie Outbreak source path', include_sources=True)
     assert 'Source:' in ask_context_with_sources
     assert 'docs/' in ask_context_with_sources or 'events/' in ask_context_with_sources or 'common/' in ask_context_with_sources

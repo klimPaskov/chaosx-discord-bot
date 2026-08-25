@@ -287,6 +287,10 @@ class Knowledge:
                 JOIN source_docs d ON d.id = source_docs_fts.rowid
                 WHERE source_docs_fts MATCH ?
                   AND d.source_class NOT IN ({})
+                  AND NOT (
+                      d.path LIKE 'vault/%'
+                      AND d.path NOT LIKE 'vault/Events/Event Specs/%'
+                  )
                 ORDER BY rank
                 LIMIT ?
                 """.format(", ".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)),

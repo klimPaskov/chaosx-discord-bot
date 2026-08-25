@@ -6,11 +6,14 @@ from pathlib import Path
 from chaosx_bot.conversation_memory import (
     KEEP_AFTER_COMPACT,
     MAX_MESSAGES_PER_CHANNEL,
+    USER_PROFILE_COMPACT_THRESHOLD,
     capture_message,
     compact_if_due,
+    compact_user_profile_if_due,
     conversation_context_for,
     known_authors_for,
     user_history_for,
+    user_profile_for,
 )
 
 GUILD = 1001
@@ -103,6 +106,43 @@ def test_known_authors_for_maps_latest_display_names(tmp_path: Path) -> None:
         assert 5000 not in mapping  # admin rows stay out of the public directory
 
     asyncio.run(run())
+
+
+def test_user_profile_compacts_and_personalizes(tmp_path: Path) -> None:
+    db = tmp_path / "mem.db"
+
+    async def run() -> None:
+        # Below threshold: no profile built yet.
+        await _capture(db, n=3, author="Holly")
+        assert await compact_user_profile_if_due(db, 3000, summarize=_fake_profile_summarize) is False
+        assert await user_profile_for(db, 3000) == ""
+
+        # Cross the threshold (default 25) with real messages.
+        for i in range(USER_PROFILE_COMPACT_THRESHOLD):
+            await capture_message(
+                db,
+                guild_id=GUILD,
+                channel_id=CHANNEL,
+                author_id=3000,
+                author_name="Holly",
+                content=f"suggestion {i}: more {('railway guns' if i % 2 else 'penguin states')}",
+                created_at=_iso(10 + i),
+                is_bot_self=False,
+                allowed_guild_id=ALLOWED,
+            )
+        assert await compact_user_profile_if_due(db, 3000, summarize=_fake_profile_summarize) is True
+        block = await user_profile_for(db, 3000)
+        assert "User profile for Holly" in block
+        assert "penguin states" in block or "railway guns" in block
+
+    asyncio.run(run())
+
+
+async def _fake_profile_summarize(prompt: str) -> str:
+    # Pulls the concrete facts out of the transcript for the assertion.
+    if "penguin states" in prompt:
+        return "Prefers penguin states; suggested more of them."
+    return "Suggested railway guns."
 
 
 def test_capture_skips_non_guild_slash_other_bots(tmp_path: Path) -> None:

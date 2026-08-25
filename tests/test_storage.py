@@ -1,6 +1,6 @@
 import json
 
-from chaosx_bot.storage import Store, normalize_question_key
+from chaosx_bot.storage import Store
 
 
 async def test_list_playtest_reports_returns_observations(tmp_path):
@@ -40,8 +40,6 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert "weekly_content_dump" in by_name
     assert by_name["weekly_content_dump"][0] == 1
     assert "fresh visuals" in by_name["weekly_content_dump"][2]
-    assert by_name["question_answer_tracking"][0] == 1
-    assert "/admin qna" in by_name["question_answer_tracking"][2]
     assert by_name["auto_question_answering"][0] == 1
     assert "uses the public model" in by_name["auto_question_answering"][2]
     assert by_name["auto_soft_rule_warnings"][0] == 1
@@ -50,7 +48,7 @@ async def test_automation_list_includes_descriptions(tmp_path):
     assert "dynamic banter" in by_name["auto_bot_topic_banter"][2]
     assert by_name["playtest_result_synthesis"][0] == 1
     assert "private model-generated report" in by_name["playtest_result_synthesis"][2]
-    assert await store.automation_enabled("question_answer_tracking")
+    assert "question_answer_tracking" not in by_name
     assert await store.automation_enabled("auto_question_answering")
     assert await store.automation_enabled("auto_soft_rule_warnings")
     assert await store.automation_enabled("auto_bot_topic_banter")
@@ -270,107 +268,3 @@ async def test_warned_users_groups_soft_warnings_by_user(tmp_path):
     assert [row[0] for row in warned_again] == [123, 124]
 
 
-async def test_question_answer_log_lists_searches_and_counts_popular_questions(tmp_path):
-    store = Store(tmp_path / "chaosx-test.db")
-    await store.init()
-    assert normalize_question_key("<@123> How does Zombie Outbreak work?!") == "how does zombie outbreak work"
-
-    await store.record_question_answer(
-        mode="slash",
-        actor_id=100,
-        guild_id=456,
-        channel_id=789,
-        source_message_id=None,
-        bot_message_id=2000,
-        parent_bot_message_id=None,
-        question="How does Zombie Outbreak work?",
-        answer="Zombie Outbreak starts a spreading crisis.",
-        prompt_hash="hash-1",
-    )
-    # First occurrence of a question is NOT saved (repeat gate).
-    assert await store.list_question_answers(guild_id=456, limit=10) == []
-    await store.record_question_answer(
-        mode="mention ask",
-        actor_id=101,
-        guild_id=456,
-        channel_id=789,
-        source_message_id=1001,
-        bot_message_id=2001,
-        parent_bot_message_id=None,
-        question="how does zombie outbreak work",
-        answer="Zombie Outbreak spreads through infected states.",
-        prompt_hash="hash-2",
-    )
-    # Second occurrence (same normalized key) IS saved.
-    await store.record_question_answer(
-        mode="slash",
-        actor_id=102,
-        guild_id=456,
-        channel_id=999,
-        source_message_id=None,
-        bot_message_id=2002,
-        parent_bot_message_id=None,
-        question="What is Fury?",
-        answer="Fury is an event concept when documented.",
-        prompt_hash="hash-3",
-    )
-    # Fury is a first occurrence -> not saved.
-    assert len(await store.list_question_answers(guild_id=456, limit=10)) == 1
-    await store.record_question_answer(
-        mode="slash",
-        actor_id=103,
-        guild_id=999,
-        channel_id=789,
-        source_message_id=None,
-        bot_message_id=2003,
-        parent_bot_message_id=None,
-        question="How does Zombie Outbreak work?",
-        answer="Other guild answer.",
-        prompt_hash="hash-4",
-    )
-
-    rows = await store.list_question_answers(guild_id=456, limit=10)
-    search_rows = await store.list_question_answers(guild_id=456, limit=10, query="Fury")
-    popular = await store.list_popular_question_answers(guild_id=456, limit=10)
-
-    assert [row[6] for row in rows] == ["how does zombie outbreak work"]
-    assert len(search_rows) == 0
-    assert popular[0][1] == 1
-    assert popular[0][3] == "how does zombie outbreak work"
-    assert "infected states" in popular[0][4]
-
-
-async def test_question_answer_clear_wipes_saved_rows_and_counters(tmp_path):
-    store = Store(tmp_path / "chaosx-test.db")
-    await store.init()
-    for _ in range(2):
-        await store.record_question_answer(
-            mode="slash",
-            actor_id=100,
-            guild_id=456,
-            channel_id=789,
-            source_message_id=None,
-            bot_message_id=2000,
-            parent_bot_message_id=None,
-            question="How does Zombie Outbreak work?",
-            answer="Zombie Outbreak starts a spreading crisis.",
-            prompt_hash="hash-1",
-        )
-    assert len(await store.list_question_answers(guild_id=456, limit=10)) == 1
-    deleted = await store.clear_question_answers()
-    assert deleted == 1
-    assert await store.list_question_answers(guild_id=456, limit=10) == []
-    # Counters reset: the next occurrence is treated as a first ask again.
-    await store.record_question_answer(
-        mode="slash",
-        actor_id=100,
-        guild_id=456,
-        channel_id=789,
-        source_message_id=None,
-        bot_message_id=2000,
-        parent_bot_message_id=None,
-        question="How does Zombie Outbreak work?",
-        answer="Zombie Outbreak starts a spreading crisis.",
-        prompt_hash="hash-1",
-    )
-    assert await store.list_question_answers(guild_id=456, limit=10) == []
