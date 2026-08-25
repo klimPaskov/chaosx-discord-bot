@@ -3944,9 +3944,28 @@ def register_commands(bot: ChaosXBot) -> None:
             else:
                 await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    @admin.command(name="user-memory", description="Show saved memory (profile + recent history) about a user.")
-    async def admin_user_memory(interaction: discord.Interaction, user: str, limit: int = 10) -> None:
+    @admin.command(name="user-memory", description="Show saved memory (profile + recent history) for all users, or one user by name/ID.")
+    async def admin_user_memory(interaction: discord.Interaction, user: str = "", limit: int = 10) -> None:
         if not await owner_gate(interaction, settings):
+            return
+        # No user given: dump memory for every user the bot has something for,
+        # skipping users with nothing saved.
+        if not user.strip():
+            known = await known_authors_for(bot.settings.db_path, limit=500, scope="public")
+            blocks: list[str] = []
+            for uid, name in sorted(known.items(), key=lambda item: item[1].casefold()):
+                profile = await user_profile_for(bot.settings.db_path, uid, scope="public")
+                history = await user_history_for(bot.settings.db_path, uid, scope="public", limit=limit)
+                parts = [part for part in (profile, history) if part]
+                if parts:
+                    blocks.append(f"## {name}\n" + "\n\n".join(parts))
+            text = "\n\n---\n\n".join(blocks) if blocks else "No saved user memory yet."
+            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"all users ({len(blocks)})")
+            for part in _chunk(text):
+                if interaction.response.is_done():
+                    await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                else:
+                    await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
             return
         # Resolve by numeric ID first, then by display name from captured history.
         author_id: int | None = None
