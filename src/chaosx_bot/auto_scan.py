@@ -224,6 +224,26 @@ def looks_like_catalog_lookup(content: str) -> bool:
     )
 
 
+_MODEL_IDENTITY_QUESTION_RE = re.compile(
+    r"what(?:\s+model|\s+llm|\s+ai(?: model)?|\s+language model|'s your model| is your model)"
+    r"|which\s+model"
+    r"|model\s+(?:are|do)\s+you"
+    r"|what\s+are\s+you\s+(?:running|built|powered)\s+on"
+    r"|what\s+model\s+(?:are|do)\s+you"
+    r"|are\s+you\s+(?:running\s+on|using)\s+\S*model",
+    re.IGNORECASE,
+)
+
+
+def looks_like_model_identity_question(content: str) -> bool:
+    """True when the text asks what model the bot is running.
+
+    The model name is NOT part of the bot's main context; it is injected as
+    a lookup only when someone actually asks. This gate mirrors the catalog
+    lookup pattern (detect intent -> provide the answer from config)."""
+    return bool(_MODEL_IDENTITY_QUESTION_RE.search(content or ""))
+
+
 def classify_soft_warning(content: str) -> AutoScanDecision:
     text = content or ""
     if not text.strip():

@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny_reason
 import pytest
+from chaosx_bot.auto_scan import looks_like_model_identity_question
 
 from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, schedule_chaosx_restart, validate_issue_report
 from chaosx_bot.config import Settings
@@ -341,6 +342,18 @@ def test_auto_scan_prompts_require_dynamic_model_generated_text():
     assert "soft warning" in warning_prompt
 
 
+def test_model_identity_question_detector():
+    assert looks_like_model_identity_question("what model are you using?")
+    assert looks_like_model_identity_question("which model are you?")
+    assert looks_like_model_identity_question("what ai model runs the bot?")
+    assert looks_like_model_identity_question("what llm do you use?")
+    assert looks_like_model_identity_question("what are you running on?")
+    assert looks_like_model_identity_question("model are you?")
+    assert not looks_like_model_identity_question("how does the zombie event work?")
+    assert not looks_like_model_identity_question("what is a focus tree?")
+    assert not looks_like_model_identity_question("hello")
+
+
 def test_public_prompt_injects_model_name_for_identity_questions():
     prompt = build_public_prompt(
         user_request="what model are you?",
@@ -384,6 +397,15 @@ def test_auto_scan_and_owner_prompts_inject_model_name():
         model_name="deepseek-v4-flash",
     )
     assert "you are running on the deepseek-v4-flash model" in owner_prompt
+    # Model name is a lookup, not main context: ordinary questions get no injection.
+    plain_answer = build_auto_scan_answer_prompt(
+        user_message="how does the zombie event work?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="Event 2: Zombie Outbreak",
+        gate_reason="grounded mod question",
+    )
+    assert "you are running on the" not in plain_answer
 
 
 def test_community_help_uses_search_and_root_feedback_commands():
