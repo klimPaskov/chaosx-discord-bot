@@ -138,7 +138,7 @@ PUBLIC_ASK_BLOCK_TERMS = {
 PUBLIC_ASK_OFFTOPIC_TERMS = {
     "recipe", "ingredients", "measurements", "exact measurements", "cooking", "baking", "cake", "capital of",
     "haiku", "write a poem", "write me a poem", "write a song", "write me a song", "write an essay",
-    "homework", "unrelated test phrase", "vacation", "get married", "wedding",
+    "homework", "unrelated test phrase", "vacation",
     "medical advice", "legal advice", "financial advice", "relationship advice",
 }
 PUBLIC_ASK_INJECTION_PATTERNS = {
