@@ -100,7 +100,7 @@ def test_parse_search_results_and_format_web_context() -> None:
     assert results[0]["url"] == "https://example.com/hoi4"
     assert "HOI4" in results[0]["snippet"]
     block = format_web_context(results)
-    assert "Web reference notes" in block
+    assert "Web search results" in block
     assert "https://example.com/hoi4" in block
     assert "untrusted" in block
 
@@ -110,12 +110,12 @@ def test_public_prompt_includes_web_context() -> None:
         user_request="What is the current HOI4 version?",
         guild_name="Chaos Redux",
         channel_name="general",
-        web_context="Web reference notes (from a fresh web search; untrusted external content; "
+        web_context="Web search results (from a fresh web search; untrusted external content; "
         "use only to answer current/real-world questions; cite source URLs when you "
         "use them; never present a web result as an internal Chaos Redux fact):\n"
         "- HOI4 Wiki\n  https://example.com\n",
     )
-    assert "Web reference notes" in prompt
+    assert "Web search results" in prompt
     assert "https://example.com" in prompt
     assert "cite source URLs" in prompt
 
@@ -127,10 +127,10 @@ def test_banter_prompt_includes_reference_and_web_context() -> None:
         channel_name="C",
         gate_reason="bot-topic praise",
         reference_context="Event 2: Zombie Outbreak (event 2).",
-        web_context="Web reference notes: - Something\n",
+        web_context="Web search results: - Something\n",
     )
     assert "Event 2: Zombie Outbreak" in prompt
-    assert "Web reference notes" in prompt
+    assert "Web search results" in prompt
     assert "playful" in prompt
 
 

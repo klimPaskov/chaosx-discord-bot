@@ -55,7 +55,7 @@ def test_public_prompt_scopes_and_refuses_dangerous_requests():
     )
     assert "Community user question" in prompt
     assert "Answer only questions related to Chaos Redux" in prompt
-    assert "Internal reference notes" in prompt
+    assert "Chaos Redux reference material for answer accuracy" in prompt
     assert "Spec says outbreak pressure" in prompt
     assert "Do not mention file paths" in prompt
     assert "Only include repo/spec/code paths when the user explicitly asks" in prompt
@@ -73,15 +73,15 @@ def test_public_prompt_grounds_on_reference_and_never_encourages_guessing():
         channel_name="general",
         reference_context="Zombie Outbreak is event 2.",
     )
-    assert "You must base your answer on the provided internal reference notes" in grounded
-    assert "none were available" not in grounded
+    assert "You must base your answer on the provided Chaos Redux reference material" in grounded
+    assert "none was available" not in grounded
     empty = build_public_prompt(
         user_request="what is event 2?",
         guild_name="Chaos Redux",
         channel_name="general",
         reference_context="",
     )
-    assert "none were available" in empty
+    assert "none was available" in empty
     assert "Do not guess or invent Chaos Redux facts" in empty
 
 

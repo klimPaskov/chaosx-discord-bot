@@ -305,7 +305,7 @@ def test_public_prompt_can_include_lower_priority_reply_chain_context():
     )
     assert "ChaosX reply-chain context" in prompt
     assert "current message is replying to a prior ChaosX answer" in prompt
-    assert "Internal reference notes for answer accuracy" in prompt
+    assert "Chaos Redux reference material for answer accuracy" in prompt
     assert "Community user question" in prompt
 
 
@@ -334,7 +334,7 @@ def test_auto_scan_prompts_require_dynamic_model_generated_text():
         assert "generate the actual public text dynamically" in prompt
         assert "Do not use canned wording" in prompt
         assert "Do not use @everyone" in prompt
-    assert "Reference context for the model-generated answer" in answer_prompt
+    assert "Chaos Redux reference material for the model-generated answer" in answer_prompt
     assert "Event 2: Zombie Outbreak" in answer_prompt
     assert "playful" in banter_prompt
     assert "Never invent facts" in banter_prompt
