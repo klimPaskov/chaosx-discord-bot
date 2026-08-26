@@ -14,7 +14,7 @@ from chaosx_bot.indexer import (
     is_vault_indexable,
     rebuild_index,
 )
-from chaosx_bot.knowledge import Knowledge
+from chaosx_bot.knowledge import Knowledge, _fts_and_query, _fts_query
 
 
 def test_rebuild_index_and_event_lookup(tmp_path: Path):
@@ -354,3 +354,19 @@ def test_qoder_fingerprint_tracks_export_hash(tmp_path: Path):
     fingerprint_v2 = index_commit(repo, qoder_path=qoder)
     assert fingerprint_v2.endswith('qoder:hash-v2')
     assert fingerprint_v1 != fingerprint_v2
+
+
+def test_fts_query_builders_never_produce_column_filter_syntax():
+    # Hoops report 2026-08-26: /ask failed with "no such column: code" when a
+    # user query contained a hyphen-joined token. FTS5 misparses a bare
+    # `x-code` / `event-5` MATCH term as a column filter. The builders must
+    # split hyphens and quote every term so MATCH only sees literal terms.
+    assert _fts_and_query("event-5") == '"event" AND "5"'
+    assert _fts_and_query("mod-code") == '"mod" AND "code"'
+    assert _fts_and_query("what is the code for event 5") == '"what" AND "is" AND "the" AND "code" AND "for" AND "event" AND "5"'
+    assert _fts_query("event-5") == '"event" OR "5"'
+    assert _fts_query("") == '""'
+    assert _fts_and_query("") == '""'
+    # Plain queries unchanged in shape (quoted terms, no hyphens needed).
+    assert _fts_and_query("zombie outbreak") == '"zombie" AND "outbreak"'
+    assert _fts_query("zombie outbreak") == '"zombie" OR "outbreak"'

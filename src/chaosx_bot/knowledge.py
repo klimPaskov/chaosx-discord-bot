@@ -630,13 +630,18 @@ def _explicit_numeric_lookup_id(value: str, *prefixes: str) -> str | None:
 
 
 def _fts_query(query: str) -> str:
-    tokens = re.findall(r"[A-Za-z0-9_\-]+", query)
-    return " OR ".join(tokens[:8]) or '""'
+    # Same hyphen/quoting treatment as _fts_and_query; see its docstring.
+    tokens = re.findall(r"[A-Za-z0-9_]+", query)
+    return " OR ".join(f'"{t}"' for t in tokens[:8]) or '""'
 
 
 def _fts_and_query(query: str) -> str:
-    tokens = re.findall(r"[A-Za-z0-9_\-]+", query)
-    return " AND ".join(tokens[:8]) or '""'
+    # Hyphens are separators to the FTS5 tokenizer, but a bare hyphen-joined
+    # token in MATCH (e.g. `event-5`, `mod-code`) is misparsed as a column
+    # filter ("no such column: 5"/"no such column: code"). Split on hyphens
+    # and quote each term so MATCH always treats them as literal terms.
+    tokens = re.findall(r"[A-Za-z0-9_]+", query)
+    return " AND ".join(f'"{t}"' for t in tokens[:8]) or '""'
 
 
 def _clean_snippet(value: str) -> str:
