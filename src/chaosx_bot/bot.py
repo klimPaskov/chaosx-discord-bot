@@ -132,8 +132,7 @@ PUBLIC_ASK_BLOCK_TERMS = {
     "api token", "access token", "discord token", "password", "credential", "delete server", "nuke server",
     "hack server", "malware", "phishing", "bypass instructions", "mass ping",
     "@everyone", "@here", "ban everyone", "delete channel", "delete role", "manage server", "moderation",
-    "write a script", "write me a script", "write a python script", "python script", "write code",
-    "give me code", "write a program", "write a bot", "make a bot", "scrape", "scraper",
+    "write a python script", "python script", "write a bot", "make a bot", "scrape", "scraper",
     "load_token", "urllib", "requests.get", "discord api",
 }
 PUBLIC_ASK_OFFTOPIC_TERMS = {
@@ -151,6 +150,13 @@ PUBLIC_OUTPUT_FORBIDDEN_TERMS = {
     "safe server moderation", "channel organization", "reporting abuse",
     "ingredients:", "method:", "recipe", "baking steps", "cooking steps",
 }
+# Non-mod programming languages whose fenced blocks must never surface in a
+# public answer. HOI4 mod script (.txt Paradox script) and unlabeled fences
+# are legitimate Chaos Redux content and are allowed.
+NON_MOD_FENCE_LANGUAGES = (
+    r"python|py|bash|sh|shell|zsh|js|ts|jsx|tsx|go|golang|rust|rs|java|c\b|cpp|"
+    r"cs|rb|ruby|php|sql|json|yaml|yml|toml|powershell|ps1|perl|lua|dockerfile"
+)
 # Code-like line markers. If a public answer contains several of these, it is
 # a code dump (script/implementation), never a legitimate community answer.
 # Optional leading diff markers (+/-) are tolerated (models sometimes emit
@@ -165,7 +171,7 @@ PUBLIC_OUTPUT_CODE_LINE_PATTERNS = (
     re.compile(r"load_token|read_text\(\)\.splitlines|Authorization.*Bot \{", re.IGNORECASE),
     re.compile(r"^\s*[+\-]?\s*for .* in .*:", re.MULTILINE),
     re.compile(r"^\s*[+\-]?\s*(?:await\s+)?[a-z_]+\(.*\)\s*$", re.MULTILINE),
-    re.compile(r"```(?:python|py|bash|sh|shell|js|ts|go|rust|sql)", re.IGNORECASE),
+    re.compile(r"```\s*(?:" + NON_MOD_FENCE_LANGUAGES + r")\b", re.IGNORECASE | re.MULTILINE),
 )
 PUBLIC_ANSWER_LABEL_RE = re.compile(
     r"""
@@ -274,19 +280,18 @@ def sanitize_public_ask_output(output: str) -> str:
 
 
 def looks_like_code_dump(text: str) -> bool:
-    """True when a public answer is actually raw code (script/implementation).
+    """True when a public answer is actually raw non-mod code (script/implementation).
 
     Community answers never contain multiple code-shaped lines. A few matching
-    lines (imports, def/class, assignments, function calls, code fences) mean
-    the model leaked a script instead of answering — redirect instead of
-    posting it. Short inline references (a single ``/event`` style token or a
-    one-line mention) do not count.
+    lines (imports, def/class, assignments, function calls, non-mod code
+    fences) mean the model leaked a script instead of answering — redirect
+    instead of posting it. HOI4 mod script (.txt Paradox script: event/focus/
+    option blocks, unlabeled or `txt` fences) is legitimate Chaos Redux
+    content and passes through. Short inline references (a single ``/event``
+    style token or a one-line mention) do not count.
     """
     if not text:
         return False
-    if "```" in text and re.search(r"```[a-zA-Z]*", text):
-        # Any fenced code block in a public answer is a leak.
-        return True
     matches = sum(1 for pattern in PUBLIC_OUTPUT_CODE_LINE_PATTERNS if pattern.search(text))
     return matches >= 3
 

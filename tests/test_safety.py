@@ -66,6 +66,39 @@ def test_public_output_never_leaks_code_dumps():
     assert sanitize_public_ask_output("Event 2 is called Zombie Outbreak. Use `/event 2` for details.") == "Event 2 is called Zombie Outbreak. Use `/event 2` for details."
 
 
+def test_public_output_allows_hoi4_mod_script():
+    # HOI4 mod script (Paradox .txt) is legitimate Chaos Redux content and
+    # must NOT be redirected (Hoops 2026-08-26: "It can show hoi4 script/mod
+    # code when needed though").
+    hoi4_script = (
+        "```txt\n"
+        "event = {\n"
+        "    id = chaos_redux.2\n"
+        "    title = chaos_redux.2.t\n"
+        "    desc = chaos_redux.2.d\n"
+        "    option = {\n"
+        "        name = chaos_redux.2.a\n"
+        "    }\n"
+        "}\n"
+        "```"
+    )
+    assert sanitize_public_ask_output(hoi4_script) != PUBLIC_ASK_REDIRECT
+    assert "event = {" in sanitize_public_ask_output(hoi4_script)
+    # Unlabeled fence with mod script also passes.
+    unlabeled = (
+        "```\n"
+        "focus = {\n"
+        "    id = chaos_focus_001\n"
+        "    x = 1\n"
+        "    y = 2\n"
+        "}\n"
+        "```"
+    )
+    assert sanitize_public_ask_output(unlabeled) != PUBLIC_ASK_REDIRECT
+    # A plain-language answer describing a mechanic still passes.
+    assert sanitize_public_ask_output("Zombie Outbreak spreads through shared state with three evolution stages.") == "Zombie Outbreak spreads through shared state with three evolution stages."
+
+
 def test_owner_prompt_allows_explicit_admin_mentions_but_public_prompt_does_not():
     owner_prompt = build_owner_prompt(
         owner_request="post @everyone announcement in #announcements",
