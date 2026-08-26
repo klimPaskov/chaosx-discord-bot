@@ -455,6 +455,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             server_members=bot.members_block(),
             referenced_users=await bot.referenced_user_contexts_block(user_message),
             web_context=web_context,
+            model_name=bot.settings.ask_model,
         )
     elif decision.action == "banter":
         prompt = build_auto_scan_banter_prompt(
@@ -471,6 +472,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             known_users=await bot.known_users_block(),
             server_members=bot.members_block(),
             web_context=web_context,
+            model_name=bot.settings.ask_model,
         )
     elif decision.action == "soft_warning":
         prompt = build_auto_scan_warning_prompt(
@@ -878,6 +880,7 @@ async def ai_review_issue_report(
             channel_name="issue-review",
             reference_context="",
             source_paths_allowed=False,
+            model_name=bot.settings.ask_model,
         ),
         timeout_seconds=bot.settings.hermes_timeout_seconds,
         model=bot.settings.ask_model,
@@ -1841,6 +1844,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         conversation_context=admin_conversation_context,
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
+        model_name=bot.settings.operator_model,
     )
     # Admin task messages stay in the admin memory partition (public asks never see them).
     await mark_messages_admin(bot.settings.db_path, [message.id])
@@ -2279,6 +2283,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         referenced_users=await bot.referenced_user_contexts_block(request),
         channel_context=channel_context,
         web_context=web_context,
+        model_name=bot.settings.ask_model,
     )
     # No thinking feed for mention asks: only slash commands can carry an
     # ephemeral ("only you can see this") message, and DMs are not used.
@@ -3055,6 +3060,7 @@ async def run_hermes_command(
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
             server_facts=bot.server_facts_block(),
+            model_name=bot.settings.operator_model,
         )
         if owner_only
         else build_public_prompt(
@@ -3072,6 +3078,7 @@ async def run_hermes_command(
             server_members=bot.members_block(),
             referenced_users=await bot.referenced_user_contexts_block(request),
             channel_context=channel_context,
+            model_name=bot.settings.ask_model,
         )
     )
     model = provider = reasoning_effort = toolsets = None

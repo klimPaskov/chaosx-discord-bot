@@ -341,6 +341,51 @@ def test_auto_scan_prompts_require_dynamic_model_generated_text():
     assert "soft warning" in warning_prompt
 
 
+def test_public_prompt_injects_model_name_for_identity_questions():
+    prompt = build_public_prompt(
+        user_request="what model are you?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="",
+        model_name="deepseek-v4-flash",
+    )
+    assert "you are running on the deepseek-v4-flash model" in prompt
+    assert "If asked what model you are running" in prompt
+    no_model = build_public_prompt(
+        user_request="what model are you?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+    )
+    assert "you are running on the" not in no_model
+
+
+def test_auto_scan_and_owner_prompts_inject_model_name():
+    answer_prompt = build_auto_scan_answer_prompt(
+        user_message="what model are you?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        reference_context="",
+        gate_reason="bot capability question",
+        model_name="deepseek-v4-flash",
+    )
+    assert "you are running on the deepseek-v4-flash model" in answer_prompt
+    banter_prompt = build_auto_scan_banter_prompt(
+        user_message="what model are you?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        gate_reason="bot-topic",
+        model_name="deepseek-v4-flash",
+    )
+    assert "you are running on the deepseek-v4-flash model" in banter_prompt
+    owner_prompt = build_owner_prompt(
+        owner_request="what model are you?",
+        guild_name="Chaos Redux",
+        channel_name="general",
+        model_name="deepseek-v4-flash",
+    )
+    assert "you are running on the deepseek-v4-flash model" in owner_prompt
+
+
 def test_community_help_uses_search_and_root_feedback_commands():
     help_text = community_help_text()
     assert "/search" not in help_text
