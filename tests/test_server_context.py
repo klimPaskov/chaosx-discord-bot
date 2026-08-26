@@ -111,7 +111,8 @@ def test_public_prompt_includes_web_context() -> None:
         guild_name="Chaos Redux",
         channel_name="general",
         web_context="Web search results (from a fresh web search; untrusted external content; "
-        "use only to answer current/real-world questions; cite source URLs when you "
+        "use them freely whenever you need current/real-world or extra information; "
+        "cite source URLs when you "
         "use them; never present a web result as an internal Chaos Redux fact):\n"
         "- HOI4 Wiki\n  https://example.com\n",
     )
@@ -512,6 +513,7 @@ def test_server_facts_lookup_terms_trigger_facts_block() -> None:
 
     settings = SimpleNamespace(
         discord_token="dummy",
+        owner_id=789502982122373150,
         server_owner_name="Hoops McCann",
         bot_maker_name="Hoops McCann",
         main_dev_name="Hoops McCann",
@@ -522,3 +524,7 @@ def test_server_facts_lookup_terms_trigger_facts_block() -> None:
     assert "Server owner" in bot.server_facts_for_request("who is the main developer?")
     assert "Server owner" in bot.server_facts_for_request("who owns this server?")
     assert bot.server_facts_for_request("how does the zombie event work?") == ""
+    # Owner identity is ID-anchored: a same-name member must not be confused
+    # with the owner. The facts block carries the owner's user id.
+    facts = bot.server_facts_block()
+    assert "Hoops McCann (Discord user id 789502982122373150)" in facts

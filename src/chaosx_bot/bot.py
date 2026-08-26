@@ -16,7 +16,14 @@ import discord
 from discord import app_commands
 
 from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
-from .auto_scan import BOT_TOPIC_RE, AutoScanDecision, classify_message, looks_like_catalog_lookup, looks_like_model_identity_question
+from .auto_scan import (
+    BOT_TOPIC_RE,
+    AutoScanDecision,
+    classify_mention_banter,
+    classify_message,
+    looks_like_catalog_lookup,
+    looks_like_model_identity_question,
+)
 from .conversation_memory import (
     backfill_capture,
     capture_message,
@@ -125,6 +132,9 @@ PUBLIC_ASK_BLOCK_TERMS = {
     "api token", "access token", "discord token", "password", "credential", "delete server", "nuke server",
     "hack server", "malware", "phishing", "bypass instructions", "mass ping",
     "@everyone", "@here", "ban everyone", "delete channel", "delete role", "manage server", "moderation",
+    "write a script", "write me a script", "write a python script", "python script", "write code",
+    "give me code", "write a program", "write a bot", "make a bot", "scrape", "scraper",
+    "load_token", "urllib", "requests.get", "discord api",
 }
 PUBLIC_ASK_OFFTOPIC_TERMS = {
     "recipe", "ingredients", "measurements", "exact measurements", "cooking", "baking", "cake", "capital of",
@@ -141,6 +151,22 @@ PUBLIC_OUTPUT_FORBIDDEN_TERMS = {
     "safe server moderation", "channel organization", "reporting abuse",
     "ingredients:", "method:", "recipe", "baking steps", "cooking steps",
 }
+# Code-like line markers. If a public answer contains several of these, it is
+# a code dump (script/implementation), never a legitimate community answer.
+# Optional leading diff markers (+/-) are tolerated (models sometimes emit
+# pasted code with diff prefixes).
+PUBLIC_OUTPUT_CODE_LINE_PATTERNS = (
+    re.compile(r"^\s*[+\-]?\s*(?:import|from)\s+[a-zA-Z_]", re.MULTILINE),
+    re.compile(r"^\s*[+\-]?\s*def\s+[a-zA-Z_]", re.MULTILINE),
+    re.compile(r"^\s*[+\-]?\s*class\s+[a-zA-Z_]", re.MULTILINE),
+    re.compile(r"^\s*[+\-]?\s*(?:GUILD_ID|API|TARGET|TOKEN|BOT_TOKEN|CHANNEL_ID|URL)\s*=", re.MULTILINE),
+    re.compile(r"^\s*[+\-]?\s*(?:return|raise|print)\s+", re.MULTILINE),
+    re.compile(r"urllib\.request|requests\.(?:get|post)|httpx\.", re.IGNORECASE),
+    re.compile(r"load_token|read_text\(\)\.splitlines|Authorization.*Bot \{", re.IGNORECASE),
+    re.compile(r"^\s*[+\-]?\s*for .* in .*:", re.MULTILINE),
+    re.compile(r"^\s*[+\-]?\s*(?:await\s+)?[a-z_]+\(.*\)\s*$", re.MULTILINE),
+    re.compile(r"```(?:python|py|bash|sh|shell|js|ts|go|rust|sql)", re.IGNORECASE),
+)
 PUBLIC_ANSWER_LABEL_RE = re.compile(
     r"""
     ^\s*
@@ -242,7 +268,27 @@ def sanitize_public_ask_output(output: str) -> str:
     text = cleaned.casefold()
     if any(term in text for term in PUBLIC_OUTPUT_FORBIDDEN_TERMS):
         return PUBLIC_ASK_REDIRECT
+    if looks_like_code_dump(cleaned):
+        return PUBLIC_ASK_REDIRECT
     return redact_internal_infrastructure(cleaned)
+
+
+def looks_like_code_dump(text: str) -> bool:
+    """True when a public answer is actually raw code (script/implementation).
+
+    Community answers never contain multiple code-shaped lines. A few matching
+    lines (imports, def/class, assignments, function calls, code fences) mean
+    the model leaked a script instead of answering — redirect instead of
+    posting it. Short inline references (a single ``/event`` style token or a
+    one-line mention) do not count.
+    """
+    if not text:
+        return False
+    if "```" in text and re.search(r"```[a-zA-Z]*", text):
+        # Any fenced code block in a public answer is a leak.
+        return True
+    matches = sum(1 for pattern in PUBLIC_OUTPUT_CODE_LINE_PATTERNS if pattern.search(text))
+    return matches >= 3
 
 
 def public_ask_wants_sources(request: str) -> bool:
@@ -1154,7 +1200,7 @@ class ChaosXBot(discord.Client):
         s = self.settings
         parts = [
             "Server facts:",
-            f"- Server owner: {s.server_owner_name}",
+            f"- Server owner: {s.server_owner_name} (Discord user id {s.owner_id})",
             f"- ChaosX bot maker: {s.bot_maker_name}",
             f"- Main Chaos Redux developer: {s.main_dev_name}",
         ]
@@ -1798,6 +1844,19 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
 
     if not mentioned and not name_addressed and not replies_to_known_chain:
         return False
+    # Direct @ChaosX mentions that are purely casual/social get the playful
+    # banter path instead of the formal public ask (Hoops 2026-08-26). Real
+    # questions and domain asks fall through to the normal public ask path.
+    if mentioned and not replies_to_known_chain:
+        banter = classify_mention_banter(
+            message.content or "",
+            request,
+            settings=bot.settings,
+            knowledge=bot.knowledge,
+        )
+        if banter.action == "banter":
+            await run_mention_banter(bot, message, request, banter)
+            return True
     await run_public_ask_message(
         bot,
         message,
@@ -2200,6 +2259,45 @@ async def _scan_history_background(
             await interaction.followup.send(f"History scan failed: `{type(exc).__name__}: {exc}`", ephemeral=True)
         except Exception:
             pass
+
+
+async def run_mention_banter(bot: ChaosXBot, message: discord.Message, request: str, decision: AutoScanDecision) -> None:
+    """Playful banter reply for casual/social direct @ChaosX mentions.
+
+    Same grounding and web access as the auto-scan banter path, routed through
+    the mention surface (Hoops 2026-08-26: direct mentions should stay
+    playful/witty/ironic like banter, not the formal ask path).
+    """
+    guild_id = message.guild.id if message.guild else None
+    channel_id = getattr(message.channel, "id", None)
+    if decision.question is None:
+        decision.question = request
+    result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+    if not result.ok or not model_output.strip():
+        reason = auto_scan_model_failure_reason(decision, result, model_output)
+        await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention banter model failure", summary=reason)
+        return
+    sent = await reply_with_chunks(message, model_output)
+    await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention bot-topic banter", summary=decision.reason)
+    if sent is not None:
+        try:
+            await bot.store.record_message_ask_turn(
+                mode="mention banter",
+                actor_id=message.author.id,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                source_message_id=message.id,
+                bot_message_id=sent.id,
+                parent_bot_message_id=None,
+                prompt_hash=result.prompt_hash,
+                status="ok",
+                request=sanitize_admin_context_text(request, limit=1200),
+                output_excerpt=sanitize_admin_context_text(model_output, limit=2500),
+                keep_last=bot.settings.reply_memory_keep_last,
+            )
+        except Exception as exc:
+            await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention banter reply memory error", summary=type(exc).__name__)
+    schedule_compaction(bot.settings, channel_id=channel_id)
 
 
 async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, request: str, *, parent_bot_message_id: int | None = None) -> None:
@@ -4067,8 +4165,8 @@ def register_commands(bot: ChaosXBot) -> None:
             else:
                 await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
-    @admin.command(name="user-memory", description="Show saved memory (profile + recent history) for all users, or one user by name/ID.")
-    async def admin_user_memory(interaction: discord.Interaction, user: str = "", limit: int = 10) -> None:
+    @admin.command(name="user-memory", description="Show saved memory (profile summary) for all users, or one user by name/ID.")
+    async def admin_user_memory(interaction: discord.Interaction, user: str = "") -> None:
         if not await owner_gate(interaction, settings):
             return
         # No user given: dump memory for every user the bot has something for,
@@ -4078,10 +4176,8 @@ def register_commands(bot: ChaosXBot) -> None:
             blocks: list[str] = []
             for uid, name in sorted(known.items(), key=lambda item: item[1].casefold()):
                 profile = await user_profile_for(bot.settings.db_path, uid, scope="public")
-                history = await user_history_for(bot.settings.db_path, uid, scope="public", limit=limit)
-                parts = [part for part in (profile, history) if part]
-                if parts:
-                    blocks.append(f"## {name}\n" + "\n\n".join(parts))
+                if profile:
+                    blocks.append(f"## {name}\n" + profile)
             text = "\n\n---\n\n".join(blocks) if blocks else "No saved user memory yet."
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"all users ({len(blocks)})")
             for part in _chunk(text):
@@ -4108,10 +4204,13 @@ def register_commands(bot: ChaosXBot) -> None:
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"not found: {user.strip()}")
             return
         profile = await user_profile_for(bot.settings.db_path, author_id, scope="public")
-        history = await user_history_for(bot.settings.db_path, author_id, scope="public", limit=limit)
-        parts = [part for part in (profile, history) if part]
-        text = "\n\n".join(parts) if parts else f"No saved memory yet for user id `{author_id}` (profile builds after enough captured messages)."
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"user id {author_id} limit {limit}")
+        if profile:
+            known = await known_authors_for(bot.settings.db_path, limit=500, scope="public")
+            display_name = known.get(author_id, str(author_id))
+            text = f"## {display_name} (user id {author_id})\n\n" + profile
+        else:
+            text = f"No saved memory yet for user id `{author_id}` (profile builds after enough captured messages)."
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"user id {author_id}")
         for part in _chunk(text):
             if interaction.response.is_done():
                 await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())

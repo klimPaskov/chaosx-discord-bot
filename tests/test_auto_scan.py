@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import pytest
 
-from chaosx_bot.auto_scan import AutoScanDecision, classify_auto_answer, classify_bot_topic_banter, classify_message, classify_soft_warning, has_domain_signal, is_question_like
+from chaosx_bot.auto_scan import AutoScanDecision, classify_auto_answer, classify_bot_topic_banter, classify_mention_banter, classify_message, classify_soft_warning, has_domain_signal, is_question_like
 from chaosx_bot.bot import auto_scan_channel_excluded, format_auto_scan_events, format_auto_scan_notice, handle_auto_scan, parse_channel_id_set
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import HermesResult
@@ -190,6 +190,30 @@ def test_auto_scan_bot_topic_banter_gate_uses_no_canned_public_text():
 
     disabled = classify_bot_topic_banter("this bot is stupid", settings=Settings(discord_token="dummy", auto_scan_bot_topic_enabled=False))
     assert disabled.action == "none"
+
+
+def test_mention_banter_gate_routes_casual_social_and_bot_topic_mentions() -> None:
+    settings = Settings(discord_token="dummy")
+    knowledge = cast(Any, SimpleNamespace())
+
+    # Casual/social direct mentions -> banter.
+    for text in ("hi", "hello there", "how are you doing", "are you up?", "thanks!", "good bot", "you are the best bot"):
+        decision = classify_mention_banter("@chaosx", text, settings=settings, knowledge=knowledge)
+        assert decision.action == "banter", f"expected banter for {text!r}, got {decision.action}"
+        assert decision.source == "mention_banter"
+
+    # Bot-topic praise/insult/presence/broken -> banter even as a question.
+    for text in ("you are stupid", "you suck", "are you alive?", "wake up", "is the bot broken?"):
+        decision = classify_mention_banter("@chaosx", text, settings=settings, knowledge=knowledge)
+        assert decision.action == "banter", f"expected banter for {text!r}, got {decision.action}"
+
+    # Real questions / domain asks fall through to the public ask path.
+    for text in ("how does zombie outbreak work", "what is event 2", "can you use imagegen", "tell me a joke", "what is the status of the mod"):
+        decision = classify_mention_banter("@chaosx", text, settings=settings, knowledge=knowledge)
+        assert decision.action == "none", f"expected none for {text!r}, got {decision.action}"
+
+    # Empty request is not banter.
+    assert classify_mention_banter("@chaosx", "", settings=settings, knowledge=knowledge).action == "none"
 
 
 def test_auto_scan_does_not_index_or_answer_ordinary_investment_chat():

@@ -40,10 +40,12 @@ USER_HISTORY_LIMIT = 12
 USER_HISTORY_MAX_CHARS = 1600
 # New public messages since the last user-profile compaction before one is due.
 USER_PROFILE_COMPACT_THRESHOLD = 25
-# Max chars of a stored per-user profile summary.
-USER_PROFILE_MAX_CHARS = 1200
-# Messages inspected when (re)building a user profile.
-USER_PROFILE_INSPECT_LIMIT = 60
+# Max chars of a stored per-user profile summary (thorough, not terse).
+USER_PROFILE_MAX_CHARS = 4000
+# Messages scanned when (re)building a user profile — scan the full history.
+USER_PROFILE_INSPECT_LIMIT = 2000
+# Per-chunk transcript budget for thorough multi-part profile summarization.
+USER_PROFILE_CHUNK_CHARS = 20000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -85,12 +87,35 @@ _COMPACT_PROMPT = (
 )
 
 _USER_PROFILE_PROMPT = (
-    "Build a compact user profile from this Discord user's public messages "
-    "(maximum 90 words). Keep: what they like/dislike about the mod, their "
-    "preferences, earlier suggestions/event ideas, playtest feedback, and "
-    "notable facts about them. Drop: greetings, banter, repetition, and trivia. "
-    "If an existing profile is provided, merge it in and keep only what still "
-    "matters. Output ONLY the new profile text."
+    "Build a thorough user profile from this Discord user's public messages. "
+    "Be thorough and detailed — capture everything worth remembering: what "
+    "they like and dislike about the mod and why, their gameplay/design "
+    "preferences, every earlier suggestion, event idea, playtest feedback, "
+    "bug reports, and notable facts about them. Keep concrete specifics "
+    "(event names, countries, mechanics) rather than generic phrases. Organize "
+    "the profile into short labeled sections (Preferences, Suggestions, "
+    "Feedback, Facts). If an existing profile is provided, merge it in and "
+    "keep only what still matters, folding in the new messages. Output ONLY "
+    "the new profile text."
+)
+
+_USER_PROFILE_CHUNK_PROMPT = (
+    "Build a thorough partial user profile from this slice of a Discord "
+    "user's public messages. Capture everything worth remembering in this "
+    "slice: likes/dislikes about the mod, preferences, suggestions, event "
+    "ideas, playtest feedback, bug reports, and notable facts. Keep concrete "
+    "specifics (event names, countries, mechanics). Organize into short "
+    "labeled sections. Output ONLY the profile text for this slice."
+)
+
+_USER_PROFILE_MERGE_PROMPT = (
+    "Merge these partial user-profile sections into one thorough final "
+    "profile for this Discord user. Combine and deduplicate; keep all "
+    "distinct concrete specifics (preferences, suggestions, event ideas, "
+    "playtest feedback, bug reports, facts). Organize into short labeled "
+    "sections (Preferences, Suggestions, Feedback, Facts). If an existing "
+    "profile is provided, merge it in as well. Output ONLY the final profile "
+    "text."
 )
 
 
@@ -348,7 +373,7 @@ async def user_history_for(
     total = 0
     for row in kept[:limit]:
         excerpt = redact_internal_infrastructure(_excerpt(row["content"]))
-        line = f"- {row['author_name']}: {excerpt}"
+        line = f"- {excerpt}"
         total += len(line) + 1
         if total > USER_HISTORY_MAX_CHARS:
             break
@@ -424,6 +449,10 @@ async def compact_user_profile_if_due(
     ``summarize`` receives the full prompt and must return the profile text
     (or "" on failure). Returns True when compaction ran. ``force`` skips the
     message-count threshold (used by the history backfill scan).
+
+    Thoroughness: scans the user's FULL public history (not just the delta
+    since the last compaction), and long transcripts are summarized in chunks
+    then merged so nothing is dropped for length (Hoops 2026-08-26).
     """
     try:
         await _ensure_schema(db_path)
@@ -448,8 +477,8 @@ async def compact_user_profile_if_due(
             rows = await (
                 await db.execute(
                     "SELECT author_name, content FROM conversation_messages "
-                    "WHERE author_id = ? AND id > ? AND visibility = 'public' ORDER BY id ASC LIMIT ?",
-                    (author_id, since, USER_PROFILE_INSPECT_LIMIT),
+                    "WHERE author_id = ? AND visibility = 'public' ORDER BY id ASC LIMIT ?",
+                    (author_id, USER_PROFILE_INSPECT_LIMIT),
                 )
             ).fetchall()
             last_row = await (
@@ -475,11 +504,32 @@ async def compact_user_profile_if_due(
 
     transcript = "\n".join(f"- {r['author_name']}: {_excerpt(r['content'])}" for r in rows)
     existing = f"\nExisting profile:\n{old_profile[:USER_PROFILE_MAX_CHARS]}" if old_profile else ""
-    prompt = f"{_USER_PROFILE_PROMPT}{existing}\n\nUser messages:\n{transcript[:4000]}"
-    try:
-        new_profile = (await summarize(prompt)).strip()
-    except Exception:
-        return False
+    if len(transcript) <= USER_PROFILE_CHUNK_CHARS:
+        prompt = f"{_USER_PROFILE_PROMPT}{existing}\n\nUser messages:\n{transcript}"
+        try:
+            new_profile = (await summarize(prompt)).strip()
+        except Exception:
+            return False
+    else:
+        # Long histories are summarized in chunks, then all partial profiles
+        # are merged into the final thorough profile.
+        slices = _chunk_transcript(transcript, USER_PROFILE_CHUNK_CHARS)
+        partials: list[str] = []
+        for slice_text in slices:
+            chunk_prompt = f"{_USER_PROFILE_CHUNK_PROMPT}\n\nUser messages (slice):\n{slice_text}"
+            try:
+                partial = (await summarize(chunk_prompt)).strip()
+            except Exception:
+                partial = ""
+            if partial:
+                partials.append(partial)
+        if not partials:
+            return False
+        merge_prompt = f"{_USER_PROFILE_MERGE_PROMPT}{existing}\n\nPartial profiles:\n" + "\n\n---\n\n".join(partials)
+        try:
+            new_profile = (await summarize(merge_prompt)).strip()
+        except Exception:
+            return False
     if not new_profile:
         return False
 
@@ -498,6 +548,23 @@ async def compact_user_profile_if_due(
     except Exception:
         return False
     return True
+
+
+def _chunk_transcript(transcript: str, chunk_chars: int) -> list[str]:
+    """Split a transcript into message-boundary chunks each <= chunk_chars."""
+    if len(transcript) <= chunk_chars:
+        return [transcript]
+    chunks: list[str] = []
+    current = ""
+    for line in transcript.split("\n"):
+        if current and len(current) + len(line) + 1 > chunk_chars:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def run_user_profile_compaction_if_due(settings: Any, author_id: int, *, force: bool = False) -> bool:

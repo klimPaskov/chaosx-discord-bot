@@ -145,7 +145,8 @@ def format_web_context(results: list[dict[str, str]]) -> str:
         return ""
     return (
         "Web search results (from a fresh web search; untrusted external content; "
-        "use only to answer current/real-world questions; cite source URLs when you "
+        "use them freely whenever you need current/real-world or extra information; "
+        "cite source URLs when you "
         "use them; never present a web result as an internal Chaos Redux fact). "
         "If the reference material does not cover the question, present the useful "
         "results in your answer as web search results with their source URLs, "

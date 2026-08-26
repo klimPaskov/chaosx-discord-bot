@@ -381,6 +381,79 @@ def _bot_topic_reason(text: str) -> str:
     return "bot-topic conversation"
 
 
+MENTION_CASUAL_RE = re.compile(
+    r"^(?:hi+|hello+(?:\s+there)?|hey+|yo|sup|howdy|good\s+(?:morning|afternoon|evening)|"
+    r"how\s+(?:are|r)\s+(?:you|u)(?:\s+(?:doing|today|feeling))?|how'?s\s+it\s+going|"
+    r"what'?s\s+up|wassup|long\s+time\s+no\s+see|nice\s+to\s+meet\s+you|"
+    r"thanks?|thank\s+you|thx|ty|"
+    r"(?:are|r)\s+you\s+(?:up|there|here)|you\s+there|"
+    r"(?:you(?:'re|\s+are)?\s+(?:great|cool|awesome|amazing|the\s+best(?:\s+bot)?|smart|based|helpful|useful|funny|nice))|"
+    r"(?:i\s+(?:love|like|appreciate)\s+you)|good\s+bot)\s*[!.?]*$",
+    re.IGNORECASE,
+)
+
+
+def classify_mention_banter(content: str, request: str, *, settings: Settings, knowledge: Knowledge | None = None) -> AutoScanDecision:
+    """Classify a DIRECT @ChaosX mention request as playful banter.
+
+    Direct mentions that are purely casual/social (greetings, praise, presence
+    checks, light roasts) get the banter path instead of the formal public ask
+    (Hoops 2026-08-26: direct mentions should stay playful/witty/ironic like
+    banter rather than the formal ask path). Real questions and domain asks
+    fall through to the normal public ask path (returns action == \"none\").
+    """
+    text = (request or "").strip()
+    if not text:
+        return AutoScanDecision("none")
+    if len(text) > settings.auto_scan_max_message_chars:
+        return AutoScanDecision("none")
+    if is_blocked_for_auto_answer(text):
+        return AutoScanDecision("none")
+    # Catalog/domain asks must never become banter — they go to public ask.
+    if looks_like_catalog_lookup(text) or has_domain_signal(text):
+        return AutoScanDecision("none")
+    # Strong bot-topic signals (praise/insult/presence/broken/replacement) are
+    # banter even when phrased as a question (e.g. "are you alive?").
+    if (
+        BOT_PRAISE_RE.search(text)
+        or BOT_INSULT_RE.search(text)
+        or BOT_BROKEN_RE.search(text)
+        or BOT_SLEEP_RE.search(text)
+        or BOT_REPLACEMENT_RE.search(text)
+    ):
+        reference_context = _mention_banter_reference(text, knowledge)
+        return AutoScanDecision(
+            action="banter",
+            confidence=100,
+            reason=_bot_topic_reason(text),
+            question=text,
+            source="mention_banter",
+            reference_context=reference_context,
+        )
+    # Purely casual/social phrases get the banter path too.
+    if MENTION_CASUAL_RE.search(text):
+        reference_context = _mention_banter_reference(text, knowledge)
+        return AutoScanDecision(
+            action="banter",
+            confidence=100,
+            reason="mention casual/social",
+            question=text,
+            source="mention_banter",
+            reference_context=reference_context,
+        )
+    # Everything else (including real questions) falls through to public ask.
+    return AutoScanDecision("none")
+
+
+def _mention_banter_reference(text: str, knowledge: Knowledge | None) -> str:
+    if knowledge is None:
+        return ""
+    lookup = getattr(knowledge, "public_ask_context", None)
+    if not callable(lookup):
+        return ""
+    return str(lookup(text) or "")
+
+
 def _explicit_catalog_answer(question: str, *, knowledge: Knowledge) -> AutoScanDecision:
     if match := EVENT_ID_RE.search(question):
         event_id = match.group(1)

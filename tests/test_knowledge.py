@@ -87,21 +87,27 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
             vault_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/%'").fetchone()[0]
             event_spec_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/Events/Event Specs/%'").fetchone()[0]
             concept_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/concepts/%'").fetchone()[0]
+            reference_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/Reference/%'").fetchone()[0]
+            systems_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path LIKE 'vault/Systems/%'").fetchone()[0]
             hidden_docs = conn.execute("SELECT COUNT(*) FROM source_docs WHERE lower(path) LIKE '%important tokens%'").fetchone()[0]
         finally:
             conn.close()
         assert vault_docs > 0
         assert hidden_docs == 0
-        # Public ask context must NOT surface vault concept/planning notes
-        # (Obsidian vault is admin-only reference since 2026-08-25) — only
-        # the Event Specs folder stays public.
-        fury_context = knowledge.public_ask_context('Fury aggressor model')
-        if concept_docs > 0:
-            assert 'aggressor' not in fury_context or 'vault/concepts' not in fury_context
+        # Public vault access is allowlisted to Events/Planning/Assets/Content/
+        # SlopX only — Reference/Systems/concepts must NOT be indexed or
+        # surface in public ask context (2026-08-26).
+        assert concept_docs == 0
+        assert reference_docs == 0
+        assert systems_docs == 0
         # Event Specs folder remains a public reference source.
         event_spec_ctx = knowledge.public_ask_context('Event Specs')
         if event_spec_docs > 0:
             assert event_spec_ctx.strip()
+        # Allowed roots must actually surface in public ask retrieval.
+        if vault_docs > 0:
+            vault_ctx = knowledge.public_ask_context('Chaos Redux event')
+            assert vault_ctx.strip()
     ask_context_with_sources = knowledge.public_ask_context('Zombie Outbreak source path', include_sources=True)
     assert 'Source:' in ask_context_with_sources
     assert 'docs/' in ask_context_with_sources or 'events/' in ask_context_with_sources or 'common/' in ask_context_with_sources

@@ -24,12 +24,11 @@ SKIP_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "tmp"}
 VAULT_TEXT_EXTENSIONS = {".md", ".txt"}
 VAULT_ALLOWED_ROOTS = {
     "Assets",
+    "Content",
     "Events",
-    "Reference",
-    "Systems",
-    "concepts",
+    "Planning",
+    "SlopX",
 }
-VAULT_ALLOWED_PLANNING_SUBROOTS = {"Community Suggestions"}
 VAULT_SKIP_DIRS = {".git", ".obsidian", ".trash", "Archive", "Scratch", "raw", "__pycache__"}
 VAULT_SKIP_FILES = {"important tokens.md", "index.md", "log.md", "SCHEMA.md", "Temp.md"}
 QODER_TEXT_EXTENSIONS = {".md", ".txt"}
@@ -247,8 +246,6 @@ def is_vault_indexable(vault: Path, path: Path) -> bool:
     if not rel.parts:
         return False
     if rel.parts[0] in VAULT_ALLOWED_ROOTS:
-        return True
-    if rel.parts[0] == "Planning" and len(rel.parts) > 1 and rel.parts[1] in VAULT_ALLOWED_PLANNING_SUBROOTS:
         return True
     return False
 

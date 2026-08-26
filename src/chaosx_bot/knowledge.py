@@ -10,6 +10,7 @@ from pathlib import Path
 from .indexer import (
     CatalogReadError,
     INDEX_SCHEMA_VERSION,
+    VAULT_ALLOWED_ROOTS,
     catalog_fingerprint,
     connect,
     index_commit,
@@ -278,22 +279,25 @@ class Knowledge:
     def _public_ask_fts_rows(self, safe_query: str, limit: int) -> list[tuple]:
         conn = connect(self.db_path)
         try:
+            vault_allow = " OR ".join(
+                f"d.path LIKE 'vault/{root}/%'" for root in sorted(VAULT_ALLOWED_ROOTS)
+            )
             return conn.execute(
-                """
+                f"""
                 SELECT d.path, d.source_class,
                        snippet(source_docs_fts, 2, '', '', ' … ', 35) AS snip,
                        bm25(source_docs_fts) AS rank
                 FROM source_docs_fts
                 JOIN source_docs d ON d.id = source_docs_fts.rowid
                 WHERE source_docs_fts MATCH ?
-                  AND d.source_class NOT IN ({})
+                  AND d.source_class NOT IN ({", ".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)})
                   AND NOT (
                       d.path LIKE 'vault/%'
-                      AND d.path NOT LIKE 'vault/Events/Event Specs/%'
+                      AND NOT ({vault_allow})
                   )
                 ORDER BY rank
                 LIMIT ?
-                """.format(", ".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)),
+                """,
                 (safe_query, *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES), limit),
             ).fetchall()
         finally:

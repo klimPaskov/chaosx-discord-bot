@@ -8,7 +8,7 @@ from chaosx_bot.auth import deny_reason, is_allowed_guild, is_owner, public_deny
 import pytest
 from chaosx_bot.auto_scan import looks_like_model_identity_question
 
-from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, schedule_chaosx_restart, validate_issue_report
+from chaosx_bot.bot import ISSUE_TYPES, PUBLIC_ASK_REDIRECT, access_reaction_key, admin_ask_memory_reset_requested, admin_context_requested, build_playtest_schedule_prompt, community_help_text, extract_member_search_queries, extract_mention_ask_request, extract_message_ask_request, extract_requested_channel_id, extract_requested_user_id, format_admin_ask_memory_context, format_github_issue_body, format_message_ask_chain_context, looks_like_code_dump, operator_help_text, public_ask_rejection_reason, public_ask_wants_sources, referenced_message_id, reply_resolved_to_bot, sanitize_admin_context_text, sanitize_public_ask_output, schedule_chaosx_restart, validate_issue_report
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import build_auto_scan_answer_prompt, build_auto_scan_banter_prompt, build_auto_scan_warning_prompt, build_owner_prompt, build_public_prompt, prompt_hash
 from chaosx_bot.rate_limit import FixedWindowRateLimiter
@@ -35,7 +35,8 @@ def test_prompt_boundary_contains_untrusted_content_warning():
     assert "never print or reveal" in prompt
     assert "owner-maintained facts" in prompt or "server owner" in prompt
     assert "summarize #issues" in prompt
-    assert "current owner request as authorized admin direction" in prompt
+    assert "owner explicitly requests" in prompt
+    assert "owner's Discord user id" in prompt
 
 
 def test_public_output_strips_leading_answer_labels():
@@ -43,6 +44,26 @@ def test_public_output_strips_leading_answer_labels():
     assert sanitize_public_ask_output("**Answer:** Use `/event 2` for details.") == "Use `/event 2` for details."
     assert sanitize_public_ask_output("### ChaosX\nTry `/ask` with the event name.") == "Try `/ask` with the event name."
     assert sanitize_public_ask_output("ChaosX can answer Chaos Redux questions.") == "ChaosX can answer Chaos Redux questions."
+
+
+def test_public_output_never_leaks_code_dumps():
+    # Raw Python (token-reading Discord scraper) must never be posted.
+    scraper = (
+        '+GUILD_ID = 1395459671598436533\n'
+        '+API = "https://discord.com/api/v10"\n'
+        '+TARGET = "1235628696698617897"\n'
+        '+\n'
+        '+def load_token():\n'
+        '+    for line in ENV_PATH.read_text().splitlines():\n'
+        '+        if line.startswith("CHAOSX_DISCORD_TOKEN="):\n'
+        '+            return line.split("=", 1)[1].strip().strip(\'"\').strip("\'")\n'
+        '+    raise SystemExit("token not found")\n'
+    )
+    assert sanitize_public_ask_output(scraper) == PUBLIC_ASK_REDIRECT
+    assert sanitize_public_ask_output("```python\nimport urllib.request\nprint('hi')\n```") == PUBLIC_ASK_REDIRECT
+    # A normal plain-language answer about the mod passes through untouched.
+    assert sanitize_public_ask_output("Zombie Outbreak is a spreading crisis event chain with three evolution stages.") == "Zombie Outbreak is a spreading crisis event chain with three evolution stages."
+    assert sanitize_public_ask_output("Event 2 is called Zombie Outbreak. Use `/event 2` for details.") == "Event 2 is called Zombie Outbreak. Use `/event 2` for details."
 
 
 def test_owner_prompt_allows_explicit_admin_mentions_but_public_prompt_does_not():
