@@ -2502,7 +2502,15 @@ async def send_scripted_response(
         return
     await interaction.response.defer(ephemeral=not public, thinking=True)
     try:
-        output = await asyncio.to_thread(render)
+        if asyncio.iscoroutinefunction(render):
+            # Async renders (e.g. /event's render_event with web fallback) must
+            # be awaited in the loop. asyncio.to_thread() on a coroutine
+            # function returns the unawaited coroutine object, which made
+            # /event hang forever ("coroutine ... was never awaited" + no
+            # interaction response; regression f929baa6 2026-08-06).
+            output = await render()
+        else:
+            output = await asyncio.to_thread(render)
     except Exception as exc:
         output = f"ChaosX scripted command failed: `{type(exc).__name__}: {exc}`"
     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)

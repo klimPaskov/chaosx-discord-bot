@@ -163,6 +163,47 @@ async def test_scripted_render_runs_off_gateway_loop_and_attachment_error_is_sil
 
 
 @pytest.mark.asyncio
+async def test_scripted_response_awaits_async_render() -> None:
+    """Async renders must be awaited, not run through to_thread (f929baa6 regression:
+    /event returned an unawaited coroutine -> TypeError -> interaction never responded)."""
+    followup = _Followup()
+    store = _Store()
+
+    class Response:
+        async def defer(self, **_kwargs: Any) -> None:
+            return None
+
+    async def render() -> str:
+        return "Async event content"
+
+    bot = SimpleNamespace(
+        settings=Settings(discord_token="dummy", allowed_guild_id=2, owner_id=99),
+        rate_limiter=SimpleNamespace(
+            check=lambda **_kwargs: SimpleNamespace(allowed=True, retry_after_seconds=0)
+        ),
+        store=store,
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        guild_id=2,
+        channel_id=3,
+        response=Response(),
+        followup=followup,
+    )
+
+    await send_scripted_response(
+        cast(Any, bot),
+        cast(Any, interaction),
+        command_name="chaosx event",
+        summary="1",
+        render=render,
+    )
+
+    assert [content for content, _kwargs in followup.calls] == ["Async event content"]
+    assert store.audits[0]["command"] == "chaosx event"
+
+
+@pytest.mark.asyncio
 async def test_visual_working_status_shows_updates_and_cleans_up():
     status = _Status()
     followup = _WorkingFollowup(status)
