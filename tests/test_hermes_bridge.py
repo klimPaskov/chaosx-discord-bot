@@ -75,6 +75,10 @@ def test_public_prompt_grounds_on_reference_and_never_encourages_guessing():
     )
     assert "You must base your answer on the provided Chaos Redux reference material" in grounded
     assert "none was available" not in grounded
+    # Chat/channel chatter is never a source of Chaos Redux content facts (Hoops
+    # 2026-08-27: bot claimed community-discussed Namibia topics were mod content).
+    assert "never present something discussed in chat as a Chaos Redux event, feature, or mechanic" in grounded
+    assert "repo wiki, mod docs, and notes that define what exists in Chaos Redux" in grounded
     empty = build_public_prompt(
         user_request="what is event 2?",
         guild_name="Chaos Redux",
@@ -83,6 +87,7 @@ def test_public_prompt_grounds_on_reference_and_never_encourages_guessing():
     )
     assert "none was available" in empty
     assert "Do not guess or invent Chaos Redux facts" in empty
+    assert "does not make it Chaos Redux content" in empty
 
 
 @pytest.mark.asyncio
