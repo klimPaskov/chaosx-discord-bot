@@ -555,6 +555,12 @@ class EventVisualMcpClient:
                     },
                     "states": ["active"],
                     "resolutions": [{"width": width, "height": height, "uiScale": 1.0}],
+                    "generatedScenarios": {
+                        "enabled": True,
+                        "count": 1,
+                        "seed": os.urandom(8).hex(),
+                        "preservePlaceholder": False,
+                    },
                 },
             )
         )
