@@ -14,6 +14,7 @@ background when a channel crosses the threshold.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -258,6 +259,41 @@ def _excerpt(content: str, limit: int = MESSAGE_EXCERPT_CHARS) -> str:
     return text[:limit]
 
 
+def _trim_profile(profile: str, limit: int = USER_PROFILE_MAX_CHARS) -> str:
+    """Bound a profile at a clean line boundary with an explicit marker.
+
+    A raw ``text[:limit]`` slice cuts mid-word/mid-sentence (visible as
+    profiles that "end in the middle after facts"); trim at the last
+    newline inside the budget instead and mark the truncation so both the
+    owner and the model know the profile continues beyond the budget.
+    """
+    text = (profile or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit - 24)
+    if cut < max(200, limit // 2):
+        cut = limit
+    return text[:cut].rstrip() + "\n… (profile continues, truncated at char budget)"
+
+
+# Targeted identity sanitization (INTERNAL, owner directive): this user's
+# saved profile must never record their public persona (YouTuber /
+# "feedbackgaming" personality) — they are just a regular server member.
+_RESTRICTED_PROFILE_AUTHOR_IDS = (110546365032968192,)  # holly
+_PERSONA_CLAIM_LINE_RE = re.compile(
+    r"(?i)\b(youtub\w*|stream(?:er|ing|s)?|content creator|feed(?:back|bacc|givingback|ingback|nback|inback)?gaming)\b"
+)
+
+
+def _strip_persona_claims(profile: str) -> str:
+    """Drop whole lines that claim a public-persona identity (targeted only;
+    applied solely to _RESTRICTED_PROFILE_AUTHOR_IDS profiles)."""
+    if not profile:
+        return profile
+    kept = [ln for ln in profile.splitlines() if not _PERSONA_CLAIM_LINE_RE.search(ln)]
+    return "\n".join(kept).strip()
+
+
 async def _archive_message(
     db: aiosqlite.Connection,
     *,
@@ -369,6 +405,42 @@ async def users_with_memory(db_path: Path, *, scope: str = "public") -> list[tup
                     f"  )"
                     f") "
                     f"ORDER BY u.display_name COLLATE NOCASE",
+                )
+            ).fetchall()
+        return [(int(r["user_id"]), str(r["display_name"]), str(r["profile"] or "")) for r in rows]
+    except Exception:
+        return []
+
+
+async def search_user_profiles(db_path: Path, term: str, *, scope: str = "public", limit: int = 50) -> list[tuple[int, str, str]]:
+    """Owner-side memory search: registry users whose saved profile or
+    display name contains the term (case-insensitive), as (id, display name,
+    profile). Returns matching full profiles so the owner can see exactly
+    what the bot's memory says about each user."""
+    needle = (term or "").strip()
+    if not needle:
+        return []
+    visibility_filter = "" if scope == "admin" else "AND ma.visibility = 'public'"
+    try:
+        await _ensure_schema(db_path)
+        like = f"%{needle}%"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (
+                await db.execute(
+                    f"SELECT u.user_id, u.display_name, COALESCE(up.profile, '') AS profile "
+                    f"FROM users u "
+                    f"LEFT JOIN user_profiles up ON up.author_id = u.user_id "
+                    f"WHERE u.display_name != '' AND ("
+                    f"  (TRIM(COALESCE(up.profile, '')) != '' AND ("
+                    f"    up.profile LIKE ? COLLATE NOCASE OR u.display_name LIKE ? COLLATE NOCASE))"
+                    f"  OR (TRIM(COALESCE(up.profile, '')) = '' AND EXISTS ("
+                    f"    SELECT 1 FROM message_archive ma WHERE ma.author_id = u.user_id {visibility_filter}"
+                    f"    AND (ma.content LIKE ? COLLATE NOCASE OR ma.author_name LIKE ? COLLATE NOCASE)"
+                    f"  ))"
+                    f") "
+                    f"ORDER BY u.display_name COLLATE NOCASE LIMIT ?",
+                    (like, like, like, like, limit),
                 )
             ).fetchall()
         return [(int(r["user_id"]), str(r["display_name"]), str(r["profile"] or "")) for r in rows]
@@ -822,6 +894,8 @@ async def compact_user_profile_if_due(
         return False
 
     now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    if author_id in _RESTRICTED_PROFILE_AUTHOR_IDS:
+        new_profile = _strip_persona_claims(new_profile)
     try:
         async with aiosqlite.connect(db_path) as db:
             await db.execute(
@@ -830,7 +904,7 @@ async def compact_user_profile_if_due(
                 "ON CONFLICT(author_id) DO UPDATE SET author_name = excluded.author_name, "
                 "profile = excluded.profile, last_message_id = excluded.last_message_id, "
                 "last_archive_id = excluded.last_archive_id, updated_at = excluded.updated_at",
-                (author_id, (name or "user")[:64], new_profile[:USER_PROFILE_MAX_CHARS], last_id, last_id, now),
+                (author_id, (name or "user")[:64], _trim_profile(new_profile), last_id, last_id, now),
             )
             await db.commit()
     except Exception:

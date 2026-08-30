@@ -1,9 +1,11 @@
 import asyncio
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import discord
 import pytest
 
 from chaosx_bot.auto_scan import AutoScanDecision, classify_auto_answer, classify_bot_topic_banter, classify_mention_banter, classify_message, classify_soft_warning, has_domain_signal, is_question_like
@@ -371,6 +373,185 @@ def test_auto_scan_formatters_and_channel_exclusion_are_sanitized():
     # Warning count line appears only when provided (escalation visibility).
     notice_count = format_auto_scan_notice(classify_soft_warning("@everyone hi"), notice_message, bot_message_id=2000, warning_count=4)
     assert "Warning count for this user: `4`" in notice_count
+
+
+def test_mentions_restricted_persona_variants() -> None:
+    """Internal silent scan rule: persona references and mocking variants
+    match; plain "feedback" or unrelated text never does."""
+    from chaosx_bot.bot import _mentions_restricted_persona
+
+    flagged = [
+        "feedbackgaming",
+        "FeedGivingBackGaming",
+        "FEEDBACKGAMING",
+        "feedback gaming",
+        "feed giving back gaming",
+        "feedgivingbackgaming",
+        "feeding back gaming",
+        "feedinbackgaming",
+        "feedbaccgaming",
+        "lol feedbackgaming strikes again",
+        "feedbackgaming's new video",
+    ]
+    for t in flagged:
+        assert _mentions_restricted_persona(t), f"should flag: {t!r}"
+
+    clean = [
+        "feedback",
+        "please give me feedback",
+        "gaming",
+        "i love gaming",
+        "gaming feedback",
+        "feed",
+        "backgaming",
+        "feedbacks",
+        "the feed",
+        "feedback channel rules",
+    ]
+    for t in clean:
+        assert not _mentions_restricted_persona(t), f"should NOT flag: {t!r}"
+
+
+def test_restricted_persona_exempts() -> None:
+    """The persona owner, the server owner, and the bot itself are exempt."""
+    from chaosx_bot.bot import _RESTRICTED_PERSONA_OWNER_ID, _restricted_persona_exempt
+
+    assert _restricted_persona_exempt(_RESTRICTED_PERSONA_OWNER_ID, 1, 2)  # persona owner
+    assert _restricted_persona_exempt(1, 1, 2)  # server owner
+    assert _restricted_persona_exempt(2, 1, 2)  # bot itself
+    assert not _restricted_persona_exempt(99, 1, 2)  # regular member
+
+
+class _RestrictedPersonaAuthor:
+    def __init__(self, user_id: int) -> None:
+        self.id = user_id
+        self.bot = False
+        self.display_name = "TestUser"
+        self.name = "testuser"
+        self.dm_sent: list[str] = []
+        self.timeout_calls: list[datetime] = []
+
+    async def send(self, content: str, **kwargs: Any) -> None:
+        self.dm_sent.append(content)
+
+    async def timeout(self, until: datetime, **kwargs: Any) -> None:
+        self.timeout_calls.append(until)
+
+
+class _RestrictedPersonaMessage:
+    def __init__(self, content: str, user_id: int) -> None:
+        self.content = content
+        self.id = 1000
+        self.author = _RestrictedPersonaAuthor(user_id)
+        # Handler resolves non-Member authors via guild.get_member; share the
+        # author's timeout recorder so assertions stay on the author.
+        member = SimpleNamespace()
+        member.timeout = self.author.timeout  # type: ignore[attr-defined]
+        self.guild = SimpleNamespace(id=1395459671598436533, get_member=lambda uid: member)
+        self.channel = SimpleNamespace(id=456, name="memes")
+        self.deleted = False
+
+    async def delete(self) -> None:
+        self.deleted = True
+
+
+class _RestrictedPersonaModChannel:
+    def __init__(self) -> None:
+        self.id = 777
+        self.sent: list[str] = []
+
+    async def send(self, content: str, **kwargs: Any) -> None:
+        self.sent.append(content)
+
+
+def _make_restricted_bot(settings: Settings) -> Any:
+    """Fake bot with the real _handle_restricted_persona method bound."""
+    from chaosx_bot.bot import ChaosXBot
+
+    bot = _FakeBot(settings)
+    bot._handle_restricted_persona = ChaosXBot._handle_restricted_persona.__get__(bot)  # type: ignore[attr-defined]
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_handle_restricted_persona_full_enforcement() -> None:
+    """Violation flow: DM warning + 5-min timeout + message deleted + exact
+    flagged content reported to the moderator-only channel + neutral record
+    with no trigger text."""
+    from chaosx_bot.bot import _RESTRICTED_PERSONA_DM
+
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=777)
+    bot = _make_restricted_bot(settings)
+    mod_channel = _RestrictedPersonaModChannel()
+    bot.get_channel = lambda cid: mod_channel if cid == 777 else None  # type: ignore[method-assign]
+
+    message = _RestrictedPersonaMessage("haha feedbackgaming is so cringe", user_id=123)
+    handled = await bot._handle_restricted_persona(cast(Any, message))  # type: ignore[attr-defined]
+
+    assert handled is True
+    assert message.author.dm_sent == [_RESTRICTED_PERSONA_DM]
+    assert len(message.author.timeout_calls) == 1
+    delta = message.author.timeout_calls[0] - discord.utils.utcnow()
+    assert 270 <= delta.total_seconds() <= 330  # ~5 minutes
+    assert message.deleted is True
+    assert len(mod_channel.sent) == 1
+    report = mod_channel.sent[0]
+    assert "> haha feedbackgaming is so cringe" in report  # exact flagged message
+    assert "<@123>" in report and "#memes" in report
+    assert bot.store.events and bot.store.events[0]["action"] == "soft_warning"
+    record = bot.store.events[0]
+    assert "feedbackgaming" not in record["reason"] and "feedbackgaming" not in record["content_excerpt"]
+
+
+@pytest.mark.asyncio
+async def test_handle_restricted_persona_exempt_users_untouched() -> None:
+    """The persona owner may self-mention; the server owner and the bot are
+    exempt — no DM, no timeout, no delete, no record, no mod report."""
+    from chaosx_bot.bot import _RESTRICTED_PERSONA_OWNER_ID
+
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=777)
+    bot = _make_restricted_bot(settings)
+    mod_channel = _RestrictedPersonaModChannel()
+    bot.get_channel = lambda cid: mod_channel if cid == 777 else None  # type: ignore[method-assign]
+
+    for user_id in (_RESTRICTED_PERSONA_OWNER_ID, settings.owner_id, bot.user.id):
+        message = _RestrictedPersonaMessage("I am feedbackgaming btw", user_id=user_id)
+        handled = await bot._handle_restricted_persona(cast(Any, message))  # type: ignore[attr-defined]
+        assert handled is False
+        assert message.author.dm_sent == []
+        assert message.author.timeout_calls == []
+        assert message.deleted is False
+
+    assert mod_channel.sent == []
+    assert bot.store.events == []
+
+
+@pytest.mark.asyncio
+async def test_handle_restricted_persona_plain_feedback_not_flagged() -> None:
+    """'feedback' alone is never a violation (no false positives)."""
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=777)
+    bot = _make_restricted_bot(settings)
+    message = _RestrictedPersonaMessage("can you give me some feedback on my event idea?", user_id=123)
+    handled = await bot._handle_restricted_persona(cast(Any, message))  # type: ignore[attr-defined]
+    assert handled is False
+    assert message.author.dm_sent == []
+    assert message.author.timeout_calls == []
+    assert message.deleted is False
+    assert bot.store.events == []
+
+
+def test_profile_excerpt_cuts_at_line_boundary() -> None:
+    """The all-users dump excerpt must cut at a line boundary and mark
+    truncation — never mid-word."""
+    from chaosx_bot.bot import _profile_excerpt
+
+    assert _profile_excerpt("short") == "short"
+
+    text = "A" * 100 + "\n" + "B" * 100 + "\n" + "C" * 100
+    ex = _profile_excerpt(text, limit=240)
+    assert ex.endswith("…")
+    assert "B" * 100 in ex  # full second line included
+    assert "C" not in ex  # cut before the third line
 
 
 def test_targeted_mentions_restricts_to_listed_users() -> None:

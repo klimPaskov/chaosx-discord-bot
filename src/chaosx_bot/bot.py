@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, cast
 
 import aiohttp
@@ -35,6 +35,7 @@ from .conversation_memory import (
     registered_users,
     schedule_compaction,
     schedule_user_profile_compaction,
+    search_user_profiles,
     sync_user_registry,
     user_history_for,
     user_profile_for,
@@ -238,6 +239,81 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
         chunks.append(text[:cut])
         text = text[cut:].lstrip()
     return chunks
+
+
+def _profile_excerpt(profile: str, limit: int = 240) -> str:
+    """Compact first-lines excerpt of a profile body for the all-users dump.
+
+    Cuts at a line boundary (never mid-word) and marks truncation, so the
+    dump stays short enough to post in a few messages while each entry
+    still reads cleanly. Full profiles stay one lookup away.
+    """
+    text = (profile or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    if cut < 120:
+        cut = limit
+    return text[:cut].rstrip() + "…"
+
+
+# --- Silent restricted-persona scan rule (INTERNAL, code-level only) ---
+# This rule intentionally lives in code, NOT in prompts, help text, or any
+# context the model can see, so the bot can never reveal or reason about it.
+# Users who mention the restricted persona (or mocking variants) receive a DM
+# warning and an automatic 5-minute timeout. Exempt: the persona owner, the
+# server owner, and the bot itself. Only the word "feedback" is NOT a
+# violation — a persona reference requires the "gaming" tail.
+_RESTRICTED_PERSONA_OWNER_ID = 110546365032968192  # holly — may self-mention
+_RESTRICTED_PERSONA_RE = re.compile(r"feed(?:back|bacc|givingback|ingback|nback|inback)?gaming")
+_RESTRICTED_PERSONA_TIMEOUT_S = 300
+_RESTRICTED_PERSONA_DM = (
+    "⚠️ **Automatic warning**\n"
+    "Your recent message triggered an automatic moderation action and you have "
+    f"been timed out for {_RESTRICTED_PERSONA_TIMEOUT_S // 60} minutes. "
+    "Please keep messages within server guidelines; repeated violations escalate."
+)
+
+
+def _mentions_restricted_persona(text: str) -> bool:
+    """True when the text references the restricted persona or a mocking
+    variant (spacing/punctuation-insensitive, case-insensitive). Plain
+    "feedback" never matches."""
+    norm = re.sub(r"[\s_\-.,!?\"'`*|/\\()\[\]{}:;]", "", text or "").casefold()
+    return bool(_RESTRICTED_PERSONA_RE.search(norm))
+
+
+def _restricted_persona_exempt(author_id: int, owner_id: int, bot_id: int) -> bool:
+    return author_id in {_RESTRICTED_PERSONA_OWNER_ID, owner_id, bot_id}
+
+
+async def _send_interaction_chunks(interaction: discord.Interaction, parts: list[str], *, ephemeral: bool, mentions: discord.AllowedMentions) -> None:
+    """Send chunked interaction output robustly.
+
+    Initial response first, then followups paced to the interaction webhook
+    bucket (~5/2s) with one retry per part, so a single transient failure
+    (rate-limit hiccup, API error) cannot silently truncate the rest of the
+    output mid-way.
+    """
+    first = True
+    for part in parts:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(part, ephemeral=ephemeral, allowed_mentions=mentions)
+            else:
+                await interaction.response.send_message(part, ephemeral=ephemeral, allowed_mentions=mentions)
+        except Exception:
+            try:
+                await asyncio.sleep(1.2)
+                if interaction.response.is_done():
+                    await interaction.followup.send(part, ephemeral=ephemeral, allowed_mentions=mentions)
+                else:
+                    await interaction.response.send_message(part, ephemeral=ephemeral, allowed_mentions=mentions)
+            except Exception:
+                continue
+        if not first:
+            await asyncio.sleep(0.4)
+        first = False
 
 
 def _format_duration(seconds: int) -> str:
@@ -1715,9 +1791,92 @@ class ChaosXBot(discord.Client):
         # count gate; runs via the public model.
         if not (self.user is not None and message.author.id == self.user.id):
             schedule_user_profile_compaction(self.settings, message.author.id)
+        if await self._handle_restricted_persona(message):
+            return
         if await handle_message_ask(self, message):
             return
         await handle_auto_scan(self, message)
+
+    async def _handle_restricted_persona(self, message: discord.Message) -> bool:
+        """Internal silent scan rule (code-level, never in prompt context or
+        help). On a restricted-persona mention: DM warning + automatic
+        timeout, the flagged message is deleted, and the issue (with the
+        exact message text) is reported to the moderator-only channel.
+        Recorded neutrally (no trigger text). Exemptions: the persona
+        owner, the server owner, and the bot itself. Returns True when the
+        violation was handled (no further public handling)."""
+        if message.author.bot:
+            return False
+        bot_id = self.user.id if self.user is not None else 0
+        if _restricted_persona_exempt(message.author.id, self.settings.owner_id, bot_id):
+            return False
+        if not _mentions_restricted_persona(message.content or ""):
+            return False
+        # DM warning (best effort — user may have DMs closed).
+        try:
+            await message.author.send(_RESTRICTED_PERSONA_DM)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Automatic 5-minute timeout (requires a guild member; DMs have no timeout).
+        member = message.author if isinstance(message.author, discord.Member) else None
+        if member is None and message.guild is not None:
+            member = message.guild.get_member(message.author.id)
+        if member is not None:
+            try:
+                await member.timeout(
+                    discord.utils.utcnow() + timedelta(seconds=_RESTRICTED_PERSONA_TIMEOUT_S),
+                    reason="automatic moderation (restricted topic)",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        # Delete the flagged message (best effort; needs Manage Messages).
+        content = message.content or ""
+        deleted = False
+        try:
+            await message.delete()
+            deleted = True
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+        # Report to the moderator-only channel with the exact flagged message.
+        try:
+            channel_id = self.settings.auto_scan_notify_channel_id or self.settings.automation_reminder_channel_id
+            if channel_id:
+                channel = self.get_channel(channel_id)
+                if channel is None:
+                    channel = await self.fetch_channel(channel_id)
+                if channel is not None and hasattr(channel, "send"):
+                    author_name = message.author.display_name or message.author.name
+                    channel_name = getattr(message.channel, "name", str(getattr(message.channel, "id", "?")))
+                    flagged = "\n".join(f"> {ln}" for ln in content.splitlines()) or "> (empty message)"
+                    report = (
+                        f"🚨 **Automatic moderation — restricted topic violation**\n"
+                        f"**User:** <@{message.author.id}> (`{author_name}`)\n"
+                        f"**Channel:** #{channel_name}\n"
+                        f"**Action:** DM warning + 5-min timeout + message "
+                        + ("deleted" if deleted else "NOT deleted (missing permission?)")
+                        + "\n**Flagged message:**\n" + flagged
+                    )
+                    await channel.send(report, allowed_mentions=targeted_mentions([message.author.id]))
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+        # Neutral internal record (reason only, no trigger text) so repeat
+        # violations are visible to the owner via the warned-users list.
+        try:
+            await self.store.record_auto_scan_event(
+                action="soft_warning",
+                reason="restricted topic mention (automatic)",
+                confidence=99,
+                actor_id=message.author.id,
+                guild_id=message.guild.id if message.guild else None,
+                channel_id=getattr(message.channel, "id", None),
+                source_message_id=message.id,
+                bot_message_id=None,
+                content_excerpt="",
+                response_excerpt="",
+            )
+        except Exception:
+            pass
+        return True
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         await self.handle_access_reaction(payload, added=True)
@@ -4266,12 +4425,12 @@ def register_commands(bot: ChaosXBot) -> None:
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin warned-users", summary=str(len(rows)))
         # Targeted mentions: the listed <@id>s render clickable so the owner
         # can click straight through to each warned user's profile.
-        mentions = targeted_mentions([int(r[0]) for r in rows if r and r[0]])
-        for part in _chunk(text):
-            if interaction.response.is_done():
-                await interaction.followup.send(part, ephemeral=True, allowed_mentions=mentions)
-            else:
-                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=mentions)
+        await _send_interaction_chunks(
+            interaction,
+            _chunk(text),
+            ephemeral=True,
+            mentions=targeted_mentions([int(r[0]) for r in rows if r and r[0]]),
+        )
 
     @admin.command(name="user-memory", description="Show saved memory (profile summary) for all users, or one user by name/ID.")
     async def admin_user_memory(interaction: discord.Interaction, user: str = "", public: bool = False) -> None:
@@ -4287,18 +4446,15 @@ def register_commands(bot: ChaosXBot) -> None:
             for uid, name, profile in rows:
                 if not profile.strip():
                     continue
-                # Mention the user so the owner can click through to the
-                # profile (targeted mention parsing on send).
-                blocks.append(f"## {name} — <@{uid}>\n" + profile.strip())
+                # Compact excerpt per user (full profile via specific lookup)
+                # so the dump stays short enough to post reliably.
+                blocks.append(f"## {name} — <@{uid}>\n" + _profile_excerpt(profile))
                 listed_ids.append(uid)
+            if blocks:
+                blocks.append("> Full profile for a user: `/admin user-memory user:<name or ID>`")
             text = "\n\n---\n\n".join(blocks) if blocks else "No saved user memory yet."
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"all users ({len(blocks)})")
-            mentions = targeted_mentions(listed_ids)
-            for part in _chunk(text):
-                if interaction.response.is_done():
-                    await interaction.followup.send(part, ephemeral=True, allowed_mentions=mentions)
-                else:
-                    await interaction.response.send_message(part, ephemeral=True, allowed_mentions=mentions)
+            await _send_interaction_chunks(interaction, _chunk(text), ephemeral=True, mentions=targeted_mentions(listed_ids))
             return
         # Resolve by numeric ID first, then by display name from the full
         # user registry (which knows EVERY member, even silent ones).
@@ -4341,13 +4497,41 @@ def register_commands(bot: ChaosXBot) -> None:
             display_name = registered.get(author_id, str(author_id)) if registered else str(author_id)
             text = f"No saved profile summary yet for `{display_name}` (they haven't sent any messages I've captured)."
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"user id {author_id}" + (" public" if public else ""))
-        mentions = targeted_mentions([author_id])
-        ephemeral = not public
-        for part in _chunk(text):
-            if interaction.response.is_done():
-                await interaction.followup.send(part, ephemeral=ephemeral, allowed_mentions=mentions)
+        await _send_interaction_chunks(interaction, _chunk(text), ephemeral=not public, mentions=targeted_mentions([author_id]))
+
+    @admin.command(name="memory-search", description="Search saved user memory/profiles for a term (owner-only).")
+    async def admin_memory_search(interaction: discord.Interaction, term: str) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        needle = term.strip()
+        if not needle:
+            await interaction.response.send_message("Give me a term to search for.", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            return
+        rows = await search_user_profiles(bot.settings.db_path, needle, scope="public")
+        if not rows:
+            await interaction.response.send_message(f"No saved user memory matches `{needle}`.", ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin memory-search", summary=f"term {needle!r} (0 matches)")
+            return
+        blocks: list[str] = []
+        listed_ids: list[int] = []
+        needle_low = needle.casefold()
+        for uid, name, profile in rows:
+            listed_ids.append(uid)
+            if profile.strip():
+                # Show only the lines that matched (up to 6) so the owner can
+                # see exactly what the memory says about the term.
+                matched = [ln for ln in profile.splitlines() if needle_low in ln.casefold()]
+                body = "\n".join(matched[:6])
+                if len(matched) > 6:
+                    body += f"\n… ({len(matched) - 6} more matching lines)"
+                blocks.append(f"## {name} — <@{uid}>\n" + (body or _profile_excerpt(profile, limit=160)))
             else:
-                await interaction.response.send_message(part, ephemeral=ephemeral, allowed_mentions=mentions)
+                blocks.append(f"## {name} — <@{uid}>\n(messages captured, profile not yet summarized)")
+        text = "\n\n---\n\n".join(blocks)
+        if len(rows) == 50:
+            text += "\n\n---\n\n> Showing the first 50 matches — refine the term to narrow down."
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin memory-search", summary=f"term {needle!r} ({len(rows)} matches)")
+        await _send_interaction_chunks(interaction, _chunk(text), ephemeral=True, mentions=targeted_mentions(listed_ids))
 
     @admin.command(name="scan-history", description="Backfill-scan all server message history and build user memory from it.")
     async def admin_scan_history(interaction: discord.Interaction, limit: int = 0) -> None:

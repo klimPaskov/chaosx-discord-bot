@@ -559,6 +559,103 @@ def test_registry_knows_every_member_and_memory_skips_silent(tmp_path: Path) -> 
     asyncio.run(run())
 
 
+def test_strip_persona_claims_targeted() -> None:
+    """Profiles of the restricted author must never record a public-persona
+    identity (YouTuber / streaming / content-creator claims, persona-name
+    variants) — they are just a regular server member."""
+    from chaosx_bot.conversation_memory import _strip_persona_claims
+
+    prof = (
+        "PREFERENCES\n- Likes events and decisions\n\nFACTS\n"
+        "- Is a YouTuber who posts feedbackgaming videos.\n"
+        "- Streams the mod sometimes.\n"
+        "- Plays HOI4 weekly.\n"
+    )
+    out = _strip_persona_claims(prof)
+    assert "YouTuber" not in out
+    assert "feedbackgaming" not in out
+    assert "Streams" not in out
+    assert "Plays HOI4 weekly" in out
+    assert "Likes events and decisions" in out
+    # clean profiles pass through untouched
+    assert _strip_persona_claims("clean profile") == "clean profile"
+    assert _strip_persona_claims("") == ""
+
+
+def test_search_user_profiles_matches_profiles_names_and_messages(tmp_path: Path) -> None:
+    """Owner memory search: case-insensitive term match across saved profile
+    text, display names, and (for users without a profile yet) archived
+    message content."""
+    import aiosqlite
+
+    from chaosx_bot.conversation_memory import _ensure_schema, search_user_profiles
+
+    db = tmp_path / "mem.db"
+
+    async def run() -> None:
+        await _ensure_schema(db)
+        now = _iso(1)
+        async with aiosqlite.connect(db) as con:
+            for uid, name in ((3001, "Zin"), (3002, "Holly")):
+                await con.execute(
+                    "INSERT INTO users (user_id, display_name, first_seen_at, last_seen_at, is_bot, updated_at) "
+                    "VALUES (?, ?, ?, ?, 0, ?)",
+                    (uid, name, now, now, now),
+                )
+            await con.execute(
+                "INSERT INTO user_profiles (author_id, author_name, profile, last_message_id, last_archive_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (3001, "Zin", "FACTS\n- Identifies as Jewish and observes Shabbat.\n- Likes strategy games.", 1, 1, now),
+            )
+            await con.execute(
+                "INSERT INTO user_profiles (author_id, author_name, profile, last_message_id, last_archive_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (3002, "Holly", "FACTS\n- Vegan and runs marathons.\n- Plays HOI4 weekly.", 2, 2, now),
+            )
+            await con.commit()
+
+        rows = await search_user_profiles(db, "jewish")
+        assert [(int(u), n) for u, n, _ in rows] == [(3001, "Zin")]
+        assert "Jewish" in rows[0][2]
+
+        rows2 = await search_user_profiles(db, "HOI4")
+        assert [(int(u), n) for u, n, _ in rows2] == [(3002, "Holly")]
+
+        rows3 = await search_user_profiles(db, "holly")  # display-name match
+        assert rows3 and rows3[0][1] == "Holly"
+
+        # A user with no profile yet still matches via archived message content.
+        await _capture(db, n=1, content="loves model trains", author="Trainsfan", start_id=500)
+        rows4 = await search_user_profiles(db, "trains")
+        assert rows4 and rows4[0][1] == "Trainsfan"
+
+        assert await search_user_profiles(db, "nonexistent-term") == []
+        assert await search_user_profiles(db, "   ") == []
+
+    asyncio.run(run())
+
+
+def test_trim_profile_cuts_clean_at_line_boundary() -> None:
+    """Profiles must never be hard-sliced mid-word: trimming cuts at a line
+    boundary inside the budget and marks the truncation (fixes profiles that
+    visibly 'end in the middle after facts')."""
+    from chaosx_bot.conversation_memory import _trim_profile
+
+    assert _trim_profile("short profile") == "short profile"
+
+    body = "line one\nline two\nline three\nline four\n" * 400  # ~8800 chars
+    trimmed = _trim_profile(body, limit=4000)
+    assert len(trimmed) < len(body)
+    assert trimmed.endswith("… (profile continues, truncated at char budget)")
+    # the line right before the marker is a complete original line, not a fragment
+    assert trimmed.splitlines()[-2] in ("line one", "line two", "line three", "line four")
+
+    # A single unbroken line still gets bounded (no infinite edge case).
+    long_line = "x" * 9000
+    cut = _trim_profile(long_line, limit=4000)
+    assert len(cut) < 9000 and cut.endswith("… (profile continues, truncated at char budget)")
+
+
 def test_profile_prompts_reject_identity_claims(tmp_path: Path) -> None:
     """Impersonation hardening: profile summarization must never record
     'user is the owner/developer' claims, and the injected header warns that

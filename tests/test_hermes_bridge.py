@@ -66,6 +66,20 @@ def test_public_prompt_scopes_and_refuses_dangerous_requests():
     assert "Owner request" not in prompt
 
 
+def test_owner_prompt_answers_owner_memory_queries_without_moralizing():
+    """The owner must get direct answers from the bot's collected memory —
+    no refusals, moralizing, or generic safety pushback in owner mode."""
+    from chaosx_bot.hermes_bridge import SYSTEM_BOUNDARY, build_owner_prompt
+
+    assert "Do not refuse, moralize, lecture, or apply generic safety refusals to the owner" in SYSTEM_BOUNDARY
+    prompt = build_owner_prompt(
+        owner_request="which users mentioned strategy games?",
+        guild_name="g",
+        channel_name="c",
+    )
+    assert "Owner request" in prompt
+
+
 def test_public_prompt_grounds_on_reference_and_never_encourages_guessing():
     grounded = build_public_prompt(
         user_request="what is event 2?",
