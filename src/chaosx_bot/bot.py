@@ -25,15 +25,20 @@ from .auto_scan import (
     looks_like_model_identity_question,
 )
 from .conversation_memory import (
+    MEMORY_MAINTENANCE_INTERVAL_S,
     backfill_capture,
     capture_message,
     conversation_context_for,
     known_authors_for,
+    maintain_user_memories,
     mark_messages_admin,
+    registered_users,
     schedule_compaction,
     schedule_user_profile_compaction,
+    sync_user_registry,
     user_history_for,
     user_profile_for,
+    users_with_memory,
 )
 from .catalog_validation import format_workbook_validation, validate_workbook
 from .community_notes import (
@@ -1077,7 +1082,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
 - `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for model-generated auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
-- `/admin user-memory [user:<name or ID>]` — owner-only viewer for saved per-user memory (profile + recent history). With no user, dumps memory for every user the bot has something saved on (empty users skipped).
+- `/admin user-memory [user:<name or ID>]` — owner-only viewer for saved per-user memory (profile + recent history). With no user, dumps memory for every user in the database that has memory saved (users who have never sent messages are skipped).
 - `/admin scan-history [limit:<n>]` — owner-only backfill: reads all readable channel/thread history in the server, captures it into conversation memory, and force-builds user profiles in the background (deduped, so it is safe to rerun). Results are posted to the command channel when finished.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
@@ -1143,6 +1148,7 @@ class ChaosXBot(discord.Client):
         )
         self._playtest_synthesis_task: asyncio.Task[None] | None = None
         self._mcp_warm_task: asyncio.Task[None] | None = None
+        self._memory_maintenance_task: asyncio.Task[None] | None = None
         self._playtest_synthesis_lock = asyncio.Lock()
         self._auto_scan_classify_lock = asyncio.Lock()
         self._playtest_synthesis_requested = False
@@ -1183,8 +1189,57 @@ class ChaosXBot(discord.Client):
     async def _refresh_members_background(self) -> None:
         try:
             await self.guild_members.refresh()
+            await self._sync_member_registry()
         finally:
             self._members_refresh_inflight = False
+
+    async def _sync_member_registry(self) -> None:
+        """Upsert EVERY guild member into the user registry (even members who
+        never sent a message) so /admin user-memory and the directory know the
+        whole server. Names come from Discord member data only — never from
+        saved memory — so identity stays ID-based and impersonation-safe."""
+        members: list[tuple[int, str, bool]] = []
+        seen: set[int] = set()
+        for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+            uid = member.get("id")
+            if uid is None or int(uid) in seen:
+                continue
+            seen.add(int(uid))
+            display = (
+                (member.get("nick") or "")
+                or (member.get("user") or {}).get("global_name")
+                or (member.get("user") or {}).get("username")
+                or ""
+            )
+            if display:
+                members.append((int(uid), str(display).strip(), False))
+        # Guild member cache as a second source (covers members REST may miss).
+        for guild in self.guilds:
+            if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
+                continue
+            for member in guild.members:
+                if member.id in seen or getattr(member, "bot", False):
+                    continue
+                seen.add(member.id)
+                name = getattr(member, "display_name", None) or getattr(member, "name", None)
+                if name:
+                    members.append((member.id, str(name).strip(), False))
+        if members:
+            await sync_user_registry(self.settings.db_path, members)
+
+    async def _memory_maintenance_loop(self) -> None:
+        """Hermes-style continuous memory curation: periodically refresh the
+        member registry and rebuild any stale user profiles from the durable
+        archive so memories are always maintained, never lost."""
+        while True:
+            await asyncio.sleep(MEMORY_MAINTENANCE_INTERVAL_S)
+            try:
+                if self.guild_members.needs_refresh() and not self._members_refresh_inflight:
+                    self._members_refresh_inflight = True
+                    asyncio.create_task(self._refresh_members_background(), name="chaosx-members-refresh")
+                await maintain_user_memories(self.settings)
+            except Exception:
+                continue
 
     def rules_block(self) -> str:
         """Prompt-ready server-rules block; kicks a background refresh when stale."""
@@ -1291,6 +1346,13 @@ class ChaosXBot(discord.Client):
         except Exception:
             history = {}
         for uid, name in history.items():
+            mapping.setdefault(uid, name)
+        # Persistent user registry (complete member list, survives REST gaps).
+        try:
+            registry = dict(await registered_users(self.settings.db_path, limit=limit))
+        except Exception:
+            registry = {}
+        for uid, name in registry.items():
             mapping.setdefault(uid, name)
         # Guild member cache fallback.
         for guild in self.guilds:
@@ -1467,6 +1529,15 @@ class ChaosXBot(discord.Client):
         )
         await self.leave_unauthorized_guilds()
         self.schedule_playtest_result_synthesis(delay_seconds=5)
+        # Seed the user registry with ALL guild members and keep per-user
+        # memories maintained continuously from the durable archive.
+        if not self._members_refresh_inflight:
+            self._members_refresh_inflight = True
+            asyncio.create_task(self._refresh_members_background(), name="chaosx-members-init")
+        if self._memory_maintenance_task is None or self._memory_maintenance_task.done():
+            self._memory_maintenance_task = asyncio.create_task(
+                self._memory_maintenance_loop(), name="chaosx-memory-maintenance"
+            )
         if self._mcp_warm_task is None or self._mcp_warm_task.done():
             self._mcp_warm_task = asyncio.create_task(
                 self._warm_mcp_session(), name="chaosx-mcp-warmup"
@@ -2206,6 +2277,10 @@ async def _scan_history_background(
         authors: dict[int, str] = {}
         me_id = bot.user.id if bot.user is not None else None
 
+        # Seed the registry with ALL members before scanning so the database
+        # knows the complete server, then capture the full readable history.
+        await bot._sync_member_registry()
+
         for channel in channels:
             try:
                 if isinstance(channel, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
@@ -2232,8 +2307,8 @@ async def _scan_history_background(
                             message_id=message.id,
                             allowed_guild_id=bot.settings.allowed_guild_id,
                         )
-                        captured += 1
                         if ok:
+                            captured += 1
                             authors.setdefault(author_id, name)
             except Exception as exc:
                 errored.append(f"{getattr(channel, 'name', channel.id)} ({type(exc).__name__})")
@@ -4182,15 +4257,20 @@ def register_commands(bot: ChaosXBot) -> None:
     async def admin_user_memory(interaction: discord.Interaction, user: str = "") -> None:
         if not await owner_gate(interaction, settings):
             return
-        # No user given: dump memory for every user the bot has something for,
-        # skipping users with nothing saved.
+        # No user given: dump memory for every user in the database that has
+        # memory saved (a profile or captured messages). Users who have never
+        # sent any messages have nothing saved and are skipped.
         if not user.strip():
-            known = await known_authors_for(bot.settings.db_path, limit=500, scope="public")
+            rows = await users_with_memory(bot.settings.db_path, scope="public")
             blocks: list[str] = []
-            for uid, name in sorted(known.items(), key=lambda item: item[1].casefold()):
-                profile = await user_profile_for(bot.settings.db_path, uid, scope="public")
-                if profile:
-                    blocks.append(f"## {name}\n" + profile)
+            for uid, name, profile in rows:
+                try:
+                    recent = await user_history_for(bot.settings.db_path, uid, scope="public")
+                except Exception:
+                    recent = ""
+                parts = [p for p in (profile, recent) if p]
+                if parts:
+                    blocks.append(f"## {name}\n" + "\n".join(parts))
             text = "\n\n---\n\n".join(blocks) if blocks else "No saved user memory yet."
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"all users ({len(blocks)})")
             for part in _chunk(text):
@@ -4199,30 +4279,41 @@ def register_commands(bot: ChaosXBot) -> None:
                 else:
                     await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
             return
-        # Resolve by numeric ID first, then by display name from captured history.
+        # Resolve by numeric ID first, then by display name from the full
+        # user registry (which knows EVERY member, even silent ones).
         author_id: int | None = None
         match = re.fullmatch(r"\d{15,25}", user.strip())
         if match:
             author_id = int(match.group(0))
+        registered: dict[int, str] = {}
         if author_id is None:
-            known = await known_authors_for(bot.settings.db_path, limit=200, scope="public")
+            try:
+                registered = dict(await registered_users(bot.settings.db_path))
+            except Exception:
+                registered = {}
             needle = user.strip().casefold()
-            for uid, name in known.items():
+            for uid, name in registered.items():
                 if name.casefold() == needle:
                     author_id = uid
                     break
         if author_id is None:
-            text = f"No saved memory found for `{user.strip()}`. The bot only remembers users who have talked to it (display names from captured history)."
+            text = f"No user found for `{user.strip()}` in the server directory."
             await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"not found: {user.strip()}")
             return
         profile = await user_profile_for(bot.settings.db_path, author_id, scope="public")
-        if profile:
-            known = await known_authors_for(bot.settings.db_path, limit=500, scope="public")
-            display_name = known.get(author_id, str(author_id))
-            text = f"## {display_name} (user id {author_id})\n\n" + profile
+        recent = await user_history_for(bot.settings.db_path, author_id, scope="public")
+        if profile or recent:
+            if not registered:
+                try:
+                    registered = dict(await registered_users(bot.settings.db_path))
+                except Exception:
+                    registered = {}
+            display_name = registered.get(author_id, str(author_id))
+            text = f"## {display_name} (user id {author_id})\n\n" + "\n".join(p for p in (profile, recent) if p)
         else:
-            text = f"No saved memory yet for user id `{author_id}` (profile builds after enough captured messages)."
+            display_name = registered.get(author_id, str(author_id)) if registered else str(author_id)
+            text = f"No saved memory yet for `{display_name}` (they haven't sent any messages I've captured)."
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"user id {author_id}")
         for part in _chunk(text):
             if interaction.response.is_done():
