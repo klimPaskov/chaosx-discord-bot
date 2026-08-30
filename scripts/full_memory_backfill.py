@@ -63,15 +63,45 @@ async def main() -> None:
 
         print(f"Logged in as {client.user} — scanning guild {guild.name} ({guild.id})")
 
-        # 1) Member registry: ALL members, even silent ones.
+        # 1) Member registry: ALL members, even silent ones. Uses the REST
+        # member endpoint (like GuildMembers) so no privileged members intent
+        # is required; `guild.fetch_members` would need Intents.members.
         members: list[tuple[int, str, bool]] = []
         try:
-            async for member in guild.fetch_members(limit=None):
-                if member.bot:
-                    continue
-                name = (member.display_name or member.name or "").strip()
-                if name:
-                    members.append((member.id, name, False))
+            from chaosx_bot.server_rules import DISCORD_API_BASE, DISCORD_BOT_UA
+            import aiohttp
+
+            headers = {"Authorization": f"Bot {settings.discord_token}", "User-Agent": DISCORD_BOT_UA}
+            after = ""
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    url = f"{DISCORD_API_BASE}/guilds/{guild.id}/members?limit=1000"
+                    if after:
+                        url += f"&after={after}"
+                    async with session.get(url, headers=headers) as response:
+                        if response.status != 200:
+                            print(f"Member fetch HTTP {response.status} (continuing)")
+                            break
+                        page = await response.json()
+                    if not page:
+                        break
+                    for member in page:
+                        uid = member.get("id")
+                        if uid is None or (member.get("user") or {}).get("bot"):
+                            continue
+                        display = (
+                            (member.get("nick") or "")
+                            or (member.get("user") or {}).get("global_name")
+                            or (member.get("user") or {}).get("username")
+                            or ""
+                        )
+                        if display:
+                            members.append((int(uid), str(display).strip(), False))
+                    if len(page) < 1000:
+                        break
+                    after = str(page[-1].get("user", {}).get("id", ""))
+                    if not after:
+                        break
         except Exception as exc:  # noqa: BLE001
             print(f"Member fetch failed (continuing): {type(exc).__name__}: {exc}")
         synced = await sync_user_registry(settings.db_path, members)
