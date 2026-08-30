@@ -215,6 +215,36 @@ def test_thinking_feed_ephemeral_posts_only_you_can_see_message() -> None:
     assert sent_ephemeral == [True]
 
 
+def test_thinking_feed_dm_mode_streams_to_owner_dm() -> None:
+    """Owner mode: the feed message is sent to the user's DM channel and
+    reasoning edits that DM message live (Hoops: reasoning as a DM)."""
+    from chaosx_bot.bot import _ThinkingFeed
+
+    edited: list[str] = []
+
+    class FakeDmMsg:
+        id = 777
+
+        async def edit(self, content: str = "", **_: object) -> None:
+            edited.append(content)
+
+    class FakeDm:
+        async def send(self, content: str) -> FakeDmMsg:
+            return FakeDmMsg()
+
+    class FakeUser:
+        async def create_dm(self) -> FakeDm:
+            return FakeDm()
+
+    feed = _ThinkingFeed(FakeBot(), label="ask", interaction=None, raw=True, dm_user=FakeUser())  # type: ignore[arg-type]
+    assert asyncio.run(feed.start()) is True
+    assert feed.message is not None
+    feed._last_edit = 0.0  # bypass the edit throttle so the test isn't slow
+    asyncio.run(feed.emit("thinking about the user memory query", ""))
+    assert edited, "DM feed must be edited live with reasoning"
+    assert "thinking about the user memory query" in edited[-1]
+
+
 def test_thinking_feed_active_rules() -> None:
     """The ephemeral feed must force an ephemeral defer for public /ask —
     otherwise Discord posts the feed as a normal visible message (Hoops

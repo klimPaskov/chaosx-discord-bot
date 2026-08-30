@@ -95,6 +95,7 @@ from .hermes_bridge import (
     AUTO_SCAN_BANTER_BOUNDARY,
     AUTO_SCAN_WARNING_BOUNDARY,
     PUBLIC_ASK_BOUNDARY,
+    SYSTEM_BOUNDARY,
 )
 from .knowledge import Knowledge
 from .issue_duplicates import (
@@ -2159,23 +2160,31 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
     # Admin task messages stay in the admin memory partition (public asks never see them).
     await mark_messages_admin(bot.settings.db_path, [message.id])
     hermes_timeout = bot.settings.admin_ask_timeout_seconds
-    # No thinking feed for mention asks: only slash commands can carry an
-    # ephemeral ("only you can see this") message, and DMs are not used.
+    # The owner's live reasoning is streamed to their DMs while the answer
+    # builds; the tool-enabled Hermes run is the automatic fallback.
+    feed = _ThinkingFeed(
+        bot,
+        label="admin mention ask",
+        interaction=None,
+        raw=True,
+        dm_user=message.author,
+    )
+    await feed.start()
 
     async with message.channel.typing():
-        result = await run_hermes(
-            hermes_bin=bot.settings.hermes_bin,
-            profile=bot.settings.hermes_profile,
-            repo=bot.settings.chaos_redux_repo,
+        result = await _public_model_completion(
+            bot=bot,
+            system=SYSTEM_BOUNDARY,
             prompt=prompt,
-            timeout_seconds=hermes_timeout,
             model=bot.settings.operator_model,
-            provider=bot.settings.operator_provider,
             reasoning_effort=bot.settings.operator_reasoning_effort,
-            toolsets=None,
-            ignore_rules=False,
+            timeout_seconds=hermes_timeout,
             activity_label="admin mention ask",
             actor_id=message.author.id,
+            feed=feed,
+            fallback_toolsets=None,
+            fallback_ignore_rules=False,
+            fallback_provider=bot.settings.operator_provider,
         )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
@@ -2254,18 +2263,21 @@ def thinking_feed_active(
 class _ThinkingFeed:
     """Live thinking feed: streams the model's reasoning while it works.
 
-    Single display mode: an EPHEMERAL interaction message in the SAME
-    channel as the command ("Only you can see this message"), so only the
-    user who invoked the command sees it and can dismiss it with Discord's
-    built-in ✕. Never a DM, never a public channel broadcast, and no
-    basket-emoji dismissal.
+    Two display modes:
+    - DM mode (owner): the feed is sent to the owner's DM channel as a
+      message that is edited live as reasoning streams in — the owner sees
+      the bot's reasoning in a direct message, wherever the command ran.
+    - Ephemeral mode (everyone else): an EPHEMERAL interaction message in
+      the SAME channel as the command ("Only you can see this message"),
+      dismissible with Discord's built-in ✕.
 
-    Reasoning is scrubbed for regular users; the owner's ephemeral feed is
-    raw (only they can see it either way). The final answer is always posted
-    as the normal public reply.
+    Reasoning is scrubbed for regular users; the owner's feed is raw (DM or
+    ephemeral — only they can see it either way). The final answer is always
+    posted as the normal reply.
 
     Only slash/context commands can carry an ephemeral feed — plain
-    `@ChaosX` mention asks have no interaction, so they get no thinking feed.
+    `@ChaosX` mention asks have no interaction, but the owner's DM feed
+    works for those too (it needs no interaction, only the owner user id).
 
     Edits are throttled to stay inside Discord's edit-rate limits and the
     2000-char message cap.
@@ -2279,13 +2291,15 @@ class _ThinkingFeed:
         bot: "ChaosXBot",
         *,
         label: str,
-        interaction: discord.Interaction,
+        interaction: discord.Interaction | None,
         raw: bool = False,
+        dm_user: discord.User | discord.Member | None = None,
     ) -> None:
         self.bot = bot
         self.label = label
         self.interaction = interaction
         self.raw = raw
+        self.dm_user = dm_user
         self.message: discord.Message | None = None
         self.reasoning = ""
         self.content = ""
@@ -2293,10 +2307,16 @@ class _ThinkingFeed:
 
     async def start(self) -> bool:
         try:
-            self.message = await self.interaction.followup.send(
-                "🧠 **ChaosX is thinking…**",
-                ephemeral=True,
-            )
+            if self.dm_user is not None:
+                dm = await self.dm_user.create_dm()
+                self.message = await dm.send("🧠 **ChaosX is thinking…**")
+            elif self.interaction is not None:
+                self.message = await self.interaction.followup.send(
+                    "🧠 **ChaosX is thinking…**",
+                    ephemeral=True,
+                )
+            else:
+                return False
             self._last_edit = time.monotonic()
             return True
         except Exception:
@@ -2349,15 +2369,20 @@ async def _public_model_completion(
     activity_label: str,
     actor_id: int | None = None,
     feed: _ThinkingFeed | None = None,
+    fallback_toolsets: str | None = "safe",
+    fallback_ignore_rules: bool = True,
+    fallback_provider: str | None = None,
 ) -> HermesResult:
-    """Run a public (no-tools) model completion: direct API fast path first.
+    """Run a no-tools model completion via the direct streaming API.
 
     Public asks never need tools, so a raw chat completion is both faster
     (~1-3s vs ~5-9s through a Hermes CLI subprocess) and safer (no code
     execution surface). Falls back to the Hermes subprocess on any direct
     path failure so a transient API issue never breaks answering. When a
     feed is provided, the model's reasoning is streamed live (raw DM for the
-    owner, scrubbed per-user DM or ephemeral feed for the asking user).
+    owner, scrubbed per-user ephemeral feed for the asking user). The
+    fallback Hermes run uses the caller-specified toolsets/ignore_rules so
+    owner paths can keep their tool access if the direct path fails.
     """
     digest = prompt_hash(prompt)
     user_part = prompt[len(system):].strip() if prompt.startswith(system) else prompt.strip()
@@ -2398,10 +2423,10 @@ async def _public_model_completion(
             prompt=prompt,
             timeout_seconds=timeout_seconds,
             model=model,
-            provider=bot.settings.ask_provider,
+            provider=fallback_provider or bot.settings.ask_provider,
             reasoning_effort=reasoning_effort,
-            toolsets="safe",
-            ignore_rules=True,
+            toolsets=fallback_toolsets,
+            ignore_rules=fallback_ignore_rules,
             activity_label=activity_label,
             actor_id=actor_id,
             progress_callback=feed_progress if feed is not None else None,
@@ -3367,7 +3392,8 @@ async def run_hermes_command(
     activity_box: list[HermesRunActivity | None] = [None]
     progress_stop: asyncio.Event | None = None
     progress_task: asyncio.Task[None] | None = None
-    if owner_only:
+    owner_stream = owner_only and command_name == "admin ask"
+    if owner_only and not owner_stream:
         progress_stop = asyncio.Event()
         progress_task = asyncio.create_task(
             _owner_progress_loop(
@@ -3464,24 +3490,25 @@ async def run_hermes_command(
         activity_box[0] = activity
 
     try:
-        if not owner_only and use_ask_model:
-            assert model is not None and reasoning_effort is not None  # set by use_ask_model branch
+        if (not owner_only and use_ask_model) or owner_stream:
+            assert model is not None and reasoning_effort is not None  # set by the model branch
+            is_owner = interaction.user.id == bot.settings.owner_id
             feed: _ThinkingFeed | None = None
-            if feed_active:
-                # Ephemeral: posted in the SAME channel, "Only you can see this
-                # message", dismissible by the user with Discord's built-in ✕.
-                # Owner's feed is raw; everyone else gets scrubbed reasoning.
+            if (not owner_only and feed_active) or (owner_stream and is_owner):
+                # Owner's feed is delivered as a live DM (raw reasoning);
+                # everyone else gets the scrubbed in-channel ephemeral feed.
                 feed = _ThinkingFeed(
                     bot,
                     label=command_name,
                     interaction=interaction,
-                    raw=(interaction.user.id == bot.settings.owner_id),
+                    raw=is_owner,
+                    dm_user=interaction.user if is_owner else None,
                 )
             if feed is not None:
                 await feed.start()
             result = await _public_model_completion(
                 bot=bot,
-                system=PUBLIC_ASK_BOUNDARY,
+                system=SYSTEM_BOUNDARY if owner_stream else PUBLIC_ASK_BOUNDARY,
                 prompt=prompt,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -3489,6 +3516,9 @@ async def run_hermes_command(
                 activity_label=command_name,
                 actor_id=interaction.user.id,
                 feed=feed,
+                fallback_toolsets=None if owner_stream else "safe",
+                fallback_ignore_rules=False if owner_stream else True,
+                fallback_provider=bot.settings.operator_provider if owner_stream else None,
             )
         else:
             result = await run_hermes(
