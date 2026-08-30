@@ -419,6 +419,16 @@ class Store:
             row = await cur.fetchone()
         return bool(row and row[0])
 
+    async def warning_count_for(self, actor_id: int) -> int:
+        """Total recorded soft warnings for one user (the warned-users count)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM auto_scan_events WHERE actor_id = ? AND action = 'soft_warning'",
+                (actor_id,),
+            )
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
     async def list_warned_users(self, *, guild_id: int | None = None, limit: int = 25) -> list[tuple]:
         """Group soft-warning events by user: actor_id, warning count, last warned at, latest reason."""
         limit = max(1, min(limit, 100))

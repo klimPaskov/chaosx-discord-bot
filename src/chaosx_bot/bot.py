@@ -15,7 +15,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions
+from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions, targeted_mentions
 from .auto_scan import (
     BOT_TOPIC_RE,
     AutoScanDecision,
@@ -413,7 +413,7 @@ def format_warned_users(rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
-def format_auto_scan_notice(decision: AutoScanDecision, message: discord.Message, *, bot_message_id: int | None) -> str:
+def format_auto_scan_notice(decision: AutoScanDecision, message: discord.Message, *, bot_message_id: int | None, warning_count: int | None = None) -> str:
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
     message_link = getattr(message, "jump_url", "")
@@ -425,7 +425,8 @@ def format_auto_scan_notice(decision: AutoScanDecision, message: discord.Message
         f"- Guild: `{guild_id}`\n"
         f"- Reason: {sanitize_admin_context_text(decision.reason, limit=220)}\n"
         f"- Confidence: `{decision.confidence}`\n"
-        f"- Action taken: soft warning only\n"
+        + (f"- Warning count for this user: `{warning_count}`\n" if warning_count is not None else "")
+        + f"- Action taken: soft warning only\n"
         + (f"- Message: {message_link}\n" if message_link else "")
         + (f"- Warning message ID: `{bot_message_id}`\n" if bot_message_id else "")
         + f"\n```text\n{excerpt}\n```"
@@ -444,8 +445,15 @@ async def send_auto_scan_notice(bot: ChaosXBot, decision: AutoScanDecision, mess
             return
     if not isinstance(channel, discord.abc.Messageable):
         return
-    for part in _chunk(format_auto_scan_notice(decision, message, bot_message_id=bot_message_id)):
-        await channel.send(part, allowed_mentions=safe_allowed_mentions())
+    try:
+        warning_count = await bot.store.warning_count_for(message.author.id)
+    except Exception:
+        warning_count = None
+    # Targeted mention: the warned user's <@id> renders clickable so mods can
+    # jump to their profile, without enabling any other mention parsing.
+    mentions = targeted_mentions([message.author.id])
+    for part in _chunk(format_auto_scan_notice(decision, message, bot_message_id=bot_message_id, warning_count=warning_count)):
+        await channel.send(part, allowed_mentions=mentions)
 
 
 async def record_auto_scan_event(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message, *, bot_message_id: int | None, response: str) -> None:
@@ -706,18 +714,27 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         limit = bot.settings.auto_scan_warning_limit_per_user_hour
         if limit <= 0:
             return False
-        rate = bot.rate_limiter.check(bucket="auto_warning", user_id=message.author.id, limit=limit, window_seconds=3600)
-        if not rate.allowed:
-            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason="soft-warning rate limited"), message, bot_message_id=None, response="")
-            return False
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow soft-warning: {decision.reason}"), message, bot_message_id=None, response="")
+            await send_auto_scan_notice(bot, decision, message, bot_message_id=None)
+            return True
+        rate = bot.rate_limiter.check(bucket="auto_warning", user_id=message.author.id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            # Repeat rule-break within the hour: ALWAYS record the warning so
+            # it accumulates in the warned-users list (Hoops 2026-08-30), but
+            # skip the in-channel reply to avoid spamming the same user. The
+            # mod notice still fires so repeat offenses stay visible.
+            await record_auto_scan_event(bot, decision, message, bot_message_id=None, response="")
             await send_auto_scan_notice(bot, decision, message, bot_message_id=None)
             return True
         result, model_output = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
-            await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
+            # The rule break still counts as a warning even when the model
+            # reply failed; the failure is surfaced in the recorded reason.
+            failed = AutoScanDecision("soft_warning", confidence=decision.confidence, reason=f"{decision.reason} (model reply failed: {reason})", source=decision.source)
+            await record_auto_scan_event(bot, failed, message, bot_message_id=None, response=result.stderr or result.stdout)
+            await send_auto_scan_notice(bot, failed, message, bot_message_id=None)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning model failure", summary=reason)
             return False
         sent = await reply_with_chunks(message, model_output)
@@ -1082,7 +1099,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
 - `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for model-generated auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
-- `/admin user-memory [user:<name or ID>]` — owner-only viewer for saved per-user memory (profile + recent history). With no user, dumps memory for every user in the database that has memory saved (users who have never sent messages are skipped).
+- `/admin user-memory [user:<name or ID>] [public:<bool>]` — owner-only viewer for saved per-user memory (profile summarizations only; recent raw messages stay internal). With no user, dumps summaries for every user in the database that has memory saved (users who have never sent messages are skipped, always ephemeral). With a specific user, the optional `public:true` posts the answer as a normal channel message instead of ephemeral; user mentions are clickable so you can open their profile.
 - `/admin scan-history [limit:<n>]` — owner-only backfill: reads all readable channel/thread history in the server, captures it into conversation memory, and force-builds user profiles in the background (deduped, so it is safe to rerun). Results are posted to the command channel when finished.
 - `/admin jobs action:list` — checks tracked automation/job records. Use only if an expected reminder, digest, or webhook result did not appear.
 - `/admin permissions-audit` — reviews bot/server/GitHub permissions for risky or excessive access. Use after invite/role/permission changes.
@@ -4247,37 +4264,41 @@ def register_commands(bot: ChaosXBot) -> None:
         rows = await bot.store.list_warned_users(guild_id=interaction.guild_id, limit=limit)
         text = format_warned_users(rows)
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin warned-users", summary=str(len(rows)))
+        # Targeted mentions: the listed <@id>s render clickable so the owner
+        # can click straight through to each warned user's profile.
+        mentions = targeted_mentions([int(r[0]) for r in rows if r and r[0]])
         for part in _chunk(text):
             if interaction.response.is_done():
-                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                await interaction.followup.send(part, ephemeral=True, allowed_mentions=mentions)
             else:
-                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=mentions)
 
     @admin.command(name="user-memory", description="Show saved memory (profile summary) for all users, or one user by name/ID.")
-    async def admin_user_memory(interaction: discord.Interaction, user: str = "") -> None:
+    async def admin_user_memory(interaction: discord.Interaction, user: str = "", public: bool = False) -> None:
         if not await owner_gate(interaction, settings):
             return
-        # No user given: dump memory for every user in the database that has
-        # memory saved (a profile or captured messages). Users who have never
-        # sent any messages have nothing saved and are skipped.
+        # The no-arg dump lists EVERYONE's memory — always ephemeral. The
+        # optional `public` flag only applies to a specific-user lookup, so
+        # it can be posted as a normal (channel-visible) message.
         if not user.strip():
             rows = await users_with_memory(bot.settings.db_path, scope="public")
             blocks: list[str] = []
+            listed_ids: list[int] = []
             for uid, name, profile in rows:
-                try:
-                    recent = await user_history_for(bot.settings.db_path, uid, scope="public")
-                except Exception:
-                    recent = ""
-                parts = [p for p in (profile, recent) if p]
-                if parts:
-                    blocks.append(f"## {name}\n" + "\n".join(parts))
+                if not profile.strip():
+                    continue
+                # Mention the user so the owner can click through to the
+                # profile (targeted mention parsing on send).
+                blocks.append(f"## {name} — <@{uid}>\n" + profile.strip())
+                listed_ids.append(uid)
             text = "\n\n---\n\n".join(blocks) if blocks else "No saved user memory yet."
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"all users ({len(blocks)})")
+            mentions = targeted_mentions(listed_ids)
             for part in _chunk(text):
                 if interaction.response.is_done():
-                    await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                    await interaction.followup.send(part, ephemeral=True, allowed_mentions=mentions)
                 else:
-                    await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                    await interaction.response.send_message(part, ephemeral=True, allowed_mentions=mentions)
             return
         # Resolve by numeric ID first, then by display name from the full
         # user registry (which knows EVERY member, even silent ones).
@@ -4301,25 +4322,32 @@ def register_commands(bot: ChaosXBot) -> None:
             await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"not found: {user.strip()}")
             return
-        profile = await user_profile_for(bot.settings.db_path, author_id, scope="public")
-        recent = await user_history_for(bot.settings.db_path, author_id, scope="public")
-        if profile or recent:
+        profile_block = await user_profile_for(bot.settings.db_path, author_id, scope="public")
+        # Admin view: the raw summarization only (strip the prompt-facing
+        # header line; recent raw messages stay internal).
+        profile_body = ""
+        if profile_block:
+            head, _, rest = profile_block.partition("\n")
+            profile_body = rest if head.startswith("User profile") else profile_block
+        if profile_body.strip():
             if not registered:
                 try:
                     registered = dict(await registered_users(bot.settings.db_path))
                 except Exception:
                     registered = {}
             display_name = registered.get(author_id, str(author_id))
-            text = f"## {display_name} (user id {author_id})\n\n" + "\n".join(p for p in (profile, recent) if p)
+            text = f"## {display_name} — <@{author_id}> (user id {author_id})\n\n" + profile_body.strip()
         else:
             display_name = registered.get(author_id, str(author_id)) if registered else str(author_id)
-            text = f"No saved memory yet for `{display_name}` (they haven't sent any messages I've captured)."
-        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"user id {author_id}")
+            text = f"No saved profile summary yet for `{display_name}` (they haven't sent any messages I've captured)."
+        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"user id {author_id}" + (" public" if public else ""))
+        mentions = targeted_mentions([author_id])
+        ephemeral = not public
         for part in _chunk(text):
             if interaction.response.is_done():
-                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                await interaction.followup.send(part, ephemeral=ephemeral, allowed_mentions=mentions)
             else:
-                await interaction.response.send_message(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                await interaction.response.send_message(part, ephemeral=ephemeral, allowed_mentions=mentions)
 
     @admin.command(name="scan-history", description="Backfill-scan all server message history and build user memory from it.")
     async def admin_scan_history(interaction: discord.Interaction, limit: int = 0) -> None:

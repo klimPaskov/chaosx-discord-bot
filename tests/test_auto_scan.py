@@ -368,6 +368,26 @@ def test_auto_scan_formatters_and_channel_exclusion_are_sanitized():
     assert "Action taken: soft warning only" in notice
     assert "secret" not in notice
 
+    # Warning count line appears only when provided (escalation visibility).
+    notice_count = format_auto_scan_notice(classify_soft_warning("@everyone hi"), notice_message, bot_message_id=2000, warning_count=4)
+    assert "Warning count for this user: `4`" in notice_count
+
+
+def test_targeted_mentions_restricts_to_listed_users() -> None:
+    """Owner-facing output (warned-users list, notices, user-memory dump)
+    may parse mentions for the listed users only — never everyone/roles."""
+    from chaosx_bot.auth import targeted_mentions
+
+    mentions = targeted_mentions([123, 456, 123])
+    assert mentions.everyone is False
+    assert mentions.roles is False
+    assert mentions.users is not True and mentions.users is not False
+    ids = {u.id for u in mentions.users}  # type: ignore[union-attr]
+    assert ids == {123, 456}  # deduplicated
+
+    empty = targeted_mentions([])
+    assert empty.users is not True  # no broad user parsing
+
 
 class _FakeStore:
     def __init__(self) -> None:
@@ -495,6 +515,31 @@ async def test_handle_auto_scan_owner_gets_answers_but_no_warnings(monkeypatch):
     handled2 = await handle_auto_scan(cast(Any, bot2), cast(Any, answer_message))
     assert handled2 is True
     assert any("Model-generated auto-scan reply" in r["content"] for r in answer_message.replies)
+
+
+@pytest.mark.asyncio
+async def test_handle_auto_scan_records_repeat_warnings_beyond_rate_limit(monkeypatch):
+    """Repeated rule-breaks keep accumulating in the warned-users list even
+    when the per-hour public-reply rate limit is hit (Hoops 2026-08-30): every
+    break is recorded as a soft warning; only the in-channel reply is capped."""
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
+    bot = _FakeBot(settings)
+    monkeypatch.setattr("chaosx_bot.bot.generate_auto_scan_model_response", _fake_model_output)
+
+    def fake_warning(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        return AutoScanDecision("soft_warning", confidence=100, reason="spam ping", question="", source="rules")
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_warning)
+
+    limit = settings.auto_scan_warning_limit_per_user_hour
+    messages = [_FakeMessage("@everyone free nitro") for _ in range(limit + 2)]
+    for message in messages:
+        assert await handle_auto_scan(cast(Any, bot), cast(Any, message)) is True
+
+    soft_events = [e for e in bot.store.events if e["action"] == "soft_warning"]
+    assert len(soft_events) == limit + 2  # every rule-break recorded
+    replies = sum(len(m.replies) for m in messages)
+    assert replies == limit  # public replies rate-limited; records are not
 
 
 @pytest.mark.asyncio

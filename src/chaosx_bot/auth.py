@@ -19,6 +19,23 @@ def safe_allowed_mentions() -> discord.AllowedMentions:
     return discord.AllowedMentions(everyone=False, users=False, roles=False, replied_user=False)
 
 
+def targeted_mentions(user_ids: list[int]) -> discord.AllowedMentions:
+    """Allow mention parsing ONLY for the given user ids.
+
+    Used for owner/mod-facing output (warned-users list, soft-warning
+    notices) so `<@id>` renders as a real clickable user mention — without
+    opening mass/role/other-user mention parsing. `users` accepts a list of
+    ids or user objects; passing a list restricts parsing to exactly those.
+    """
+
+    return discord.AllowedMentions(
+        everyone=False,
+        users=[discord.Object(id=uid) for uid in dict.fromkeys(user_ids)],
+        roles=False,
+        replied_user=False,
+    )
+
+
 def public_deny_reason(guild_id: int | None, allowed_guild_id: int | None) -> str | None:
     if not is_allowed_guild(guild_id, allowed_guild_id):
         return "ChaosX is locked to a different guild."
