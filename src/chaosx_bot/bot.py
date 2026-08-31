@@ -270,9 +270,11 @@ _RESTRICTED_PERSONA_RE = re.compile(r"feed(?:back|bacc|givingback|ingback|nback|
 _RESTRICTED_PERSONA_TIMEOUT_S = 300
 _RESTRICTED_PERSONA_DM = (
     "⚠️ **Automatic warning**\n"
-    "Your recent message triggered an automatic moderation action and you have "
-    f"been timed out for {_RESTRICTED_PERSONA_TIMEOUT_S // 60} minutes. "
-    "Please keep messages within server guidelines; repeated violations escalate."
+    "This user prefers to stay anonymous — please don't mention or refer to "
+    "them in this server. Your message was removed and you have been timed "
+    f"out for {_RESTRICTED_PERSONA_TIMEOUT_S // 60} minutes. "
+    "If you refer to this user again, you will be warned; repeated "
+    "violations escalate."
 )
 
 
@@ -1814,30 +1816,57 @@ class ChaosXBot(discord.Client):
         if not _mentions_restricted_persona(message.content or ""):
             return False
         # DM warning (best effort — user may have DMs closed).
+        dm_ok = False
         try:
             await message.author.send(_RESTRICTED_PERSONA_DM)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-        # Automatic 5-minute timeout (requires a guild member; DMs have no timeout).
+            dm_ok = True
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(
+                f"ChaosX restricted-persona DM failed for {message.author.id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        # Automatic 5-minute timeout (requires a guild member; DMs have no
+        # timeout). The bot runs WITHOUT the members intent, so message.author
+        # is usually a plain User and the member cache is empty — resolve the
+        # member via REST (fetch_member) first, then the cache as fallback.
+        timeout_ok = False
+        timeout_err = ""
         member = message.author if isinstance(message.author, discord.Member) else None
         if member is None and message.guild is not None:
-            member = message.guild.get_member(message.author.id)
+            fetch_member = cast(Any, getattr(message.guild, "fetch_member", None))
+            if callable(fetch_member):
+                try:
+                    member = await fetch_member(message.author.id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                    timeout_err = f"member fetch failed: {type(exc).__name__}: {exc}"
+            if member is None:
+                member = message.guild.get_member(message.author.id)
         if member is not None:
             try:
                 await member.timeout(
                     discord.utils.utcnow() + timedelta(seconds=_RESTRICTED_PERSONA_TIMEOUT_S),
                     reason="automatic moderation (restricted topic)",
                 )
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+                timeout_ok = True
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                timeout_err = f"{type(exc).__name__}: {exc}"
+        else:
+            timeout_err = timeout_err or "no guild member object (cache empty and REST unavailable)"
+        print(
+            f"ChaosX restricted-persona: user={message.author.id} "
+            f"dm_sent={dm_ok} timeout_applied={timeout_ok} ({timeout_err or 'ok'})"
+        )
         # Delete the flagged message (best effort; needs Manage Messages).
         content = message.content or ""
         deleted = False
         try:
             await message.delete()
             deleted = True
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            pass
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+            print(
+                f"ChaosX restricted-persona delete failed for {message.author.id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
         # Report to the moderator-only channel with the exact flagged message.
         try:
             channel_id = self.settings.auto_scan_notify_channel_id or self.settings.automation_reminder_channel_id
@@ -1849,17 +1878,20 @@ class ChaosXBot(discord.Client):
                     author_name = message.author.display_name or message.author.name
                     channel_name = getattr(message.channel, "name", str(getattr(message.channel, "id", "?")))
                     flagged = "\n".join(f"> {ln}" for ln in content.splitlines()) or "> (empty message)"
+                    action_bits = [
+                        "DM warning " + ("sent" if dm_ok else "FAILED"),
+                        "5-min timeout " + ("applied" if timeout_ok else f"FAILED ({timeout_err or 'unknown'})"),
+                        "message " + ("deleted" if deleted else "NOT deleted (missing permission?)"),
+                    ]
                     report = (
                         f"🚨 **Automatic moderation — restricted topic violation**\n"
                         f"**User:** <@{message.author.id}> (`{author_name}`)\n"
                         f"**Channel:** #{channel_name}\n"
-                        f"**Action:** DM warning + 5-min timeout + message "
-                        + ("deleted" if deleted else "NOT deleted (missing permission?)")
-                        + "\n**Flagged message:**\n" + flagged
+                        f"**Action:** " + " · ".join(action_bits) + "\n**Flagged message:**\n" + flagged
                     )
                     await channel.send(report, allowed_mentions=targeted_mentions([message.author.id]))
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            pass
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+            print(f"ChaosX restricted-persona report failed: {type(exc).__name__}: {exc}")
         # Neutral internal record (reason only, no trigger text) so repeat
         # violations are visible to the owner via the warned-users list.
         try:

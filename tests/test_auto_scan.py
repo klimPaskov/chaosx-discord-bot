@@ -422,6 +422,15 @@ def test_restricted_persona_exempts() -> None:
     assert not _restricted_persona_exempt(99, 1, 2)  # regular member
 
 
+def _awaited(value: Any) -> Any:
+    """Return an awaitable that resolves to ``value`` (fake REST response)."""
+
+    async def _inner() -> Any:
+        return value
+
+    return _inner()
+
+
 class _RestrictedPersonaAuthor:
     def __init__(self, user_id: int) -> None:
         self.id = user_id
@@ -443,11 +452,17 @@ class _RestrictedPersonaMessage:
         self.content = content
         self.id = 1000
         self.author = _RestrictedPersonaAuthor(user_id)
-        # Handler resolves non-Member authors via guild.get_member; share the
-        # author's timeout recorder so assertions stay on the author.
+        # Handler resolves non-Member authors via REST fetch_member first
+        # (the bot runs without the members intent), then get_member as a
+        # cache fallback; share the author's timeout recorder so assertions
+        # stay on the author.
         member = SimpleNamespace()
         member.timeout = self.author.timeout  # type: ignore[attr-defined]
-        self.guild = SimpleNamespace(id=1395459671598436533, get_member=lambda uid: member)
+        self.guild = SimpleNamespace(
+            id=1395459671598436533,
+            fetch_member=lambda uid: _awaited(member),
+            get_member=lambda uid: None,  # empty cache — real-world state
+        )
         self.channel = SimpleNamespace(id=456, name="memes")
         self.deleted = False
 
@@ -498,6 +513,7 @@ async def test_handle_restricted_persona_full_enforcement() -> None:
     report = mod_channel.sent[0]
     assert "> haha feedbackgaming is so cringe" in report  # exact flagged message
     assert "<@123>" in report and "#memes" in report
+    assert "DM warning sent" in report and "5-min timeout applied" in report and "message deleted" in report
     assert bot.store.events and bot.store.events[0]["action"] == "soft_warning"
     record = bot.store.events[0]
     assert "feedbackgaming" not in record["reason"] and "feedbackgaming" not in record["content_excerpt"]
@@ -538,6 +554,28 @@ async def test_handle_restricted_persona_plain_feedback_not_flagged() -> None:
     assert message.author.timeout_calls == []
     assert message.deleted is False
     assert bot.store.events == []
+
+
+@pytest.mark.asyncio
+async def test_handle_restricted_persona_cache_fallback_without_fetch_member() -> None:
+    """When REST fetch_member is unavailable, the handler falls back to the
+    guild member cache (get_member) and the timeout still applies."""
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=777)
+    bot = _make_restricted_bot(settings)
+    mod_channel = _RestrictedPersonaModChannel()
+    bot.get_channel = lambda cid: mod_channel if cid == 777 else None  # type: ignore[method-assign]
+
+    message = _RestrictedPersonaMessage("stop talking about feedbackgaming", user_id=321)
+    # Simulate an older/gateway-only guild object: no fetch_member, cache hit.
+    member = SimpleNamespace()
+    member.timeout = message.author.timeout  # type: ignore[attr-defined]
+    message.guild = SimpleNamespace(id=1395459671598436533, get_member=lambda uid: member)
+
+    handled = await bot._handle_restricted_persona(cast(Any, message))  # type: ignore[attr-defined]
+
+    assert handled is True
+    assert len(message.author.timeout_calls) == 1
+    assert "5-min timeout applied" in mod_channel.sent[0]
 
 
 def test_profile_excerpt_cuts_at_line_boundary() -> None:
