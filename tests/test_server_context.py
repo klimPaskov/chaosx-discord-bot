@@ -383,7 +383,7 @@ def test_format_channel_reference_empty() -> None:
     assert format_channel_reference([]) == ""
 
 
-def test_format_member_directory_uses_display_names_no_bots() -> None:
+def test_format_member_directory_uses_usernames_no_bots() -> None:
     members = [
         {"id": "1", "user": {"id": "1", "username": "zin1496", "global_name": "Hoops McCann"}},
         {"id": "2", "nick": "Holly", "user": {"id": "2", "username": "holly_dev", "global_name": "holly_dev"}},
@@ -391,13 +391,36 @@ def test_format_member_directory_uses_display_names_no_bots() -> None:
         {"id": "4", "user": {"id": "4", "username": "solo", "global_name": None}},
     ]
     ref = format_member_directory(members)
-    assert "- Hoops McCann (1)" in ref
-    assert "- Holly (2)" in ref
+    # Reference names are actual usernames — display names (global_name/nick)
+    # are never used, so same-display-name users can never be conflated.
+    assert "- zin1496 (1)" in ref
+    assert "- holly_dev (2)" in ref
+    assert "Hoops McCann" not in ref and "Holly" not in ref
     assert "ChaosBot" not in ref  # bots excluded
     assert "- solo (4)" in ref
-    assert ref.index("Holly") < ref.index("Hoops McCann")  # sorted by name
+    assert ref.index("holly_dev") < ref.index("zin1496")  # sorted by username
     # Names only, never mentions/pings.
     assert "<@" not in ref
+
+
+def test_user_reference_name_uses_username_not_display_name() -> None:
+    from chaosx_bot.guild_members import user_reference_name
+
+    assert user_reference_name({"user": {"username": "holly_dev", "global_name": "Holly", "discriminator": "0000"}}) == "holly_dev"
+    assert user_reference_name({"nick": "Holly", "user": {"username": "holly_dev", "global_name": "holly_dev"}}) == "holly_dev"
+    # Legacy accounts keep their discriminator so reference names stay unique.
+    assert user_reference_name({"user": {"username": "legacy", "discriminator": "1234"}}) == "legacy#1234"
+    assert user_reference_name({"user": {"username": "", "global_name": "Holly"}}) == ""
+
+
+def test_author_reference_name_uses_username() -> None:
+    from chaosx_bot.guild_members import author_reference_name
+
+    user = SimpleNamespace(name="holly_dev", discriminator="0000", display_name="Holly")
+    assert author_reference_name(user) == "holly_dev"
+    legacy = SimpleNamespace(name="legacy", discriminator="1234", display_name="Legacy")
+    assert author_reference_name(legacy) == "legacy#1234"
+    assert author_reference_name(SimpleNamespace(name="", discriminator="0000")) == ""
 
 
 def test_format_member_directory_empty() -> None:
@@ -532,8 +555,14 @@ def test_server_facts_never_use_real_name() -> None:
 
 def test_public_boundary_can_name_users_without_pinging() -> None:
     prompt = build_public_prompt(user_request="who said that?", guild_name="G", channel_name="C")
-    assert "name them by their display name" in prompt
+    assert "name them by their actual username" in prompt
+    assert "usernames are unique" in prompt
+    assert "never use a display name" in prompt
     assert "never ping/mention a user" in prompt
+    # Persona/YouTube labeling is banned in the public boundary.
+    assert "Never label any user as a persona" in prompt
+    # Identity is always the user id.
+    assert "Always identify users by their user id internally" in prompt
 
 
 def test_public_boundary_knows_members_and_can_use_referenced_memory() -> None:

@@ -73,7 +73,7 @@ from .focus_trees import (
     SharedMcpSession,
 )
 from .guild_channels import GuildChannels
-from .guild_members import GuildMembers
+from .guild_members import GuildMembers, author_reference_name, user_reference_name
 from .channel_context import ChannelReader
 from .web_grounding import WebGrounder, format_web_results_for_display
 from .vault_index import refresh_vault_indexes
@@ -1301,14 +1301,9 @@ class ChaosXBot(discord.Client):
             if uid is None or int(uid) in seen:
                 continue
             seen.add(int(uid))
-            display = (
-                (member.get("nick") or "")
-                or (member.get("user") or {}).get("global_name")
-                or (member.get("user") or {}).get("username")
-                or ""
-            )
-            if display:
-                members.append((int(uid), str(display).strip(), False))
+            reference = user_reference_name(member)
+            if reference:
+                members.append((int(uid), reference, False))
         # Guild member cache as a second source (covers members REST may miss).
         for guild in self.guilds:
             if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
@@ -1317,7 +1312,7 @@ class ChaosXBot(discord.Client):
                 if member.id in seen or getattr(member, "bot", False):
                     continue
                 seen.add(member.id)
-                name = getattr(member, "display_name", None) or getattr(member, "name", None)
+                name = getattr(member, "name", None) or ""
                 if name:
                     members.append((member.id, str(name).strip(), False))
         if members:
@@ -1411,12 +1406,14 @@ class ChaosXBot(discord.Client):
         return self.guild_members.members_block()
 
     async def known_users_block(self, *, limit: int = 60) -> str:
-        """Prompt-ready user directory: display names for users the bot knows.
+        """Prompt-ready user directory: unique usernames for users the bot knows.
 
         Built from the REST member directory (all server members) plus
         captured public conversation history (author_id -> latest
         author_name), plus any guild member cache entries. Lets the bot name
-        users directly without pinging them.
+        users directly by username without pinging them. Display names are
+        never used (impersonation-safe); a name matching the restricted
+        persona is replaced by a neutral id label.
         """
         mapping: dict[int, str] = {}
         # REST member directory first (complete member list, bots excluded).
@@ -1424,14 +1421,9 @@ class ChaosXBot(discord.Client):
             uid = member.get("id")
             if uid is None:
                 continue
-            display = (
-                (member.get("nick") or "")
-                or (member.get("user") or {}).get("global_name")
-                or (member.get("user") or {}).get("username")
-                or ""
-            )
-            if display:
-                mapping[int(uid)] = str(display).strip()
+            reference = user_reference_name(member)
+            if reference:
+                mapping[int(uid)] = reference
         # Captured history (may include members who changed names).
         try:
             history = await known_authors_for(
@@ -1455,7 +1447,7 @@ class ChaosXBot(discord.Client):
             if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
                 continue
             for member in guild.members:
-                name = getattr(member, "display_name", None) or getattr(member, "name", None)
+                name = getattr(member, "name", None) or ""
                 if name:
                     mapping.setdefault(member.id, name)
                 if len(mapping) >= limit:
@@ -1464,37 +1456,37 @@ class ChaosXBot(discord.Client):
                 break
         if not mapping:
             return ""
-        lines = ["User directory (display names; refer to users by these names, never ping/mention them):"]
+        lines = ["User directory (usernames; refer to users by these names — never by display name, never ping/mention them):"]
         for uid in sorted(mapping, key=lambda i: mapping[i].casefold())[:limit]:
-            lines.append(f"- {mapping[uid]} (id {uid})")
+            name = mapping[uid]
+            if _mentions_restricted_persona(name):
+                name = f"(id {uid})"
+            lines.append(f"- {name} (id {uid})")
         return "\n".join(lines)
 
     async def referenced_user_contexts_block(self, request: str) -> str:
         """Saved memory (profile + recent messages) for users named in the ask.
 
-        Matches display names from the member/user directory against the
-        request text, then loads each matched user's stored public profile
-        and history — so the bot can answer "what has X said/suggested?"
-        about ANY user, not just the asking one. Public scope only (admin
-        rows never leak). Returns '' when nothing matches or nothing stored.
+        Matches usernames from the member/user directory against the
+        request text (usernames are unique — same display names never
+        conflate users), then loads each matched user's stored public
+        profile and history — so the bot can answer "what has X
+        said/suggested?" about ANY user, not just the asking one. Public
+        scope only (admin rows never leak). Returns '' when nothing matches
+        or nothing stored.
         """
         text = (request or "").strip()
         if not text:
             return ""
-        # Reuse the directory mapping (display name -> id).
+        # Reuse the directory mapping (username -> id; usernames are unique).
         mapping: dict[int, str] = {}
         for member in self.guild_members._members:  # noqa: SLF001 - same-module access
             uid = member.get("id")
             if uid is None:
                 continue
-            display = (
-                (member.get("nick") or "")
-                or (member.get("user") or {}).get("global_name")
-                or (member.get("user") or {}).get("username")
-                or ""
-            )
-            if display:
-                mapping[int(uid)] = str(display).strip()
+            reference = user_reference_name(member)
+            if reference:
+                mapping[int(uid)] = reference
         try:
             history = await known_authors_for(self.settings.db_path, limit=80, scope="public")
         except Exception:
@@ -1529,7 +1521,7 @@ class ChaosXBot(discord.Client):
         return "\n\n".join(blocks)
 
     async def user_context_for(self, user_id: int, *, exclude_message_id: int | None = None) -> str:
-        """Prompt-ready info about the asking user: display name, top role,
+        """Prompt-ready info about the asking user: username, top role,
         their stored profile (preferences/suggestions from earlier messages),
         and their recent captured messages (public scope only). Best-effort;
         any failure returns an empty string so answering never breaks."""
@@ -1553,7 +1545,7 @@ class ChaosXBot(discord.Client):
                 continue
             member = guild.get_member(user_id)
             if member is not None:
-                display = member.display_name
+                display = member.name
                 top_role = getattr(member, "top_role", None)
                 if top_role is not None and top_role.name not in ("@everyone", ""):
                     role = top_role.name
@@ -1562,12 +1554,7 @@ class ChaosXBot(discord.Client):
             # REST member directory may know the user before the cache does.
             for member in self.guild_members._members:  # noqa: SLF001 - same-module access
                 if str(member.get("id")) == str(user_id):
-                    display = (
-                        (member.get("nick") or "")
-                        or (member.get("user") or {}).get("global_name")
-                        or (member.get("user") or {}).get("username")
-                        or None
-                    )
+                    display = user_reference_name(member) or None
                     break
         parts: list[str] = []
         who = f"Asking user: {display}" if display else ""
@@ -1777,12 +1764,16 @@ class ChaosXBot(discord.Client):
             await guild.leave()
 
     async def on_message(self, message: discord.Message) -> None:
+        # Internal restricted-persona scan runs BEFORE any capture so a
+        # flagged message can never enter memory/history/profile contexts.
+        if await self._handle_restricted_persona(message):
+            return
         await capture_message(
             self.settings.db_path,
             guild_id=message.guild.id if message.guild else None,
             channel_id=getattr(message.channel, "id", 0),
             author_id=message.author.id,
-            author_name=message.author.display_name or message.author.name,
+            author_name=author_reference_name(message.author),
             content=message.content or "",
             created_at=message.created_at.isoformat(timespec="seconds"),
             is_bot_self=self.user is not None and message.author.id == self.user.id,
@@ -1794,8 +1785,6 @@ class ChaosXBot(discord.Client):
         # count gate; runs via the public model.
         if not (self.user is not None and message.author.id == self.user.id):
             schedule_user_profile_compaction(self.settings, message.author.id)
-        if await self._handle_restricted_persona(message):
-            return
         if await handle_message_ask(self, message):
             return
         await handle_auto_scan(self, message)
@@ -1875,7 +1864,7 @@ class ChaosXBot(discord.Client):
                 if channel is None:
                     channel = await self.fetch_channel(channel_id)
                 if channel is not None and hasattr(channel, "send"):
-                    author_name = message.author.display_name or message.author.name
+                    author_name = author_reference_name(message.author)
                     channel_name = getattr(message.channel, "name", str(getattr(message.channel, "id", "?")))
                     flagged = "\n".join(f"> {ln}" for ln in content.splitlines()) or "> (empty message)"
                     action_bits = [
@@ -2524,11 +2513,7 @@ async def _scan_history_background(
                         if author_id == me_id or getattr(author, "bot", False):
                             skipped += 1
                             continue
-                        name = (
-                            (getattr(author, "display_name", "") or getattr(author, "name", "") or "unknown")
-                            if author is not None
-                            else "unknown"
-                        )
+                        name = author_reference_name(author) if author is not None else "unknown"
                         ok = await backfill_capture(
                             bot.settings.db_path,
                             guild_id=guild.id,
@@ -4518,7 +4503,7 @@ def register_commands(bot: ChaosXBot) -> None:
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"all users ({len(blocks)})")
             await _send_interaction_chunks(interaction, _chunk(text), ephemeral=True, mentions=targeted_mentions(listed_ids))
             return
-        # Resolve by numeric ID first, then by display name from the full
+        # Resolve by numeric ID first, then by username from the full
         # user registry (which knows EVERY member, even silent ones).
         author_id: int | None = None
         match = re.fullmatch(r"\d{15,25}", user.strip())

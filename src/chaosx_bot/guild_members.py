@@ -23,12 +23,40 @@ MEMBER_DIRECTORY_MAX_CHARS = 4000
 MEMBER_DIRECTORY_LIMIT = 120
 
 
-def format_member_directory(members: list[dict[str, Any]]) -> str:
-    """Render a compact display-name directory for prompts.
+def user_reference_name(member: dict[str, Any]) -> str:
+    """Actual global username (unique), with legacy discriminator when present.
 
-    Each member is listed as ``- <display name> (<id>)`` so the model can
-    reference users by name without pinging them (no mentions, no tags).
-    Sorted by display name; capped to keep the block small.
+    NEVER the display name: nicknames/global names can collide or be
+    impersonated — usernames are the only stable reference names.
+    """
+    user = member.get("user") or {}
+    username = str(user.get("username") or "").strip()
+    if not username:
+        return ""
+    discriminator = str(user.get("discriminator") or "0")
+    if discriminator not in ("0", "0000"):
+        return f"{username}#{discriminator}"
+    return username
+
+
+def author_reference_name(author: Any) -> str:
+    """Actual username for discord.py user/member objects (unique reference)."""
+    name = getattr(author, "name", None) or ""
+    if not name:
+        return ""
+    discriminator = str(getattr(author, "discriminator", None) or "0")
+    if discriminator not in ("0", "0000"):
+        return f"{name}#{discriminator}"
+    return name
+
+
+def format_member_directory(members: list[dict[str, Any]]) -> str:
+    """Render a compact username directory for prompts.
+
+    Each member is listed as ``- <username> (<id>)`` so the model can
+    reference users by their unique username without pinging them (no
+    mentions, no tags). Display names are never used — they can be
+    impersonated. Sorted by username; capped to keep the block small.
     """
     names: list[str] = []
     seen: set[int] = set()
@@ -39,15 +67,10 @@ def format_member_directory(members: list[dict[str, Any]]) -> str:
         if uid is None or int(uid) in seen:
             continue
         seen.add(int(uid))
-        display = (
-            (member.get("nick") or "").strip()
-            or (member.get("user") or {}).get("global_name")  # type: ignore[union-attr]
-            or (member.get("user") or {}).get("username")  # type: ignore[union-attr]
-            or ""
-        ).strip()
-        if not display:
+        reference = user_reference_name(member)
+        if not reference:
             continue
-        names.append(f"- {display} ({uid})")
+        names.append(f"- {reference} ({uid})")
     if not names:
         return ""
     names.sort(key=str.casefold)
@@ -107,7 +130,7 @@ class GuildMembers:
             not self._members or time.monotonic() - self._fetched_at > MEMBERS_REFRESH_TTL_S
         )
 
-    def members_block(self, header: str = "Server member directory (display names; refer to users by these names, never ping/mention them)") -> str:
+    def members_block(self, header: str = "Server member directory (usernames; refer to users by these names — never by display name, never ping/mention them)") -> str:
         """Prompt-ready member directory, or empty when not fetched yet."""
         text = format_member_directory(self._members)
         if not text:

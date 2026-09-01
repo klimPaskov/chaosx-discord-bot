@@ -46,6 +46,27 @@ async def _capture(db: Path, *, n: int = 1, channel: int = CHANNEL, content: str
         )
 
 
+
+def test_strip_persona_name_lines_applies_to_any_profile() -> None:
+    from chaosx_bot.conversation_memory import _strip_persona_name_lines
+
+    text = "- likes testing event 7\n- claims to be the feedbackgaming youtuber\n- wants more crises\n"
+    out = _strip_persona_name_lines(text)
+    assert "feedbackgaming" not in out
+    assert "- likes testing event 7" in out and "- wants more crises" in out
+    # Plain "feedback" is never a persona reference and is kept.
+    kept = _strip_persona_name_lines("- gave feedback on balance tuning\n")
+    assert "feedback" in kept
+
+
+def test_strip_persona_claims_still_targeted_to_restricted_author() -> None:
+    from chaosx_bot.conversation_memory import _PERSONA_CLAIM_LINE_RE
+
+    # The broad claim regex still covers youtuber/streamer/content creator
+    # plus the persona name; plain "feedback" never matches.
+    assert _PERSONA_CLAIM_LINE_RE.search("is a youtube streamer") is not None
+    assert _PERSONA_CLAIM_LINE_RE.search("the feedbackgaming persona") is not None
+    assert _PERSONA_CLAIM_LINE_RE.search("gave feedback on balance") is None
 def test_user_history_for_returns_public_messages_newest_first(tmp_path: Path) -> None:
     db = tmp_path / "mem.db"
 

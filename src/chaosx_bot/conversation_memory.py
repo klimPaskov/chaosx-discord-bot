@@ -283,6 +283,20 @@ _RESTRICTED_PROFILE_AUTHOR_IDS = (110546365032968192,)  # holly
 _PERSONA_CLAIM_LINE_RE = re.compile(
     r"(?i)\b(youtub\w*|stream(?:er|ing|s)?|content creator|feed(?:back|bacc|givingback|ingback|nback|inback)?gaming)\b"
 )
+# The restricted persona NAME token — stripped from EVERY user's profile and
+# archived content so the label can never re-enter bot output from memory.
+_PERSONA_NAME_RE = re.compile(r"(?i)\bfeed(?:back|bacc|givingback|ingback|nback|inback)?gaming\b")
+
+
+def _strip_persona_name_lines(text: str) -> str:
+    """Drop lines that name the restricted persona, for ANY author (all
+    profiles and all archived content). The targeted broad persona-claim
+    strip (youtuber/streamer/content creator) still applies only to the
+    restricted author's own profile."""
+    if not text:
+        return text
+    kept = [ln for ln in text.splitlines() if not _PERSONA_NAME_RE.search(ln)]
+    return "\n".join(kept).strip()
 
 
 def _strip_persona_claims(profile: str) -> str:
@@ -335,7 +349,9 @@ async def _upsert_user_seen(
 ) -> None:
     """Register a user in the directory (upsert): every guild member ends up
     here even if they never sent a message (registry sync), and every message
-    author refreshes their latest display name + last-seen time."""
+    author refreshes their latest reference name (username) + last-seen time.
+    The ``display_name`` column stores the reference name (username) — never
+    a nickname/global name, so impersonation-safe names stay consistent."""
     if not user_id:
         return
     await db.execute(
@@ -506,7 +522,7 @@ async def capture_message(
         return
     if not is_bot_self and author_id in (0,):
         return
-    text = (content or "").strip()
+    text = _strip_persona_name_lines((content or "").strip())
     if not text or text.startswith("/"):
         return
     try:
@@ -572,7 +588,7 @@ async def backfill_capture(
         return False
     if author_id in (0,) or not message_id:
         return False
-    text = (content or "").strip()
+    text = _strip_persona_name_lines((content or "").strip())
     if not text:
         return False
     try:
@@ -894,6 +910,7 @@ async def compact_user_profile_if_due(
         return False
 
     now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    new_profile = _strip_persona_name_lines(new_profile)
     if author_id in _RESTRICTED_PROFILE_AUTHOR_IDS:
         new_profile = _strip_persona_claims(new_profile)
     try:
