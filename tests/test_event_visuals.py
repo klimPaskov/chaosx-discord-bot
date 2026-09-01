@@ -401,6 +401,29 @@ def test_empty_scripted_gui_preview_is_suppressed() -> None:
         _crop_and_scale_gui_preview(output.getvalue(), 320, 200)
 
 
+
+
+def test_gui_preview_upscale_keeps_hard_edges() -> None:
+    """Upscaled previews must keep crisp 1px edges (NEAREST), not LANCZOS-smear them.
+
+    Regression: _crop_and_scale_gui_preview used LANCZOS for 2-4x enlargements,
+    which blurred bitmap-font scripted-GUI previews.
+    """
+    image = Image.new("RGB", (320, 200), "#ffffff")
+    ImageDraw.Draw(image).rectangle((60, 60, 100, 100), fill="#000000")
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+
+    preview = _crop_and_scale_gui_preview(output.getvalue(), 320, 200)
+    img = Image.open(io.BytesIO(preview)).convert("L")
+    assert img.size[0] > 320 // 2  # content was enlarged to fill the max preview size
+
+    # Scan the middle row across the black square's left edge: NEAREST yields only
+    # hard 0/255 pixels, LANCZOS would introduce intermediate grays.
+    row = [img.getpixel((x, img.size[1] // 2)) for x in range(img.size[0])]
+    intermediates = sum(1 for v in row if v not in (0, 255))
+    assert intermediates == 0
+
 def test_offline_disclaimer_is_removed_from_gui_svg() -> None:
     svg = b'''<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200">
       <rect width="320" height="200" fill="#111923"/>

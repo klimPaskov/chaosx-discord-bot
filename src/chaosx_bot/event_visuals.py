@@ -743,7 +743,12 @@ def _crop_and_scale_gui_preview(png: bytes, max_width: int, max_height: int) -> 
     scale = min(max_width / cropped.width, max_height / cropped.height, 4.0)
     if scale != 1.0:
         target = (max(1, round(cropped.width * scale)), max(1, round(cropped.height * scale)))
-        cropped = cropped.resize(target, Image.Resampling.LANCZOS)
+        # Enlargements must not interpolate: HOI4 scripted-GUI text is bitmap-font, and
+        # LANCZOS 2-4x upscales smear glyph edges into blur. NEAREST keeps the native
+        # pixel grid (same approach hoi4-agent-tools uses for glyph coverage resizing);
+        # downscales stay LANCZOS so oversized content shrinks smoothly.
+        resampling = Image.Resampling.NEAREST if scale > 1.0 else Image.Resampling.LANCZOS
+        cropped = cropped.resize(target, resampling)
     output = io.BytesIO()
     cropped.save(output, format="PNG", optimize=True)
     return output.getvalue()
