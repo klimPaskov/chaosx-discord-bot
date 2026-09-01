@@ -73,7 +73,7 @@ from .focus_trees import (
     SharedMcpSession,
 )
 from .guild_channels import GuildChannels
-from .guild_members import GuildMembers, author_reference_name, user_reference_name
+from .guild_members import GuildMembers, colliding_display_ids, user_reference_name
 from .channel_context import ChannelReader
 from .web_grounding import WebGrounder, format_web_results_for_display
 from .vault_index import refresh_vault_indexes
@@ -1301,9 +1301,14 @@ class ChaosXBot(discord.Client):
             if uid is None or int(uid) in seen:
                 continue
             seen.add(int(uid))
-            reference = user_reference_name(member)
-            if reference:
-                members.append((int(uid), reference, False))
+            display = (
+                (member.get("nick") or "")
+                or (member.get("user") or {}).get("global_name")
+                or (member.get("user") or {}).get("username")
+                or ""
+            )
+            if display:
+                members.append((int(uid), str(display).strip(), False))
         # Guild member cache as a second source (covers members REST may miss).
         for guild in self.guilds:
             if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
@@ -1312,7 +1317,7 @@ class ChaosXBot(discord.Client):
                 if member.id in seen or getattr(member, "bot", False):
                     continue
                 seen.add(member.id)
-                name = getattr(member, "name", None) or ""
+                name = getattr(member, "display_name", None) or getattr(member, "name", None)
                 if name:
                     members.append((member.id, str(name).strip(), False))
         if members:
@@ -1406,13 +1411,14 @@ class ChaosXBot(discord.Client):
         return self.guild_members.members_block()
 
     async def known_users_block(self, *, limit: int = 60) -> str:
-        """Prompt-ready user directory: unique usernames for users the bot knows.
+        """Prompt-ready user directory: display names for users the bot knows.
 
         Built from the REST member directory (all server members) plus
         captured public conversation history (author_id -> latest
         author_name), plus any guild member cache entries. Lets the bot name
-        users directly by username without pinging them. Display names are
-        never used (impersonation-safe); a name matching the restricted
+        users by display name without pinging them. Members whose display
+        name collides with another member's (or the owner's) are listed by
+        their actual username instead; a name matching the restricted
         persona is replaced by a neutral id label.
         """
         mapping: dict[int, str] = {}
@@ -1421,9 +1427,14 @@ class ChaosXBot(discord.Client):
             uid = member.get("id")
             if uid is None:
                 continue
-            reference = user_reference_name(member)
-            if reference:
-                mapping[int(uid)] = reference
+            display = (
+                (member.get("nick") or "")
+                or (member.get("user") or {}).get("global_name")
+                or (member.get("user") or {}).get("username")
+                or ""
+            )
+            if display:
+                mapping[int(uid)] = str(display).strip()
         # Captured history (may include members who changed names).
         try:
             history = await known_authors_for(
@@ -1447,7 +1458,7 @@ class ChaosXBot(discord.Client):
             if guild.id not in (self.settings.allowed_guild_id, self.settings.command_guild_id):
                 continue
             for member in guild.members:
-                name = getattr(member, "name", None) or ""
+                name = getattr(member, "display_name", None) or getattr(member, "name", None)
                 if name:
                     mapping.setdefault(member.id, name)
                 if len(mapping) >= limit:
@@ -1456,9 +1467,21 @@ class ChaosXBot(discord.Client):
                 break
         if not mapping:
             return ""
-        lines = ["User directory (usernames; refer to users by these names — never by display name, never ping/mention them):"]
+        # Display names by default; members whose display name collides with
+        # another member's (or the owner's) are switched to actual usernames.
+        collided = colliding_display_ids(
+            list(mapping.items()), owner_id=self.settings.owner_id
+        )
+        usernames: dict[int, str] = {}
+        for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+            uid = member.get("id")
+            if uid is not None:
+                usernames[int(uid)] = user_reference_name(member) or ""
+        lines = ["User directory (display names; use the actual username when two users share a display name — never ping/mention them):"]
         for uid in sorted(mapping, key=lambda i: mapping[i].casefold())[:limit]:
             name = mapping[uid]
+            if uid in collided and usernames.get(uid):
+                name = usernames[uid]
             if _mentions_restricted_persona(name):
                 name = f"(id {uid})"
             lines.append(f"- {name} (id {uid})")
@@ -1467,26 +1490,31 @@ class ChaosXBot(discord.Client):
     async def referenced_user_contexts_block(self, request: str) -> str:
         """Saved memory (profile + recent messages) for users named in the ask.
 
-        Matches usernames from the member/user directory against the
-        request text (usernames are unique — same display names never
-        conflate users), then loads each matched user's stored public
-        profile and history — so the bot can answer "what has X
-        said/suggested?" about ANY user, not just the asking one. Public
-        scope only (admin rows never leak). Returns '' when nothing matches
-        or nothing stored.
+        Matches display names from the member/user directory against the
+        request text, then loads each matched user's stored public profile
+        and history — so the bot can answer "what has X said/suggested?"
+        about ANY user, not just the asking one. When several users share a
+        display name, all matching users are returned, each labeled by their
+        actual username. Public scope only (admin rows never leak). Returns
+        '' when nothing matches or nothing stored.
         """
         text = (request or "").strip()
         if not text:
             return ""
-        # Reuse the directory mapping (username -> id; usernames are unique).
+        # Reuse the directory mapping (display name -> id).
         mapping: dict[int, str] = {}
         for member in self.guild_members._members:  # noqa: SLF001 - same-module access
             uid = member.get("id")
             if uid is None:
                 continue
-            reference = user_reference_name(member)
-            if reference:
-                mapping[int(uid)] = reference
+            display = (
+                (member.get("nick") or "")
+                or (member.get("user") or {}).get("global_name")
+                or (member.get("user") or {}).get("username")
+                or ""
+            )
+            if display:
+                mapping[int(uid)] = str(display).strip()
         try:
             history = await known_authors_for(self.settings.db_path, limit=80, scope="public")
         except Exception:
@@ -1503,8 +1531,20 @@ class ChaosXBot(discord.Client):
                 matched.append((uid, name))
         if not matched:
             return ""
+        # Colliding display names resolve to all matching users; label each
+        # collided user by their actual username so they stay distinct.
+        collided = colliding_display_ids(
+            list(mapping.items()), owner_id=self.settings.owner_id
+        )
+        usernames: dict[int, str] = {}
+        for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+            uid = member.get("id")
+            if uid is not None:
+                usernames[int(uid)] = user_reference_name(member) or ""
         blocks: list[str] = []
         for uid, name in matched[:5]:
+            if uid in collided and usernames.get(uid):
+                name = usernames[uid]
             try:
                 profile = await user_profile_for(self.settings.db_path, uid)
             except Exception:
@@ -1521,7 +1561,7 @@ class ChaosXBot(discord.Client):
         return "\n\n".join(blocks)
 
     async def user_context_for(self, user_id: int, *, exclude_message_id: int | None = None) -> str:
-        """Prompt-ready info about the asking user: username, top role,
+        """Prompt-ready info about the asking user: display name, top role,
         their stored profile (preferences/suggestions from earlier messages),
         and their recent captured messages (public scope only). Best-effort;
         any failure returns an empty string so answering never breaks."""
@@ -1545,7 +1585,7 @@ class ChaosXBot(discord.Client):
                 continue
             member = guild.get_member(user_id)
             if member is not None:
-                display = member.name
+                display = member.display_name
                 top_role = getattr(member, "top_role", None)
                 if top_role is not None and top_role.name not in ("@everyone", ""):
                     role = top_role.name
@@ -1554,10 +1594,45 @@ class ChaosXBot(discord.Client):
             # REST member directory may know the user before the cache does.
             for member in self.guild_members._members:  # noqa: SLF001 - same-module access
                 if str(member.get("id")) == str(user_id):
-                    display = user_reference_name(member) or None
+                    display = (
+                        (member.get("nick") or "")
+                        or (member.get("user") or {}).get("global_name")
+                        or (member.get("user") or {}).get("username")
+                        or None
+                    )
                     break
+        # Confirmed impersonation: another member shares this display name
+        # (or a non-owner uses the owner's display name) -> include the
+        # actual username so the asking user stays distinct.
+        username: str | None = None
+        if display:
+            same = 0
+            for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+                if str(member.get("id")) == str(user_id):
+                    username = user_reference_name(member) or None
+                if (
+                    (member.get("nick") or "")
+                    or (member.get("user") or {}).get("global_name")
+                    or (member.get("user") or {}).get("username")
+                    or ""
+                ) == display:
+                    same += 1
+            if str(user_id) != str(self.settings.owner_id):
+                for member in self.guild_members._members:  # noqa: SLF001 - same-module access
+                    if str(member.get("id")) == str(self.settings.owner_id):
+                        owner_display = (
+                            (member.get("nick") or "")
+                            or (member.get("user") or {}).get("global_name")
+                            or (member.get("user") or {}).get("username")
+                            or ""
+                        )
+                        if owner_display and owner_display == display:
+                            same += 1
+                        break
         parts: list[str] = []
         who = f"Asking user: {display}" if display else ""
+        if username and same and same > 1:
+            who += f" (username: {username})"
         if role:
             who += f" (top role: {role})"
         if who:
@@ -1773,7 +1848,7 @@ class ChaosXBot(discord.Client):
             guild_id=message.guild.id if message.guild else None,
             channel_id=getattr(message.channel, "id", 0),
             author_id=message.author.id,
-            author_name=author_reference_name(message.author),
+            author_name=message.author.display_name or message.author.name,
             content=message.content or "",
             created_at=message.created_at.isoformat(timespec="seconds"),
             is_bot_self=self.user is not None and message.author.id == self.user.id,
@@ -1864,7 +1939,7 @@ class ChaosXBot(discord.Client):
                 if channel is None:
                     channel = await self.fetch_channel(channel_id)
                 if channel is not None and hasattr(channel, "send"):
-                    author_name = author_reference_name(message.author)
+                    author_name = message.author.display_name or message.author.name
                     channel_name = getattr(message.channel, "name", str(getattr(message.channel, "id", "?")))
                     flagged = "\n".join(f"> {ln}" for ln in content.splitlines()) or "> (empty message)"
                     action_bits = [
@@ -2513,7 +2588,11 @@ async def _scan_history_background(
                         if author_id == me_id or getattr(author, "bot", False):
                             skipped += 1
                             continue
-                        name = author_reference_name(author) if author is not None else "unknown"
+                        name = (
+                            (getattr(author, "display_name", "") or getattr(author, "name", "") or "unknown")
+                            if author is not None
+                            else "unknown"
+                        )
                         ok = await backfill_capture(
                             bot.settings.db_path,
                             guild_id=guild.id,
@@ -4503,7 +4582,7 @@ def register_commands(bot: ChaosXBot) -> None:
             await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin user-memory", summary=f"all users ({len(blocks)})")
             await _send_interaction_chunks(interaction, _chunk(text), ephemeral=True, mentions=targeted_mentions(listed_ids))
             return
-        # Resolve by numeric ID first, then by username from the full
+        # Resolve by numeric ID first, then by display name from the full
         # user registry (which knows EVERY member, even silent ones).
         author_id: int | None = None
         match = re.fullmatch(r"\d{15,25}", user.strip())

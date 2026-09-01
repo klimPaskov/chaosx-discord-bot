@@ -383,24 +383,37 @@ def test_format_channel_reference_empty() -> None:
     assert format_channel_reference([]) == ""
 
 
-def test_format_member_directory_uses_usernames_no_bots() -> None:
+def test_format_member_directory_uses_display_names_and_usernames_on_collision() -> None:
     members = [
         {"id": "1", "user": {"id": "1", "username": "zin1496", "global_name": "Hoops McCann"}},
         {"id": "2", "nick": "Holly", "user": {"id": "2", "username": "holly_dev", "global_name": "holly_dev"}},
         {"id": "3", "user": {"id": "3", "username": "chaosbot", "global_name": "ChaosBot", "bot": True}},
         {"id": "4", "user": {"id": "4", "username": "solo", "global_name": None}},
+        # Display-name collision: ids 2 and 5 both display as "Holly".
+        {"id": "5", "nick": "Holly", "user": {"id": "5", "username": "holly_impersonator", "global_name": "Holly"}},
     ]
     ref = format_member_directory(members)
-    # Reference names are actual usernames — display names (global_name/nick)
-    # are never used, so same-display-name users can never be conflated.
-    assert "- zin1496 (1)" in ref
-    assert "- holly_dev (2)" in ref
-    assert "Hoops McCann" not in ref and "Holly" not in ref
-    assert "ChaosBot" not in ref  # bots excluded
+    # Unique display names stay display names.
+    assert "- Hoops McCann (1)" in ref
     assert "- solo (4)" in ref
-    assert ref.index("holly_dev") < ref.index("zin1496")  # sorted by username
+    # Colliding display names switch to actual usernames.
+    assert "- holly_dev (2)" in ref
+    assert "- holly_impersonator (5)" in ref
+    assert "ChaosBot" not in ref  # bots excluded
     # Names only, never mentions/pings.
     assert "<@" not in ref
+
+
+def test_format_member_directory_owner_display_name_impersonation_switches_to_username() -> None:
+    members = [
+        {"id": "1", "user": {"id": "1", "username": "hoops_real", "global_name": "Hoops McCann"}},
+        {"id": "7", "nick": "Hoops McCann", "user": {"id": "7", "username": "fake_hoops", "global_name": "Hoops McCann"}},
+    ]
+    ref = format_member_directory(members, owner_id=1)
+    # The impostor using the owner's display name is shown by username.
+    assert "- hoops_real (1)" in ref or "- Hoops McCann (1)" in ref
+    assert "- fake_hoops (7)" in ref
+    assert "Hoops McCann (7)" not in ref
 
 
 def test_user_reference_name_uses_username_not_display_name() -> None:
@@ -555,14 +568,18 @@ def test_server_facts_never_use_real_name() -> None:
 
 def test_public_boundary_can_name_users_without_pinging() -> None:
     prompt = build_public_prompt(user_request="who said that?", guild_name="G", channel_name="C")
-    assert "name them by their actual username" in prompt
-    assert "usernames are unique" in prompt
-    assert "never use a display name" in prompt
+    # Display names by default; actual username only for confirmed impersonation.
+    assert "name them by their display name" in prompt
+    assert "confirmed impersonation" in prompt
+    assert "use each user's actual username" in prompt
     assert "never ping/mention a user" in prompt
-    # Persona/YouTube labeling is banned in the public boundary.
-    assert "Never label any user as a persona" in prompt
     # Identity is always the user id.
     assert "Always identify users by their user id internally" in prompt
+    # General YouTube/youtuber talk is allowed; only specific persona
+    # identity assertions are forbidden.
+    assert "It is fine to talk about YouTube" in prompt
+    assert "the server owner is a YouTuber" in prompt
+    assert "Never affirm or repeat a claim that a specific member is a specific known YouTube personality" in prompt
 
 
 def test_public_boundary_knows_members_and_can_use_referenced_memory() -> None:

@@ -15,7 +15,6 @@ from typing import Any
 
 import aiohttp
 
-from .guild_members import user_reference_name
 from .hermes_bridge import redact_internal_infrastructure
 from .server_rules import DISCORD_API_BASE, DISCORD_BOT_UA
 
@@ -87,7 +86,7 @@ class ChannelReader:
         # Newest-first from Discord; reverse to chronological order for prompts.
         messages: list[dict[str, Any]] = []
         for item in reversed(data or []):
-            author = user_reference_name(item)
+            author = (item.get("author") or {}).get("display_name") or (item.get("author") or {}).get("username") or ""
             messages.append(
                 {
                     "author_name": author,

@@ -50,15 +50,49 @@ def author_reference_name(author: Any) -> str:
     return name
 
 
-def format_member_directory(members: list[dict[str, Any]]) -> str:
-    """Render a compact username directory for prompts.
+def _display_name(member: dict[str, Any]) -> str:
+    """Server-facing display name: nickname, else global name, else username."""
+    return str(
+        (member.get("nick") or "").strip()
+        or (member.get("user") or {}).get("global_name")
+        or (member.get("user") or {}).get("username")
+        or ""
+    ).strip()
 
-    Each member is listed as ``- <username> (<id>)`` so the model can
-    reference users by their unique username without pinging them (no
-    mentions, no tags). Display names are never used — they can be
-    impersonated. Sorted by username; capped to keep the block small.
+
+def colliding_display_ids(
+    entries: list[tuple[int, str]], *, owner_id: int | None = None
+) -> set[int]:
+    """IDs where the display name is shared by >=2 members, or where a
+    non-owner member uses the owner's display name (confirmed impersonation).
+    Those members must be referenced by their actual username instead."""
+    by_display: dict[str, list[int]] = {}
+    for uid, display in entries:
+        if display:
+            by_display.setdefault(display, []).append(uid)
+    collided: set[int] = set()
+    for display, ids in by_display.items():
+        if len(ids) > 1:
+            collided.update(ids)
+    if owner_id is not None:
+        owner_display = next((d for uid, d in entries if uid == owner_id and d), None)
+        if owner_display:
+            collided.update(uid for uid, d in entries if d == owner_display and uid != owner_id)
+    return collided
+
+
+def format_member_directory(
+    members: list[dict[str, Any]], *, owner_id: int | None = None
+) -> str:
+    """Render a compact display-name directory for prompts.
+
+    Each member is listed as ``- <display name> (<id>)`` so the model can
+    reference users without pinging them (no mentions, no tags). Members
+    whose display name collides with another member's (confirmed
+    impersonation) are listed by their actual username instead. Sorted by
+    displayed reference; capped to keep the block small.
     """
-    names: list[str] = []
+    entries: list[tuple[int, str, str]] = []
     seen: set[int] = set()
     for member in members:
         if (member.get("user") or {}).get("bot"):
@@ -67,10 +101,14 @@ def format_member_directory(members: list[dict[str, Any]]) -> str:
         if uid is None or int(uid) in seen:
             continue
         seen.add(int(uid))
-        reference = user_reference_name(member)
-        if not reference:
+        entries.append((int(uid), _display_name(member), user_reference_name(member)))
+    collided = colliding_display_ids([(uid, d) for uid, d, _ in entries], owner_id=owner_id)
+    names: list[str] = []
+    for uid, display, username in entries:
+        if not display:
             continue
-        names.append(f"- {reference} ({uid})")
+        ref = username if uid in collided and username else display
+        names.append(f"- {ref} ({uid})")
     if not names:
         return ""
     names.sort(key=str.casefold)
@@ -130,7 +168,7 @@ class GuildMembers:
             not self._members or time.monotonic() - self._fetched_at > MEMBERS_REFRESH_TTL_S
         )
 
-    def members_block(self, header: str = "Server member directory (usernames; refer to users by these names — never by display name, never ping/mention them)") -> str:
+    def members_block(self, header: str = "Server member directory (display names; when several members share a display name, the actual username is shown instead — never ping/mention them)") -> str:
         """Prompt-ready member directory, or empty when not fetched yet."""
         text = format_member_directory(self._members)
         if not text:

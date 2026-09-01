@@ -349,9 +349,9 @@ async def _upsert_user_seen(
 ) -> None:
     """Register a user in the directory (upsert): every guild member ends up
     here even if they never sent a message (registry sync), and every message
-    author refreshes their latest reference name (username) + last-seen time.
-    The ``display_name`` column stores the reference name (username) — never
-    a nickname/global name, so impersonation-safe names stay consistent."""
+    author refreshes their latest display name + last-seen time. Identity is
+    always the user id; names are display names (collision/impersonation
+    handling happens at prompt build time, not in storage)."""
     if not user_id:
         return
     await db.execute(
