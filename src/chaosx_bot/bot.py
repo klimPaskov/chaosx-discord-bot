@@ -2634,7 +2634,8 @@ class _ThinkingFeed:
     """
 
     EDIT_THROTTLE_S = 1.2
-    MAX_CHARS = 1800
+    MAX_CHARS = 1900          # reasoning per feed message (Discord 2000 cap, margin)
+    MAX_MESSAGES = 12         # cap continuation messages so the chain isn't cut off
 
     def __init__(
         self,
@@ -2651,22 +2652,25 @@ class _ThinkingFeed:
         self.raw = raw
         self.dm_user = dm_user
         self.message: discord.Message | None = None
+        self.messages: list[discord.Message] = []
         self.reasoning = ""
         self.content = ""
+        self._send = None
+        self._page_start = 0
         self._last_edit = 0.0
 
     async def start(self) -> bool:
         try:
             if self.dm_user is not None:
-                dm = await self.dm_user.create_dm()
-                self.message = await dm.send("🧠 **ChaosX is thinking…**")
+                channel = await self.dm_user.create_dm()
+                self._send = channel.send
+                self.message = await self._send("🧠 **ChaosX is thinking…**")
             elif self.interaction is not None:
-                self.message = await self.interaction.followup.send(
-                    "🧠 **ChaosX is thinking…**",
-                    ephemeral=True,
-                )
+                self._send = lambda text: self.interaction.followup.send(text, ephemeral=True)
+                self.message = await self._send("🧠 **ChaosX is thinking…**")
             else:
                 return False
+            self.messages.append(self.message)
             self._last_edit = time.monotonic()
             return True
         except Exception:
@@ -2688,18 +2692,48 @@ class _ThinkingFeed:
         if time.monotonic() - self._last_edit < self.EDIT_THROTTLE_S:
             return
         self._last_edit = time.monotonic()
-        try:
-            await self.message.edit(content=self._render())
-        except Exception:
-            pass
+        await self._refresh()
 
-    def _render(self) -> str:
+    async def _refresh(self) -> None:
+        """Repaginate the reasoning across feed messages so it is never cut off.
+
+        Each message holds up to MAX_CHARS of reasoning. When the current page
+        fills and more reasoning has streamed in, a continuation message is
+        sent so the whole chain stays visible instead of truncating the tail.
+        """
         if not self.reasoning.strip():
+            return
+        # Close out any overflowed pages by posting a new continuation message.
+        while (len(self.reasoning) - self._page_start) > self.MAX_CHARS and len(self.messages) < self.MAX_MESSAGES:
+            chunk = self.reasoning[self._page_start : self._page_start + self.MAX_CHARS]
+            if self.message is not None:
+                try:
+                    await self.message.edit(content=self._render_chunk(chunk, first=(self._page_start == 0)))
+                except Exception:
+                    pass
+            self._page_start += self.MAX_CHARS
+            try:
+                self.message = await self._send("🧠 **ChaosX is thinking… (cont.)**")
+            except Exception:
+                break
+            self.messages.append(self.message)
+        # Edit the currently-active page with the reasoning that fits it.
+        chunk = self.reasoning[self._page_start : self._page_start + self.MAX_CHARS]
+        if self.message is not None and chunk.strip():
+            try:
+                await self.message.edit(content=self._render_chunk(chunk, first=(self._page_start == 0)))
+            except Exception:
+                pass
+
+    def _render_chunk(self, chunk: str, *, first: bool) -> str:
+        chunk = chunk.strip()
+        if not chunk:
             return "🧠 **ChaosX is thinking…**"
-        return ("🧠 **ChaosX is thinking:**\n" + self.reasoning.strip())[: self.MAX_CHARS]
+        prefix = "🧠 **ChaosX is thinking:**\n" if first else ""
+        return prefix + chunk
 
     async def finish(self, final_answer: str = "") -> None:
-        """Leave the thinking message visible — do NOT delete it.
+        """Leave the thinking message(s) visible — do NOT delete them.
 
         The ephemeral feed persists until the user dismisses it with
         Discord's built-in ✕. The final answer is posted as the normal reply

@@ -25,7 +25,7 @@ import httpx
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_TIMEOUT_S = 45.0
-DEFAULT_MAX_TOKENS = 1200
+DEFAULT_MAX_TOKENS = 4096
 
 _KEY_LINE = re.compile(r"^DEEPSEEK_API_KEY=(.*)$", re.IGNORECASE)
 _KEY_CANDIDATES = (
