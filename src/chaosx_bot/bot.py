@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -563,7 +564,7 @@ def auto_scan_model_failure_reason(decision: AutoScanDecision, result: HermesRes
     return f"{decision.action} model output rejected"
 
 
-async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message) -> tuple[HermesResult, str]:
+async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message, images: list[str] | None = None) -> tuple[HermesResult, str]:
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
     user_message = decision.question or message.content or ""
@@ -643,6 +644,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             timeout_seconds=bot.settings.hermes_timeout_seconds,
             activity_label=f"auto-scan {decision.action}",
             actor_id=message.author.id,
+            images=images or [],
         )
     output = ""
     if result.ok:
@@ -723,7 +725,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow auto-answer: {decision.reason}"), message, bot_message_id=None, response=decision.reference_context)
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
@@ -767,7 +769,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow bot-topic banter: {decision.reason}"), message, bot_message_id=None, response="")
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
@@ -806,7 +808,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, decision, message, bot_message_id=None, response="")
             await send_auto_scan_notice(bot, decision, message, bot_message_id=None)
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             # The rule break still counts as a warning even when the model
@@ -2142,6 +2144,39 @@ async def public_gate(interaction: discord.Interaction, settings: Settings) -> b
     return True
 
 
+_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "tif", "tiff"}
+
+
+async def extract_message_images(message: discord.Message, *, max_images: int = 3, max_bytes: int = 8_000_000) -> list[str]:
+    """Return image data URIs from a message's attachments for vision analysis.
+
+    Lets the vision-capable model inspect content users post: game screenshots,
+    bug-report evidence, Chaos Redux asset images, and MCP-rendered PNGs.
+    Discord attachment bytes are fetched and encoded as data URIs so they reach
+    the model directly without exposing an ephemeral Discord URL or a rate-
+    limited proxy. Skips non-image attachments and oversized files.
+    """
+    attachments = getattr(message, "attachments", None) or []
+    uris: list[str] = []
+    for attachment in attachments:
+        if len(uris) >= max_images:
+            break
+        try:
+            ext = (attachment.filename or "").rsplit(".", 1)[-1].lower() if "." in (attachment.filename or "") else ""
+            ctype = (attachment.content_type or "").lower()
+            if not (ctype.startswith("image/") or ext in _IMAGE_EXTENSIONS):
+                continue
+            if attachment.size > max_bytes:
+                continue
+            data = await attachment.read()
+        except Exception:
+            continue
+        mime = ctype or (f"image/{ext}" if ext else "image/png")
+        b64 = base64.b64encode(data).decode("ascii")
+        uris.append(f"data:{mime};base64,{b64}")
+    return uris
+
+
 async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.mention_ask_enabled or bot.user is None:
         return False
@@ -2277,6 +2312,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             timeout_seconds=hermes_timeout,
             activity_label="admin mention ask",
             actor_id=message.author.id,
+            images=await extract_message_images(message),
             feed=feed,
             fallback_toolsets=None,
             fallback_ignore_rules=False,
@@ -2468,6 +2504,7 @@ async def _public_model_completion(
     fallback_toolsets: str | None = "safe",
     fallback_ignore_rules: bool = True,
     fallback_provider: str | None = None,
+    images: list[str] | None = None,
 ) -> HermesResult:
     """Run a no-tools model completion via the direct streaming API.
 
@@ -2489,6 +2526,7 @@ async def _public_model_completion(
             user=user_part,
             model=model,
             reasoning_effort=reasoning_effort,
+            images=images or [],
         ):
             if content_delta:
                 answer_chunks.append(content_delta)
@@ -2649,7 +2687,7 @@ async def run_mention_banter(bot: ChaosXBot, message: discord.Message, request: 
     channel_id = getattr(message.channel, "id", None)
     if decision.question is None:
         decision.question = request
-    result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+    result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
     if not result.ok or not model_output.strip():
         reason = auto_scan_model_failure_reason(decision, result, model_output)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention banter model failure", summary=reason)
@@ -2771,6 +2809,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
             timeout_seconds=bot.settings.hermes_timeout_seconds,
             activity_label=command_name,
             actor_id=message.author.id,
+            images=await extract_message_images(message),
         )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:

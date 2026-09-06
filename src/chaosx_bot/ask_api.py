@@ -56,16 +56,34 @@ class DirectAskError(RuntimeError):
     """Raised when the direct completion path fails and callers may fall back."""
 
 
+def _build_user_content(user: str, images: list[str] | None = None):
+    """Build the user message content passed to the model.
+
+    With no images this is plain text (the existing fast path). When images
+    are supplied (user screenshots, mod assets, MCP-rendered PNGs, etc.), use
+    an OpenAI-style content-part list so a vision-capable model can analyze
+    them: text first, then one image_url part per image. The text carries the
+    full system boundary + grounding context; images ride alongside it.
+    """
+    if not images:
+        return user
+    parts: list[dict] = [{"type": "text", "text": user}]
+    for image in images:
+        parts.append({"type": "image_url", "image_url": {"url": image}})
+    return parts
+
+
 async def direct_chat_completion(
     *,
     system: str,
     user: str,
-    model: str = "deepseek-v4-flash",
+    model: str = "deepseek-v4-flash-vision-exp",
     base_url: str = DEEPSEEK_BASE_URL,
     reasoning_effort: str = "low",
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = 0.7,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    images: list[str] | None = None,
 ) -> str:
     """Run a single chat completion and return the trimmed assistant text."""
     key = resolve_api_key()
@@ -76,7 +94,7 @@ async def direct_chat_completion(
         "model": model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": _build_user_content(user, images)},
         ],
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -113,12 +131,13 @@ async def direct_chat_completion_stream(
     *,
     system: str,
     user: str,
-    model: str = "deepseek-v4-flash",
+    model: str = "deepseek-v4-flash-vision-exp",
     base_url: str = DEEPSEEK_BASE_URL,
     reasoning_effort: str = "low",
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = 0.7,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    images: list[str] | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a chat completion, yielding (reasoning_delta, content_delta).
 
@@ -134,7 +153,7 @@ async def direct_chat_completion_stream(
         "model": model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": _build_user_content(user, images)},
         ],
         "max_tokens": max_tokens,
         "temperature": temperature,
