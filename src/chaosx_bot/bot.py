@@ -2275,6 +2275,36 @@ async def _image_data_uri(attachment, *, max_bytes: int = 12_000_000) -> str | N
     return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
 
 
+def _persist_image_uris(images: list[str] | None, prefix: str = "chaosx_att") -> list[str]:
+    """Save image data URIs to temp files, returning their paths.
+
+    Used for the tool-enabled Hermes fallback: the CLI chat reads text only,
+    so inline image data URIs are invisible to it. Writing each image to a
+    temp file and pointing the agent at those paths lets it run its vision
+    capability while also using its tools (e.g. match the avatar to a member).
+    Caller is responsible for removing the returned files afterward.
+    """
+    paths: list[str] = []
+    for idx, uri in enumerate(images or []):
+        if "," not in uri:
+            continue
+        header, _, payload = uri.partition(",")
+        mime = header[5:].split(";", 1)[0].strip()
+        ext = {
+            "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+            "image/webp": "webp", "image/bmp": "bmp", "image/tiff": "tif",
+        }.get(mime, "png")
+        try:
+            data = base64.b64decode(payload)
+        except Exception:
+            continue
+        fd, path = tempfile.mkstemp(suffix=f".{ext}", prefix=f"{prefix}_")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        paths.append(path)
+    return paths
+
+
 async def _text_attachment(attachment, *, max_chars: int = 4000) -> str | None:
     """Return decoded text for a readable file attachment, else None.
 
@@ -2805,21 +2835,47 @@ async def _public_model_completion(
             if feed is not None:
                 await feed.emit(f"\n[{activity.stage}]", "")
 
-        result = await run_hermes(
-            hermes_bin=bot.settings.hermes_bin,
-            profile=bot.settings.hermes_profile,
-            repo=bot.settings.chaos_redux_repo,
-            prompt=prompt + ("\n\n" + attachment_text if attachment_text else ""),
-            timeout_seconds=timeout_seconds,
-            model=model,
-            provider=fallback_provider or bot.settings.ask_provider,
-            reasoning_effort=reasoning_effort,
-            toolsets=fallback_toolsets,
-            ignore_rules=fallback_ignore_rules,
-            activity_label=activity_label,
-            actor_id=actor_id,
-            progress_callback=feed_progress if feed is not None else None,
-        )
+        # The direct (no-tools) path failed or empty-answered. Persist any
+        # attached images to disk so the tool-enabled Hermes fallback can run
+        # its vision capability on them (the CLI chat is text-only and would
+        # otherwise see no image), then point the agent at those paths. Clean
+        # the temp files up after the run.
+        image_paths: list[str] = []
+        fallback_prompt = prompt + ("\n\n" + attachment_text if attachment_text else "")
+        if images:
+            try:
+                image_paths = _persist_image_uris(images)
+            except Exception:
+                image_paths = []
+            if image_paths:
+                fallback_prompt += (
+                    "\n\nThe user attached image(s) for this request, which have been saved to disk so "
+                    "your tools can analyze them. Look at each image with your vision capability and "
+                    "use it to answer the user:\n"
+                    + "\n".join(f"- {path}" for path in image_paths)
+                )
+        try:
+            result = await run_hermes(
+                hermes_bin=bot.settings.hermes_bin,
+                profile=bot.settings.hermes_profile,
+                repo=bot.settings.chaos_redux_repo,
+                prompt=fallback_prompt,
+                timeout_seconds=timeout_seconds,
+                model=model,
+                provider=fallback_provider or bot.settings.ask_provider,
+                reasoning_effort=reasoning_effort,
+                toolsets=fallback_toolsets,
+                ignore_rules=fallback_ignore_rules,
+                activity_label=activity_label,
+                actor_id=actor_id,
+                progress_callback=feed_progress if feed is not None else None,
+            )
+        finally:
+            for path in image_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
         if feed is not None:
             await feed.finish(result.stdout.strip() or result.stderr.strip() or "No output.")
         return result

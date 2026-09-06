@@ -224,3 +224,64 @@ async def test_public_model_completion_defaults_empty(monkeypatch):
     )
     assert result.ok
     assert captured["images"] == []
+
+
+@pytest.mark.asyncio
+async def test_public_model_completion_fallback_keeps_image(monkeypatch):
+    """When the direct path fails, the tool-enabled Hermes fallback must be
+    pointed at the attached image so it doesn't say 'no image'."""
+    from chaosx_bot.bot import HermesResult
+    from chaosx_bot.ask_api import DirectAskError
+
+    captured = {}
+
+    async def failing_stream(**kw):
+        raise DirectAskError("direct stream returned an empty answer")
+        yield  # pragma: no cover - makes this an async generator that raises on iterate
+
+    monkeypatch.setattr(bot_module, "direct_chat_completion_stream", failing_stream)
+    monkeypatch.setattr(bot_module, "_persist_image_uris", lambda images, prefix="chaosx_att": ["/tmp/chaosx_att_test.png"])
+
+    async def a_fake_run_hermes(**kw):
+        captured.update(kw)
+        return HermesResult(prompt_hash="h", returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(bot_module, "run_hermes", a_fake_run_hermes)
+
+    settings = SimpleNamespace(
+        hermes_bin="/usr/bin/hermes",
+        hermes_profile="chaos_redux",
+        chaos_redux_repo="/repo",
+        ask_provider="deepseek",
+    )
+    bot = SimpleNamespace(settings=settings)
+    prompt = build_public_prompt(user_request="which user has this avatar?", guild_name="G", channel_name="C", reference_context="")
+    result = await _public_model_completion(
+        bot=bot, system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-v4-flash-vision-exp",
+        reasoning_effort="high", timeout_seconds=60, activity_label="t",
+        images=["data:image/png;base64,YWJj"],
+    )
+    assert result.ok
+    assert "/tmp/chaosx_att_test.png" in captured["prompt"]
+    assert "vision capability" in captured["prompt"]
+
+
+def test_persist_image_uris_writes_files():
+    import base64
+    import os
+    import io as _io
+    from PIL import Image
+    from chaosx_bot.bot import _persist_image_uris
+
+    buf = _io.BytesIO()
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(buf, "PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    paths = _persist_image_uris([uri])
+    assert len(paths) == 1
+    assert os.path.exists(paths[0]) and os.path.splitext(paths[0])[1] == ".png"
+    image = Image.open(paths[0])
+    image.load()
+    assert image.convert("RGB").getpixel((0, 0)) == (255, 0, 0)
+    for path in paths:
+        os.remove(path)
+    assert not os.path.exists(paths[0])
