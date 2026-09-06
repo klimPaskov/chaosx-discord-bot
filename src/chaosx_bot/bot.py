@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import tempfile
 from urllib.parse import urlparse
 import sys
 import time
@@ -2147,7 +2149,10 @@ async def public_gate(interaction: discord.Interaction, settings: Settings) -> b
     return True
 
 
-_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "tif", "tiff"}
+_IMAGE_EXTENSIONS = {
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "tif", "tiff",
+    "dds", "tga", "ico", "icns", "ppm", "pbm", "pgm", "pnm", "xpm", "jfif", "apng",
+}
 _TEXT_EXTENSIONS = {
     "txt", "log", "md", "markdown", "json", "jsonl", "csv", "tsv", "xml", "yaml", "yml",
     "toml", "ini", "cfg", "conf", "py", "js", "ts", "jsx", "tsx", "sh", "bat", "ps1",
@@ -2177,34 +2182,132 @@ async def _read_attachment_bytes(attachment) -> bytes | None:
         return None
 
 
-async def _image_data_uri(attachment, *, max_bytes: int = 8_000_000) -> str | None:
-    """Return an image data URI for an image attachment, else None."""
-    ext = _attachment_ext(attachment)
-    ctype = (getattr(attachment, "content_type", None) or "").lower()
-    if not (ctype.startswith("image/") or ext in _IMAGE_EXTENSIONS):
+def _looks_like_image(data: bytes, ext: str, ctype: str) -> bool:
+    """Detect an image by magic bytes (robust) or by extension/content-type."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if data[:3] == b"\xFF\xD8\xFF":
+        return True
+    if data[:4] == b"GIF8":
+        return True
+    if data[:2] == b"BM":
+        return True
+    if data[:4] == b"DDS ":
+        return True
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return ext in _IMAGE_EXTENSIONS or ctype.startswith("image/")
+
+
+def _pil_to_png(data: bytes) -> bytes | None:
+    """Convert image bytes to PNG via Pillow; None if Pillow can't open it."""
+    try:
+        from PIL import Image
+        image = Image.open(io.BytesIO(data))
+        image.load()  # force decode so bad images raise here
+        buf = io.BytesIO()
+        image.convert("RGBA").save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
         return None
+
+
+async def _ffmpeg_to_png(data: bytes, *, ext_hint: str = "", timeout_s: float = 12.0) -> bytes | None:
+    """Convert image bytes to PNG via ffmpeg (handles DDS, TGA, and other
+    formats Pillow can't open). Uses a temp file so ffmpeg can sniff it."""
+    suffix = "." + ext_hint if ext_hint and ext_hint.isalnum() else ".img"
+    in_fd = in_path = out_path = None
+    try:
+        in_fd, in_path = tempfile.mkstemp(suffix=suffix)
+        os.write(in_fd, data)
+        os.close(in_fd)
+        in_fd = None
+        out_path = in_path + ".png"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", in_path, "-frames:v", "1", out_path,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        if proc.returncode != 0:
+            return None
+        with open(out_path, "rb") as fh:
+            return fh.read()
+    except Exception:
+        return None
+    finally:
+        if in_fd is not None:
+            try:
+                os.close(in_fd)
+            except OSError:
+                pass
+        for path in (in_path, out_path):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+async def _image_data_uri(attachment, *, max_bytes: int = 12_000_000) -> str | None:
+    """Return an image data URI (as PNG) for an image attachment, else None.
+
+    Any readably-encoded image format is turned into PNG so the vision model
+    can analyse it — including DDS/TGA/TIFF via Pillow or ffmpeg, so mod
+    textures and other HOI4 assets are no longer dropped as unknown binaries.
+    """
     if getattr(attachment, "size", 0) > max_bytes:
         return None
     data = await _read_attachment_bytes(attachment)
     if not data:
         return None
-    mime = ctype or (f"image/{ext}" if ext else "image/png")
-    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    ext = _attachment_ext(attachment)
+    ctype = (getattr(attachment, "content_type", None) or "").lower()
+    if not _looks_like_image(data, ext, ctype):
+        return None
+    png = _pil_to_png(data)
+    if png is None:
+        png = await _ffmpeg_to_png(data, ext_hint=ext)
+    if png is None:
+        return None
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
 
 
 async def _text_attachment(attachment, *, max_chars: int = 4000) -> str | None:
-    """Return decoded text for a text-like file attachment, else None."""
-    ext = _attachment_ext(attachment)
-    ctype = (getattr(attachment, "content_type", None) or "").lower()
-    looks_text = ext in _TEXT_EXTENSIONS or any(ctype.startswith(x) for x in _TEXT_MIME_PREFIXES)
-    if not looks_text:
-        return None
+    """Return decoded text for a readable file attachment, else None.
+
+    Tries UTF-8 (then cp1252) for any reasonably-sized attachment — not just
+    known text extensions — so reports, logs, config/code with unusual names
+    are still read. Binary content is rejected via null-byte + control-char
+    heuristics rather than by a fixed extension list.
+    """
     if getattr(attachment, "size", 0) > max_chars * 6:
         return None
     data = await _read_attachment_bytes(attachment)
     if not data or b"\x00" in data[:2048]:
         return None
-    return data.decode("utf-8", errors="replace")[:max_chars]
+    sample = data[:400]
+    nonprint = sum(1 for b in sample if b < 0x09 or (0x0E <= b < 0x20))
+    if nonprint > len(sample) * 0.05:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("cp1252")
+        except UnicodeDecodeError:
+            return None
+    return text[:max_chars]
+
+
+def _format_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
 
 
 async def _fetch_url_text(url: str, *, max_chars: int = 2500, timeout_s: float = 8.0) -> str | None:
@@ -2257,16 +2360,17 @@ async def _fetch_links(text: str, *, max_urls: int = 3, max_chars: int = 2500) -
 async def attachment_context_for(message: discord.Message, *, max_images: int = 3, max_text: int = 4000, max_urls: int = 3, url_chars: int = 2500) -> tuple[list[str], str]:
     """Extract usable model input from a message's attachments and links.
 
-    Returns (image_data_uris, text_block). Images become vision content parts;
-    text-like file attachments are read and decoded, and any http(s) links in
-    the message are fetched and cleaned, all returned as a labeled text block so
-    the model can analyse bug reports, error logs, config/code, and linked
-    pages. Nothing is silently ignored: images, text files, and links all
-    reach the model.
+    Returns (image_data_uris, text_block). Images (any decoderable format,
+    incl. DDS/TGA/TIFF) are converted to PNG and become vision content parts;
+    readable file attachments are decoded as text; http(s) links are fetched
+    and cleaned. Files that can't be read are still acknowledged by name and
+    size so nothing is silently ignored.
     """
     images: list[str] = []
     text_blocks: list[str] = []
+    unreadable: list[str] = []
     for attachment in getattr(message, "attachments", None) or []:
+        name = getattr(attachment, "filename", None) or "file"
         uri = await _image_data_uri(attachment)
         if uri and len(images) < max_images:
             images.append(uri)
@@ -2274,14 +2378,18 @@ async def attachment_context_for(message: discord.Message, *, max_images: int = 
         if len(text_blocks) < max_urls:
             text = await _text_attachment(attachment, max_chars=max_text)
             if text is not None:
-                name = getattr(attachment, "filename", None) or "file"
                 text_blocks.append(f"`{name}`:\n{text}")
+                continue
+        if len(unreadable) < max_urls:
+            unreadable.append(f"`{name}` ({_format_size(getattr(attachment, 'size', 0) or 0)})")
     links = await _fetch_links(getattr(message, "content", "") or "", max_urls=max_urls, max_chars=url_chars)
     sections: list[str] = []
     if text_blocks:
         sections.append("Attached file contents:\n" + "\n\n".join(text_blocks))
     if links:
         sections.append("Linked page contents:\n" + "\n\n".join(links))
+    if unreadable:
+        sections.append("Unreadable attachments (only metadata; content could not be decoded):\n" + ", ".join(unreadable))
     return images, "\n\n".join(sections)
 
 
