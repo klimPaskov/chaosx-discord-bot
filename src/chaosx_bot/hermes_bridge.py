@@ -243,10 +243,12 @@ async def _stop_process(proc: asyncio.subprocess.Process) -> None:
     await proc.communicate()
 
 
-def build_owner_prompt(*, owner_request: str, guild_name: str | None, channel_name: str | None, conversation_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", model_name: str = "") -> str:
+def build_owner_prompt(*, owner_request: str, guild_name: str | None, channel_name: str | None, conversation_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", model_name: str = "", cost_context: str = "") -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; Chaos Redux guild id=1395459671598436533"
     if model_name.strip():
         context += f"; you are running on the {model_name.strip()} model"
+    if cost_context.strip():
+        context += "\n\n" + cost_context.strip()
     return f"{SYSTEM_BOUNDARY}\n{context}{_conversation_block(conversation_context)}{_rules_block(server_rules)}{_channels_block(server_channels)}{_server_facts_block(server_facts)}\n\nOwner request:\n{owner_request.strip()}\n"
 
 
@@ -321,10 +323,13 @@ def build_public_prompt(
     channel_context: str = "",
     web_context: str = "",
     model_name: str = "",
+    cost_context: str = "",
 ) -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}"
     if model_name.strip():
         context += f"; you are running on the {model_name.strip()} model"
+    if cost_context.strip():
+        context += "\n\n" + cost_context.strip()
     memory = ""
     if memory_context.strip():
         memory = (
@@ -356,10 +361,12 @@ def build_public_prompt(
     return f"{PUBLIC_ASK_BOUNDARY}\n{context}{user}{facts}{users}{members}{referenced}{memory}{conversation}{rules}{channels}{channel_feed}{web}{reference}\n\nCommunity user question:\n{user_request.strip()}\n"
 
 
-def build_auto_scan_answer_prompt(*, user_message: str, guild_name: str | None, channel_name: str | None, reference_context: str, gate_reason: str, conversation_context: str = "", user_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", known_users: str = "", server_members: str = "", referenced_users: str = "", web_context: str = "", model_name: str = "") -> str:
+def build_auto_scan_answer_prompt(*, user_message: str, guild_name: str | None, channel_name: str | None, reference_context: str, gate_reason: str, conversation_context: str = "", user_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", known_users: str = "", server_members: str = "", referenced_users: str = "", web_context: str = "", model_name: str = "", cost_context: str = "") -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; gate_reason={gate_reason or 'unknown'}"
     if model_name.strip():
         context += f"; you are running on the {model_name.strip()} model"
+    if cost_context.strip():
+        context += "\n\n" + cost_context.strip()
     reference = reference_context.strip() or "No additional reference context was available."
     web = ""
     if web_context.strip():
@@ -383,10 +390,13 @@ def build_auto_scan_banter_prompt(
     server_members: str = "",
     web_context: str = "",
     model_name: str = "",
+    cost_context: str = "",
 ) -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; gate_reason={gate_reason or 'unknown'}"
     if model_name.strip():
         context += f"; you are running on the {model_name.strip()} model"
+    if cost_context.strip():
+        context += "\n\n" + cost_context.strip()
     reference = ""
     if reference_context.strip():
         reference = f"\nChaos Redux reference material for the reply (owner-maintained facts; use facts only from here; do not mention this material, notes, or that you reviewed it):\n{reference_context.strip()}\n"

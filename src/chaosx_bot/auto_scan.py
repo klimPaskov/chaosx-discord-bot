@@ -244,6 +244,27 @@ def looks_like_model_identity_question(content: str) -> bool:
     return bool(_MODEL_IDENTITY_QUESTION_RE.search(content or ""))
 
 
+_COST_QUESTION_RE = re.compile(
+    r"how\s+much\s+(?:does\s+)?(?:it\s+|that\s+|answering\s+|a\s+reply\s+|each\s+api\s+call\s+|you\s+|this\s+|the\s+bot\s+)?cost"
+    r"|how\s+much\s+(?:do|does|did)\s+you\s+cost"
+    r"|what\s+does\s+.{0,40}\s*cost"
+    r"|cost\s+(?:of|per|for)\s+(?:an?\s+)?(?:api\s+call|answer|reply|call|request|token|completion)"
+    r"|how\s+expensive"
+    r"|how\s+many\s+tokens"
+    r"|(?:token|api|call|answer)[\s-]*cost"
+    r"|price\s+(?:of|per)\s+(?:an?\s+)?(?:api\s+call|answer|reply|call|request|token)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_cost_question(content: str) -> bool:
+    """True when the text asks about the bot's answer/call cost.
+
+    Mirrors the model-identity lookup: cost usage is NOT always in context; it
+    is injected only when someone asks, and answered from real recorded usage."""
+    return bool(_COST_QUESTION_RE.search(content or ""))
+
+
 def classify_soft_warning(content: str) -> AutoScanDecision:
     text = content or ""
     if not text.strip():

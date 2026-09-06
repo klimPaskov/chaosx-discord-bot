@@ -15,11 +15,12 @@ need tools and project-rule context.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 
@@ -33,6 +34,15 @@ _KEY_CANDIDATES = (
     Path("/srv/chaosx/chaosx-discord-bot/.env"),
     Path.home() / ".hermes" / "profiles" / "chaos_redux" / ".env",
 )
+
+
+async def _emit_usage(on_usage, usage: dict[str, Any] | None) -> None:
+    """Dispatch a usage block to an optional sync/async callback (fire-and-forget safe)."""
+    if on_usage is None or not usage:
+        return
+    result = on_usage(usage)
+    if inspect.isawaitable(result):
+        await result
 
 
 def resolve_api_key() -> str:
@@ -84,6 +94,7 @@ async def direct_chat_completion(
     temperature: float = 0.7,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     images: list[str] | None = None,
+    on_usage: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
 ) -> str:
     """Run a single chat completion and return the trimmed assistant text."""
     key = resolve_api_key()
@@ -120,6 +131,7 @@ async def direct_chat_completion(
                 f"direct completion HTTP {response.status_code}: {response.text[:300]}"
             )
         data = response.json()
+    await _emit_usage(on_usage, data.get("usage"))
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:  # pragma: no cover - defensive
@@ -138,6 +150,7 @@ async def direct_chat_completion_stream(
     temperature: float = 0.7,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     images: list[str] | None = None,
+    on_usage: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Stream a chat completion, yielding (reasoning_delta, content_delta).
 
@@ -158,6 +171,7 @@ async def direct_chat_completion_stream(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     if reasoning_effort and reasoning_effort.strip().lower() in {
         "low",
@@ -186,8 +200,14 @@ async def direct_chat_completion_stream(
                     break
                 try:
                     chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if chunk.get("usage"):
+                    await _emit_usage(on_usage, chunk.get("usage"))
+                    continue
+                try:
                     delta = chunk["choices"][0]["delta"]
-                except (ValueError, KeyError, IndexError, TypeError):
+                except (KeyError, IndexError, TypeError):
                     continue
                 reasoning = delta.get("reasoning_content") or ""
                 content = delta.get("content") or ""

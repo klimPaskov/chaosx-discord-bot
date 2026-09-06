@@ -6,6 +6,8 @@ from typing import Optional
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .cost import DEFAULT_PRICING
+
 
 class Settings(BaseSettings):
     """Runtime settings loaded from environment or .env."""
@@ -102,6 +104,14 @@ class Settings(BaseSettings):
     operator_model: str = Field(default="deepseek-v4-flash-vision-exp", description="Model override for protected autonomous server operations")
     operator_provider: str = Field(default="deepseek", description="Provider override for protected autonomous server operations")
     operator_reasoning_effort: str = Field(default="high", description="Reasoning effort for protected autonomous server operations")
+    model_pricing: dict[str, dict[str, float]] = Field(
+        default_factory=lambda: dict(DEFAULT_PRICING),
+        description="Per-million-token USD price table: model -> {input, output}. JSON string via CHAOSX_MODEL_PRICING.",
+    )
+    cost_usage_path: Path = Field(
+        default=Path("./data/cost_usage.json"),
+        description="JSON file accumulating per-call token usage + estimated cost for self-awareness lookups.",
+    )
     webhook_host: str = Field(default="127.0.0.1")
     webhook_port: int = Field(default=8787, ge=1, le=65535)
     github_webhook_secret: str = Field(default="", repr=False)

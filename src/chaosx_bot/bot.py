@@ -26,8 +26,36 @@ from .auto_scan import (
     classify_mention_banter,
     classify_message,
     looks_like_catalog_lookup,
+    looks_like_cost_question,
     looks_like_model_identity_question,
 )
+from .cost import CostTracker
+
+_COST_TRACKER: CostTracker | None = None
+
+
+def _get_cost_tracker(settings: Settings) -> CostTracker:
+    global _COST_TRACKER
+    if _COST_TRACKER is None:
+        _COST_TRACKER = CostTracker(settings.cost_usage_path)
+    return _COST_TRACKER
+
+
+def _cost_lookup_block(*, settings: Settings, text: str) -> str:
+    """Return a real recorded-usage cost block when the user asks about cost.
+
+    Mirrors the model-identity lookup: cost usage is not in every prompt; it is
+    injected only when someone asks, and answered from actual recorded usage."""
+    if not looks_like_cost_question(text or ""):
+        return ""
+    try:
+        return (
+            "Self-awareness — the user is asking about the bot's own cost. Answer "
+            "from this REAL recorded API usage (actual billed tokens, not an estimate):\n"
+            + _get_cost_tracker(settings).summary(pricing=settings.model_pricing)
+        )
+    except Exception:
+        return ""
 from .conversation_memory import (
     MEMORY_MAINTENANCE_INTERVAL_S,
     backfill_capture,
@@ -604,6 +632,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             referenced_users=await bot.referenced_user_contexts_block(user_message),
             web_context=web_context,
             model_name=bot.settings.ask_model if looks_like_model_identity_question(user_message) else "",
+            cost_context=_cost_lookup_block(settings=bot.settings, text=user_message),
         )
     elif decision.action == "banter":
         prompt = build_auto_scan_banter_prompt(
@@ -621,6 +650,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             server_members=bot.members_block(),
             web_context=web_context,
             model_name=bot.settings.ask_model if looks_like_model_identity_question(user_message) else "",
+            cost_context=_cost_lookup_block(settings=bot.settings, text=user_message),
         )
     elif decision.action == "soft_warning":
         prompt = build_auto_scan_warning_prompt(
@@ -2533,6 +2563,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
         model_name=bot.settings.operator_model if looks_like_model_identity_question(owner_request) else "",
+        cost_context=_cost_lookup_block(settings=bot.settings, text=owner_request),
     )
     # Admin task messages stay in the admin memory partition (public asks never see them).
     await mark_messages_admin(bot.settings.db_path, [message.id])
@@ -2812,6 +2843,9 @@ async def _public_model_completion(
             model=model,
             reasoning_effort=reasoning_effort,
             images=images or [],
+            on_usage=lambda usage: _get_cost_tracker(bot.settings).record(
+                model=model, usage=usage, pricing=bot.settings.model_pricing
+            ),
         ):
             if content_delta:
                 answer_chunks.append(content_delta)
@@ -3123,6 +3157,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         channel_context=channel_context,
         web_context=web_context,
         model_name=bot.settings.ask_model if looks_like_model_identity_question(request) else "",
+        cost_context=_cost_lookup_block(settings=bot.settings, text=request),
     )
     # No thinking feed for mention asks: only slash commands can carry an
     # ephemeral ("only you can see this") message, and DMs are not used.
@@ -3912,6 +3947,7 @@ async def run_hermes_command(
             server_channels=bot.channels_block(),
             server_facts=bot.server_facts_block(),
             model_name=bot.settings.operator_model if looks_like_model_identity_question(owner_request) else "",
+            cost_context=_cost_lookup_block(settings=bot.settings, text=owner_request),
         )
         if owner_only
         else build_public_prompt(
@@ -3930,6 +3966,7 @@ async def run_hermes_command(
             referenced_users=await bot.referenced_user_contexts_block(request),
             channel_context=channel_context,
             model_name=bot.settings.ask_model if looks_like_model_identity_question(request) else "",
+            cost_context=_cost_lookup_block(settings=bot.settings, text=request),
         )
     )
     model = provider = reasoning_effort = toolsets = None
