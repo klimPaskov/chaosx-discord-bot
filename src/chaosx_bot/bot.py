@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+from urllib.parse import urlparse
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -564,10 +565,11 @@ def auto_scan_model_failure_reason(decision: AutoScanDecision, result: HermesRes
     return f"{decision.action} model output rejected"
 
 
-async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message, images: list[str] | None = None) -> tuple[HermesResult, str]:
+async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message) -> tuple[HermesResult, str]:
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
     user_message = decision.question or message.content or ""
+    images, attachment_text = await attachment_context_for(message)
     conversation_context = await conversation_context_for(
         bot.settings.db_path,
         channel_id=getattr(message.channel, "id", 0),
@@ -645,6 +647,7 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
             activity_label=f"auto-scan {decision.action}",
             actor_id=message.author.id,
             images=images or [],
+            attachment_text=attachment_text,
         )
     output = ""
     if result.ok:
@@ -725,7 +728,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow auto-answer: {decision.reason}"), message, bot_message_id=None, response=decision.reference_context)
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
@@ -769,7 +772,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow bot-topic banter: {decision.reason}"), message, bot_message_id=None, response="")
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
@@ -808,7 +811,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, decision, message, bot_message_id=None, response="")
             await send_auto_scan_notice(bot, decision, message, bot_message_id=None)
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
+        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             # The rule break still counts as a warning even when the model
@@ -2145,36 +2148,141 @@ async def public_gate(interaction: discord.Interaction, settings: Settings) -> b
 
 
 _IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "tif", "tiff"}
+_TEXT_EXTENSIONS = {
+    "txt", "log", "md", "markdown", "json", "jsonl", "csv", "tsv", "xml", "yaml", "yml",
+    "toml", "ini", "cfg", "conf", "py", "js", "ts", "jsx", "tsx", "sh", "bat", "ps1",
+    "html", "htm", "css", "sql", "tex", "rst", "diff", "patch", "gitignore", "env",
+}
+_TEXT_MIME_PREFIXES = (
+    "text/", "application/json", "application/xml", "application/yaml", "application/x-yaml",
+    "application/javascript", "application/x-sh", "application/sql", "application/x-www-form-urlencoded",
+)
+_URL_RE = re.compile(r'https?://[^\s<>"()[\]]+')
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_PRIVATE_HOST_RE = re.compile(
+    r"(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.0\.0\.|\[::1\]|169\.254\.|metadata\.google\.internal\b)",
+    re.I,
+)
 
 
-async def extract_message_images(message: discord.Message, *, max_images: int = 3, max_bytes: int = 8_000_000) -> list[str]:
-    """Return image data URIs from a message's attachments for vision analysis.
+def _attachment_ext(attachment) -> str:
+    name = getattr(attachment, "filename", None) or ""
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
-    Lets the vision-capable model inspect content users post: game screenshots,
-    bug-report evidence, Chaos Redux asset images, and MCP-rendered PNGs.
-    Discord attachment bytes are fetched and encoded as data URIs so they reach
-    the model directly without exposing an ephemeral Discord URL or a rate-
-    limited proxy. Skips non-image attachments and oversized files.
-    """
-    attachments = getattr(message, "attachments", None) or []
-    uris: list[str] = []
-    for attachment in attachments:
-        if len(uris) >= max_images:
-            break
-        try:
-            ext = (attachment.filename or "").rsplit(".", 1)[-1].lower() if "." in (attachment.filename or "") else ""
-            ctype = (attachment.content_type or "").lower()
-            if not (ctype.startswith("image/") or ext in _IMAGE_EXTENSIONS):
-                continue
-            if attachment.size > max_bytes:
-                continue
-            data = await attachment.read()
-        except Exception:
+
+async def _read_attachment_bytes(attachment) -> bytes | None:
+    try:
+        return await attachment.read()
+    except Exception:
+        return None
+
+
+async def _image_data_uri(attachment, *, max_bytes: int = 8_000_000) -> str | None:
+    """Return an image data URI for an image attachment, else None."""
+    ext = _attachment_ext(attachment)
+    ctype = (getattr(attachment, "content_type", None) or "").lower()
+    if not (ctype.startswith("image/") or ext in _IMAGE_EXTENSIONS):
+        return None
+    if getattr(attachment, "size", 0) > max_bytes:
+        return None
+    data = await _read_attachment_bytes(attachment)
+    if not data:
+        return None
+    mime = ctype or (f"image/{ext}" if ext else "image/png")
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+async def _text_attachment(attachment, *, max_chars: int = 4000) -> str | None:
+    """Return decoded text for a text-like file attachment, else None."""
+    ext = _attachment_ext(attachment)
+    ctype = (getattr(attachment, "content_type", None) or "").lower()
+    looks_text = ext in _TEXT_EXTENSIONS or any(ctype.startswith(x) for x in _TEXT_MIME_PREFIXES)
+    if not looks_text:
+        return None
+    if getattr(attachment, "size", 0) > max_chars * 6:
+        return None
+    data = await _read_attachment_bytes(attachment)
+    if not data or b"\x00" in data[:2048]:
+        return None
+    return data.decode("utf-8", errors="replace")[:max_chars]
+
+
+async def _fetch_url_text(url: str, *, max_chars: int = 2500, timeout_s: float = 8.0) -> str | None:
+    """Fetch a URL and return cleaned page text (None on failure/non-text).
+
+    Strips <script>/<style> blocks and HTML tags to hand the model readable
+    page text instead of raw markup/CSS/JS noise."""
+    host = urlparse(url).hostname or ""
+    if not host or _PRIVATE_HOST_RE.search(host):
+        return None
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; ChaosX/1.0)"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    return None
+                ctype = response.headers.get("Content-Type", "").lower()
+                if not (ctype.startswith("text/") or "json" in ctype or "xml" in ctype or "html" in ctype):
+                    return None
+                body = await response.text(errors="replace")
+    except Exception:
+        return None
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", body)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+async def _fetch_links(text: str, *, max_urls: int = 3, max_chars: int = 2500) -> list[str]:
+    """Fetch each http(s) URL in the text and return cleaned page text blocks."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _URL_RE.finditer(text or ""):
+        url = match.group(0).rstrip(".,;)!?")
+        if url in seen:
             continue
-        mime = ctype or (f"image/{ext}" if ext else "image/png")
-        b64 = base64.b64encode(data).decode("ascii")
-        uris.append(f"data:{mime};base64,{b64}")
-    return uris
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= max_urls:
+            break
+    blocks: list[str] = []
+    for url in urls:
+        content = await _fetch_url_text(url, max_chars=max_chars)
+        if content:
+            blocks.append(f"<{url}>\n{content}")
+    return blocks
+
+
+async def attachment_context_for(message: discord.Message, *, max_images: int = 3, max_text: int = 4000, max_urls: int = 3, url_chars: int = 2500) -> tuple[list[str], str]:
+    """Extract usable model input from a message's attachments and links.
+
+    Returns (image_data_uris, text_block). Images become vision content parts;
+    text-like file attachments are read and decoded, and any http(s) links in
+    the message are fetched and cleaned, all returned as a labeled text block so
+    the model can analyse bug reports, error logs, config/code, and linked
+    pages. Nothing is silently ignored: images, text files, and links all
+    reach the model.
+    """
+    images: list[str] = []
+    text_blocks: list[str] = []
+    for attachment in getattr(message, "attachments", None) or []:
+        uri = await _image_data_uri(attachment)
+        if uri and len(images) < max_images:
+            images.append(uri)
+            continue
+        if len(text_blocks) < max_urls:
+            text = await _text_attachment(attachment, max_chars=max_text)
+            if text is not None:
+                name = getattr(attachment, "filename", None) or "file"
+                text_blocks.append(f"`{name}`:\n{text}")
+    links = await _fetch_links(getattr(message, "content", "") or "", max_urls=max_urls, max_chars=url_chars)
+    sections: list[str] = []
+    if text_blocks:
+        sections.append("Attached file contents:\n" + "\n\n".join(text_blocks))
+    if links:
+        sections.append("Linked page contents:\n" + "\n\n".join(links))
+    return images, "\n\n".join(sections)
 
 
 async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
@@ -2302,6 +2410,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
     )
     await feed.start()
 
+    images, attachment_text = await attachment_context_for(message)
     async with message.channel.typing():
         result = await _public_model_completion(
             bot=bot,
@@ -2312,7 +2421,8 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             timeout_seconds=hermes_timeout,
             activity_label="admin mention ask",
             actor_id=message.author.id,
-            images=await extract_message_images(message),
+            images=images,
+            attachment_text=attachment_text,
             feed=feed,
             fallback_toolsets=None,
             fallback_ignore_rules=False,
@@ -2505,6 +2615,7 @@ async def _public_model_completion(
     fallback_ignore_rules: bool = True,
     fallback_provider: str | None = None,
     images: list[str] | None = None,
+    attachment_text: str = "",
 ) -> HermesResult:
     """Run a no-tools model completion via the direct streaming API.
 
@@ -2519,6 +2630,8 @@ async def _public_model_completion(
     """
     digest = prompt_hash(prompt)
     user_part = prompt[len(system):].strip() if prompt.startswith(system) else prompt.strip()
+    if attachment_text:
+        user_part = user_part + "\n\n" + attachment_text
     try:
         answer_chunks: list[str] = []
         async for reasoning_delta, content_delta in direct_chat_completion_stream(
@@ -2554,7 +2667,7 @@ async def _public_model_completion(
             hermes_bin=bot.settings.hermes_bin,
             profile=bot.settings.hermes_profile,
             repo=bot.settings.chaos_redux_repo,
-            prompt=prompt,
+            prompt=prompt + ("\n\n" + attachment_text if attachment_text else ""),
             timeout_seconds=timeout_seconds,
             model=model,
             provider=fallback_provider or bot.settings.ask_provider,
@@ -2687,7 +2800,7 @@ async def run_mention_banter(bot: ChaosXBot, message: discord.Message, request: 
     channel_id = getattr(message.channel, "id", None)
     if decision.question is None:
         decision.question = request
-    result, model_output = await generate_auto_scan_model_response(bot, decision, message, images=await extract_message_images(message))
+    result, model_output = await generate_auto_scan_model_response(bot, decision, message)
     if not result.ok or not model_output.strip():
         reason = auto_scan_model_failure_reason(decision, result, model_output)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention banter model failure", summary=reason)
@@ -2799,6 +2912,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     )
     # No thinking feed for mention asks: only slash commands can carry an
     # ephemeral ("only you can see this") message, and DMs are not used.
+    images, attachment_text = await attachment_context_for(message)
     async with message.channel.typing():
         result = await _public_model_completion(
             bot=bot,
@@ -2809,7 +2923,8 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
             timeout_seconds=bot.settings.hermes_timeout_seconds,
             activity_label=command_name,
             actor_id=message.author.id,
-            images=await extract_message_images(message),
+            images=images,
+            attachment_text=attachment_text,
         )
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
