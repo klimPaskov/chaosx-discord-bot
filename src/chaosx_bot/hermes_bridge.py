@@ -143,6 +143,37 @@ def redact_public_reasoning(text: str) -> str:
 _CONFIG_LOCK = asyncio.Lock()
 
 
+def clean_hermes_answer(raw: str) -> str:
+    """Extract the human-facing answer from a Hermes `chat` run's stdout.
+
+    When the agent ends its turn on a tool call or emits reasoning as its
+    response (e.g. it wrote an `<api_call>` for a tool it doesn't have), the
+    raw stdout carries that structured markup instead of a plain answer. Strip
+    those blocks so a reply never leaks `<analysis>`/`<api_call>`/`<output>`/
+    `***` back to Discord. Real final-answer text that follows the tool loop is
+    preserved; if nothing but markup remains, this returns "".
+    """
+    if not raw:
+        return ""
+    text = raw
+    text = re.sub(
+        r"<(analysis|api_call|output|harness|plan|thinking|environment_context|metadata)\b.*?</\1>",
+        " ",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
+    text = re.sub(r"<\|im_end\|>|<\|img_\w+_placeholder\|>", " ", text)
+    # Drop standalone "***" separators (and any leftover bare tag fragments).
+    text = re.sub(r"(?m)^[ \t]*\*{3,}[ \t]*$", "", text)
+    text = re.sub(r"\s*\*{3,}\s*$", "", text)
+    text = re.sub(r"^\s*\*{3,}\s*", "", text)
+    text = re.sub(r"</?(analysis|api_call|output|harness|plan|thinking|environment_context|metadata)\b[^>]*>", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
 @dataclass(frozen=True)
 class HermesResult:
     prompt_hash: str
@@ -504,7 +535,7 @@ async def run_hermes(
         return HermesResult(
             prompt_hash=digest,
             returncode=proc.returncode or 0,
-            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stdout=clean_hermes_answer(stdout_b.decode("utf-8", errors="replace")),
             stderr=stderr_b.decode("utf-8", errors="replace"),
         )
     except asyncio.CancelledError:

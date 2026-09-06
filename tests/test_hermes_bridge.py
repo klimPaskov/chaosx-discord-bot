@@ -167,3 +167,29 @@ def test_public_prompt_allows_paths_when_explicitly_requested():
     )
     assert "Source paths were explicitly requested" in prompt
     assert "docs/specs/zombie_outbreak.md" in prompt
+
+
+def test_clean_hermes_answer_strips_structured_markup():
+    from chaosx_bot.hermes_bridge import clean_hermes_answer
+
+    raw = (
+        "<analysis>\nLet me work through this.\n</analysis>\n"
+        "<api_call>\n  \"endpoint\": \"guilds/x/members\"\n</api_call>***\n"
+        "And here is the real answer."
+    )
+    out = clean_hermes_answer(raw)
+    assert "<analysis>" not in out and "<api_call>" not in out
+    assert "And here is the real answer" in out
+
+
+def test_clean_hermes_answer_returns_empty_for_markup_only():
+    from chaosx_bot.hermes_bridge import clean_hermes_answer
+
+    raw = "<analysis>thinking...</analysis>\n<api_call>\n{}\n</api_call>***"
+    assert clean_hermes_answer(raw) == ""
+
+
+def test_clean_hermes_answer_preserves_plain_answer():
+    from chaosx_bot.hermes_bridge import clean_hermes_answer
+
+    assert clean_hermes_answer("It printed: `hello`") == "It printed: `hello`"

@@ -2876,8 +2876,24 @@ async def _public_model_completion(
                     os.remove(path)
                 except OSError:
                     pass
+        answer = result.stdout.strip()
+        if not answer:
+            # The Hermes run returned only structured tool-call/reasoning markup
+            # (or nothing). Substitute a graceful message rather than posting an
+            # empty or raw <analysis>/<api_call> blob.
+            answer = result.stderr.strip() or (
+                "I couldn't finish that step with my tools — try rephrasing, or "
+                "check that it's something I can do with the tools I have."
+            )
+            result = HermesResult(
+                prompt_hash=result.prompt_hash,
+                returncode=result.returncode,
+                stdout=answer,
+                stderr=result.stderr,
+                timed_out=result.timed_out,
+            )
         if feed is not None:
-            await feed.finish(result.stdout.strip() or result.stderr.strip() or "No output.")
+            await feed.finish(answer)
         return result
 
 
