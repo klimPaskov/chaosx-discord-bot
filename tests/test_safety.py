@@ -149,10 +149,10 @@ def test_ask_model_defaults_to_deepseek_flash():
     assert settings.auto_scan_banter_limit_per_user_hour == 8
     assert settings.hermes_timeout_seconds == 900
     assert settings.admin_ask_timeout_seconds == 0
-    assert settings.ask_model == "deepseek-v4-flash-vision-exp"
+    assert settings.ask_model == "deepseek-flash"
     assert settings.ask_provider == "deepseek"
     assert settings.ask_reasoning_effort == "low"
-    assert settings.operator_model == "deepseek-v4-flash-vision-exp"
+    assert settings.operator_model == "deepseek-flash"
     assert settings.operator_provider == "deepseek"
     assert settings.operator_reasoning_effort == "high"
     assert settings.automation_reminder_channel_id == 1395464062367698977

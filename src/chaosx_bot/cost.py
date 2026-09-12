@@ -18,6 +18,8 @@ from typing import Any
 
 DEFAULT_PRICING: dict[str, dict[str, float]] = {
     # Per-million-token USD prices. Configurable via CHAOSX_MODEL_PRICING.
+    "deepseek-flash": {"input": 0.30, "output": 1.20},
+    # Legacy id kept so usage recorded before 2026-09 still prices.
     "deepseek-v4-flash-vision-exp": {"input": 0.50, "output": 1.50},
 }
 

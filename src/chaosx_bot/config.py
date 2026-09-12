@@ -98,10 +98,10 @@ class Settings(BaseSettings):
     admin_ask_memory_keep_last: int = Field(default=20, ge=1, le=100, description="Stored /admin ask turns to retain per owner/channel/thread")
     reply_context_turns: int = Field(default=6, ge=0, le=20, description="Previous model-backed ChaosX reply-chain turns to inject when a user replies to a stored bot answer; 0 disables reply-chain context")
     reply_memory_keep_last: int = Field(default=0, ge=0, le=10000, description="Stored model-backed message asks to retain per guild/channel; 0 keeps all stored asks")
-    ask_model: str = Field(default="deepseek-v4-flash-vision-exp", description="Model override for broad ask commands")
+    ask_model: str = Field(default="deepseek-flash", description="Model override for broad ask commands")
     ask_provider: str = Field(default="deepseek", description="Provider override for broad ask commands")
     ask_reasoning_effort: str = Field(default="low", description="Reasoning effort for broad ask commands")
-    operator_model: str = Field(default="deepseek-v4-flash-vision-exp", description="Model override for protected autonomous server operations")
+    operator_model: str = Field(default="deepseek-flash", description="Model override for protected autonomous server operations")
     operator_provider: str = Field(default="deepseek", description="Provider override for protected autonomous server operations")
     operator_reasoning_effort: str = Field(default="high", description="Reasoning effort for protected autonomous server operations")
     model_pricing: dict[str, dict[str, float]] = Field(

@@ -21,7 +21,7 @@ def test_cost_tracker_records_and_summarizes():
     tf = tempfile.mktemp(suffix=".json")
     tracker = CostTracker(tf)
     tracker.record(
-        model="deepseek-v4-flash-vision-exp",
+        model="deepseek-flash",
         usage={
             "prompt_tokens": 21,
             "completion_tokens": 64,

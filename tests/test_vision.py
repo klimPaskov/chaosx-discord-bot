@@ -180,7 +180,7 @@ async def test_public_model_completion_forwards_images(monkeypatch):
     monkeypatch.setattr(bot_module, "direct_chat_completion_stream", fake_stream)
     prompt = build_public_prompt(user_request="hi", guild_name="G", channel_name="C", reference_context="ctx")
     result = await _public_model_completion(
-        bot=object(), system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-v4-flash-vision-exp",
+        bot=object(), system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-flash",
         reasoning_effort="low", timeout_seconds=60, activity_label="t",
         images=["data:image/png;base64,YWJj"],
     )
@@ -199,7 +199,7 @@ async def test_public_model_completion_appends_attachment_text(monkeypatch):
     monkeypatch.setattr(bot_module, "direct_chat_completion_stream", fake_stream)
     prompt = build_public_prompt(user_request="what log says?", guild_name="G", channel_name="C", reference_context="ctx")
     result = await _public_model_completion(
-        bot=object(), system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-v4-flash-vision-exp",
+        bot=object(), system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-flash",
         reasoning_effort="low", timeout_seconds=60, activity_label="t",
         attachment_text="Attached file contents:\n`crash.log`:\nError at line 12",
     )
@@ -219,7 +219,7 @@ async def test_public_model_completion_defaults_empty(monkeypatch):
     monkeypatch.setattr(bot_module, "direct_chat_completion_stream", fake_stream)
     prompt = build_public_prompt(user_request="hi", guild_name="G", channel_name="C", reference_context="ctx")
     result = await _public_model_completion(
-        bot=object(), system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-v4-flash-vision-exp",
+        bot=object(), system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-flash",
         reasoning_effort="low", timeout_seconds=60, activity_label="t",
     )
     assert result.ok
@@ -257,7 +257,7 @@ async def test_public_model_completion_fallback_keeps_image(monkeypatch):
     bot = SimpleNamespace(settings=settings)
     prompt = build_public_prompt(user_request="which user has this avatar?", guild_name="G", channel_name="C", reference_context="")
     result = await _public_model_completion(
-        bot=bot, system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-v4-flash-vision-exp",
+        bot=bot, system=PUBLIC_ASK_BOUNDARY, prompt=prompt, model="deepseek-flash",
         reasoning_effort="high", timeout_seconds=60, activity_label="t",
         images=["data:image/png;base64,YWJj"],
     )
