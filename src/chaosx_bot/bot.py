@@ -3868,6 +3868,26 @@ async def _owner_progress_loop(
             continue
 
 
+def reasoning_effort_for_path(
+    settings: Settings,
+    *,
+    owner_only: bool,
+    use_ask_model: bool = False,
+    use_operator_model: bool = False,
+) -> str:
+    """Resolve the reasoning effort for one model-backed ChaosX path.
+
+    Public surfaces (community asks, mention asks, auto-scan, scripted public
+    commands) run light so replies stay fast and cheap; every owner/admin
+    surface reasons hard. The effort is resolved even when a path pins no model
+    of its own, so a command can never silently inherit the Hermes profile
+    default instead of the effort this path is supposed to use.
+    """
+    if use_operator_model or owner_only:
+        return settings.operator_reasoning_effort
+    return settings.ask_reasoning_effort
+
+
 async def run_hermes_command(
     bot: ChaosXBot,
     interaction: discord.Interaction,
@@ -4024,10 +4044,14 @@ async def run_hermes_command(
     model = provider = reasoning_effort = toolsets = None
     if use_operator_model:
         model, provider = bot.settings.operator_model, bot.settings.operator_provider
-        reasoning_effort = bot.settings.operator_reasoning_effort
     elif use_ask_model:
         model, provider = bot.settings.ask_model, bot.settings.ask_provider
-        reasoning_effort = bot.settings.ask_reasoning_effort
+    reasoning_effort = reasoning_effort_for_path(
+        bot.settings,
+        owner_only=owner_only,
+        use_ask_model=use_ask_model,
+        use_operator_model=use_operator_model,
+    )
     if not owner_only:
         toolsets = "safe"
         ignore_rules = True
