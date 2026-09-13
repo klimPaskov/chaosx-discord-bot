@@ -416,7 +416,7 @@ def test_public_prompt_injects_model_name_for_identity_questions():
         reference_context="",
         model_name="deepseek-v4-flash",
     )
-    assert "you are running on the deepseek-v4-flash model" in prompt
+    assert "you are running on the DeepSeek V4.1 Flash model" in prompt
     assert "If asked what model you are running" in prompt
     no_model = build_public_prompt(
         user_request="what model are you?",
@@ -435,7 +435,7 @@ def test_auto_scan_and_owner_prompts_inject_model_name():
         gate_reason="bot capability question",
         model_name="deepseek-v4-flash",
     )
-    assert "you are running on the deepseek-v4-flash model" in answer_prompt
+    assert "you are running on the DeepSeek V4.1 Flash model" in answer_prompt
     banter_prompt = build_auto_scan_banter_prompt(
         user_message="what model are you?",
         guild_name="Chaos Redux",
@@ -443,14 +443,14 @@ def test_auto_scan_and_owner_prompts_inject_model_name():
         gate_reason="bot-topic",
         model_name="deepseek-v4-flash",
     )
-    assert "you are running on the deepseek-v4-flash model" in banter_prompt
+    assert "you are running on the DeepSeek V4.1 Flash model" in banter_prompt
     owner_prompt = build_owner_prompt(
         owner_request="what model are you?",
         guild_name="Chaos Redux",
         channel_name="general",
         model_name="deepseek-v4-flash",
     )
-    assert "you are running on the deepseek-v4-flash model" in owner_prompt
+    assert "you are running on the DeepSeek V4.1 Flash model" in owner_prompt
     # Model name is a lookup, not main context: ordinary questions get no injection.
     plain_answer = build_auto_scan_answer_prompt(
         user_message="how does the zombie event work?",
