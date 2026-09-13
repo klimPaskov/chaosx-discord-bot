@@ -2611,6 +2611,10 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         server_channels=bot.channels_block(),
         model_name=bot.settings.operator_model if looks_like_model_identity_question(owner_request) else "",
         cost_context=_cost_lookup_block(settings=bot.settings, text=owner_request),
+        # The owner mention/reply path is the surface Hoops actually uses; without
+        # identity facts the model refused to name the bot maker/owner (it will not
+        # guess a name). Mirrors the /admin ask path, which always passes them.
+        server_facts=bot.server_facts_block(),
     )
     # Admin task messages stay in the admin memory partition (public asks never see them).
     await mark_messages_admin(bot.settings.db_path, [message.id])

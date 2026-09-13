@@ -663,3 +663,29 @@ def test_server_facts_block_tells_the_bot_to_answer_directly() -> None:
     block = bot.server_facts_block()
     assert "ChaosX bot maker: Hoops McCann" in block
     assert "never say you do not know" in block
+
+
+
+def test_owner_message_ask_passes_server_facts() -> None:
+    """Regression: the owner mention/reply path built its prompt with no facts,
+    so the model refused to name the bot maker instead of answering."""
+    import ast
+    import pathlib
+
+    import chaosx_bot
+
+    src = pathlib.Path(chaosx_bot.__file__).with_name("bot.py").read_text()
+    tree = ast.parse(src)
+    fn = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_admin_ask_message"
+    )
+    calls = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "build_owner_prompt"
+    ]
+    assert calls, "build_owner_prompt call not found in run_admin_ask_message"
+    kwargs = {kw.arg for call in calls for kw in call.keywords}
+    assert "server_facts" in kwargs, "owner path must pass server_facts"
