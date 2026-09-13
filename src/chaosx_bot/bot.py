@@ -34,6 +34,32 @@ from .cost import CostTracker
 _COST_TRACKER: CostTracker | None = None
 
 
+# Server/bot identity facts (bot maker, owner, main dev) are looked up on demand,
+# never kept in the main context. The literal phrase list alone missed natural
+# phrasings ("who is your developer?", "who made this bot?"), which made the bot
+# improvise and answer that it did not know who built it — so the phrases are
+# backed by a pattern matching maker/creator/owner/dev questions in either order.
+SERVER_FACTS_TOPIC_RE = re.compile(
+    r"\b(?:who|whose|what)\b[^?]{0,60}?"
+    r"\b(?:made|make|makes|created|creates|built|builds|developed|develops|programmed|programs|"
+    r"wrote|writes|coded|codes|maker|creator|developer|dev|owner|owns|runs|maintains|maintainer|"
+    r"author|behind|responsible)\b[^?]{0,60}?"
+    r"\b(?:you|your|u|bot|chaosx|chaos redux|server|mod)\b"
+    r"|\b(?:who|whose|what)\b[^?]{0,60}?"
+    r"\b(?:you|your|u|bot|chaosx|chaos redux|server|mod)\b[^?]{0,40}?"
+    r"\b(?:made|maker|creator|created|developer|dev|owner|owns|built|behind|runs|maintains|maintainer|author)\b",
+    re.IGNORECASE,
+)
+
+
+def request_needs_server_facts(request: str, terms: tuple[str, ...]) -> bool:
+    """True when the ask concerns bot/server identity (maker, owner, developer)."""
+    text = (request or "").casefold()
+    if not text:
+        return False
+    return any(term in text for term in terms) or bool(SERVER_FACTS_TOPIC_RE.search(text))
+
+
 def _get_cost_tracker(settings: Settings) -> CostTracker:
     global _COST_TRACKER
     if _COST_TRACKER is None:
@@ -1396,6 +1422,7 @@ class ChaosXBot(discord.Client):
             f"- Server owner: {s.server_owner_name} (Discord user id {s.owner_id})",
             f"- ChaosX bot maker: {s.bot_maker_name}",
             f"- Main Chaos Redux developer: {s.main_dev_name}",
+            "- If asked who made, created or built ChaosX, who owns or runs it, or who the owner/developer is: answer with these names plainly and never say you do not know.",
         ]
         return "\n".join(parts)
 
@@ -1427,6 +1454,27 @@ class ChaosXBot(discord.Client):
         "built the bot",
         "developer of chaos",
         "dev of chaos",
+        # natural phrasings the pattern above also covers, listed for clarity
+        "your developer",
+        "your dev",
+        "your creator",
+        "your maker",
+        "your owner",
+        "who is the owner",
+        "who is your owner",
+        "made this bot",
+        "created this bot",
+        "built this bot",
+        "made the bot",
+        "owns the bot",
+        "behind chaosx",
+        "behind the bot",
+        "who wrote you",
+        "who coded you",
+        "who made chaosx",
+        "who created chaosx",
+        "who developed chaosx",
+        "who runs chaosx",
     )
 
     def server_facts_for_request(self, request: str) -> str:
@@ -1435,8 +1483,7 @@ class ChaosXBot(discord.Client):
         Kept lookup-style (like user saved memory) so identity facts are not
         in the main context window unless actually relevant.
         """
-        text = (request or "").casefold()
-        if any(term in text for term in self._SERVER_FACTS_LOOKUP_TERMS):
+        if request_needs_server_facts(request, self._SERVER_FACTS_LOOKUP_TERMS):
             return self.server_facts_block()
         return ""
 

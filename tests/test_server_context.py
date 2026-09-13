@@ -611,3 +611,55 @@ def test_server_facts_lookup_terms_trigger_facts_block() -> None:
     # with the owner. The facts block carries the owner's user id.
     facts = bot.server_facts_block()
     assert "Hoops McCann (Discord user id 789502982122373150)" in facts
+
+
+
+def test_identity_questions_trigger_server_facts_lookup() -> None:
+    """Natural maker/owner/dev phrasings must fetch the facts, not improvise."""
+    from chaosx_bot.bot import ChaosXBot, request_needs_server_facts
+
+    terms = ChaosXBot._SERVER_FACTS_LOOKUP_TERMS
+    for question in (
+        "who made you?",
+        "who is your developer?",
+        "who developed you?",
+        "who made this bot?",
+        "who is your creator?",
+        "who owns the bot?",
+        "who is the bot maker?",
+        "who is behind ChaosX?",
+        "who runs this server?",
+        "who is the server owner?",
+        "who maintains the bot?",
+    ):
+        assert request_needs_server_facts(question, terms), question
+
+
+def test_unrelated_questions_do_not_trigger_server_facts_lookup() -> None:
+    from chaosx_bot.bot import ChaosXBot, request_needs_server_facts
+
+    terms = ChaosXBot._SERVER_FACTS_LOOKUP_TERMS
+    for question in (
+        "what events does the mod add?",
+        "how do I install the mod?",
+        "who is Holly?",
+        "what mod is this?",
+        "how many evolution stages does Fury have?",
+        "",
+    ):
+        assert not request_needs_server_facts(question, terms), question
+
+
+def test_server_facts_block_tells_the_bot_to_answer_directly() -> None:
+    from chaosx_bot.bot import ChaosXBot
+
+    bot = ChaosXBot.__new__(ChaosXBot)
+    bot.settings = SimpleNamespace(
+        server_owner_name="Hoops McCann",
+        owner_id=789502982122373150,
+        bot_maker_name="Hoops McCann",
+        main_dev_name="Hoops McCann",
+    )
+    block = bot.server_facts_block()
+    assert "ChaosX bot maker: Hoops McCann" in block
+    assert "never say you do not know" in block
