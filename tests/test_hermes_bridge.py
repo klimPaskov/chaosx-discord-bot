@@ -193,3 +193,35 @@ def test_clean_hermes_answer_preserves_plain_answer():
     from chaosx_bot.hermes_bridge import clean_hermes_answer
 
     assert clean_hermes_answer("It printed: `hello`") == "It printed: `hello`"
+
+
+def test_strip_tool_call_markup_drops_dsml_calls() -> None:
+    """DeepSeek emits tool calls as DSML markup; the no-tools direct path showed it."""
+    from chaosx_bot.hermes_bridge import clean_hermes_answer, strip_tool_call_markup
+
+    spaced = chr(10).join([
+        "<| DSML | calls>",
+        '<| DSML | invoke name="web_search">',
+        '<| DSML | parameter name="query" string="true">DeepSeek pricing</| DSML | parameter>',
+        "</| DSML | invoke>",
+        "</| DSML | calls>",
+    ])
+    fullwidth = chr(10).join([
+        "Answer text",
+        "<\uff5cDSML\uff5ccalls>",
+        '<\uff5cDSML\uff5cinvoke name="web_search">',
+        "</\uff5cDSML\uff5cinvoke>",
+        "</\uff5cDSML\uff5ccalls>",
+    ])
+    assert strip_tool_call_markup(spaced) == ""
+    assert strip_tool_call_markup(fullwidth) == "Answer text"
+    assert clean_hermes_answer(spaced) == ""
+
+
+def test_strip_tool_call_markup_keeps_prose() -> None:
+    from chaosx_bot.hermes_bridge import strip_tool_call_markup
+
+    assert strip_tool_call_markup("It costs about $0.0002 per reply.") == "It costs about $0.0002 per reply."
+    assert strip_tool_call_markup('Answer <tool_call>{"name":"web_search"}</tool_call>') == "Answer"
+    mixed = "Costs ~$0.0002." + chr(10) + '<|DSML|calls><|DSML|invoke name="web_search"></|DSML|invoke></|DSML|calls>'
+    assert strip_tool_call_markup(mixed) == "Costs ~$0.0002."

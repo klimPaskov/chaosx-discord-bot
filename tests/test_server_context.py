@@ -689,3 +689,42 @@ def test_owner_message_ask_passes_server_facts() -> None:
     assert calls, "build_owner_prompt call not found in run_admin_ask_message"
     kwargs = {kw.arg for call in calls for kw in call.keywords}
     assert "server_facts" in kwargs, "owner path must pass server_facts"
+
+
+def test_cost_questions_in_plain_money_wording() -> None:
+    """Hoops asked "how much money do your responds spend" and got no cost context."""
+    from chaosx_bot.auto_scan import looks_like_cost_question
+
+    for question in (
+        "how much money do your responds spend",
+        "how much money do your responses spend",
+        "how much do your replies cost",
+        "how much does answering cost",
+        "what does each reply cost",
+        "how much money do you cost",
+        "what is your cost",
+        "how many tokens do you use",
+    ):
+        assert looks_like_cost_question(question), question
+
+
+def test_unrelated_questions_are_not_cost_questions() -> None:
+    from chaosx_bot.auto_scan import looks_like_cost_question
+
+    for question in (
+        "where is the Germany focus tree",
+        "how do I install the mod",
+        "what events exist",
+    ):
+        assert not looks_like_cost_question(question), question
+
+
+def test_public_model_completion_strips_tool_markup() -> None:
+    """The direct no-tools path must never post raw tool-call markup."""
+    import pathlib
+
+    import chaosx_bot
+
+    src = pathlib.Path(chaosx_bot.__file__).with_name("bot.py").read_text()
+    start = src.index("async def _public_model_completion(")
+    assert "strip_tool_call_markup(" in src[start:start + 8000]

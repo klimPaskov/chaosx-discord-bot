@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .models import display_model_name
+
 DEFAULT_PRICING: dict[str, dict[str, float]] = {
     # Per-million-token USD prices. Configurable via CHAOSX_MODEL_PRICING.
     "deepseek-flash": {"input": 0.30, "output": 1.20},
@@ -156,7 +158,7 @@ class CostTracker:
         if last:
             last_cost = float(last.get("cost_estimate") or 0.0)
             lines.append(
-                f"Last call: {last['model']} used "
+                f"Last call: {display_model_name(last['model'])} used "
                 f"{last['prompt_tokens']} prompt + {last['completion_tokens']} completion "
                 f"({last.get('reasoning_tokens', 0)} reasoning) tokens ≈ ${last_cost:.4f}"
             )
@@ -164,7 +166,7 @@ class CostTracker:
             for model, b in sorted(models.items()):
                 p = pricing.get(model) or {k: 0.0 for k in ("input", "output")}
                 lines.append(
-                    f"{model}: {b['calls']} call(s), "
+                    f"{display_model_name(model)}: {b['calls']} call(s), "
                     f"{b['prompt_tokens']} prompt + {b['completion_tokens']} completion "
                     f"({b['reasoning_tokens']} reasoning) tokens, "
                     f"≈ ${b['cost_estimate']:.4f} "

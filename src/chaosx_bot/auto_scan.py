@@ -252,7 +252,14 @@ _COST_QUESTION_RE = re.compile(
     r"|how\s+expensive"
     r"|how\s+many\s+tokens"
     r"|(?:token|api|call|answer)[\s-]*cost"
-    r"|price\s+(?:of|per)\s+(?:an?\s+)?(?:api\s+call|answer|reply|call|request|token)",
+    r"|price\s+(?:of|per)\s+(?:an?\s+)?(?:api\s+call|answer|reply|call|request|token)"
+    r"|how\s+much\s+(?:money|dollars?|usd)\b[^?]{0,40}?\b(?:you|your|it|this|that|the\s+bot|bot|replies|reply|responses?|responds?|answers?|calls?)\b"
+    r"|\b(?:money|dollars?)\s+(?:do|does|did)\s+(?:you|your|it|the\s+bot|this\s+bot)"
+    r"|how\s+much\s+(?:do|does)\s+(?:your|the|a)\s+(?:replies|reply|responses?|responds?|answers?|calls?)\s+(?:cost|spend)"
+    r"|\b(?:your|the)\s+(?:replies|reply|responses?|responds?|answers?|calls?)\s+(?:cost|spend)"
+    r"|\bcost\s+per\s+(?:reply|response|answer|call|message)"
+    r"|what\s+is\s+your\s+(?:api\s+)?cost"
+    r"|how\s+much\s+(?:do|does)\s+(?:you|your)\s+spend",
     re.IGNORECASE,
 )
 

@@ -148,6 +148,7 @@ from .hermes_bridge import (
     prompt_hash,
     redact_internal_infrastructure,
     redact_public_reasoning,
+    strip_tool_call_markup,
     run_hermes,
     AUTO_SCAN_ANSWER_BOUNDARY,
     AUTO_SCAN_BANTER_BOUNDARY,
@@ -2902,7 +2903,7 @@ async def _public_model_completion(
                 answer_chunks.append(content_delta)
             if feed is not None:
                 await feed.emit(reasoning_delta, content_delta)
-        answer = "".join(answer_chunks).strip()
+        answer = strip_tool_call_markup("".join(answer_chunks).strip())
         if not answer:
             raise DirectAskError("direct stream returned an empty answer")
         if feed is not None:
