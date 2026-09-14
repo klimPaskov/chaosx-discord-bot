@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     command_guild_id: Optional[int] = Field(default=1395459671598436533)
     public_ask_limit_per_hour: int = Field(default=-1, ge=-1, le=100, description="Public ask rate limit per user per hour; -1 = unlimited (no check), 0 = disabled")
     web_search_enabled: bool = Field(default=True, description="Allow server-side web-search grounding for public asks when local notes have no answer")
+    web_evidence_enabled: bool = Field(default=True, description="Fetch the top web-search result pages and use their real page text/tables; attaches a source-table image when one is found")
+    web_evidence_max_pages: int = Field(default=2, ge=0, le=3, description="How many search-result pages to fetch as source evidence; 0 disables page fetching")
     thinking_feed_enabled: bool = Field(default=False, description="Show a per-user dismissable thinking feed to the user the bot is answering (owner always gets the raw ephemeral feed); False hides thinking from everyone else")
     server_owner_name: str = Field(default="Hoops McCann", description="Display name of the Discord server owner")
     bot_maker_name: str = Field(default="Hoops McCann", description="Who made/maintains the ChaosX bot")

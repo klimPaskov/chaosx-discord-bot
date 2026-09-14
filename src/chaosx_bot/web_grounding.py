@@ -24,6 +24,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 import aiohttp
 
 from .server_rules import DISCORD_BOT_UA
+from .web_sources import (
+    EvidenceImage,
+    collect_page_evidence,
+    evidence_image,
+    format_evidence_context,
+)
 
 WEB_SEARCH_MAX_RESULTS = 5
 WEB_SEARCH_MAX_CHARS = 2500
@@ -212,6 +218,26 @@ class WebGrounder:
     async def search_context(self, query: str) -> str:
         """Formatted prompt-ready web reference block ('' on failure)."""
         return format_web_context(await self.search_results(query))
+
+    async def search_evidence(
+        self, query: str, *, max_pages: int = 2, evidence_enabled: bool = True
+    ) -> tuple[str, EvidenceImage | None]:
+        """Search context plus source-page evidence from the real result pages.
+
+        Search snippets alone made ChaosX hedge on live facts it could have read:
+        this opens the top ``max_pages`` result pages, adds their page text and
+        data tables to the prompt context, and returns a rendered table PNG when
+        a usable data table exists so the answer can attach visual evidence.
+        Every step is best-effort — failures degrade to the plain search context.
+        """
+        results = await self.search_results(query)
+        context = format_web_context(results)
+        if not results or not evidence_enabled or max_pages <= 0:
+            return context, None
+        pages = await collect_page_evidence(results, max_pages=max_pages)
+        if not pages:
+            return context, None
+        return context + format_evidence_context(pages), evidence_image(pages)
 
     async def _search_bing(self, query: str) -> list[dict[str, str]]:
         page = await self._get(BING_URL, {"q": query})

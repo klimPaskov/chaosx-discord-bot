@@ -134,6 +134,7 @@ from .guild_channels import GuildChannels
 from .guild_members import GuildMembers, colliding_display_ids, user_reference_name
 from .channel_context import ChannelReader
 from .web_grounding import WebGrounder, format_web_results_for_display
+from .web_sources import EvidenceImage
 from .vault_index import refresh_vault_indexes
 from .ask_api import DirectAskError, direct_chat_completion, direct_chat_completion_stream
 from .hermes_bridge import (
@@ -622,7 +623,9 @@ def auto_scan_model_failure_reason(decision: AutoScanDecision, result: HermesRes
     return f"{decision.action} model output rejected"
 
 
-async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message) -> tuple[HermesResult, str]:
+async def generate_auto_scan_model_response(
+    bot: ChaosXBot, decision: AutoScanDecision, message: discord.Message
+) -> tuple[HermesResult, str, EvidenceImage | None]:
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
     user_message = decision.question or message.content or ""
@@ -637,11 +640,20 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
     # (event/scenario/cluster/mechanic): a miss there must be a plain
     # "not found", never a web-search dump.
     web_context = ""
+    evidence: EvidenceImage | None = None
     if (
         bot.settings.web_search_enabled
+        and decision.action in {"answer", "banter"}
         and not looks_like_catalog_lookup(user_message)
     ):
-        web_context = await bot.web.search_context(user_message)
+        # Fetches the real pages behind the top results (not just snippets) so
+        # the answer carries live values, and returns a source-table image when
+        # one exists so the reply can attach the evidence itself.
+        web_context, evidence = await bot.web.search_evidence(
+            user_message,
+            max_pages=bot.settings.web_evidence_max_pages,
+            evidence_enabled=bot.settings.web_evidence_enabled,
+        )
     if decision.action == "answer":
         prompt = build_auto_scan_answer_prompt(
             user_message=user_message,
@@ -711,20 +723,36 @@ async def generate_auto_scan_model_response(bot: ChaosXBot, decision: AutoScanDe
     output = ""
     if result.ok:
         output = sanitize_public_ask_output(result.stdout.strip())
-    return result, output
+    return result, output, evidence
 
 
-async def reply_with_chunks(message: discord.Message, text: str) -> discord.Message | None:
+def evidence_file(image: EvidenceImage | None) -> discord.File | None:
+    """Fresh Discord attachment for an evidence PNG.
+
+    A discord.File wraps a stream that Discord consumes on send, so every send
+    site builds its own from the same bytes.
+    """
+    if image is None or not image.png:
+        return None
+    return discord.File(io.BytesIO(image.png), filename=image.filename)
+
+
+async def reply_with_chunks(
+    message: discord.Message, text: str, *, evidence: EvidenceImage | None = None
+) -> discord.Message | None:
     """Reply once, then continue safely in-channel if output exceeds Discord's limit."""
 
     first_sent: discord.Message | None = None
     for index, part in enumerate(_chunk(text)):
         if index == 0:
-            first_sent = await message.reply(
-                part,
-                mention_author=False,
-                allowed_mentions=safe_allowed_mentions(),
-            )
+            first_kwargs: dict[str, Any] = {
+                "mention_author": False,
+                "allowed_mentions": safe_allowed_mentions(),
+            }
+            attachment = evidence_file(evidence)
+            if attachment is not None:
+                first_kwargs["file"] = attachment
+            first_sent = await message.reply(part, **first_kwargs)
         else:
             await message.channel.send(part, allowed_mentions=safe_allowed_mentions())
     return first_sent
@@ -787,13 +815,13 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow auto-answer: {decision.reason}"), message, bot_message_id=None, response=decision.reference_context)
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        result, model_output, evidence = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer model failure", summary=reason)
             return False
-        first_sent = await reply_with_chunks(message, model_output)
+        first_sent = await reply_with_chunks(message, model_output, evidence=evidence)
         prompt_hash_value = result.prompt_hash
         if first_sent:
             try:
@@ -831,13 +859,13 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow bot-topic banter: {decision.reason}"), message, bot_message_id=None, response="")
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        result, model_output, evidence = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan banter model failure", summary=reason)
             return False
-        sent = await reply_with_chunks(message, model_output)
+        sent = await reply_with_chunks(message, model_output, evidence=evidence)
         await record_auto_scan_event(
             bot,
             decision,
@@ -870,7 +898,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, decision, message, bot_message_id=None, response="")
             await send_auto_scan_notice(bot, decision, message, bot_message_id=None)
             return True
-        result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+        result, model_output, evidence = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
             # The rule break still counts as a warning even when the model
@@ -880,7 +908,7 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await send_auto_scan_notice(bot, failed, message, bot_message_id=None)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning model failure", summary=reason)
             return False
-        sent = await reply_with_chunks(message, model_output)
+        sent = await reply_with_chunks(message, model_output, evidence=evidence)
         await record_auto_scan_event(
             bot,
             decision,
@@ -3100,12 +3128,12 @@ async def run_mention_banter(bot: ChaosXBot, message: discord.Message, request: 
     channel_id = getattr(message.channel, "id", None)
     if decision.question is None:
         decision.question = request
-    result, model_output = await generate_auto_scan_model_response(bot, decision, message)
+    result, model_output, evidence = await generate_auto_scan_model_response(bot, decision, message)
     if not result.ok or not model_output.strip():
         reason = auto_scan_model_failure_reason(decision, result, model_output)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention banter model failure", summary=reason)
         return
-    sent = await reply_with_chunks(message, model_output)
+    sent = await reply_with_chunks(message, model_output, evidence=evidence)
     await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention bot-topic banter", summary=decision.reason)
     if sent is not None:
         try:
@@ -3186,11 +3214,16 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     # needs it (never for catalog lookups — a miss must be a plain "not
     # found", not a search dump).
     web_context = ""
+    evidence: EvidenceImage | None = None
     if (
         bot.settings.web_search_enabled
         and not looks_like_catalog_lookup(request)
     ):
-        web_context = await bot.web.search_context(request)
+        web_context, evidence = await bot.web.search_evidence(
+            request,
+            max_pages=bot.settings.web_evidence_max_pages,
+            evidence_enabled=bot.settings.web_evidence_enabled,
+        )
     prompt = build_public_prompt(
         user_request=request,
         guild_name=guild_name,
@@ -3248,7 +3281,14 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     for i, part in enumerate(_chunk(output)):
         content = part
         if i == 0:
-            first_sent = await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
+            first_kwargs: dict[str, Any] = {
+                "mention_author": False,
+                "allowed_mentions": safe_allowed_mentions(),
+            }
+            attachment = evidence_file(evidence)
+            if attachment is not None:
+                first_kwargs["file"] = attachment
+            first_sent = await message.reply(content, **first_kwargs)
         else:
             await message.channel.send(content, allowed_mentions=safe_allowed_mentions())
     if first_sent and result.ok and memory_output != PUBLIC_ASK_REDIRECT:
@@ -4003,12 +4043,17 @@ async def run_hermes_command(
     # needs it (public asks only; never for catalog lookups — a miss must be
     # a plain "not found", not a dump).
     web_context = ""
+    evidence: EvidenceImage | None = None
     if (
         not owner_only
         and bot.settings.web_search_enabled
         and not looks_like_catalog_lookup(request)
     ):
-        web_context = await bot.web.search_context(request)
+        web_context, evidence = await bot.web.search_evidence(
+            request,
+            max_pages=bot.settings.web_evidence_max_pages,
+            evidence_enabled=bot.settings.web_evidence_enabled,
+        )
     prompt = (
         build_owner_prompt(
             owner_request=owner_request,
@@ -4167,14 +4212,20 @@ async def run_hermes_command(
     if send_output or not result.ok:
         for i, part in enumerate(_chunk(output)):
             prefix = f"{header}\n" if i == 0 and header else ""
+            attachment = evidence_file(evidence) if i == 0 else None
             if feed_active and public:
                 # The interaction deferred ephemeral for the thinking feed, so
                 # followups would stay ephemeral. The final answer is posted
                 # as a normal channel message so everyone sees it, while the
                 # feed remains "only you can see this".
+                send_kwargs: dict[str, Any] = {
+                    "allowed_mentions": safe_allowed_mentions(),
+                }
+                if attachment is not None:
+                    send_kwargs["file"] = attachment
                 sent = await interaction.channel.send(  # type: ignore[union-attr]
                     prefix + part,
-                    allowed_mentions=safe_allowed_mentions(),
+                    **send_kwargs,
                 )
             else:
                 followup_kwargs: dict[str, Any] = {
@@ -4183,6 +4234,8 @@ async def run_hermes_command(
                 }
                 if i == 0 and should_record_reply_memory:
                     followup_kwargs["wait"] = True
+                if attachment is not None:
+                    followup_kwargs["file"] = attachment
                 sent = await interaction.followup.send(
                     prefix + part,
                     **followup_kwargs,

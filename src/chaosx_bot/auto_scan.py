@@ -177,6 +177,35 @@ def has_domain_signal(content: str) -> bool:
     return any(_contains_normalized_phrase(text, term) for term in AUTO_SCAN_DOMAIN_TERMS)
 
 
+# Domain words that are far too generic to carry an unaddressed auto-answer on
+# their own: they appear in ordinary chat constantly ("gives you API access?",
+# "best server?", "any bugs?"). They still count for the scripted/exact answer
+# paths above, but a message whose ONLY domain signal is one of these must not
+# reach the project-context lookup.
+AUTO_SCAN_GENERIC_DOMAIN_TERMS = {
+    "access",
+    "bug",
+    "community",
+    "issue",
+    "server",
+    "suggestion",
+}
+
+
+def matched_domain_terms(content: str) -> list[str]:
+    text = normalize_scan_text(content)
+    return [term for term in AUTO_SCAN_DOMAIN_TERMS if _contains_normalized_phrase(text, term)]
+
+
+def specific_domain_terms(content: str) -> list[str]:
+    """Matched domain terms that are specific enough to gate an answer."""
+    return [
+        term
+        for term in matched_domain_terms(content)
+        if term not in AUTO_SCAN_GENERIC_DOMAIN_TERMS
+    ]
+
+
 def has_grounded_context_signal(content: str) -> bool:
     text = normalize_scan_text(content)
     return any(
@@ -325,6 +354,20 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
             return exact
 
     if not has_domain_signal(question):
+        return AutoScanDecision("none")
+
+    # The lookup below is the gate, but it falls back to an OR query (and then
+    # a fixed digest), so ONE generic word matches unrelated project snippets
+    # and every casual question looks "grounded": Hoops' ollama/API-pricing
+    # message matched only "access" (from "gives you deepseek access?") and was
+    # auto-answered with "grounded Chaos Redux question" at confidence 100.
+    # Require a real project anchor, a specific second domain term, or
+    # catalog-name intent before treating the lookup as grounding.
+    if not (
+        has_grounded_context_signal(question)
+        or CATALOG_NAME_INTENT_RE.search(question)
+        or specific_domain_terms(question)
+    ):
         return AutoScanDecision("none")
 
     if STATUS_RE.search(question):

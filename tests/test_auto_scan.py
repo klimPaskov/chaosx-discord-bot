@@ -675,8 +675,8 @@ class _FakeBot:
         return None
 
 
-async def _fake_model_output(*args: Any, **kwargs: Any) -> tuple[HermesResult, str]:
-    return HermesResult(prompt_hash="model-hash", returncode=0, stdout="Model-generated auto-scan reply", stderr=""), "Model-generated auto-scan reply"
+async def _fake_model_output(*args: Any, **kwargs: Any) -> tuple[HermesResult, str, None]:
+    return HermesResult(prompt_hash="model-hash", returncode=0, stdout="Model-generated auto-scan reply", stderr=""), "Model-generated auto-scan reply", None
 
 
 @pytest.mark.asyncio
@@ -799,8 +799,8 @@ async def test_handle_auto_scan_chunks_long_banter_output(monkeypatch):
             source="bot_topic",
         )
 
-    async def fake_model(*args: Any, **kwargs: Any) -> tuple[HermesResult, str]:
-        return HermesResult(prompt_hash="model-hash", returncode=0, stdout=long_output, stderr=""), long_output
+    async def fake_model(*args: Any, **kwargs: Any) -> tuple[HermesResult, str, None]:
+        return HermesResult(prompt_hash="model-hash", returncode=0, stdout=long_output, stderr=""), long_output, None
 
     monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
     monkeypatch.setattr("chaosx_bot.bot.generate_auto_scan_model_response", fake_model)
