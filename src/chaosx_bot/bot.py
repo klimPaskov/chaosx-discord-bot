@@ -12,6 +12,7 @@ import tempfile
 from urllib.parse import urlparse
 import sys
 import logging
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2746,49 +2747,64 @@ async def context_attachment_text(
     except Exception as exc:  # noqa: BLE001
         logger.warning("context attachment lookup failed: %r", exc)
         return existing_text
-    wants_pointer = _points_at_attachment(getattr(message, "content", "") or "")
-    with_attachments = [item for item in candidates if list(getattr(item[2], "attachments", None) or [])]
-    if not with_attachments:
-        logger.info(
-            "context attachments: scanned %d earlier message(s) in channel %s, none carried an "
-            "attachment (reply=%s, pointer=%s)",
-            len(candidates),
-            getattr(getattr(message, "channel", None), "id", "?"),
-            getattr(message, "reference", None) is not None,
-            wants_pointer,
-        )
-        return existing_text
-    for depth, origin, candidate in candidates:
-        if depth > 1 and not wants_pointer:
-            continue
-        attachments = list(getattr(candidate, "attachments", None) or [])
-        if not attachments:
-            continue
-        room = max(0, settings.video_max_processed_images - len(images))
-        ctx_images, ctx_text = await attachment_context_for(
-            candidate,
-            max_images=room,
-            settings=settings,
-            include_links=False,
-        )
-        if not ctx_text and not ctx_images:
-            logger.warning("context attachments from %s produced nothing usable", origin)
-            continue
-        images.extend(ctx_images[:room])
-        logger.info(
-            "context attachments from %s (message %s) used for message %s: %d images, %d chars",
-            origin,
-            getattr(candidate, "id", "?"),
-            getattr(message, "id", "?"),
-            len(ctx_images),
-            len(ctx_text),
-        )
-        header = (
-            f"## From an earlier message ({origin}) — the user did not attach anything to the current "
-            "message, so this is the material they are pointing at:"
-        )
-        body = "\n".join(part for part in (header, ctx_text) if part)
-        return (existing_text + "\n\n" if existing_text else "") + body
+    wants_pointer = _points_at_attachment(getattr(message, "content", "") or "") or _continued_media_pointer(
+        message, settings, client
+    )
+
+    async def _harvest(items: list[tuple[int, str, Any]]) -> str | None:
+        for depth, origin, candidate in items:
+            if depth > 1 and not wants_pointer:
+                continue
+            if not list(getattr(candidate, "attachments", None) or []):
+                continue
+            room = max(0, settings.video_max_processed_images - len(images))
+            ctx_images, ctx_text = await attachment_context_for(
+                candidate,
+                max_images=room,
+                settings=settings,
+                include_links=False,
+            )
+            if not ctx_text and not ctx_images:
+                logger.warning("context attachments from %s produced nothing usable", origin)
+                continue
+            images.extend(ctx_images[:room])
+            logger.info(
+                "context attachments from %s (message %s) used for message %s: %d images, %d chars",
+                origin,
+                getattr(candidate, "id", "?"),
+                getattr(message, "id", "?"),
+                len(ctx_images),
+                len(ctx_text),
+            )
+            header = (
+                f"## From an earlier message ({origin}) — the user did not attach anything to the current "
+                "message, so this is the material they are pointing at:"
+            )
+            return "\n".join(part for part in (header, ctx_text) if part)
+        return None
+
+    nearby = [item for item in candidates if list(getattr(item[2], "attachments", None) or [])]
+    if nearby:
+        harvested = await _harvest(candidates)
+        if harvested:
+            return (existing_text + "\n\n" if existing_text else "") + harvested
+    # Nothing within reach of this channel. When the request points at media, look
+    # for an already-sent attachment elsewhere in the server ("reference an
+    # already sent clip, i don't want to resend it").
+    if wants_pointer:
+        wider = await _guild_attachment_candidates(client, message, settings)
+        if wider:
+            harvested = await _harvest(wider)
+            if harvested:
+                return (existing_text + "\n\n" if existing_text else "") + harvested
+    logger.info(
+        "context attachments: scanned %d nearby message(s) (+ server-wide when pointed at), none carried an "
+        "attachment (channel=%s, reply=%s, pointer=%s)",
+        len(candidates),
+        getattr(getattr(message, "channel", None), "id", "?"),
+        getattr(message, "reference", None) is not None,
+        wants_pointer,
+    )
     return existing_text
 
 
@@ -2829,6 +2845,154 @@ async def _linked_message(client: Any, guild_id: int, channel_id: int, message_i
     except Exception as exc:  # noqa: BLE001
         logger.warning("linked message %s/%s not fetchable: %r", channel_id, message_id, exc)
         return None
+
+
+_GUILD_ATTACHMENT_CACHE: dict[int, tuple[float, list[tuple[int, str, Any]]]] = {}
+_GUILD_ATTACHMENT_CACHE_TTL_S = 60.0
+
+
+async def _guild_attachment_candidates(
+    client: Any | None, message: discord.Message, settings: Settings
+) -> list[tuple[int, str, Any]]:
+    """Messages with attachments from OTHER channels in this server, best guess first.
+
+    Hoops (2026-09-19): "i want it to reference an already sent clip, i don't want
+    to resend it" — the clip may have been posted in another channel, so scanning
+    the current channel alone is not enough. One history call per readable channel,
+    results cached briefly, and the asker's own messages win over other people's.
+    """
+    if client is None or not settings.context_attachment_guild_scan_enabled:
+        return []
+    guild = getattr(message, "guild", None)
+    if guild is None:
+        return []
+    guild_id = getattr(guild, "id", 0)
+    now = time.monotonic()
+    cached = _GUILD_ATTACHMENT_CACHE.get(guild_id)
+    if cached is not None and now - cached[0] < _GUILD_ATTACHMENT_CACHE_TTL_S:
+        return cached[1]
+
+    asker = getattr(getattr(message, "author", None), "id", None)
+    current_channel_id = getattr(getattr(message, "channel", None), "id", None)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.context_attachment_guild_max_age_minutes)
+    me = getattr(guild, "me", None)
+    pool = list(getattr(guild, "text_channels", None) or []) + list(getattr(guild, "threads", None) or [])
+    readable: list[Any] = []
+    for channel in pool:
+        if getattr(channel, "id", None) == current_channel_id:
+            continue
+        if len(readable) >= settings.context_attachment_guild_channels:
+            break
+        try:
+            perms = channel.permissions_for(me) if me is not None else None
+        except Exception:  # noqa: BLE001
+            perms = None
+        if perms is not None and not getattr(perms, "read_message_history", False):
+            continue
+        readable.append(channel)
+
+    found: list[tuple[Any, Any]] = []
+    scanned = 0
+    failures: list[str] = []
+    gate = asyncio.Semaphore(8)
+
+    async def _scan(channel: Any) -> list[Any]:
+        nonlocal scanned
+        hits: list[Any] = []
+        async with gate:
+            try:
+                async for older in channel.history(limit=settings.context_attachment_guild_messages):
+                    scanned += 1
+                    if not list(getattr(older, "attachments", None) or []):
+                        continue
+                    created = getattr(older, "created_at", None)
+                    if created is not None and created < cutoff:
+                        break
+                    hits.append(older)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"#{getattr(channel, 'name', channel)}: {exc!r}")
+        return hits
+
+    if readable:
+        for channel, hits in zip(readable, await asyncio.gather(*(_scan(channel) for channel in readable))):
+            found.extend((hit, channel) for hit in hits)
+
+    found.sort(
+        key=lambda pair: (
+            0 if getattr(getattr(pair[0], "author", None), "id", None) == asker else 1,
+            -int(getattr(pair[0], "id", 0) or 0),
+        )
+    )
+    candidates = [
+        (
+            2 + index,
+            f"an earlier message in #{getattr(channel, 'name', 'another channel')}",
+            older,
+        )
+        for index, (older, channel) in enumerate(found[: settings.context_attachment_guild_channels])
+    ]
+    _GUILD_ATTACHMENT_CACHE[guild_id] = (now, candidates)
+    logger.info(
+        "server-wide attachment scan: %d/%d channel(s) readable, %d message(s) read, %d with attachments, "
+        "%d failure(s) %s (channel=%s)",
+        len(readable),
+        len(pool),
+        scanned,
+        len(found),
+        len(failures),
+        failures[:3],
+        getattr(getattr(message, "channel", None), "id", "?"),
+    )
+    return candidates
+
+
+def _continued_media_pointer(message: Any, settings: Settings, client: Any | None) -> bool:
+    """True when the previous thing this user said here pointed at media.
+
+    Handles "chaosx try again" straight after "what is the video about?" — the
+    retry itself carries no cue word, but the intent has not changed, and the
+    attachment lookup should still run.
+    """
+    db_path = getattr(settings, "db_path", None)
+    channel_id = getattr(getattr(message, "channel", None), "id", None)
+    if db_path is None or channel_id is None:
+        return False
+    bot_id = getattr(getattr(client, "user", None), "id", None)
+    current_id = str(getattr(message, "id", "") or "")
+    try:
+        con = sqlite3.connect(str(db_path))
+    except Exception as exc:  # noqa: BLE001
+        logger.info("continued-pointer lookup unavailable: %r", exc)
+        return False
+    try:
+        rows = con.execute(
+            "select author_id, content, created_at, message_id from conversation_messages "
+            "where channel_id = ? order by id desc limit 8",
+            (str(channel_id),),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.info("continued-pointer query failed: %r", exc)
+        return False
+    finally:
+        con.close()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    for author_id, content, created_at, message_id in rows:
+        if current_id and str(message_id or "") == current_id:
+            continue
+        if bot_id is not None and str(author_id or "") == str(bot_id):
+            continue
+        try:
+            when = datetime.fromisoformat(str(created_at))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if when < cutoff:
+            break
+        if _points_at_attachment(content or ""):
+            logger.info("continued attachment intent: earlier message in this channel pointed at media")
+            return True
+    return False
 
 
 async def _context_attachment_candidates(

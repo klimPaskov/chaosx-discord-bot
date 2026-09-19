@@ -63,6 +63,30 @@ class FakeReference:
         self.message_id = message_id
 
 
+class FakePerms:
+    def __init__(self, read_message_history: bool = True):
+        self.read_message_history = read_message_history
+
+
+class FakeGuildChannel(FakeChannel):
+    def __init__(self, name: str, history: list, *, can_read: bool = True):
+        super().__init__(history)
+        self.name = name
+        self.id = abs(hash(name)) % 1_000_000 + 1
+        self._can_read = can_read
+
+    def permissions_for(self, member):
+        return FakePerms(self._can_read)
+
+
+class FakeGuild:
+    def __init__(self, channels: list):
+        self.id = 1395459671598436533
+        self.text_channels = channels
+        self.threads = []
+        self.me = object()
+
+
 class FakeMessage:
     def __init__(
         self,
@@ -74,6 +98,8 @@ class FakeMessage:
         fetch: dict | None = None,
         age_minutes: int = 0,
         message_id: int = 900,
+        guild=None,
+        author_id: int = 789502982122373150,
     ):
         self.attachments = attachments or []
         self.content = content
@@ -81,6 +107,8 @@ class FakeMessage:
         self.reference = reference
         self.created_at = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
         self.channel = FakeChannel(history or [], fetch)
+        self.guild = guild
+        self.author = type("Author", (), {"id": author_id, "display_name": "tester"})()
 
 
 def _settings(**overrides) -> Settings:
@@ -254,6 +282,86 @@ def test_message_link_parsing() -> None:
     assert links == [(1, 2, 3)]
 
 
+def test_server_wide_scan_finds_already_sent_clip_in_another_channel() -> None:
+    """Hoops: "i want it to reference an already sent clip, i don't want to resend it"."""
+    botmod._GUILD_ATTACHMENT_CACHE.clear()
+    clip = FakeMessage([FakeAttachment("clip.mp4", "video/mp4", b"\x00" * 64)], "", message_id=500)
+    clips_channel = FakeGuildChannel("clips", [clip])
+    guild = FakeGuild([clips_channel])
+    ask = FakeMessage([], "ChaosX what is the video about? What is the context here?", guild=guild)
+    images: list[str] = []
+    text = asyncio.run(
+        botmod.context_attachment_text(
+            ask, settings=_settings(), images=images, existing_text="", client=object()
+        )
+    )
+    assert "an earlier message in #clips" in text
+
+
+def test_server_wide_scan_prefers_the_askers_own_attachment() -> None:
+    botmod._GUILD_ATTACHMENT_CACHE.clear()
+    stranger = FakeMessage([_png_attachment("theirs.png")], "", message_id=900, author_id=4242)
+    mine = FakeMessage([_png_attachment("mine.png")], "", message_id=800)
+    guild = FakeGuild([FakeGuildChannel("clips", [stranger, mine])])
+    ask = FakeMessage([], "ChaosX check the screenshot I sent earlier", guild=guild)
+    images: list[str] = []
+    asyncio.run(
+        botmod.context_attachment_text(
+            ask, settings=_settings(), images=images, existing_text="", client=object()
+        )
+    )
+    assert len(images) == 1  # the asker's own message was harvested, not the newer stranger's
+
+
+def test_server_wide_scan_skipped_without_a_pointer() -> None:
+    botmod._GUILD_ATTACHMENT_CACHE.clear()
+    clip = FakeMessage([FakeAttachment("clip.mp4", "video/mp4", b"\x00" * 64)], "", message_id=500)
+    guild = FakeGuild([FakeGuildChannel("clips", [clip])])
+    ask = FakeMessage([], "what is the chaos meter cap?", guild=guild)
+    images: list[str] = []
+    text = asyncio.run(
+        botmod.context_attachment_text(
+            ask, settings=_settings(), images=images, existing_text="", client=object()
+        )
+    )
+    assert text == ""
+    assert images == []
+
+
+def test_server_wide_scan_respects_read_history_permission() -> None:
+    botmod._GUILD_ATTACHMENT_CACHE.clear()
+    clip = FakeMessage([_png_attachment()], "", message_id=500)
+    guild = FakeGuild([FakeGuildChannel("private", [clip], can_read=False)])
+    ask = FakeMessage([], "ChaosX what is in the screenshot above?", guild=guild)
+    images: list[str] = []
+    text = asyncio.run(
+        botmod.context_attachment_text(
+            ask, settings=_settings(), images=images, existing_text="", client=object()
+        )
+    )
+    assert text == ""
+    assert images == []
+
+
+def test_server_wide_scan_can_be_disabled() -> None:
+    botmod._GUILD_ATTACHMENT_CACHE.clear()
+    clip = FakeMessage([_png_attachment()], "", message_id=500)
+    guild = FakeGuild([FakeGuildChannel("clips", [clip])])
+    ask = FakeMessage([], "ChaosX what is in the screenshot above?", guild=guild)
+    images: list[str] = []
+    text = asyncio.run(
+        botmod.context_attachment_text(
+            ask,
+            settings=_settings(context_attachment_guild_scan_enabled=False),
+            images=images,
+            existing_text="",
+            client=object(),
+        )
+    )
+    assert text == ""
+    assert images == []
+
+
 def test_unavailable_history_is_survivable() -> None:
     ask = FakeMessage([], "nothing here")
     ask.channel = FakeChannel([])
@@ -276,3 +384,54 @@ def test_text_file_from_earlier_message_is_included() -> None:
     )
     assert "chaos meter caps at 100" in text
     assert "1 message above" in text
+
+
+def test_retry_inherits_media_intent_from_the_previous_message(tmp_path) -> None:
+    """"chaosx try again" after "what is the video about?" must still find the clip."""
+    import sqlite3 as _sqlite3
+    from datetime import datetime as _dt, timezone as _tz
+
+    db = tmp_path / "conv.db"
+    con = _sqlite3.connect(db)
+    con.execute(
+        "create table conversation_messages (id integer primary key, channel_id text, author_id text, "
+        "author_name text, content text, created_at text, visibility text, message_id text)"
+    )
+    con.execute(
+        "insert into conversation_messages (channel_id, author_id, author_name, content, created_at, "
+        "visibility, message_id) values (?,?,?,?,?,?,?)",
+        (
+            "555",
+            "789502982122373150",
+            "Hoops McCann",
+            "ChaosX what is the video about? What is the context here?",
+            _dt.now(_tz.utc).isoformat(),
+            "public",
+            "1",
+        ),
+    )
+    con.execute(
+        "insert into conversation_messages (channel_id, author_id, author_name, content, created_at, "
+        "visibility, message_id) values (?,?,?,?,?,?,?)",
+        ("555", "1526134739122262077", "ChaosX", "no video reached me", _dt.now(_tz.utc).isoformat(), "public", "2"),
+    )
+    con.commit()
+    con.close()
+
+    botmod._GUILD_ATTACHMENT_CACHE.clear()
+    clip = FakeMessage([_png_attachment("clip.png")], "", message_id=500)
+    guild = FakeGuild([FakeGuildChannel("clips", [clip])])
+    ask = FakeMessage([], "chaosx try again", guild=guild, message_id=3)
+    ask.channel.id = "555"
+    images: list[str] = []
+    text = asyncio.run(
+        botmod.context_attachment_text(
+            ask,
+            settings=_settings(db_path=db),
+            images=images,
+            existing_text="",
+            client=object(),
+        )
+    )
+    assert len(images) == 1
+    assert "an earlier message in #clips" in text
