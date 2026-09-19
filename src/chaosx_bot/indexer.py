@@ -442,16 +442,16 @@ def rebuild_index(
     return IndexStats(docs=docs, events=events, scenarios=scenarios, clusters=clusters, commit_sha=commit)
 
 
-def _catalog_rows(repo: Path, *, csv_name: str, sheet_index: int) -> list[dict[str, str]]:
+def _catalog_rows(repo: Path, *, csv_name: str, sheet_index: int, sheet_name: str = "") -> list[dict[str, str]]:
     """Read the maintained workbook first, with CSV as a compatibility fallback."""
 
     xlsx_path = repo / "docs/spreadsheets/chaos_redux_events_catalog.xlsx"
     if xlsx_path.exists():
         try:
-            return _xlsx_sheet_rows(xlsx_path, sheet_index=sheet_index)
+            return _xlsx_sheet_rows(xlsx_path, sheet_index=sheet_index, sheet_name=sheet_name)
         except (BadZipFile, ET.ParseError, KeyError, OSError, ValueError) as exc:
             raise CatalogReadError(
-                f"Could not read catalog workbook sheet {sheet_index}"
+                f"Could not read catalog workbook sheet {sheet_name or sheet_index}"
             ) from exc
     csv_path = repo / "docs/spreadsheets" / csv_name
     if csv_path.exists():
@@ -460,12 +460,52 @@ def _catalog_rows(repo: Path, *, csv_name: str, sheet_index: int) -> list[dict[s
     return []
 
 
-def _xlsx_sheet_rows(path: Path, *, sheet_index: int) -> list[dict[str, str]]:
+_WORKBOOK_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_SHEET_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _xlsx_sheet_member(zf: ZipFile, *, sheet_name: str, sheet_index: int) -> str:
+    """Resolve the workbook member holding a named sheet.
+
+    Sheets must be found by NAME: the catalog workbook gained a "Cluster
+    Memberships" sheet between Clusters and Scenarios (2026-09-19), which shifted
+    every later sheet's positional index and silently emptied the Scenarios
+    catalog (0 rows while the sheet itself was fine). Positions are unstable;
+    names are not. The positional member stays as a fallback for workbooks
+    without the expected names.
+    """
+    members = set(zf.namelist())
+    if sheet_name:
+        try:
+            workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+            relationships = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        except (KeyError, ET.ParseError):
+            workbook = relationships = None
+        if workbook is not None and relationships is not None:
+            targets = {rel.get("Id"): (rel.get("Target") or "") for rel in relationships}
+            for sheet in workbook.findall(f".//{{{_WORKBOOK_NS}}}sheets/{{{_WORKBOOK_NS}}}sheet"):
+                if (sheet.get("name") or "").strip() != sheet_name:
+                    continue
+                target = (targets.get(sheet.get(f"{{{_SHEET_REL_NS}}}id")) or "").strip()
+                if not target:
+                    break
+                leaf = target.split("/")[-1]
+                for candidate in (f"xl/worksheets/{leaf}", f"xl/{leaf.lstrip('/')}", target.lstrip("/")):
+                    if candidate in members:
+                        return candidate
+                break
+    positional = f"xl/worksheets/sheet{sheet_index}.xml"
+    if positional in members:
+        return positional
+    raise KeyError(f"catalog workbook sheet {sheet_name or sheet_index} not found")
+
+
+def _xlsx_sheet_rows(path: Path, *, sheet_index: int, sheet_name: str = "") -> list[dict[str, str]]:
     if not path.exists():
         return []
     with ZipFile(path) as zf:
         shared = _xlsx_shared_strings(zf)
-        sheet_xml = zf.read(f"xl/worksheets/sheet{sheet_index}.xml")
+        sheet_xml = zf.read(_xlsx_sheet_member(zf, sheet_name=sheet_name, sheet_index=sheet_index))
     root = ET.fromstring(sheet_xml)
     ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     table: list[list[str]] = []
@@ -544,7 +584,7 @@ def _load_events(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> int
     )
     """)
     count = 0
-    for row_number, row in enumerate(_catalog_rows(repo, csv_name="chaos_redux_events_catalog.csv", sheet_index=1), 1):
+    for row_number, row in enumerate(_catalog_rows(repo, csv_name="chaos_redux_events_catalog.csv", sheet_index=1, sheet_name="Events"), 1):
         event_id = (row.get("ID") or "").strip()
         name = (row.get("Event Name") or "").strip()
         if not event_id and not name:
@@ -582,7 +622,7 @@ def _load_scenarios(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> 
     """)
     count = 0
     for row_number, row in enumerate(
-        _catalog_rows(repo, csv_name="chaos_redux_scenarios_catalog.csv", sheet_index=3),
+        _catalog_rows(repo, csv_name="chaos_redux_scenarios_catalog.csv", sheet_index=3, sheet_name="Scenarios"),
         1,
     ):
         raw_id = (row.get("Scenario ID") or "").strip()
@@ -631,7 +671,7 @@ def _load_clusters(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> i
     )
     """)
     count = 0
-    for row_number, row in enumerate(_catalog_rows(repo, csv_name="chaos_redux_clusters_catalog.csv", sheet_index=2), 1):
+    for row_number, row in enumerate(_catalog_rows(repo, csv_name="chaos_redux_clusters_catalog.csv", sheet_index=2, sheet_name="Clusters"), 1):
         cluster_id = (row.get("Cluster ID") or "").strip()
         name = (row.get("Cluster Name") or "").strip()
         if not cluster_id and not name:
