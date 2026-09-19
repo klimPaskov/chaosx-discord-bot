@@ -203,6 +203,40 @@ from .webhook_server import GitHubWebhookServer
 
 logger = logging.getLogger("chaosx.attachments")
 
+# Words that suggest the user is referring to an attachment they posted earlier
+# ("get it from an earlier message"). Deliberately concrete: pronoun-only
+# messages are covered by the reply-target and previous-message scan instead.
+CONTEXT_ATTACHMENT_CUES = (
+    "attachment",
+    "attached",
+    "the file",
+    "my file",
+    "the image",
+    "the picture",
+    "the screenshot",
+    "screenshot",
+    "the photo",
+    "the video",
+    "video",
+    "the clip",
+    "clip",
+    "the recording",
+    "the replay",
+    "the log",
+    "the dump",
+    "the workbook",
+    "spreadsheet",
+    "pdf",
+    "csv",
+    "above",
+    "earlier",
+    "previous",
+    "i sent",
+    "i posted",
+    "that one",
+    "the one",
+)
+
 BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
 AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
 AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
@@ -701,6 +735,9 @@ async def generate_auto_scan_model_response(
     channel_name = getattr(message.channel, "name", None)
     user_message = decision.question or message.content or ""
     images, attachment_text = await attachment_context_for(message, settings=bot.settings)
+    attachment_text = await context_attachment_text(
+        message, settings=bot.settings, images=images, existing_text=attachment_text
+    )
     conversation_context = await conversation_context_for(
         bot.settings.db_path,
         channel_id=getattr(message.channel, "id", 0),
@@ -2577,6 +2614,7 @@ async def attachment_context_for(
     max_urls: int = 3,
     url_chars: int = 2500,
     settings: Settings | None = None,
+    include_links: bool = True,
 ) -> tuple[list[str], str]:
     """Extract usable model input from a message's attachments and links.
 
@@ -2640,8 +2678,12 @@ async def attachment_context_for(
         if len(unreadable) < max_urls:
             unreadable.append(f"`{name}` ({_format_size(getattr(attachment, 'size', 0) or 0)})")
             logger.warning("attachment %s -> unreadable (no decoder, no video pipeline)", name)
-    links = await _fetch_links(getattr(message, "content", "") or "", max_urls=max_urls, max_chars=url_chars)
-    if video_settings is not None and video_settings.video_processing_enabled:
+    links = (
+        await _fetch_links(getattr(message, "content", "") or "", max_urls=max_urls, max_chars=url_chars)
+        if include_links
+        else []
+    )
+    if include_links and video_settings is not None and video_settings.video_processing_enabled:
         video_blocks.extend(
             await _video_link_blocks(getattr(message, "content", "") or "", video_settings, images)
         )
@@ -2657,13 +2699,132 @@ async def attachment_context_for(
     return images, "\n\n".join(sections)
 
 
-async def _video_attachment_block(attachment, settings: Settings, images: list[str]) -> str | None:
+async def context_attachment_text(
+    message: discord.Message,
+    *,
+    settings: Settings | None,
+    images: list[str],
+    existing_text: str = "",
+) -> str:
+    """Pull attachments from the replied-to message or from recent channel messages.
+
+    People post a clip, screenshot or file and then ask about it in a following
+    message (or reply to it). The triggering message carries no attachment, so
+    without this the model only has channel text and answers "nothing reached
+    me". Only ONE earlier message is harvested, and only when the ask itself
+    supplied no attachment.
+
+    Scan depth: the replied-to message and the immediately preceding message are
+    always considered ("the file above"); further back only when the text points
+    at an attachment ("get it from an earlier message").
+
+    Never raises: context attachments must not break a reply.
+    """
+    if settings is None or not settings.context_attachment_enabled:
+        return existing_text
+    if list(getattr(message, "attachments", None) or []):
+        return existing_text  # the ask carried its own attachment
+    if "## Attached video" in existing_text or "## Linked video" in existing_text:
+        return existing_text
+    if "Attached file contents:" in existing_text or "Unreadable attachments" in existing_text:
+        return existing_text
+    try:
+        candidates = await _context_attachment_candidates(message, settings)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context attachment lookup failed: %r", exc)
+        return existing_text
+    wants_pointer = _points_at_attachment(getattr(message, "content", "") or "")
+    for depth, origin, candidate in candidates:
+        if depth > 1 and not wants_pointer:
+            continue
+        attachments = list(getattr(candidate, "attachments", None) or [])
+        if not attachments:
+            continue
+        room = max(0, settings.video_max_processed_images - len(images))
+        ctx_images, ctx_text = await attachment_context_for(
+            candidate,
+            max_images=room,
+            settings=settings,
+            include_links=False,
+        )
+        if not ctx_text and not ctx_images:
+            logger.warning("context attachments from %s produced nothing usable", origin)
+            continue
+        images.extend(ctx_images[:room])
+        logger.info(
+            "context attachments from %s (message %s) used for message %s: %d images, %d chars",
+            origin,
+            getattr(candidate, "id", "?"),
+            getattr(message, "id", "?"),
+            len(ctx_images),
+            len(ctx_text),
+        )
+        header = (
+            f"## From an earlier message ({origin}) — the user did not attach anything to the current "
+            "message, so this is the material they are pointing at:"
+        )
+        body = "\n".join(part for part in (header, ctx_text) if part)
+        return (existing_text + "\n\n" if existing_text else "") + body
+    return existing_text
+
+
+def _points_at_attachment(text: str) -> bool:
+    """True when the text looks like it refers to an attachment it did not carry."""
+    lowered = (text or "").lower()
+    return any(cue in lowered for cue in CONTEXT_ATTACHMENT_CUES)
+
+
+async def _context_attachment_candidates(
+    message: discord.Message, settings: Settings
+) -> list[tuple[int, str, Any]]:
+    """(depth, origin label, message) triples to harvest attachments from, nearest first."""
+    out: list[tuple[int, str, Any]] = []
+    reference = getattr(message, "reference", None)
+    if reference is not None:
+        resolved = getattr(reference, "resolved", None)
+        if getattr(resolved, "id", None):
+            out.append((0, "the message this replies to", resolved))
+        else:
+            target_id = getattr(reference, "message_id", None)
+            if target_id:
+                try:
+                    fetched = await message.channel.fetch_message(target_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("could not fetch replied-to message %s: %r", target_id, exc)
+                else:
+                    out.append((0, "the message this replies to", fetched))
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.context_attachment_lookback_minutes)
+    try:
+        history = [
+            older
+            async for older in message.channel.history(
+                limit=settings.context_attachment_lookback_messages, before=message
+            )
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.info("channel history unavailable for context attachments: %r", exc)
+        history = []
+    seen = {getattr(prev, "id", None) for _, _, prev in out}
+    for index, older in enumerate(history, start=1):
+        created = getattr(older, "created_at", None)
+        if created is not None and created < cutoff:
+            break
+        if getattr(older, "id", None) in seen:
+            continue
+        out.append((index, f"{index} message{'s' if index > 1 else ''} above", older))
+    return out
+
+
+async def _video_attachment_block(
+    attachment, settings: Settings, images: list[str], origin: str = ""
+) -> str | None:
     """Analyse a video attachment: sampled frames + transcript.
 
     Returns a prompt block (and appends its frames to ``images``) or None when
     the attachment is not a video / cannot be read. Never raises.
     """
     name = getattr(attachment, "filename", None) or "video"
+    label = f"{name} ({origin})" if origin else name
     try:
         size = getattr(attachment, "size", 0) or 0
         ext = _attachment_ext(attachment)
@@ -2675,14 +2836,14 @@ async def _video_attachment_block(attachment, settings: Settings, images: list[s
                 _format_size(size),
                 _format_size(settings.video_max_bytes),
             )
-            return f"## Attached video: {name} ({_format_size(size)}) — too large to analyse (limit {_format_size(settings.video_max_bytes)})."
+            return f"## Attached video: {label} ({_format_size(size)}) — too large to analyse (limit {_format_size(settings.video_max_bytes)})."
         data = await _read_attachment_bytes(attachment)
         if not data:
             logger.warning("video attachment %s could not be downloaded", name)
             return None
         if not looks_like_video(data, ext=ext, content_type=ctype):
             return None
-        return await _analyse_video_bytes(data, label=name, settings=settings, images=images)
+        return await _analyse_video_bytes(data, label=label, settings=settings, images=images)
     except Exception as exc:  # noqa: BLE001 - attachment analysis must never break a reply
         logger.warning("video attachment analysis failed for %s: %r", name, exc)
         return None
@@ -2953,6 +3114,9 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
     await feed.start()
 
     images, attachment_text = await attachment_context_for(message, settings=bot.settings)
+    attachment_text = await context_attachment_text(
+        message, settings=bot.settings, images=images, existing_text=attachment_text
+    )
     async with message.channel.typing():
         result = await _public_model_completion(
             bot=bot,
@@ -3556,6 +3720,9 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     # No thinking feed for mention asks: only slash commands can carry an
     # ephemeral ("only you can see this") message, and DMs are not used.
     images, attachment_text = await attachment_context_for(message, settings=bot.settings)
+    attachment_text = await context_attachment_text(
+        message, settings=bot.settings, images=images, existing_text=attachment_text
+    )
     async with message.channel.typing():
         result = await _public_model_completion(
             bot=bot,
