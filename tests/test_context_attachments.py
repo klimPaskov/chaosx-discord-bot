@@ -217,6 +217,43 @@ def test_disabled_setting_is_a_no_op() -> None:
     assert images == []
 
 
+def test_pasted_message_link_is_resolved_and_harvested() -> None:
+    """The bot tells users to "drop the message link" — so a pasted link must work."""
+    clip_message = FakeMessage([_png_attachment("linked.png")], "", message_id=4321)
+
+    class FakeClient:
+        def get_channel(self, channel_id):
+            class FakeLinkedChannel:
+                async def fetch_message(self, message_id):
+                    assert message_id == 4321
+                    return clip_message
+
+            return FakeLinkedChannel()
+
+        async def fetch_channel(self, channel_id):  # pragma: no cover
+            raise RuntimeError("not needed")
+
+    ask = FakeMessage(
+        [],
+        "chaosx look at https://discord.com/channels/1395459671598436533/1396551514469699765/4321",
+    )
+    images: list[str] = []
+    text = asyncio.run(
+        botmod.context_attachment_text(
+            ask, settings=_settings(), images=images, existing_text="", client=FakeClient()
+        )
+    )
+    assert len(images) == 1
+    assert "the message link in the request" in text
+
+
+def test_message_link_parsing() -> None:
+    links = botmod._discord_message_links(
+        "see https://discord.com/channels/1/2/3 and https://discordapp.com/channels/4/5/6"
+    )
+    assert links == [(1, 2, 3)]
+
+
 def test_unavailable_history_is_survivable() -> None:
     ask = FakeMessage([], "nothing here")
     ask.channel = FakeChannel([])

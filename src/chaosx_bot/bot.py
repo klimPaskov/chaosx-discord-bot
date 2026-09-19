@@ -202,6 +202,12 @@ from .storage import Store
 from .webhook_server import GitHubWebhookServer
 
 logger = logging.getLogger("chaosx.attachments")
+if not logger.handlers:  # bot.py configures no logging of its own, so attach our own
+    _attachments_handler = logging.StreamHandler()  # stderr → journald
+    _attachments_handler.setFormatter(logging.Formatter("[attachments] %(message)s"))
+    logger.addHandler(_attachments_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 # Words that suggest the user is referring to an attachment they posted earlier
 # ("get it from an earlier message"). Deliberately concrete: pronoun-only
@@ -736,7 +742,7 @@ async def generate_auto_scan_model_response(
     user_message = decision.question or message.content or ""
     images, attachment_text = await attachment_context_for(message, settings=bot.settings)
     attachment_text = await context_attachment_text(
-        message, settings=bot.settings, images=images, existing_text=attachment_text
+        message, settings=bot.settings, images=images, existing_text=attachment_text, client=bot
     )
     conversation_context = await conversation_context_for(
         bot.settings.db_path,
@@ -2649,6 +2655,12 @@ async def attachment_context_for(
                 for a in attachments
             ],
         )
+    else:
+        logger.info(
+            "attachment inventory message=%s count=0 (no attachment on the ask) channel=%s",
+            getattr(message, "id", "?"),
+            getattr(getattr(message, "channel", None), "id", "?"),
+        )
     for attachment in attachments:
         name = getattr(attachment, "filename", None) or "file"
         uri = await _image_data_uri(attachment)
@@ -2705,18 +2717,19 @@ async def context_attachment_text(
     settings: Settings | None,
     images: list[str],
     existing_text: str = "",
+    client: Any | None = None,
 ) -> str:
-    """Pull attachments from the replied-to message or from recent channel messages.
+    """Pull attachments from a linked/replied-to/recent message.
 
     People post a clip, screenshot or file and then ask about it in a following
-    message (or reply to it). The triggering message carries no attachment, so
-    without this the model only has channel text and answers "nothing reached
-    me". Only ONE earlier message is harvested, and only when the ask itself
-    supplied no attachment.
+    message (or reply to it), or paste a message link to it. The triggering
+    message carries no attachment, so without this the model only has channel
+    text and answers "nothing reached me". Only ONE earlier message is
+    harvested, and only when the ask itself supplied no attachment.
 
-    Scan depth: the replied-to message and the immediately preceding message are
-    always considered ("the file above"); further back only when the text points
-    at an attachment ("get it from an earlier message").
+    Scan order: pasted message links, then the replied-to message, then the
+    message immediately above; 2+ messages back only when the text points at an
+    attachment ("get it from an earlier message").
 
     Never raises: context attachments must not break a reply.
     """
@@ -2729,11 +2742,22 @@ async def context_attachment_text(
     if "Attached file contents:" in existing_text or "Unreadable attachments" in existing_text:
         return existing_text
     try:
-        candidates = await _context_attachment_candidates(message, settings)
+        candidates = await _context_attachment_candidates(message, settings, client=client)
     except Exception as exc:  # noqa: BLE001
         logger.warning("context attachment lookup failed: %r", exc)
         return existing_text
     wants_pointer = _points_at_attachment(getattr(message, "content", "") or "")
+    with_attachments = [item for item in candidates if list(getattr(item[2], "attachments", None) or [])]
+    if not with_attachments:
+        logger.info(
+            "context attachments: scanned %d earlier message(s) in channel %s, none carried an "
+            "attachment (reply=%s, pointer=%s)",
+            len(candidates),
+            getattr(getattr(message, "channel", None), "id", "?"),
+            getattr(message, "reference", None) is not None,
+            wants_pointer,
+        )
+        return existing_text
     for depth, origin, candidate in candidates:
         if depth > 1 and not wants_pointer:
             continue
@@ -2774,11 +2798,48 @@ def _points_at_attachment(text: str) -> bool:
     return any(cue in lowered for cue in CONTEXT_ATTACHMENT_CUES)
 
 
+_DISCORD_MESSAGE_LINK_RE = re.compile(
+    r"https?://(?:www\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)"
+)
+
+
+def _discord_message_links(text: str, *, limit: int = 1) -> list[tuple[int, int, int]]:
+    """(guild_id, channel_id, message_id) triples from pasted Discord message links."""
+    found: list[tuple[int, int, int]] = []
+    for match in _DISCORD_MESSAGE_LINK_RE.finditer(text or ""):
+        triple = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        if triple not in found:
+            found.append(triple)
+        if len(found) >= limit:
+            break
+    return found
+
+
+async def _linked_message(client: Any, guild_id: int, channel_id: int, message_id: int) -> Any | None:
+    """Fetch the message a pasted Discord link points at (needs the live client)."""
+    if client is None:
+        return None
+    try:
+        channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("linked message channel %s not reachable: %r", channel_id, exc)
+        return None
+    try:
+        return await channel.fetch_message(message_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("linked message %s/%s not fetchable: %r", channel_id, message_id, exc)
+        return None
+
+
 async def _context_attachment_candidates(
-    message: discord.Message, settings: Settings
+    message: discord.Message, settings: Settings, *, client: Any | None = None
 ) -> list[tuple[int, str, Any]]:
     """(depth, origin label, message) triples to harvest attachments from, nearest first."""
     out: list[tuple[int, str, Any]] = []
+    for _guild_id, channel_id, message_id in _discord_message_links(getattr(message, "content", "") or ""):
+        linked = await _linked_message(client, _guild_id, channel_id, message_id)
+        if linked is not None:
+            out.append((0, "the message link in the request", linked))
     reference = getattr(message, "reference", None)
     if reference is not None:
         resolved = getattr(reference, "resolved", None)
@@ -3115,7 +3176,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
 
     images, attachment_text = await attachment_context_for(message, settings=bot.settings)
     attachment_text = await context_attachment_text(
-        message, settings=bot.settings, images=images, existing_text=attachment_text
+        message, settings=bot.settings, images=images, existing_text=attachment_text, client=bot
     )
     async with message.channel.typing():
         result = await _public_model_completion(
@@ -3721,7 +3782,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     # ephemeral ("only you can see this") message, and DMs are not used.
     images, attachment_text = await attachment_context_for(message, settings=bot.settings)
     attachment_text = await context_attachment_text(
-        message, settings=bot.settings, images=images, existing_text=attachment_text
+        message, settings=bot.settings, images=images, existing_text=attachment_text, client=bot
     )
     async with message.channel.typing():
         result = await _public_model_completion(
