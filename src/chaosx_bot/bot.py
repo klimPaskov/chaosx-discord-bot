@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 from urllib.parse import urlparse
 import sys
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -148,6 +149,7 @@ from .video_context import (
     probe_video,
     temp_workspace,
     transcribe,
+    VIDEO_EXTENSIONS,
     ytdlp_available,
 )
 from .web_grounding import WebGrounder, format_web_results_for_display
@@ -198,6 +200,8 @@ from .runtime_status import (
 from .server_rules import ServerRules
 from .storage import Store
 from .webhook_server import GitHubWebhookServer
+
+logger = logging.getLogger("chaosx.attachments")
 
 BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
 AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
@@ -2506,11 +2510,11 @@ async def _text_attachment(attachment, *, max_chars: int = 4000) -> str | None:
 
 
 def _format_size(num_bytes: int) -> str:
-    if num_bytes < 1024:
+    if num_bytes < 1000:
         return f"{num_bytes} B"
-    if num_bytes < 1024 * 1024:
-        return f"{num_bytes / 1024:.1f} KB"
-    return f"{num_bytes / (1024 * 1024):.1f} MB"
+    if num_bytes < 1000 * 1000:
+        return f"{num_bytes / 1000:.1f} KB"
+    return f"{num_bytes / (1000 * 1000):.1f} MB"
 
 
 async def _fetch_url_text(url: str, *, max_chars: int = 2500, timeout_s: float = 8.0) -> str | None:
@@ -2592,25 +2596,50 @@ async def attachment_context_for(
     video_blocks: list[str] = []
     unreadable: list[str] = []
     video_settings = settings
-    for attachment in getattr(message, "attachments", None) or []:
+    attachments = list(getattr(message, "attachments", None) or [])
+    if attachments:
+        logger.info(
+            "attachment inventory message=%s count=%d %s",
+            getattr(message, "id", "?"),
+            len(attachments),
+            [
+                (
+                    getattr(a, "filename", "?"),
+                    (getattr(a, "content_type", None) or "-"),
+                    _format_size(getattr(a, "size", 0) or 0),
+                )
+                for a in attachments
+            ],
+        )
+    for attachment in attachments:
         name = getattr(attachment, "filename", None) or "file"
         uri = await _image_data_uri(attachment)
         if uri and len(images) < max_images:
             images.append(uri)
+            logger.info("attachment %s -> image part (%d images so far)", name, len(images))
             continue
         video_block = None
         if video_settings is not None and video_settings.video_processing_enabled:
             video_block = await _video_attachment_block(attachment, video_settings, images)
         if video_block:
             video_blocks.append(video_block)
+            logger.info("attachment %s -> video block (%d chars, %d frames)", name, len(video_block), len(images))
             continue
+        if (
+            video_settings is not None
+            and video_settings.video_processing_enabled
+            and _attachment_ext(attachment).lower() in VIDEO_EXTENSIONS
+        ):
+            logger.warning("attachment %s looks like a video but produced no block", name)
         if len(text_blocks) < max_urls:
             text = await _text_attachment(attachment, max_chars=max_text)
             if text is not None:
                 text_blocks.append(f"`{name}`:\n{text}")
+                logger.info("attachment %s -> text block (%d chars)", name, len(text))
                 continue
         if len(unreadable) < max_urls:
             unreadable.append(f"`{name}` ({_format_size(getattr(attachment, 'size', 0) or 0)})")
+            logger.warning("attachment %s -> unreadable (no decoder, no video pipeline)", name)
     links = await _fetch_links(getattr(message, "content", "") or "", max_urls=max_urls, max_chars=url_chars)
     if video_settings is not None and video_settings.video_processing_enabled:
         video_blocks.extend(
@@ -2634,20 +2663,28 @@ async def _video_attachment_block(attachment, settings: Settings, images: list[s
     Returns a prompt block (and appends its frames to ``images``) or None when
     the attachment is not a video / cannot be read. Never raises.
     """
+    name = getattr(attachment, "filename", None) or "video"
     try:
         size = getattr(attachment, "size", 0) or 0
-        name = getattr(attachment, "filename", None) or "video"
         ext = _attachment_ext(attachment)
         ctype = (getattr(attachment, "content_type", None) or "").lower()
         if size and size > settings.video_max_bytes:
+            logger.warning(
+                "video attachment %s skipped: %s exceeds the %s limit",
+                name,
+                _format_size(size),
+                _format_size(settings.video_max_bytes),
+            )
             return f"## Attached video: {name} ({_format_size(size)}) — too large to analyse (limit {_format_size(settings.video_max_bytes)})."
         data = await _read_attachment_bytes(attachment)
         if not data:
+            logger.warning("video attachment %s could not be downloaded", name)
             return None
         if not looks_like_video(data, ext=ext, content_type=ctype):
             return None
         return await _analyse_video_bytes(data, label=name, settings=settings, images=images)
-    except Exception:  # noqa: BLE001 - attachment analysis must never break a reply
+    except Exception as exc:  # noqa: BLE001 - attachment analysis must never break a reply
+        logger.warning("video attachment analysis failed for %s: %r", name, exc)
         return None
 
 
@@ -2659,7 +2696,8 @@ async def _video_link_blocks(text: str, settings: Settings, images: list[str]) -
             continue
         try:
             block = await _video_link_block(url, settings, images)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("video link analysis failed for %s: %r", url, exc)
             block = None
         if block:
             blocks.append(block)
@@ -2673,14 +2711,33 @@ async def _video_link_block(url: str, settings: Settings, images: list[str]) -> 
         label = Path(urlparse(url).path).name or url
         if downloaded is not None:
             data, _ctype = downloaded
+            logger.info("video link %s -> direct download (%s)", url, _format_size(len(data)))
             return await _analyse_video_bytes(data, label=label, settings=settings, images=images, workspace=workspace)
         if settings.video_link_ytdlp_enabled and ytdlp_available():
             path = await download_platform_video(url, workspace, max_seconds=settings.video_max_seconds)
             if path is not None:
+                logger.info("video link %s -> platform download via yt-dlp", url)
                 return await _analyse_video_path(
                     path, label=f"{label} ({urlparse(url).hostname})", settings=settings, images=images, workspace=workspace
                 )
-        return None
+            logger.warning("video link %s: yt-dlp could not fetch it from this host", url)
+        else:
+            logger.warning(
+                "video link %s: platform download unavailable (video_link_ytdlp_enabled=%s, yt_dlp=%s)",
+                url,
+                settings.video_link_ytdlp_enabled,
+                ytdlp_available(),
+            )
+        # Nothing was fetched: say so explicitly. Without this the model only
+        # sees the page text and answers "no video reached me", which reads as
+        # the bot ignoring the link.
+        host = urlparse(url).hostname or urlparse(url).netloc or "link"
+        return (
+            f"## Linked video: {url} ({host}) — this link points at a video, but the bot could not download "
+            "the file from the server (platform downloads are blocked here), so there are no frames and no "
+            "speech transcript for it. Say plainly that the video itself could not be fetched; you may use the "
+            "linked page text below, but never describe or summarise video content you did not receive."
+        )
     finally:
         cleanup(workspace)
 
