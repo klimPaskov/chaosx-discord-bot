@@ -462,6 +462,56 @@ def reply_resolved_to_bot(message: discord.Message, bot_user_id: int | None) -> 
     return bool(author and getattr(author, "id", None) == bot_user_id)
 
 
+FRAGMENT_MAX_WORDS = 8
+
+
+def looks_like_fragment(request: str) -> bool:
+    """True when the addressed text carries no question of its own.
+
+    "Idk ask" / "why though" style fragments must be resolved against the
+    surrounding conversation instead of being answered as an empty ask
+    (Hoops 2026-09-19).
+    """
+    text = " ".join((request or "").split())
+    if not text:
+        return True
+    if "?" in text:
+        return False
+    return len(text.split()) <= FRAGMENT_MAX_WORDS
+
+
+def addressed_message_context(
+    *,
+    raw_content: str,
+    request: str,
+    reply_context: str = "",
+    has_conversation: bool = False,
+) -> str:
+    """Tell the model exactly which Discord message it is answering, and to resolve it.
+
+    The extracted request drops the bot's name, so it can look like a non-question
+    ("Idk ask chaosX" -> "Idk ask"). This block hands over the raw message, the
+    message(s) it replied to, and — for a fragment inside a live conversation — an
+    explicit instruction to answer what it refers to rather than "nothing to work with".
+    """
+    parts: list[str] = []
+    raw = " ".join((raw_content or "").split())
+    req = " ".join((request or "").split())
+    if raw and raw.casefold() != req.casefold():
+        parts.append(f'The Discord message you were addressed with: "{raw[:300]}"')
+    if (reply_context or "").strip():
+        parts.append(reply_context.strip())
+    if has_conversation and looks_like_fragment(request):
+        parts.append(
+            "That message is short and carries no question of its own — work out what it refers to "
+            "from the conversation above (the message it replies to and the recent messages) and "
+            "answer that, instead of saying there is nothing to work with."
+        )
+    if not parts:
+        return ""
+    return "## The message you are answering\n" + "\n".join(parts)
+
+
 def format_message_ask_chain_context(rows: list[tuple]) -> str:
     if not rows:
         return ""
@@ -2625,7 +2675,10 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
     chain_context = await fetch_message_ask_chain_context(bot, bot_message_id=parent_bot_message_id, guild_id=guild_id, channel_id=channel_id)
     if chain_context:
         owner_context += "\n\n" + chain_context
-    owner_request = request + owner_context
+    # Stored records go in the background block (below), never in the request slot:
+    # the prompt must end on the current request so an unrelated stored note can never
+    # become the answer (Hoops 2026-09-19).
+    owner_request = request
     admin_conversation_context = await conversation_context_for(
         bot.settings.db_path,
         channel_id=channel_id or 0,
@@ -2636,6 +2689,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         guild_name=guild_name,
         channel_name=channel_name,
         conversation_context=admin_conversation_context,
+        memory_context=owner_context,
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
         model_name=bot.settings.operator_model if looks_like_model_identity_question(owner_request) else "",
@@ -3210,6 +3264,21 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         channel_context = "\n".join(part for part in (main_context, linked_context) if part)
     except Exception:
         channel_context = ""
+    # The addressed message may be a short fragment or a reply inside a live chat
+    # ("Idk ask chaosX"): hand the model the raw message and what it replied to so it
+    # can answer what is actually being discussed (Hoops 2026-09-19).
+    reply_context = ""
+    if parent_bot_message_id is None:
+        try:
+            reply_context = await bot.channel_reader.reply_chain_context(channel_id, message.id)
+        except Exception:
+            reply_context = ""
+    addressed_context = addressed_message_context(
+        raw_content=message.content or "",
+        request=request,
+        reply_context=reply_context,
+        has_conversation=bool(conversation_context.strip() or channel_context.strip()),
+    )
     # Web grounding: always available so the model can reach the web when it
     # needs it (never for catalog lookups — a miss must be a plain "not
     # found", not a search dump).
@@ -3243,6 +3312,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         web_context=web_context,
         model_name=bot.settings.ask_model if looks_like_model_identity_question(request) else "",
         cost_context=_cost_lookup_block(settings=bot.settings, text=request),
+        addressed_context=addressed_context,
     )
     # No thinking feed for mention asks: only slash commands can carry an
     # ephemeral ("only you can see this") message, and DMs are not used.
@@ -4022,7 +4092,9 @@ async def run_hermes_command(
             owner_context = await fetch_admin_ask_memory_context(bot, interaction)
         owner_context += await fetch_admin_member_context(bot, interaction, request)
         owner_context += await fetch_admin_message_context(bot, interaction, request)
-    owner_request = request + owner_context
+    # Background records ride in the memory block, not the request slot (see
+    # _owner_memory_block): the prompt must end on the current owner request.
+    owner_request = request
     admin_conversation_context = ""
     if owner_only:
         admin_conversation_context = await conversation_context_for(
@@ -4060,6 +4132,7 @@ async def run_hermes_command(
             guild_name=guild_name,
             channel_name=channel_name,
             conversation_context=admin_conversation_context,
+            memory_context=owner_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
             server_facts=bot.server_facts_block(),
