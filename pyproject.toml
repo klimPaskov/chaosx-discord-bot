@@ -19,6 +19,13 @@ dev = [
     "pytest>=8.0.0,<9",
     "pytest-asyncio>=0.24.0,<1",
 ]
+# Video support: frames come from ffmpeg (a host dependency), the speech
+# transcript from a local faster-whisper model, and platform links via yt-dlp.
+# Installed in the VPS bot venv; the code degrades gracefully when absent.
+video = [
+    "faster-whisper>=1.0,<2",
+    "yt-dlp>=2024.1",
+]
 
 [project.scripts]
 chaosx-bot = "chaosx_bot.main:main"

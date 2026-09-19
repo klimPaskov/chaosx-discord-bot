@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, cast
 
 import aiohttp
@@ -133,6 +134,22 @@ from .focus_trees import (
 from .guild_channels import GuildChannels
 from .guild_members import GuildMembers, colliding_display_ids, user_reference_name
 from .channel_context import ChannelReader
+from .video_context import (
+    cleanup,
+    download_platform_video,
+    download_video,
+    extract_audio,
+    extract_frames,
+    ffmpeg_available,
+    format_video_block,
+    is_video_link,
+    looks_like_video,
+    png_data_uri,
+    probe_video,
+    temp_workspace,
+    transcribe,
+    ytdlp_available,
+)
 from .web_grounding import WebGrounder, format_web_results_for_display
 from .web_sources import EvidenceImage
 from .vault_index import refresh_vault_indexes
@@ -679,7 +696,7 @@ async def generate_auto_scan_model_response(
     guild_name = message.guild.name if message.guild else None
     channel_name = getattr(message.channel, "name", None)
     user_message = decision.question or message.content or ""
-    images, attachment_text = await attachment_context_for(message)
+    images, attachment_text = await attachment_context_for(message, settings=bot.settings)
     conversation_context = await conversation_context_for(
         bot.settings.db_path,
         channel_id=getattr(message.channel, "id", 0),
@@ -2523,8 +2540,8 @@ async def _fetch_url_text(url: str, *, max_chars: int = 2500, timeout_s: float =
     return text[:max_chars]
 
 
-async def _fetch_links(text: str, *, max_urls: int = 3, max_chars: int = 2500) -> list[str]:
-    """Fetch each http(s) URL in the text and return cleaned page text blocks."""
+def _link_urls(text: str, *, max_urls: int = 3) -> list[str]:
+    """Unique http(s) URLs in the text, in order (shared by link + video handling)."""
     urls: list[str] = []
     seen: set[str] = set()
     for match in _URL_RE.finditer(text or ""):
@@ -2535,15 +2552,28 @@ async def _fetch_links(text: str, *, max_urls: int = 3, max_chars: int = 2500) -
         urls.append(url)
         if len(urls) >= max_urls:
             break
+    return urls
+
+
+async def _fetch_links(text: str, *, max_urls: int = 3, max_chars: int = 2500) -> list[str]:
+    """Fetch each http(s) URL in the text and return cleaned page text blocks."""
     blocks: list[str] = []
-    for url in urls:
+    for url in _link_urls(text, max_urls=max_urls):
         content = await _fetch_url_text(url, max_chars=max_chars)
         if content:
             blocks.append(f"<{url}>\n{content}")
     return blocks
 
 
-async def attachment_context_for(message: discord.Message, *, max_images: int = 3, max_text: int = 4000, max_urls: int = 3, url_chars: int = 2500) -> tuple[list[str], str]:
+async def attachment_context_for(
+    message: discord.Message,
+    *,
+    max_images: int = 3,
+    max_text: int = 4000,
+    max_urls: int = 3,
+    url_chars: int = 2500,
+    settings: Settings | None = None,
+) -> tuple[list[str], str]:
     """Extract usable model input from a message's attachments and links.
 
     Returns (image_data_uris, text_block). Images (any decoderable format,
@@ -2551,15 +2581,28 @@ async def attachment_context_for(message: discord.Message, *, max_images: int = 
     readable file attachments are decoded as text; http(s) links are fetched
     and cleaned. Files that can't be read are still acknowledged by name and
     size so nothing is silently ignored.
+
+    Video attachments (and direct video links) are analysed when
+    ``settings.video_processing_enabled``: frames are sampled for the vision
+    model and the speech track is transcribed locally, both described in the
+    text block so the model knows exactly what it received.
     """
     images: list[str] = []
     text_blocks: list[str] = []
+    video_blocks: list[str] = []
     unreadable: list[str] = []
+    video_settings = settings
     for attachment in getattr(message, "attachments", None) or []:
         name = getattr(attachment, "filename", None) or "file"
         uri = await _image_data_uri(attachment)
         if uri and len(images) < max_images:
             images.append(uri)
+            continue
+        video_block = None
+        if video_settings is not None and video_settings.video_processing_enabled:
+            video_block = await _video_attachment_block(attachment, video_settings, images)
+        if video_block:
+            video_blocks.append(video_block)
             continue
         if len(text_blocks) < max_urls:
             text = await _text_attachment(attachment, max_chars=max_text)
@@ -2569,7 +2612,13 @@ async def attachment_context_for(message: discord.Message, *, max_images: int = 
         if len(unreadable) < max_urls:
             unreadable.append(f"`{name}` ({_format_size(getattr(attachment, 'size', 0) or 0)})")
     links = await _fetch_links(getattr(message, "content", "") or "", max_urls=max_urls, max_chars=url_chars)
+    if video_settings is not None and video_settings.video_processing_enabled:
+        video_blocks.extend(
+            await _video_link_blocks(getattr(message, "content", "") or "", video_settings, images)
+        )
     sections: list[str] = []
+    if video_blocks:
+        sections.append("\n\n".join(video_blocks))
     if text_blocks:
         sections.append("Attached file contents:\n" + "\n\n".join(text_blocks))
     if links:
@@ -2577,6 +2626,139 @@ async def attachment_context_for(message: discord.Message, *, max_images: int = 
     if unreadable:
         sections.append("Unreadable attachments (only metadata; content could not be decoded):\n" + ", ".join(unreadable))
     return images, "\n\n".join(sections)
+
+
+async def _video_attachment_block(attachment, settings: Settings, images: list[str]) -> str | None:
+    """Analyse a video attachment: sampled frames + transcript.
+
+    Returns a prompt block (and appends its frames to ``images``) or None when
+    the attachment is not a video / cannot be read. Never raises.
+    """
+    try:
+        size = getattr(attachment, "size", 0) or 0
+        name = getattr(attachment, "filename", None) or "video"
+        ext = _attachment_ext(attachment)
+        ctype = (getattr(attachment, "content_type", None) or "").lower()
+        if size and size > settings.video_max_bytes:
+            return f"## Attached video: {name} ({_format_size(size)}) — too large to analyse (limit {_format_size(settings.video_max_bytes)})."
+        data = await _read_attachment_bytes(attachment)
+        if not data:
+            return None
+        if not looks_like_video(data, ext=ext, content_type=ctype):
+            return None
+        return await _analyse_video_bytes(data, label=name, settings=settings, images=images)
+    except Exception:  # noqa: BLE001 - attachment analysis must never break a reply
+        return None
+
+
+async def _video_link_blocks(text: str, settings: Settings, images: list[str]) -> list[str]:
+    """Analyse video links in a message (direct files and platform links)."""
+    blocks: list[str] = []
+    for url in _link_urls(text):
+        if not is_video_link(url):
+            continue
+        try:
+            block = await _video_link_block(url, settings, images)
+        except Exception:  # noqa: BLE001
+            block = None
+        if block:
+            blocks.append(block)
+    return blocks[:1]
+
+
+async def _video_link_block(url: str, settings: Settings, images: list[str]) -> str | None:
+    workspace: Path = temp_workspace()
+    try:
+        downloaded = await download_video(url, max_bytes=settings.video_max_bytes)
+        label = Path(urlparse(url).path).name or url
+        if downloaded is not None:
+            data, _ctype = downloaded
+            return await _analyse_video_bytes(data, label=label, settings=settings, images=images, workspace=workspace)
+        if settings.video_link_ytdlp_enabled and ytdlp_available():
+            path = await download_platform_video(url, workspace, max_seconds=settings.video_max_seconds)
+            if path is not None:
+                return await _analyse_video_path(
+                    path, label=f"{label} ({urlparse(url).hostname})", settings=settings, images=images, workspace=workspace
+                )
+        return None
+    finally:
+        cleanup(workspace)
+
+
+async def _analyse_video_bytes(
+    data: bytes,
+    *,
+    label: str,
+    settings: Settings,
+    images: list[str],
+    workspace: Path | None = None,
+) -> str:
+    own_workspace = workspace is None
+    workspace = workspace or temp_workspace()
+    try:
+        source = workspace / "source.bin"
+        source.write_bytes(data)
+        return await _analyse_video_path(source, label=label, settings=settings, images=images, workspace=workspace)
+    finally:
+        if own_workspace:
+            cleanup(workspace)
+
+
+async def _analyse_video_path(
+    path: Path,
+    *,
+    label: str,
+    settings: Settings,
+    images: list[str],
+    workspace: Path,
+) -> str:
+    """Probe → frames → transcript for one video file on disk."""
+    if not ffmpeg_available():
+        return f"## Attached video: {label} (ffmpeg is unavailable on the bot host, so it could not be analysed)"
+    probe = await probe_video(path)
+    if not probe:
+        return f"## Attached video: {label} (the file could not be read as a video)"
+    duration = float(probe.get("duration") or 0.0)
+    frames, timestamps = await extract_frames(
+        path,
+        workspace,
+        count=settings.video_frame_count,
+        width=settings.video_frame_width,
+        duration=duration,
+        max_seconds=settings.video_max_seconds or None,
+    )
+    room = max(0, settings.video_max_processed_images - len(images))
+    for _stamp, png in frames[:room]:
+        images.append(png_data_uri(png))
+    transcript = ""
+    transcript_note = ""
+    if probe.get("has_audio") and settings.stt_enabled:
+        wav = workspace / "audio.wav"
+        if await extract_audio(path, wav, max_seconds=settings.stt_max_seconds):
+            transcript, transcript_note = await transcribe(
+                wav,
+                model=settings.stt_model,
+                language=settings.stt_language,
+                timeout=settings.stt_timeout_seconds,
+            )
+        else:
+            transcript_note = "skipped (no audio track could be extracted)"
+    elif not probe.get("has_audio"):
+        transcript_note = "none (the file has no audio track)"
+    else:
+        transcript_note = "skipped (speech transcription is disabled on the bot)"
+    truncated = bool(settings.video_max_seconds) and duration > settings.video_max_seconds
+    processed = dict(probe)
+    processed["processed_seconds"] = min(duration, settings.video_max_seconds) if settings.video_max_seconds else duration
+    return format_video_block(
+        label=label,
+        probe=processed,
+        transcript=transcript,
+        transcript_note=transcript_note,
+        frames=len(frames[:room]),
+        timestamps=timestamps[:room],
+        truncated=truncated,
+    )
 
 
 async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
@@ -2713,7 +2895,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
     )
     await feed.start()
 
-    images, attachment_text = await attachment_context_for(message)
+    images, attachment_text = await attachment_context_for(message, settings=bot.settings)
     async with message.channel.typing():
         result = await _public_model_completion(
             bot=bot,
@@ -3316,7 +3498,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     )
     # No thinking feed for mention asks: only slash commands can carry an
     # ephemeral ("only you can see this") message, and DMs are not used.
-    images, attachment_text = await attachment_context_for(message)
+    images, attachment_text = await attachment_context_for(message, settings=bot.settings)
     async with message.channel.typing():
         result = await _public_model_completion(
             bot=bot,

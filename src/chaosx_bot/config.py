@@ -48,6 +48,18 @@ class Settings(BaseSettings):
     auto_scan_notify_channel_id: Optional[int] = Field(default=None, description="Channel for auto-scan moderation notices; defaults to automation_reminder_channel_id")
     auto_scan_excluded_channel_ids: str = Field(default="", description="Comma-separated Discord channel/thread IDs ignored by auto-scan")
     admin_context_message_limit: int = Field(default=120, ge=10, le=500, description="Max recent Discord messages /admin ask may fetch for explicit analysis requests")
+    video_processing_enabled: bool = Field(default=True, description="Analyse video attachments and video links (sampled frames + speech transcript)")
+    video_max_bytes: int = Field(default=40_000_000, ge=0, le=500_000_000, description="Max bytes of a video attachment/link to download and analyse")
+    video_max_seconds: int = Field(default=300, ge=0, le=3600, description="Max video seconds analysed; longer clips are cut to this window")
+    video_frame_count: int = Field(default=4, ge=0, le=8, description="Frames sampled per video for the vision model")
+    video_frame_width: int = Field(default=768, ge=240, le=1600, description="Width of each sampled frame in pixels")
+    video_max_processed_images: int = Field(default=6, ge=1, le=10, description="Total images (attachments + video frames) sent to the model per message")
+    video_link_ytdlp_enabled: bool = Field(default=True, description="Use yt-dlp for platform video links (YouTube etc.) when the binary is available")
+    stt_enabled: bool = Field(default=True, description="Transcribe speech in videos/audio with the local speech model")
+    stt_model: str = Field(default="base", description="Local faster-whisper model size (tiny|base|small|medium|large-v3)")
+    stt_language: str = Field(default="en", description="Speech language hint; blank = auto-detect")
+    stt_max_seconds: int = Field(default=180, ge=0, le=1800, description="Max seconds of audio transcribed per video")
+    stt_timeout_seconds: int = Field(default=300, ge=10, le=1800, description="Hard cap for a single transcription run")
 
     @model_validator(mode="before")
     @classmethod
