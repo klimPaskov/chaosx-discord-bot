@@ -116,6 +116,8 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Repeatable events:' in status
     assert 'Fire-once events:' in status
     assert 'Triggerable scenarios:' in status
+    # The catalog status is a summary — it must not enumerate every scenario.
+    assert 'Scenario list' not in status
     assert 'Known' not in status
     assert 'Indexed commit' not in status
     assert 'source docs' not in status

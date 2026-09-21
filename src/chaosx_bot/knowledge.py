@@ -160,11 +160,9 @@ class Knowledge:
             scenarios = conn.execute("SELECT COUNT(*) FROM catalog_scenarios").fetchone()[0]
             clusters = conn.execute("SELECT COUNT(*) FROM catalog_clusters").fetchone()[0]
             status_rows = conn.execute("SELECT COALESCE(NULLIF(status, ''), 'Unmarked') AS status, COUNT(*) FROM catalog_events GROUP BY 1 ORDER BY COUNT(*) DESC, status LIMIT 6").fetchall()
-            scenario_rows = conn.execute("SELECT scenario_id, name, status FROM catalog_scenarios ORDER BY CAST(scenario_id AS INTEGER) LIMIT 8").fetchall()
         finally:
             conn.close()
         status_text = ", ".join(f"{name}: {count}" for name, count in status_rows) or "none"
-        scenario_text = ", ".join(f"SCN-{int(sid):03d} {name}" for sid, name, _status in scenario_rows if sid) or "none"
         return (
             "## Chaos Redux catalog status\n"
             f"- Events: `{events}` total\n"
@@ -175,7 +173,6 @@ class Knowledge:
             f"- Clusters: `{clusters}`\n"
             f"- Indexed docs/files: `{docs}`\n"
             f"- Event status breakdown: {status_text}\n"
-            f"- Scenario list: {scenario_text}\n"
         )
 
     def testing_queue(self, limit: int = 10) -> str:
