@@ -154,6 +154,17 @@ CREATE TABLE IF NOT EXISTS automation_config (
     config_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS routine_posts (
+    name TEXT PRIMARY KEY,
+    period_key TEXT NOT NULL DEFAULT '',
+    posted_at TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL DEFAULT '',
+    channel_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
+);
 """
 
 DEFAULT_AUTOMATIONS = {
@@ -167,6 +178,8 @@ DEFAULT_AUTOMATIONS = {
     "playtest_result_synthesis": 1,
     "weekly_content_dump": 1,
     "release_announcement_posting": 0,
+    "routine_dev_digest": 1,
+    "routine_release_posts": 1,
 }
 
 AUTOMATION_DESCRIPTIONS = {
@@ -180,6 +193,8 @@ AUTOMATION_DESCRIPTIONS = {
     "playtest_result_synthesis": "Batches new playtest observations into a private model-generated report with bugs, balance concerns, successful checks, uncertain findings, and next actions.",
     "weekly_content_dump": "Image-led weekly content-dump post. Posts only when enough fresh visuals/assets exist.",
     "release_announcement_posting": "Reserved for release announcement posting; should stay off until explicitly used.",
+    "routine_dev_digest": "Autonomous weekly dev digest: real commit/catalog/issue/Q&A facts, posted once a week to the routine posts channel.",
+    "routine_release_posts": "Autonomous release announcements: posts when the mod version in descriptor.mod changes (or a GitHub release appears).",
 }
 
 
@@ -676,3 +691,83 @@ class Store:
                 (destination, now_iso(), *names),
             )
             await db.commit()
+
+    async def routine_post_states(self, names: list[str]) -> dict[str, dict]:
+        """Stored per-post state (period key, last check, last post) for the named post types."""
+        if not names:
+            return {}
+        placeholders = ",".join("?" for _ in names)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                f"SELECT name, period_key, posted_at, checked_at, channel_id, message_id, status, detail "
+                f"FROM routine_posts WHERE name IN ({placeholders})",
+                tuple(names),
+            )
+            rows = await cur.fetchall()
+        columns = ("name", "period_key", "posted_at", "checked_at", "channel_id", "message_id", "status", "detail")
+        return {str(row[0]): dict(zip(columns, row)) for row in rows}
+
+    async def record_routine_post(
+        self,
+        name: str,
+        *,
+        period_key: str = "",
+        posted_at: str = "",
+        checked_at: str = "",
+        channel_id: str = "",
+        message_id: str = "",
+        status: str = "",
+        detail: str = "",
+    ) -> None:
+        """Upsert one routine-post state row.
+
+        Empty values never clobber existing data, so a baseline write (checked_at +
+        detail) can coexist with a later real post (period_key + posted_at).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO routine_posts(name, period_key, posted_at, checked_at, channel_id, message_id, status, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    period_key = CASE WHEN excluded.period_key != '' THEN excluded.period_key ELSE routine_posts.period_key END,
+                    posted_at = CASE WHEN excluded.posted_at != '' THEN excluded.posted_at ELSE routine_posts.posted_at END,
+                    checked_at = CASE WHEN excluded.checked_at != '' THEN excluded.checked_at ELSE routine_posts.checked_at END,
+                    channel_id = CASE WHEN excluded.channel_id != '' THEN excluded.channel_id ELSE routine_posts.channel_id END,
+                    message_id = CASE WHEN excluded.message_id != '' THEN excluded.message_id ELSE routine_posts.message_id END,
+                    status = CASE WHEN excluded.status != '' THEN excluded.status ELSE routine_posts.status END,
+                    detail = CASE WHEN excluded.detail != '' THEN excluded.detail ELSE routine_posts.detail END
+                """,
+                (name, period_key, posted_at, checked_at, channel_id, message_id, status, detail[:4000]),
+            )
+            await db.commit()
+
+    async def routine_stats(self, *, since_iso: str) -> dict[str, int]:
+        """Windowed server facts for the weekly digest (counted rows, never estimates)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async def scalar(sql: str, params: tuple = ()) -> int:
+                cur = await db.execute(sql, params)
+                row = await cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+
+            return {
+                "answers": await scalar(
+                    "SELECT COUNT(*) FROM auto_scan_events WHERE action = 'answer' AND created_at >= ?",
+                    (since_iso,),
+                ),
+                "warnings": await scalar(
+                    "SELECT COUNT(*) FROM auto_scan_events WHERE action = 'soft_warning' AND created_at >= ?",
+                    (since_iso,),
+                ),
+                "banter": await scalar(
+                    "SELECT COUNT(*) FROM auto_scan_events WHERE action = 'banter' AND created_at >= ?",
+                    (since_iso,),
+                ),
+                "asks": await scalar(
+                    "SELECT COUNT(*) FROM message_ask_memory WHERE created_at >= ?", (since_iso,)
+                ),
+                "playtests": await scalar(
+                    "SELECT COUNT(*) FROM playtest_records WHERE created_at >= ?", (since_iso,)
+                ),
+                "playtests_total": await scalar("SELECT COUNT(*) FROM playtest_records"),
+            }

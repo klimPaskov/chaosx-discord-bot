@@ -77,6 +77,8 @@ class Settings(BaseSettings):
                 "command_guild_id",
                 "automation_reminder_channel_id",
                 "content_dump_channel_id",
+                "routine_posts_channel_id",
+                "routine_release_channel_id",
                 "community_event_ideas_channel_id",
                 "access_reaction_channel_id",
                 "access_reaction_message_id",
@@ -148,6 +150,13 @@ class Settings(BaseSettings):
     automation_reminder_channel_id: Optional[int] = Field(default=1395464062367698977, description="Discord channel for automation reminders/digests")
     rules_channel_id: Optional[int] = Field(default=1395464062367698974, description="Discord #rules channel whose announcements the bot learns for rule questions and soft warnings")
     content_dump_channel_id: Optional[int] = Field(default=1516054706286235768, description="Discord channel for weekly image-led content dumps")
+    routine_posts_channel_id: Optional[int] = Field(default=1516054706286235768, description="Discord channel for autonomous routine posts (weekly dev digest)")
+    routine_release_channel_id: Optional[int] = Field(default=None, description="Discord channel for autonomous release announcements; blank reuses routine_posts_channel_id")
+    routine_posts_enabled: bool = Field(default=True, description="Master switch for autonomous routine posts (weekly dev digest + release announcements)")
+    dev_digest_weekday: int = Field(default=0, ge=0, le=6, description="Weekday for the weekly dev digest post (0=Monday)")
+    dev_digest_hour_utc: int = Field(default=12, ge=0, le=23, description="UTC hour for the weekly dev digest post")
+    routine_posts_tick_seconds: int = Field(default=600, ge=60, le=3600, description="How often the bot checks whether a routine post is due")
+    release_check_interval_hours: int = Field(default=6, ge=1, le=48, description="How often to check for a new mod version/GitHub release")
     access_reaction_channel_id: Optional[int] = Field(default=1396027815786188890, description="Info channel for the access reaction-role message")
     access_reaction_message_id: Optional[int] = Field(default=1526508030886154331, description="Message whose reactions control community access roles")
     access_reaction_chaos_emoji_id: Optional[int] = Field(default=1525495423949864960, description="Custom Chaos Redux logo emoji ID for the community-only role")

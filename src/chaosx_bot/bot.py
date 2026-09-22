@@ -15,6 +15,7 @@ import logging
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, cast
 
@@ -193,6 +194,32 @@ from .playtest_synthesis import (
     build_playtest_synthesis_prompt,
 )
 from .rate_limit import FixedWindowRateLimiter, RateLimitResult
+from .routine_posts import (
+    DEV_DIGEST,
+    DIGEST_WINDOW_DAYS,
+    RELEASE_POSTS,
+    ROUTINE_POSTS,
+    RoutinePostResult,
+    RoutinePostSpec,
+    build_digest_prompt,
+    build_release_prompt,
+    descriptor_version,
+    digest_fallback,
+    git_commit_summary,
+    git_commits_between,
+    git_files_touched,
+    git_head_sha,
+    github_issue_activity,
+    github_latest_release,
+    plan_due_posts,
+    release_fallback,
+    release_signal_changed,
+    release_state_detail,
+    sanitize_post,
+    utcnow,
+    weekly_period_key,
+    weekly_slot,
+)
 from .runtime_status import (
     collect_process_tree,
     format_hermes_progress,
@@ -248,6 +275,9 @@ BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
 AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
 AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
 AUTO_BANTER_AUTOMATION_NAME = "auto_bot_topic_banter"
+# Autonomous routine posts (weekly dev digest / release announcements): the first
+# tick waits a little so startup work (index, members, channels) settles first.
+ROUTINE_POSTS_WORKER_INITIAL_DELAY_S = 90
 PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
 PUBLIC_ASK_DOMAIN_TERMS = {
     "chaos redux", "chaosx", "hoi4", "hearts of iron", "mod", "event", "scenario", "cluster", "mechanic",
@@ -1384,6 +1414,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
+- `/admin routine action:list|preview|run [name:<routine_dev_digest|routine_release_posts>]` — owner-only control for the autonomous routine posts. `list` shows schedule, destination, last run and whether this week's post is still due; `preview` builds and posts it now without counting toward the period; `run` posts it for real. Disable any of them with `/admin automation action:disable name:<...>`.
 - `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for model-generated auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
 - `/admin user-memory [user:<name or ID>] [public:<bool>]` — owner-only viewer for saved per-user memory (profile summarizations only; recent raw messages stay internal). With no user, dumps summaries for every user in the database that has memory saved (users who have never sent messages are skipped, always ephemeral). With a specific user, the optional `public:true` posts the answer as a normal channel message instead of ephemeral; user mentions are clickable so you can open their profile.
 - `/admin scan-history [limit:<n>]` — owner-only backfill: reads all readable channel/thread history in the server, captures it into conversation memory, and force-builds user profiles in the background (deduped, so it is safe to rerun). Results are posted to the command channel when finished.
@@ -1450,6 +1481,7 @@ class ChaosXBot(discord.Client):
             port=settings.webhook_port,
         )
         self._playtest_synthesis_task: asyncio.Task[None] | None = None
+        self._routine_posts_task: asyncio.Task[None] | None = None
         self._mcp_warm_task: asyncio.Task[None] | None = None
         self._memory_maintenance_task: asyncio.Task[None] | None = None
         self._playtest_synthesis_lock = asyncio.Lock()
@@ -1893,6 +1925,19 @@ class ChaosXBot(discord.Client):
                 ["weekly_content_dump"],
                 str(self.settings.content_dump_channel_id),
             )
+        if self.settings.routine_posts_channel_id:
+            await self.store.set_automation_destination(
+                ["routine_dev_digest"],
+                str(self.settings.routine_posts_channel_id),
+            )
+        routine_release_channel = (
+            self.settings.routine_release_channel_id or self.settings.routine_posts_channel_id
+        )
+        if routine_release_channel:
+            await self.store.set_automation_destination(
+                ["routine_release_posts"],
+                str(routine_release_channel),
+            )
         await self.webhook_server.start()
         await self.update_application_description()
         register_commands(self)
@@ -1927,6 +1972,11 @@ class ChaosXBot(discord.Client):
         if self._mcp_warm_task is None or self._mcp_warm_task.done():
             self._mcp_warm_task = asyncio.create_task(
                 self._warm_mcp_session(), name="chaosx-mcp-warmup"
+            )
+        if self._routine_posts_task is None or self._routine_posts_task.done():
+            self._routine_posts_task = asyncio.create_task(
+                self._routine_posts_worker(ROUTINE_POSTS_WORKER_INITIAL_DELAY_S),
+                name="chaosx-routine-posts",
             )
         print(f"ChaosX logged in as {self.user} owner_id={self.settings.owner_id}")
 
@@ -2059,6 +2109,296 @@ class ChaosXBot(discord.Client):
                 summary=f"{len(playtest_ids)} reports -> {synthesis_id}",
             )
             return "sent"
+
+    # ------------------------------------------------------------------
+    # Autonomous routine posts (weekly dev digest + release announcements)
+    # ------------------------------------------------------------------
+
+    def _routine_post_specs(self) -> list[RoutinePostSpec]:
+        """Post types with settings overrides applied (weekday/hour, poll interval)."""
+        return [
+            replace(
+                DEV_DIGEST,
+                weekday=self.settings.dev_digest_weekday,
+                hour_utc=self.settings.dev_digest_hour_utc,
+            ),
+            replace(RELEASE_POSTS, interval_hours=self.settings.release_check_interval_hours),
+        ]
+
+    def _routine_post_destination(self, spec: RoutinePostSpec) -> int | None:
+        if spec.name == RELEASE_POSTS.name:
+            return self.settings.routine_release_channel_id or self.settings.routine_posts_channel_id
+        return self.settings.routine_posts_channel_id
+
+    async def _routine_posts_worker(self, delay_seconds: int) -> None:
+        await asyncio.sleep(max(0, delay_seconds))
+        while True:
+            try:
+                for result in await self._run_due_routine_posts():
+                    if result.action not in {"skipped", "unchanged"}:
+                        print(f"ChaosX routine post {result.name}: {result.action} {result.detail}".rstrip())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # one bad tick must never kill the loop
+                print(f"ChaosX routine posts tick failed: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(60, self.settings.routine_posts_tick_seconds))
+
+    async def _run_due_routine_posts(
+        self, *, force: str | None = None, preview: bool = False
+    ) -> list[RoutinePostResult]:
+        """Run every routine post that is due (or exactly one, when forced by the owner)."""
+        specs = self._routine_post_specs()
+        states = await self.store.routine_post_states([spec.name for spec in specs])
+        enabled = {spec.name: await self.store.automation_enabled(spec.name) for spec in specs}
+        if force:
+            due = [spec for spec in specs if spec.name == force]
+            if not due:
+                return [RoutinePostResult(name=force, action="skipped", detail="unknown post type")]
+        else:
+            if not self.settings.routine_posts_enabled:
+                return []
+            due = plan_due_posts(specs, now=utcnow(), states=states, enabled=enabled)
+        results: list[RoutinePostResult] = []
+        for spec in due:
+            if not enabled.get(spec.name, False) and not preview:
+                results.append(
+                    RoutinePostResult(name=spec.name, action="disabled", detail="automation disabled")
+                )
+                continue
+            state = states.get(spec.name) or {}
+            if spec.kind == "weekly":
+                results.append(await self._post_dev_digest(spec, state=state, preview=preview))
+            else:
+                results.append(await self._post_release_if_changed(spec, state=state, preview=preview))
+        return results
+
+    async def _collect_digest_signals(self) -> dict[str, Any]:
+        """Real facts only: live mod checkout, GitHub issues, and the bot's own DB."""
+        repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
+        window = DIGEST_WINDOW_DAYS
+        commits, event_files, version, head, issues = await asyncio.gather(
+            git_commit_summary(repo, since_days=window),
+            git_files_touched(repo, since_days=window, prefix="events"),
+            descriptor_version(repo),
+            git_head_sha(repo),
+            github_issue_activity(self.settings.github_repo, since_days=window),
+        )
+        stats = await self.store.routine_stats(
+            since_iso=(utcnow() - timedelta(days=window)).isoformat()
+        )
+        guild = self.guilds[0] if self.guilds else None
+        return {
+            "window_days": window,
+            "commits": commits,
+            "event_files": event_files,
+            "version": version,
+            "head": head,
+            "issues": issues,
+            "server": {
+                "answers": stats.get("answers", 0),
+                "qa_saved": stats.get("asks", 0),
+                "warnings": stats.get("warnings", 0),
+                "playtests": stats.get("playtests", 0),
+                "members": int(getattr(guild, "member_count", 0) or 0),
+            },
+        }
+
+    async def _routine_post_text(
+        self, *, prompt: str, activity_label: str, fallback: str
+    ) -> tuple[str, str]:
+        """Model-written post text; falls back to a facts-only version, never to silence."""
+        try:
+            result = await _public_model_completion(
+                bot=self,
+                system=SYSTEM_BOUNDARY,
+                prompt=prompt,
+                model=self.settings.operator_model,
+                reasoning_effort=self.settings.operator_reasoning_effort,
+                timeout_seconds=min(self.settings.hermes_timeout_seconds, 300),
+                activity_label=activity_label,
+                actor_id=self.settings.owner_id,
+            )
+        except Exception as exc:
+            print(f"ChaosX routine post model call failed: {type(exc).__name__}")
+            return sanitize_post(fallback), "model-error"
+        text = sanitize_post((result.stdout or "").strip())
+        if not result.ok or len(text) < 40:
+            print(
+                "ChaosX routine post used the facts-only fallback: "
+                f"ok={result.ok} chars={len(text)}"
+            )
+            return sanitize_post(fallback), "model-fallback"
+        return text, "model"
+
+    async def _deliver_routine_post(
+        self, spec: RoutinePostSpec, *, text: str, preview: bool
+    ) -> RoutinePostResult:
+        destination_id = self._routine_post_destination(spec)
+        if not destination_id:
+            return RoutinePostResult(
+                name=spec.name, action="error", detail="no destination channel configured", text=text
+            )
+        channel = self.get_channel(destination_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(destination_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                return RoutinePostResult(
+                    name=spec.name,
+                    action="error",
+                    detail=f"channel lookup failed: {type(exc).__name__}",
+                    text=text,
+                )
+        send_message = cast(
+            Callable[..., Awaitable[discord.Message]],
+            getattr(channel, "send", None),
+        )
+        if not callable(send_message):
+            return RoutinePostResult(
+                name=spec.name, action="error", detail="destination is not messageable", text=text
+            )
+        header = (
+            f"**PREVIEW — {spec.label}** (owner-triggered; not recorded as this period's post)\n\n"
+            if preview
+            else ""
+        )
+        sent: discord.Message | None = None
+        try:
+            for part in _chunk(header + text):
+                sent = await send_message(part, allowed_mentions=safe_allowed_mentions())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            return RoutinePostResult(
+                name=spec.name,
+                action="error",
+                detail=f"send failed: {type(exc).__name__}",
+                channel_id=destination_id,
+                text=text,
+            )
+        if sent is None:
+            return RoutinePostResult(
+                name=spec.name, action="error", detail="nothing sent", channel_id=destination_id, text=text
+            )
+        return RoutinePostResult(
+            name=spec.name,
+            action="posted",
+            channel_id=destination_id,
+            message_id=sent.id,
+            text=text,
+        )
+
+    async def _post_dev_digest(
+        self, spec: RoutinePostSpec, *, state: dict[str, Any], preview: bool
+    ) -> RoutinePostResult:
+        signals = await self._collect_digest_signals()
+        text, source = await self._routine_post_text(
+            prompt=build_digest_prompt(signals=signals),
+            activity_label="weekly dev digest",
+            fallback=digest_fallback(signals),
+        )
+        result = await self._deliver_routine_post(spec, text=text, preview=preview)
+        result.facts = signals
+        result.detail = f"{source}; {result.detail}".strip("; ")
+        if preview:
+            return result
+        now = utcnow().isoformat()
+        await self.store.record_routine_post(
+            spec.name,
+            period_key=weekly_period_key(utcnow()) if result.action == "posted" else "",
+            posted_at=now if result.action == "posted" else "",
+            checked_at=now,
+            channel_id=str(result.channel_id or ""),
+            message_id=str(result.message_id or ""),
+            status=result.action,
+            detail=result.detail,
+        )
+        await self.store.audit(
+            actor_id=self.settings.owner_id,
+            guild_id=self.settings.allowed_guild_id,
+            channel_id=result.channel_id,
+            command=f"automation {spec.name}",
+            summary=f"{result.action}: {result.detail}",
+        )
+        return result
+
+    async def _post_release_if_changed(
+        self, spec: RoutinePostSpec, *, state: dict[str, Any], preview: bool
+    ) -> RoutinePostResult:
+        repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
+        version, head, release = await asyncio.gather(
+            descriptor_version(repo),
+            git_head_sha(repo),
+            github_latest_release(self.settings.github_repo),
+        )
+        release_tag = str((release or {}).get("tag") or "")
+        now = utcnow().isoformat()
+        previous: dict[str, Any] = {}
+        if state.get("detail"):
+            try:
+                previous = json.loads(str(state["detail"]))
+            except json.JSONDecodeError:
+                previous = {}
+        if not preview and not release_signal_changed(state=state, version=version, tag=release_tag):
+            # First observation records the baseline; unchanged versions stay quiet.
+            await self.store.record_routine_post(
+                spec.name,
+                checked_at=now,
+                status="baseline" if not previous else "unchanged",
+                detail=release_state_detail(
+                    version=version, tag=release_tag, head=head, commits=[]
+                ),
+            )
+            return RoutinePostResult(
+                name=spec.name,
+                action="baseline" if not previous else "unchanged",
+                detail=f"version={version or 'unknown'}",
+            )
+        previous_sha = str(previous.get("head") or "")
+        commits = await git_commits_between(repo, old_sha=previous_sha) if previous_sha else []
+        if not commits:
+            summary = await git_commit_summary(repo, since_days=DIGEST_WINDOW_DAYS)
+            commits = list(summary.get("notable") or [])
+        signals = {
+            "version": version,
+            "previous_version": str(previous.get("version") or ""),
+            "head": head,
+            "release_tag": release_tag,
+            "commits": commits,
+            "commit_count": len(commits),
+        }
+        text, source = await self._routine_post_text(
+            prompt=build_release_prompt(signals=signals),
+            activity_label="release announcement",
+            fallback=release_fallback(signals),
+        )
+        result = await self._deliver_routine_post(spec, text=text, preview=preview)
+        result.facts = signals
+        result.detail = f"{source}; version={version or 'unknown'}; {result.detail}".strip("; ")
+        if preview:
+            return result
+        if result.action == "posted":
+            await self.store.record_routine_post(
+                spec.name,
+                posted_at=now,
+                checked_at=now,
+                channel_id=str(result.channel_id or ""),
+                message_id=str(result.message_id or ""),
+                status="posted",
+                detail=release_state_detail(
+                    version=version, tag=release_tag, head=head, commits=commits
+                ),
+            )
+            await self.store.audit(
+                actor_id=self.settings.owner_id,
+                guild_id=self.settings.allowed_guild_id,
+                channel_id=result.channel_id,
+                command=f"automation {spec.name}",
+                summary=f"posted: {result.detail}",
+            )
+        else:
+            await self.store.record_routine_post(
+                spec.name, checked_at=now, status=result.action
+            )
+        return result
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         allowed = self.settings.allowed_guild_id or self.settings.command_guild_id
@@ -5755,6 +6095,98 @@ def register_commands(bot: ChaosXBot) -> None:
             lines.append(f"- `{name}` — enabled=`{bool(enabled)}` — destination=`{destination or 'unset'}`\n  - {description}")
         text = "\n".join(lines)
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="routine", description="List, preview or post autonomous routine posts.")
+    async def admin_routine(interaction: discord.Interaction, action: str = "list", name: str = "") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = (action or "list").lower().strip()
+        name = (name or "").strip()
+        specs = bot._routine_post_specs()
+        valid = {spec.name: spec for spec in specs}
+        if action == "list":
+            states = await bot.store.routine_post_states(list(valid))
+            lines = ["## Routine posts (autonomous)"]
+            for spec in specs:
+                state = states.get(spec.name) or {}
+                enabled = await bot.store.automation_enabled(spec.name)
+                destination = bot._routine_post_destination(spec)
+                schedule = (
+                    f"weekly, weekday={spec.weekday} {spec.hour_utc:02d}:00 UTC"
+                    if spec.kind == "weekly"
+                    else f"checks every {spec.interval_hours}h for a version change"
+                )
+                if spec.kind == "weekly":
+                    period = weekly_period_key(utcnow())
+                    if state.get("period_key") == period:
+                        next_run = "posted this week"
+                    else:
+                        slot = weekly_slot(spec, utcnow())
+                        next_run = "due now" if utcnow() >= slot else f"due {slot.isoformat(timespec='minutes')}"
+                else:
+                    next_run = f"last check {state.get('checked_at') or 'never'}"
+                lines.append(
+                    f"- `{spec.name}` — enabled=`{enabled}` — {schedule}\n"
+                    f"  - destination: `{destination or 'unset'}`\n"
+                    f"  - last: `{state.get('status') or 'never'}` at `{state.get('posted_at') or state.get('checked_at') or 'never'}` ({next_run})\n"
+                    f"  - {spec.description}"
+                )
+            lines.append(
+                "\n`/admin routine action:preview name:<x>` builds and posts it now without counting toward the period; "
+                "`action:run name:<x>` posts for real. Kill switch: `/admin automation action:disable name:<x>`."
+            )
+            await interaction.response.send_message(
+                "\n".join(lines)[:1900], ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+        if action not in {"preview", "run"}:
+            await interaction.response.send_message(
+                "Use `action:list`, `action:preview name:<routine_dev_digest|routine_release_posts>`, or `action:run name:<...>`.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        if name not in valid:
+            await interaction.response.send_message(
+                f"Unknown post type `{name}`. Valid: {', '.join(f'`{n}`' for n in valid)}.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        results = await bot._run_due_routine_posts(force=name, preview=action == "preview")
+        result = results[0] if results else None
+        if result is None:
+            await interaction.followup.send(
+                "Nothing to do for that post type.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command=f"admin routine {action}",
+            summary=f"{result.name}: {result.action} {result.detail}".strip(),
+        )
+        if action == "preview":
+            summary = (
+                f"Preview for `{result.name}` posted to <#{result.channel_id}> "
+                f"(status `{result.action}`, {result.detail}). Not counted as this period's post."
+                if result.action == "posted"
+                else f"Preview failed for `{result.name}`: `{result.action}` {result.detail}"
+            )
+            await interaction.followup.send(
+                summary, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+        summary = (
+            f"Posted `{result.name}` to <#{result.channel_id}> ({result.detail})."
+            if result.action == "posted"
+            else f"`{result.name}`: `{result.action}` {result.detail}"
+        )
+        await interaction.followup.send(summary, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="autoscan", description="List recent ChaosX auto-scan actions.")
     async def admin_autoscan(interaction: discord.Interaction, action: str = "list", limit: int = 10) -> None:
