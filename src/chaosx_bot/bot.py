@@ -2482,6 +2482,46 @@ class ChaosXBot(discord.Client):
             tier_logger.warning("member title pass failed: %s", exc)
         return summary
 
+    async def _strip_bot_tier_roles(self, guild: discord.Guild, roles: dict[str, discord.Role]) -> int:
+        """Remove any chaos tier role worn by a bot account (the bot itself included)."""
+        removed = 0
+        ladder = {role.id for role in roles.values()}
+        bots = [member for member in list(getattr(guild, "members", []) or []) if member.bot]
+        me = guild.me
+        if me is not None and me not in bots:
+            bots.append(me)
+        for member in bots:
+            worn = [role for role in member.roles if role.id in ladder]
+            if not worn:
+                continue
+            try:
+                await member.remove_roles(*worn, reason="ChaosX: bots do not hold chaos tiers")
+                removed += len(worn)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                tier_logger.info("could not remove tier role from bot %s: %s", member.id, exc)
+        return removed
+
+    async def _apply_chaosx_role_color(self, guild: discord.Guild, report: dict[str, Any]) -> None:
+        """Keep the bot's own role in the mod's red (Hoops 2026-09-23)."""
+        wanted = int(getattr(self.settings, "chaosx_role_color", 0) or 0)
+        role = guild.me.top_role if guild.me is not None else None
+        if not wanted or role is None or role.is_default():
+            return
+        if int(role.colour.value or 0) == wanted:
+            return
+        try:
+            await role.edit(colour=discord.Colour(wanted), reason="ChaosX bot role colour")
+            report["created"].append(f"recoloured the {role.name} role to #{wanted:06X}")
+        except discord.Forbidden:
+            # Discord refuses point-blank: a bot can never edit the role it wears, because that role is
+            # its highest. Either the owner sets the colour once, or the bot gets a role above ChaosX.
+            report["failed"].append(
+                f"role colour: the bot cannot edit its own role ({role.name}) - set #{wanted:06X} once in "
+                "Server Settings > Roles, or give the bot a role above it so it can do it itself"
+            )
+        except discord.HTTPException as exc:
+            report["failed"].append(f"role colour: {exc}")
+
     async def _fill_missing_member_titles(self, *, limit: int = 3) -> int:
         """Write titles for members who have none yet, a few per pass (owner excluded, never-mention too).
 
@@ -2893,12 +2933,18 @@ class ChaosXBot(discord.Client):
             report["skipped"] = "no tier roles could be managed"
             return report
         when = utcnow().isoformat()
+        # The bot itself never wears a chaos tier (Hoops 2026-09-23): it is the ladder's keeper, not a
+        # climber, and a tier colour on the bot would also fight its own role colour.
+        report["bot_roles_removed"] = await self._strip_bot_tier_roles(guild, roles)
+        await self._apply_chaosx_role_color(guild, report)
         ladder = [name for name, _threshold in TIERS]
         upgrades: list[tuple[discord.Member, str, str]] = []
         for user_id, _xp, tier in await self.store.all_member_tiers():
             previous = await self.store.tier_role_state(user_id)
             if not force and previous == tier:
                 continue
+            if int(user_id) == int(getattr(self.user, "id", 0) or 0):
+                continue  # never colour the bot itself
             try:
                 member = guild.get_member(user_id) or await guild.fetch_member(user_id)
             except discord.NotFound:

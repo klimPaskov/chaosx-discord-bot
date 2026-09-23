@@ -188,6 +188,13 @@ class Settings(BaseSettings):
         default_factory=list,
         description="Display names scrubbed from generated posts, as a last line of defence.",
     )
+    chaosx_role_color: int = Field(
+        default=0xD6453C,
+        description=(
+            "Colour applied to the bot's own role (ChaosX) on each roles pass, so the bot always shows "
+            "the mod's red. 0 disables it (Hoops 2026-09-23: 'it should use the red color by default')."
+        ),
+    )
     owner_title: str = Field(
         default=(
             "The One and Only, First of His Name, Creator of Everything, Sovereign of the Chaos Ladder"
