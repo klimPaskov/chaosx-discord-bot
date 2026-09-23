@@ -1,9 +1,10 @@
 """Authoritative server facts taken from Discord itself.
 
-The bot's own tables answer "who has the bot seen?" — the `users` table holds people who talked to it,
-which is not the server's size (it said 36 while the server had 69 members). Any number the bot reports
-as "members" must come from Discord, and when Discord cannot be reached the count is reported as
-unavailable rather than guessed from local tables.
+The bot's own tables answer a different question: its `users` table only holds members it can currently
+see (the bot deliberately does not request the privileged GUILD_MEMBERS intent, so a full member list is
+403 and the table holds a partial set — 36 rows while the server had 69 members). Any number the bot
+reports as "members" must therefore come from Discord, and when Discord cannot be reached the count is
+reported as unavailable rather than guessed from local tables.
 
 `with_counts=true` gives Discord's own `approximate_member_count` / `approximate_presence_count` — the
 numbers members see in the member list. Exact enumeration needs the privileged GUILD_MEMBERS intent,

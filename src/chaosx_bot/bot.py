@@ -2373,8 +2373,8 @@ class ChaosXBot(discord.Client):
         # so it wins on names the diagnostic cache cannot resolve.
         stored_names = await asyncio.to_thread(load_display_names, self.settings.db_path)
         member_names = {**stored_names, **member_names}
-        # `collect_intel` fills member_count from the users table, which only counts people the bot has
-        # seen. Server size must come from Discord; the local number is kept separately, labelled.
+        # `collect_intel` fills member_count from the users table, which only holds members the bot can
+        # see. Server size must come from Discord; the local number is kept separately, labelled.
         facts.known_members = facts.member_count
         counts = await self._discord_counts()
         if counts and counts.members:
@@ -2418,8 +2418,9 @@ class ChaosXBot(discord.Client):
 
         Scope is deliberately wider than "what changed this week": community testing observations and
         community idea write-ups feed the digest too, because the post is for players. Server size comes
-        from Discord (`GuildCountsCache`), never from the `users` table, which counts only people the bot
-        has seen — reporting that as "members" is what produced a wrong "36 members" post.
+        from Discord (`GuildCountsCache`), never from the `users` table, which holds only the members the
+        bot can see (a partial set without the privileged members intent) — reporting that as "members" is
+        what produced a wrong "36 members" post.
         """
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS

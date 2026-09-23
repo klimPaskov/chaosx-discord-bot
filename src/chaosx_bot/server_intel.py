@@ -152,8 +152,9 @@ def collect_intel(db_path: Path, *, window_days: int = WINDOW_DAYS) -> IntelFact
         facts.active_members = _scalar(
             db, "SELECT COUNT(*) FROM users WHERE last_seen_at >= ?", (since,)
         )
-        # People the bot has seen. NOT the server size — `_build_server_intel` overwrites member_count
-        # with Discord's own count and keeps this figure here under an honest label.
+        # Members the bot can see (partial: no privileged members intent). NOT the server size —
+        # `_build_server_intel` overwrites member_count with Discord's own count and keeps this figure
+        # here under an honest label.
         facts.known_members = _scalar(db, "SELECT COUNT(*) FROM users")
         facts.admin_actions = _rows(
             db,
@@ -262,7 +263,7 @@ Traffic
 - Messages archived: {facts.archived_messages} across {facts.channels_active} channels
 - Busiest channels: {top_channels}
 - Server size (Discord): {facts.member_count} members{f", {facts.online_members} online now" if facts.online_members else ""}
-- Bot-side: {facts.known_members} people have interacted with the bot, {facts.active_members} active this window, {facts.new_members} new
+- Bot-side (partial — the bot has no privileged members intent): {facts.known_members} members visible to the bot, {facts.active_members} active this window, {facts.new_members} new
 
 Bot answers
 - Auto-scan answers: {facts.answers}; banter replies: {facts.banter}
