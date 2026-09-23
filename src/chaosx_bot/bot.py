@@ -276,6 +276,8 @@ from .routine_posts import (
     git_head_sha,
     github_issue_activity,
     github_latest_release,
+    iso_week_key,
+    last_complete_week,
     parse_iso,
     plan_due_posts,
     strip_online_count,
@@ -3004,18 +3006,31 @@ class ChaosXBot(discord.Client):
         """
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS
-        since_iso = (utcnow() - timedelta(days=window)).isoformat()
+        # The last complete ISO week (Mon 00:00 -> next Mon 00:00 UTC), so the post's dates, its ISO-week
+        # key and the Monday schedule all describe the same week (Hoops, 2026-09-23).
+        window_start, window_end = last_complete_week()
+        since_iso = window_start.isoformat()
         commits, event_files, version, head, issues, change_areas = await asyncio.gather(
-            git_commit_summary(repo, since_days=window),
-            git_files_touched(repo, since_days=window, prefix="events"),
+            git_commit_summary(repo, since=window_start, until=window_end),
+            git_files_touched(repo, prefix="events", since=window_start, until=window_end),
             descriptor_version(repo),
             git_head_sha(repo),
-            github_issue_activity(self.settings.github_repo, since_days=window),
+            github_issue_activity(self.settings.github_repo, since=window_start, until=window_end),
             # Weight the digest by where changes landed: commit subjects alone skew towards whichever
             # single topic was documented most, which made the digest claim one event was the whole week.
-            git_change_areas(repo, since_days=window),
+            git_change_areas(repo, since=window_start, until=window_end),
         )
         stats = await self.store.routine_stats(since_iso=since_iso)
+        # The thank-you names: top chaos earners in the covered week, minus leaderboard opt-outs (and bots).
+        opted_out = await self.store.opted_out_members("leaderboard_optout")
+        top_rows = await self.store.top_members(
+            limit=3, since_day=window_start.date().isoformat(), exclude_ids=opted_out
+        )
+        top_members = [
+            {"name": str(name), "xp": int(xp or 0)}
+            for _user_id, name, xp, _messages, _days in top_rows
+            if str(name).strip()
+        ]
         counts = await self._discord_counts()
         playtest_rows = await self.store.list_playtest_reports_since(since_iso=since_iso, limit=6)
         playtests = [
@@ -3032,6 +3047,11 @@ class ChaosXBot(discord.Client):
         guild = self.guilds[0] if self.guilds else None
         return {
             "window_days": window,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "window_key": iso_week_key(window_start),
+            "window_label": f"{window_start.strftime('%a %d %B %Y')} to {(window_end - timedelta(days=1)).strftime('%a %d %B %Y')}",
+            "top_members": top_members,
             "commits": commits,
             "event_files": event_files,
             "version": version,
@@ -3173,10 +3193,11 @@ class ChaosXBot(discord.Client):
             activity_label="weekly dev digest",
             fallback=digest_fallback(signals),
         )
-        # Say which dates the post covers: the window is rolling, the guard is the ISO week. The online
-        # count is stripped: it is stale minutes after posting (Hoops, 2026-09-23).
+        # Say which dates the post covers (the last complete ISO week) and drop the online count: it is
+        # stale minutes after posting (Hoops, 2026-09-23).
         text = strip_online_count(text)
-        text = with_window_note(text, window_days=int(signals.get("window_days") or DIGEST_WINDOW_DAYS))
+        window_start, window_end = last_complete_week()
+        text = with_window_note(text, window_start=window_start, window_end=window_end)
         result = await self._deliver_routine_post(spec, text=text, preview=preview)
         result.facts = signals
         result.detail = f"{source}; {result.detail}".strip("; ")
