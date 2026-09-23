@@ -688,6 +688,21 @@ class Store:
             )
             return [tuple(row) for row in await cur.fetchall()]
 
+    async def list_playtest_reports_since(self, *, since_iso: str, limit: int = 6) -> list[tuple]:
+        """Reports recorded in the window, newest first (community observations for the digest)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT created_at, target, report_json
+                FROM playtest_records
+                WHERE status = 'reported' AND created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (since_iso, max(1, min(limit, 25))),
+            )
+            return [tuple(row) for row in await cur.fetchall()]
+
     async def list_unsynthesized_playtest_reports(
         self, *, guild_id: int, limit: int = 25
     ) -> list[tuple]:

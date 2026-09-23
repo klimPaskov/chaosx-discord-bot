@@ -21,8 +21,14 @@ from chaosx_bot.routine_posts import (
     git_head_sha,
     is_interval_due,
     is_weekly_due,
+    content_facts_line,
+    ideas_facts_line,
     issues_facts_line,
     plan_due_posts,
+    playtest_facts_line,
+    playtest_observation,
+    repo_content_counts,
+    vault_recent_documents,
     release_fallback,
     release_signal_changed,
     release_state_detail,
@@ -49,8 +55,14 @@ def _signals() -> dict:
             "opened_count": 1,
             "closed": ["#7 Missing localisation"],
             "closed_count": 1,
+            "open_total": 2,
         },
         "server": {"answers": 12, "qa_saved": 3, "warnings": 1, "playtests": 2, "members": 40},
+        "content": {"events": 162, "decisions": 213, "focuses": 53},
+        "playtests": [{"target": "event006", "observation": "convoy payments looked correct but the AI stalled"}],
+        "event_specs": ["007 - Void Rift"],
+        "suggestions": ["Tester: add an Iceland focus tree"],
+        "repo_url": "https://github.com/klimPaskov/Chaos-Redux",
     }
 
 
@@ -173,6 +185,43 @@ def test_prompts_carry_the_facts_and_forbid_invention():
     assert "#12 Crash on load" in digest_prompt
     assert "181" in digest_prompt
 
+
+def test_digest_prompt_is_player_first_and_wider_scope():
+    prompt = build_digest_prompt(signals=_signals())
+    # audience + hard rules against repo/technical language
+    assert "not programmers" in prompt
+    assert "NEVER use file names, paths, repo hashes, branch names" in prompt
+    assert "never quote them" in prompt
+    assert "NOT a changelog" in prompt
+    # wider scope: content scale, playtests, community ideas, server
+    assert "162 event files" in prompt and "213 decision files" in prompt
+    assert "convoy payments looked correct" in prompt
+    assert "007 - Void Rift" in prompt
+    assert "add an Iceland focus tree" in prompt
+    # the five sections, in order
+    for section in ("Weekly Chaos Redux digest", "This week in the mod", "The mod right now", "From the community", "What's next"):
+        assert section in prompt
+
+
+def test_digest_fallback_is_jargon_free_and_wider_scope():
+    digest = digest_fallback(_signals())
+    assert "Weekly Chaos Redux digest" in digest
+    assert "This week in the mod" in digest
+    assert "The mod right now" in digest
+    assert "From the community" in digest
+    assert "What's next" in digest
+    assert "181 changes landed" in digest
+    assert "162 event files" in digest
+    assert "convoy payments looked correct" in digest
+    assert "007 - Void Rift" in digest
+    assert "2 still open" in digest
+    assert "https://github.com/klimPaskov/Chaos-Redux/commits" in digest
+    # no technical leakage in the fallback path
+    assert "abc1234" not in digest
+    assert "Add zombie outbreak event" not in digest
+    assert "Repo HEAD" not in digest
+    assert "@everyone" not in digest and "@here" not in digest
+
     release_prompt = build_release_prompt(
         signals={
             "version": "0.2",
@@ -189,11 +238,8 @@ def test_prompts_carry_the_facts_and_forbid_invention():
 
 def test_fallbacks_render_only_supplied_facts():
     digest = digest_fallback(_signals())
-    assert "Weekly dev digest" in digest
     assert "181" in digest
-    assert "Add zombie outbreak event" in digest
     assert "#12 Crash on load" in digest
-    assert "abc1234" in digest
 
     release = release_fallback(
         {"version": "0.2", "commits": ["Add zombie outbreak event"], "commit_count": 1}
@@ -286,3 +332,60 @@ async def test_git_signals_degrade_when_repo_is_missing(tmp_path):
     assert await descriptor_version(missing) == ""
     assert await git_head_sha(missing) == ""
     assert await git_commits_between(missing, old_sha="HEAD~1") == []
+
+# --- wider scope signals ----------------------------------------------------
+
+
+def test_repo_content_counts_counts_events_decisions_and_focuses(tmp_path):
+    repo = tmp_path / "mod"
+    (repo / "events").mkdir(parents=True)
+    (repo / "events" / "a.txt").write_text("x")
+    (repo / "events" / "nested").mkdir()
+    (repo / "events" / "nested" / "b.txt").write_text("x")
+    (repo / "common" / "decisions").mkdir(parents=True)
+    (repo / "common" / "decisions" / "one.txt").write_text("x")
+    (repo / "common" / "focus").mkdir(parents=True)
+    (repo / "common" / "focus" / "tree.txt").write_text("x")
+    (repo / "common" / "focus" / "notes.md").write_text("x")  # not .txt, ignored
+    counts = repo_content_counts(repo)
+    assert counts == {"events": 2, "decisions": 1, "focuses": 1}
+    assert repo_content_counts(tmp_path / "missing") == {"events": 0, "decisions": 0, "focuses": 0}
+
+
+def test_vault_recent_documents_honours_the_window(tmp_path):
+    import os
+    from time import time
+
+    specs = tmp_path / "vault" / "Events" / "Event Specs"
+    specs.mkdir(parents=True)
+    fresh = specs / "007 - Void Rift.md"
+    stale = specs / "002 - Zombie Outbreak.md"
+    fresh.write_text("new idea")
+    stale.write_text("old idea")
+    old = time() - 30 * 86400
+    os.utime(stale, (old, old))
+    names = vault_recent_documents(tmp_path / "vault", "Events/Event Specs", since_days=7)
+    assert names == ["007 - Void Rift"]
+    assert vault_recent_documents(tmp_path / "vault", "Planning/Community Suggestions") == []
+
+
+def test_playtest_observation_reads_only_real_observations():
+    assert playtest_observation('{"observation": "AI stalled at the convoy"}' ) == "AI stalled at the convoy"
+    assert playtest_observation("{not json") == ""
+    assert playtest_observation("") == ""
+    assert playtest_observation('{"event_id": "event006"}') == ""
+
+
+def test_fact_lines_are_honest_about_quiet_weeks():
+    assert content_facts_line({}) == "content counts unavailable"
+    assert "no playtest observations" in playtest_facts_line([])
+    assert "no new community ideas" in ideas_facts_line(event_specs=[], suggestions=[])
+    assert "event ideas/specs added" in ideas_facts_line(event_specs=["007 - Void Rift"], suggestions=[])
+    assert "no GitHub issue activity" in issues_facts_line({"available": True, "opened": [], "closed": []})
+    assert "unavailable" in issues_facts_line({"available": False})
+    assert "no issue movement (3 open)" in issues_facts_line(
+        {"available": True, "opened": [], "closed": [], "open_total": 3}
+    )
+    moved = issues_facts_line({"available": True, "opened": ["#9 crash"], "closed": [], "open_total": 3})
+    assert "#9 crash" in moved and "3 still open" in moved
+    assert "convoy" in playtest_facts_line([{"target": "event006", "observation": "convoy stalled"}])

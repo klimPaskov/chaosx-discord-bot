@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,6 +89,7 @@ ROUTINE_POSTS: tuple[RoutinePostSpec, ...] = (DEV_DIGEST, RELEASE_POSTS, SERVER_
 
 DIGEST_WINDOW_DAYS = 7
 MAX_NOTABLE_COMMITS = 12
+MAX_PLAYTEST_NOTES = 4
 MAX_ISSUE_TITLES = 8
 MAX_POST_CHARS = 1800
 
@@ -285,12 +287,22 @@ async def github_issue_activity(repo_slug: str, *, since_days: int = DIGEST_WIND
         return {"available": False, "opened": [], "closed": [], "error": "unparseable gh output"}
     opened = [f"#{i['number']} {i['title']}" for i in items if str(i.get("state", "")).upper() == "OPEN"]
     closed = [f"#{i['number']} {i['title']}" for i in items if str(i.get("state", "")).upper() == "CLOSED"]
+    open_total = 0
+    code, out, _ = await _run(
+        ["gh", "issue", "list", "--repo", repo_slug, "--state", "open", "--limit", "200", "--json", "number"]
+    )
+    if code == 0:
+        try:
+            open_total = len(json.loads(out or "[]"))
+        except json.JSONDecodeError:
+            open_total = 0
     return {
         "available": True,
         "opened": opened[:MAX_ISSUE_TITLES],
         "closed": closed[:MAX_ISSUE_TITLES],
         "opened_count": len(opened),
         "closed_count": len(closed),
+        "open_total": open_total,
     }
 
 
@@ -325,13 +337,99 @@ def _bullet(lines: Iterable[str], limit: int = MAX_NOTABLE_COMMITS) -> str:
     return "\n".join(out) if out else "- (none)"
 
 
+def repo_content_counts(repo: Path) -> dict[str, int]:
+    """Approximate content scale of the mod checkout (file counts, tolerant of layout drift).
+
+    Scope, not changelog: the digest tells players how much mod there is, not which files changed.
+    """
+    counts = {"events": 0, "decisions": 0, "focuses": 0}
+    try:
+        counts["events"] = sum(1 for _ in repo.glob("events/**/*.txt"))
+        for path in repo.glob("common/**/*.txt"):
+            lowered = str(path).lower()
+            if "decision" in lowered:
+                counts["decisions"] += 1
+            if "focus" in lowered:
+                counts["focuses"] += 1
+    except OSError:
+        return counts
+    return counts
+
+
+def vault_recent_documents(
+    vault: Path, folder: str, *, since_days: int = DIGEST_WINDOW_DAYS, limit: int = 8
+) -> list[str]:
+    """Names of documents added or edited in the window (community event ideas, suggestions)."""
+    root = vault / folder
+    if not root.exists():
+        return []
+    cutoff = time.time() - since_days * 86400
+    recent: list[tuple[float, str]] = []
+    for path in root.rglob("*.md"):
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        if modified >= cutoff:
+            recent.append((modified, path.stem))
+    recent.sort(reverse=True)
+    return [name for _, name in recent[:limit]]
+
+
+def playtest_observation(report_json: str | None) -> str:
+    """The human observation text from a stored playtest report (skips empty/unreadable reports)."""
+    raw = (report_json or "").strip()
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("observation") or "").strip()
+
+
+def content_facts_line(content: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if content.get("events"):
+        parts.append(f"{content['events']} event files")
+    if content.get("decisions"):
+        parts.append(f"{content['decisions']} decision files")
+    if content.get("focuses"):
+        parts.append(f"{content['focuses']} focus trees")
+    return ", ".join(parts) if parts else "content counts unavailable"
+
+
+def playtest_facts_line(playtests: list[dict[str, Any]]) -> str:
+    if not playtests:
+        return "no playtest observations were recorded this week"
+    lines: list[str] = []
+    for row in playtests[:MAX_PLAYTEST_NOTES]:
+        observation = str(row.get("observation") or "").strip()
+        target = str(row.get("target") or "playtest").strip()
+        if observation:
+            lines.append(f"{target}: {observation[:200]}")
+    return " | ".join(lines) if lines else f"{len(playtests)} playtest observations recorded"
+
+
+def ideas_facts_line(*, event_specs: list[str], suggestions: list[str]) -> str:
+    parts: list[str] = []
+    if event_specs:
+        parts.append(f"event ideas/specs added or edited: {', '.join(event_specs)}")
+    if suggestions:
+        parts.append(f"community suggestions captured: {', '.join(suggestions)}")
+    return "; ".join(parts) if parts else "no new community ideas were written up this week"
+
+
 def server_facts_line(server: dict[str, Any]) -> str:
     """Server-side facts, skipping zeros so a quiet week does not read as a wall of 0s."""
     parts: list[str] = []
     if server.get("answers"):
-        parts.append(f"{server['answers']} questions auto-answered")
+        parts.append(f"{server['answers']} questions auto-answered by the bot")
     if server.get("qa_saved"):
-        parts.append(f"{server['qa_saved']} stored asks")
+        # "asked", not "answered": the model must not upgrade a question into a resolved answer.
+        parts.append(f"{server['qa_saved']} questions asked in the server")
     if server.get("warnings"):
         parts.append(f"{server['warnings']} soft moderation warnings")
     if server.get("playtests"):
@@ -346,13 +444,16 @@ def issues_facts_line(issues: dict[str, Any]) -> str:
         return "GitHub issue data unavailable for this window"
     opened = issues.get("opened") or []
     closed = issues.get("closed") or []
+    open_total = int(issues.get("open_total") or 0)
     if not opened and not closed:
-        return "no GitHub issue activity"
+        return f"no issue movement ({open_total} open)" if open_total else "no GitHub issue activity"
     parts: list[str] = []
     if opened:
         parts.append(f"{len(opened)} opened/touched ({', '.join(opened)})")
     if closed:
         parts.append(f"{len(closed)} closed ({', '.join(closed)})")
+    if open_total:
+        parts.append(f"{open_total} still open")
     return "; ".join(parts)
 
 
@@ -360,51 +461,78 @@ def build_digest_prompt(*, signals: dict[str, Any], max_chars: int = MAX_POST_CH
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
     server = signals.get("server") or {}
-    return f"""Write the weekly Chaos Redux dev digest for the community.
+    content = signals.get("content") or {}
+    playtests = signals.get("playtests") or []
+    return f"""Write the weekly Chaos Redux community digest. This is a community post, NOT a changelog.
 
 Facts (use only these, invent nothing, no pings/mentions):
 - Mod version: {signals.get('version') or 'unknown'}
-- Repo HEAD: {signals.get('head') or 'unknown'}
-- Commits in the last {signals.get('window_days', DIGEST_WINDOW_DAYS)} days: {commits.get('count', 0)}
-- Event/catalog files touched: {signals.get('event_files', 0)}
-- Notable commit subjects:
+- Content in the mod right now: {content_facts_line(content)}
+- Changes landed in the last {signals.get('window_days', DIGEST_WINDOW_DAYS)} days: {commits.get('count', 0)}
+- Raw commit subjects (translate these into player language — never quote them):
 {_bullet(commits.get('notable') or [])}
 - GitHub issues: {issues_facts_line(issues)}
+- Playtest observations recorded this week: {playtest_facts_line(playtests)}
+- Community ideas: {ideas_facts_line(event_specs=signals.get('event_specs') or [], suggestions=signals.get('suggestions') or [])}
 - Server activity: {server_facts_line(server)}
 
-Write it as a forum-style post:
-1. A short title line starting with "**Weekly dev digest**" and the version.
-2. "What moved" — 3-6 bullets taken from the facts above (group related commits, no file paths).
-3. "Community" — issues/answers in one or two short lines.
-4. "What's next" — only if the facts imply it; otherwise say testing focus stays open.
+Audience: players, testers and friends of the mod — not programmers. Someone who has never opened the
+repo must understand every line.
 
-Keep it under {max_chars} characters, plain Discord markdown, no code blocks, no pings,
-no invented features, versions, dates or dates of future releases. Never claim something shipped
-unless the commit/issue facts above say so. If a fact line says there was no activity, say the rest
-of the week was quiet (in one short clause) instead of printing zeros or empty bullets."""
+Hard rules:
+- Describe what a player would notice ("the zombie outbreak event now…", "convoys pay out correctly now").
+- NEVER use file names, paths, repo hashes, branch names, commit counts as the headline, code blocks, or
+  internal shorthand/acronyms (FSM, SCN-xxx, IW-xxx, "descriptor", "catalog files"). If a term is internal,
+  describe the effect instead. Event names and their numbers are fine — players know those.
+- No pings, no invented features, versions, dates or release promises.
+
+Sections (exactly these):
+1. Title line: "**Weekly Chaos Redux digest — <version>**"
+2. "This week in the mod" — 3-5 bullets in plain language about what changed for players, grouping related work.
+3. "The mod right now" — one or two lines on scope and current focus: how much content exists, and which area is being worked on, in plain words.
+4. "From the community" — playtest observations, reported issues, ideas written up this week, server activity.
+   Use 1-3 short lines. If something was quiet, say it was quiet in a few words instead of printing zeros.
+5. "What's next" — the testing focus, plus work already visibly underway in the facts. Never promise
+   future features, say something is "coming", or give dates/release timelines.
+
+Keep it under {max_chars} characters, plain Discord markdown."""
 
 
 def digest_fallback(signals: dict[str, Any]) -> str:
+    """Facts-only digest used when the model is unavailable.
+
+    Deliberately jargon-free: counts, community signals and a pointer to the raw history, so the
+    fallback never reads worse than the model version (no commit subjects, hashes or file names).
+    """
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
     server = signals.get("server") or {}
-    return sanitize_post(
-        "\n".join(
-            [
-                f"**Weekly dev digest** — Chaos Redux {signals.get('version') or 'in development'}",
-                "",
-                f"**What moved** ({commits.get('count', 0)} commits in {signals.get('window_days', DIGEST_WINDOW_DAYS)} days, "
-                f"{signals.get('event_files', 0)} event/catalog files touched)",
-                _bullet(commits.get("notable") or []),
-                "",
-                "**Community**",
-                f"- Issues: {issues_facts_line(issues)}",
-                f"- Server: {server_facts_line(server)}",
-                "",
-                f"Repo HEAD `{signals.get('head') or 'unknown'}` — testing focus stays open.",
-            ]
-        )
-    )
+    content = signals.get("content") or {}
+    playtests = signals.get("playtests") or []
+    repo = str(signals.get("repo_url") or "").rstrip("/")
+    window = signals.get("window_days", DIGEST_WINDOW_DAYS)
+    lines = [
+        f"**Weekly Chaos Redux digest** — {signals.get('version') or 'in development'}",
+        "",
+        "**This week in the mod**",
+        f"- {commits.get('count', 0)} changes landed over the last {window} days across the mod's events and systems.",
+        "- Details of each change are in the repo history if you want the technical view.",
+        "",
+        "**The mod right now**",
+        f"- Content: {content_facts_line(content)}.",
+        "",
+        "**From the community**",
+        f"- Playtests: {playtest_facts_line(playtests)}",
+        f"- Ideas: {ideas_facts_line(event_specs=signals.get('event_specs') or [], suggestions=signals.get('suggestions') or [])}",
+        f"- Issues: {issues_facts_line(issues)}",
+        f"- Server: {server_facts_line(server)}",
+        "",
+        "**What's next**",
+        "- Testing focus stays open until the current area is confirmed; the digest updates weekly.",
+    ]
+    if repo:
+        lines.append(f"- Full change list: {repo}/commits")
+    return sanitize_post("\n".join(lines))
 
 
 def build_release_prompt(*, signals: dict[str, Any], max_chars: int = MAX_POST_CHARS) -> str:

@@ -259,6 +259,9 @@ from .routine_posts import (
     github_latest_release,
     parse_iso,
     plan_due_posts,
+    playtest_observation,
+    repo_content_counts,
+    vault_recent_documents,
     release_fallback,
     release_signal_changed,
     release_state_detail,
@@ -2398,19 +2401,40 @@ class ChaosXBot(discord.Client):
         return result
 
     async def _collect_digest_signals(self) -> dict[str, Any]:
-        """Real facts only: live mod checkout, GitHub issues, and the bot's own DB."""
+        """Real facts only: live mod checkout, vault, GitHub issues, and the bot's own DB.
+
+        Scope is deliberately wider than "what changed this week": content scale, community testing
+        observations and community idea write-ups all feed the digest, because the post is for players.
+        """
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS
-        commits, event_files, version, head, issues = await asyncio.gather(
+        since_iso = (utcnow() - timedelta(days=window)).isoformat()
+        commits, event_files, version, head, issues, content, event_specs, suggestions = await asyncio.gather(
             git_commit_summary(repo, since_days=window),
             git_files_touched(repo, since_days=window, prefix="events"),
             descriptor_version(repo),
             git_head_sha(repo),
             github_issue_activity(self.settings.github_repo, since_days=window),
+            asyncio.to_thread(repo_content_counts, repo),
+            asyncio.to_thread(
+                vault_recent_documents,
+                self.settings.obsidian_vault_path,
+                self.settings.community_event_specs_folder,
+                since_days=window,
+            ),
+            asyncio.to_thread(
+                vault_recent_documents,
+                self.settings.obsidian_vault_path,
+                self.settings.community_suggestions_folder,
+                since_days=window,
+            ),
         )
-        stats = await self.store.routine_stats(
-            since_iso=(utcnow() - timedelta(days=window)).isoformat()
-        )
+        stats = await self.store.routine_stats(since_iso=since_iso)
+        playtest_rows = await self.store.list_playtest_reports_since(since_iso=since_iso, limit=6)
+        playtests = [
+            {"target": str(row[1]), "observation": playtest_observation(row[2])}
+            for row in playtest_rows
+        ]
         guild = self.guilds[0] if self.guilds else None
         return {
             "window_days": window,
@@ -2419,6 +2443,11 @@ class ChaosXBot(discord.Client):
             "version": version,
             "head": head,
             "issues": issues,
+            "content": content,
+            "playtests": playtests,
+            "event_specs": event_specs,
+            "suggestions": suggestions,
+            "repo_url": f"https://github.com/{self.settings.github_repo}",
             "server": {
                 "answers": stats.get("answers", 0),
                 "qa_saved": stats.get("asks", 0),
