@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .formatting import block, bullets, heading, section, small
 from .indexer import (
     CatalogReadError,
     INDEX_SCHEMA_VERSION,
@@ -193,16 +194,26 @@ class Knowledge:
         finally:
             conn.close()
         if not rows:
-            return "## Testing queue\nNo events are currently marked `Needs Testing` in the catalog."
-        lines = [
-            "## Testing queue",
-            "Use this before playtesting to pick an event that needs feedback. After testing, use `/playtest report` with the event ID and what happened.",
-            "",
-        ]
+            return block(
+                heading("Testing queue", "🕹️"),
+                small("No events are currently marked `Needs Testing` in the catalog."),
+            )
+        entries = []
         for event_id, name, type_, cluster_id, severity, details in rows:
-            summary = _clean_snippet(details)[:220] if details else "No details available."
-            lines.append(f"- `Event {int(event_id):03d}` **{name}** — {type_ or 'unknown'}; cluster `{cluster_id or 'none'}`; severity `{severity or 'none'}`. {summary}")
-        return "\n".join(lines)
+            summary = _trim_words(_clean_snippet(details), 220) if details else "No details available."
+            entries.append(
+                f"`Event {int(event_id):03d}` **{name}** — {type_ or 'unknown'}; "
+                f"cluster `{cluster_id or 'none'}`; severity `{severity or 'none'}`. {summary}"
+            )
+        return block(
+            heading("Testing queue", "🕹️"),
+            section(f"{len(entries)} event(s) need feedback", "🧪"),
+            bullets(entries),
+            small(
+                "Pick one, play it, then use `/playtest report` with the event ID and what happened — and "
+                "vote on what gets tested next with the button below."
+            ),
+        )
 
     def testing_queue_rows(self, limit: int = 5) -> list[tuple[str, str]]:
         """(event_id, name) for the events marked `Needs Testing` - the poll's candidates."""
@@ -657,6 +668,15 @@ def _fts_and_query(query: str) -> str:
     # and quote each term so MATCH always treats them as literal terms.
     tokens = re.findall(r"[A-Za-z0-9_]+", query)
     return " AND ".join(f'"{t}"' for t in tokens[:8]) or '""'
+
+
+def _trim_words(text: str, limit: int) -> str:
+    """Trim to a whole word at or before `limit` so bullets never end mid-word."""
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return f"{cut}…"
 
 
 def _clean_snippet(value: str) -> str:

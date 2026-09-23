@@ -75,7 +75,8 @@ async def test_panel_text_lists_the_tiers_and_hides_opted_out_members():
     # every row carries its tier emoji, and the ladder itself is emoji-labelled
     assert "🔥" in text and "🌿" in text and "🌑" in text  # no skulls anywhere (Hoops)
     assert "💀" not in text and "☠️" not in text
-    assert "contributions earn a lot" in text
+    assert "contributions earn far more" in text
+    assert "### 🪜 The ladder" in text and "### 🏆 All time" in text  # structure, not flat prose
 
 
 @pytest.mark.asyncio

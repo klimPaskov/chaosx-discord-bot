@@ -26,8 +26,12 @@ def test_voting_weight_scales_with_tier():
 
 
 def test_perk_is_advertised_from_rising_chaos_up():
-    assert "your vote on what gets tested next carries weight 1" in cumulative_perks("Rising Chaos")
-    assert "your vote on what gets tested next carries weight 2" in cumulative_perks("Chaos Tier")
+    rising = cumulative_perks("Rising Chaos")
+    chaos = cumulative_perks("Chaos Tier")
+    assert sum("vote on what gets tested" in perk for perk in rising) == 1
+    # the upgrade is described once, not repeated as a second "weight" line
+    assert sum("vote on what gets tested" in perk for perk in chaos) == 1
+    assert "double from Chaos Tier" in chaos[chaos.index(next(p for p in chaos if "vote on what gets" in p))]
     assert not any("vote on what gets tested" in perk for perk in cumulative_perks("Gathering Storm"))
 
 

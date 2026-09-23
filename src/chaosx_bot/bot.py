@@ -255,7 +255,8 @@ from .activity import (
     tier_progress,
     voting_weight,
 )
-from .guild_stats import GuildCounts, GuildCountsCache
+from .formatting import block, bullets, heading, kv, numbered, section, small
+from .guild_stats import GuildCountsCache
 from .routine_posts import (
     DEV_DIGEST,
     DIGEST_WINDOW_DAYS,
@@ -2490,10 +2491,9 @@ class ChaosXBot(discord.Client):
         rows = await asyncio.to_thread(self.knowledge.testing_queue_rows, 5)
         if not rows:
             return []
-        # Store the display label (not the bare name) so the panel rows and the buttons agree.
-        labelled = [(key, f"Event {key}: {label}"[:100]) for key, label in rows]
-        await self.store.set_testing_poll_options(labelled)
-        return [label[:78] for _key, label in labelled]
+        # Panel rows read better with the bare name; the buttons carry the event id so the choice is clear.
+        await self.store.set_testing_poll_options(rows)
+        return [f"Event {key}: {label}"[:78] for key, label in rows]
 
     async def _testing_vote_panel_text(self, user_id: int, *, just_voted: str = "") -> str:
         """The vote itself: what is on the table, what the community has chosen, what your vote counts."""
@@ -2503,30 +2503,42 @@ class ChaosXBot(discord.Client):
         tier = str(row[1]) if row else TIERS[0][0]
         weight = voting_weight(tier)
         leaders = {key: (label, voters, total) for key, label, voters, total in tally}
-        lines = ["🗳️ **What should we test next?**"]
-        if just_voted:
-            lines.append(f"✅ Your vote is on **{just_voted}**.")
         options = await self.store.testing_poll_options()
-        if not options:
-            lines.append("No events are marked `Needs Testing` right now - nothing to vote on yet.")
+        rows: list[str] = []
         for slot, (key, label) in sorted(options.items()):
             _label, voters, total = leaders.get(key, (label, 0, 0))
-            lines.append(f"- `{slot}` **{label}** — {voters} voter(s), {total} weighted")
-        if mine is not None:
-            lines.append(f"Your current vote: **{mine[1]}** (weight {mine[2]}).")
-        lines.append("")
+            rows.append(f"`{slot}` **{label}** — {voters} voter(s), {total} weighted")
         if weight:
-            lines.append(
+            mine_line = (
                 f"Your vote as {tier} counts **{weight}**. One vote per member, changeable any time."
             )
         else:
-            lines.append(
-                f"Your vote as {tier} is recorded but does not count towards the total yet - "
-                "Rising Chaos and above carry weight. Playtesting, event ideas, suggestions and bug "
-                "reports are what move you up."
+            mine_line = (
+                f"Your vote as {tier} is recorded but does not count towards the total yet — Rising Chaos "
+                "and above carry weight. Playtesting, event ideas, suggestions and bug reports move you up."
             )
-        lines.append("The winner here is what the community wants tested next; it goes to Hoops as a signal, not a decision.")
-        return sanitize_post("\n".join(lines), max_chars=1200)
+        return sanitize_post(
+            block(
+                heading("What should we test next?", "🗳️"),
+                f"✅ Your vote is on **{just_voted}**." if just_voted else None,
+                section("On the table", "🕹️"),
+                rows or small("No events are marked `Needs Testing` right now — nothing to vote on yet."),
+                section("Your vote", "🎯"),
+                bullets(
+                    [
+                        kv("Current vote", f"**{mine[1]}** (weight {mine[2]})", "✅")
+                        if mine is not None
+                        else "You have not voted yet.",
+                        mine_line,
+                    ]
+                ),
+                small(
+                    "The winner is what the community wants tested next — it reaches Hoops as a signal, "
+                    "never as a decision."
+                ),
+            ),
+            max_chars=1200,
+        )
 
     async def on_member_join(self, member: discord.Member) -> None:
         """Every new member starts on the ladder: Calm World until they earn chaos (Hoops 2026-09-23).
@@ -2758,26 +2770,26 @@ class ChaosXBot(discord.Client):
 
     async def _tier_panel_text(self, scope: str = "all") -> str:
         """The public chaos-tier panel: the ladder, the leaders and the caller-independent state."""
-        tiers = await self.store.activity_xp_by_member()
         ladder = " → ".join(f"{tier_emoji(name)} {name} ({threshold})" for name, threshold in TIERS)
-        lines = [
-            "## 🌪️ Chaos tiers",
-            f"Chat earns a little, **contributions earn a lot**: {ladder}.",
-            "",
-        ]
         rows = await self._tier_rows(scope)
         header = "This week" if scope == "week" else "All time"
-        lines.append(f"**{header} — top {len(rows) or 0}**" if rows else f"**{header}** — no activity recorded yet.")
-        lines.extend(_tier_standings_lines(rows))
         other = "all" if scope == "week" else "week"
-        lines.extend(
-            [
-                "",
-                f"Use the buttons below to switch, or `/tiers scope:{other}`. `My tier` shows your own "
-                "progress privately; `Hide me / show me` takes you off the leaderboard if you prefer.",
-            ]
+        standings = _tier_standings_lines(rows)
+        text = block(
+            heading("Chaos tiers", "🌪️"),
+            section("The ladder", "🪜"),
+            ladder,
+            small(
+                f"Chat earns a little and is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day; contributions "
+                f"earn far more (an event idea, a suggestion or a playtest note is {int(BONUS_XP['event_idea'])})."
+            ),
+            section(f"{header} — top {len(rows)}" if rows else header, "🏆"),
+            standings or small("No activity recorded for this period yet."),
+            small(
+                f"Switch with the buttons below or `/tiers scope:{other}`. `My tier` shows your own progress "
+                "privately; `Hide me / show me` takes you off this leaderboard."
+            ),
         )
-        text = "\n".join(lines)
         return text if len(text) <= 1900 else text[:1890] + "…"
 
     async def _tier_self_text(self, user_id: int) -> str:
@@ -2793,19 +2805,37 @@ class ChaosXBot(discord.Client):
         bonus = await self.store.bonus_xp_total(user_id)
         chat_xp = max(0.0, xp - bonus)
         perks = cumulative_perks(progress.tier)
-        perk_lines = "\n".join(f"- 🎁 {perk}" for perk in perks) or "- 🎁 No perks yet - gather chaos to unlock them."
-        return (
-            f"## {tier_emoji(progress.tier)} Your chaos tier\n"
-            f"**{progress.label}** — {int(xp)} chaos earned "
-            f"({int(chat_xp)} from chat, **{int(bonus)} from contributions**).\n"
-            f"- 📊 Ranking: {position}; {weekly}.\n"
-            f"- 👁️ You are currently {hidden}.\n"
-            f"- ⚙️ Chat is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day no matter how much you post; "
-            f"contributions pay far more (an event idea, a suggestion or a playtest observation is "
-            f"{int(BONUS_XP['event_idea'])}).\n"
-            f"**Perks at {progress.tier}**\n{perk_lines}\n"
-            f"- 🔔 You are only ever mentioned by banter if you are a high-tier active member and haven't "
-            f"opted out."
+        perk_lines = bullets(f"🎁 {perk}" for perk in perks) or [f"- 🎁 No perks yet - gather chaos to unlock them."]
+        return block(
+            heading("Your chaos tier", tier_emoji(progress.tier)),
+            f"**{progress.label}**",
+            section("Where you stand", "📊"),
+            bullets(
+                [
+                    kv("Chaos earned", f"{int(xp)} ({int(chat_xp)} from chat, **{int(bonus)} from contributions**)", "💠"),
+                    kv("Ranking", f"{position}; {weekly}", "🥇"),
+                    kv("Leaderboard", hidden, "👁️"),
+                    kv(
+                        "Testing vote",
+                        f"counts {voting_weight(progress.tier)}"
+                        if voting_weight(progress.tier)
+                        else "recorded, not counted yet (Rising Chaos+ carries weight)",
+                        "🗳️",
+                    ),
+                ]
+            ),
+            section(f"Perks at {progress.tier}", "🎁"),
+            perk_lines,
+            section("How chaos works", "⚙️"),
+            bullets(
+                [
+                    f"Chat is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day no matter how much you post.",
+                    f"Contributions pay far more — an event idea, a suggestion or a playtest note is "
+                    f"{int(BONUS_XP['event_idea'])} chaos, a bug report {int(BONUS_XP['bug_report'])}.",
+                    "You are only ever mentioned by banter if you are a high-tier active member and haven't "
+                    "opted out.",
+                ]
+            ),
         )
 
     def _banter_excluded_ids(self) -> set[int]:
