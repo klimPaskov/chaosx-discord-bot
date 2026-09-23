@@ -101,9 +101,11 @@ PERKS: dict[str, tuple[str, ...]] = {
     ),
     "Rising Chaos": (
         "event ideas and suggestions you post are flagged priority for review",
+        "your vote on what gets tested next carries weight 1",
     ),
     "Chaos Tier": (
         "you are named in the weekly community round-up when you contribute",
+        "your vote on what gets tested next carries weight 2",
     ),
     "Total Chaos": (
         "your ideas go to the top of the captured list",
@@ -116,9 +118,9 @@ PERKS: dict[str, tuple[str, ...]] = {
 PERK_KEYS: dict[str, set[str]] = {
     "Calm World": {"color", "tier_up_post"},
     "Gathering Storm": {"color", "tier_up_post", "panel_emoji"},
-    "Rising Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority"},
-    "Chaos Tier": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout"},
-    "Total Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout", "idea_top"},
+    "Rising Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "voting_weight"},
+    "Chaos Tier": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout", "voting_weight"},
+    "Total Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout", "idea_top", "voting_weight"},
     "World Collapse": {
         "color",
         "tier_up_post",
@@ -127,8 +129,26 @@ PERK_KEYS: dict[str, set[str]] = {
         "digest_shoutout",
         "idea_top",
         "panel_pinned",
+        "voting_weight",
     },
 }
+
+# What a member's vote is worth when the community picks what gets tested next (Hoops 2026-09-23:
+# "add the voting weight only right now"). Everyone can vote; weight scales from Rising Chaos up.
+VOTING_WEIGHT: dict[str, int] = {
+    "Calm World": 0,
+    "Gathering Storm": 0,
+    "Rising Chaos": 1,
+    "Chaos Tier": 2,
+    "Total Chaos": 2,
+    "World Collapse": 2,
+}
+
+
+def voting_weight(tier: str) -> int:
+    """How much this tier's vote counts in a testing poll (0 = recorded, but not counted)."""
+    return int(VOTING_WEIGHT.get(tier, 0))
+
 
 # Everything below a member's tier, in ladder order, so `My tier` reads as a running list of what they
 # have collected (Hoops: "perks should have more a bit" - each tier adds one, nothing is taken away).

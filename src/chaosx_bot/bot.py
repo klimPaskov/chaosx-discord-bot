@@ -253,6 +253,7 @@ from .activity import (
     tier_emoji,
     tier_for_xp,
     tier_progress,
+    voting_weight,
 )
 from .guild_stats import GuildCounts, GuildCountsCache
 from .routine_posts import (
@@ -2059,6 +2060,8 @@ class ChaosXBot(discord.Client):
         # Persistent chaos-tier panel buttons: custom_id + timeout=None keeps a posted panel clickable
         # across restarts (the view has no per-message state beyond the scope it is showing).
         self.add_view(TierPanelView(self, timeout=None))
+        self.add_view(TestingVoteOpenView(self, timeout=None))
+        self.add_view(TestingVoteOptionsView(self, timeout=None))
         asyncio.create_task(self._refresh_rules_background())
         asyncio.create_task(self._refresh_channels_background())
         await self.store.set_automation_destination(["auto_question_answering", "auto_bot_topic_banter"], "source channel")
@@ -2481,6 +2484,49 @@ class ChaosXBot(discord.Client):
         xp = float(row[0]) if row else 0.0
         tier_logger.info("bonus xp: %s +%s (%s) -> %s", user_id, granted, kind, tier_for_xp(xp))
         return granted
+
+    async def _refresh_testing_poll_options(self) -> list[str]:
+        """Point the poll's slots at the current `Needs Testing` queue; returns the slot labels."""
+        rows = await asyncio.to_thread(self.knowledge.testing_queue_rows, 5)
+        if not rows:
+            return []
+        # Store the display label (not the bare name) so the panel rows and the buttons agree.
+        labelled = [(key, f"Event {key}: {label}"[:100]) for key, label in rows]
+        await self.store.set_testing_poll_options(labelled)
+        return [label[:78] for _key, label in labelled]
+
+    async def _testing_vote_panel_text(self, user_id: int, *, just_voted: str = "") -> str:
+        """The vote itself: what is on the table, what the community has chosen, what your vote counts."""
+        tally = await self.store.testing_vote_tally()
+        mine = await self.store.member_testing_vote(user_id)
+        row = await self.store.member_tier(user_id)
+        tier = str(row[1]) if row else TIERS[0][0]
+        weight = voting_weight(tier)
+        leaders = {key: (label, voters, total) for key, label, voters, total in tally}
+        lines = ["🗳️ **What should we test next?**"]
+        if just_voted:
+            lines.append(f"✅ Your vote is on **{just_voted}**.")
+        options = await self.store.testing_poll_options()
+        if not options:
+            lines.append("No events are marked `Needs Testing` right now - nothing to vote on yet.")
+        for slot, (key, label) in sorted(options.items()):
+            _label, voters, total = leaders.get(key, (label, 0, 0))
+            lines.append(f"- `{slot}` **{label}** — {voters} voter(s), {total} weighted")
+        if mine is not None:
+            lines.append(f"Your current vote: **{mine[1]}** (weight {mine[2]}).")
+        lines.append("")
+        if weight:
+            lines.append(
+                f"Your vote as {tier} counts **{weight}**. One vote per member, changeable any time."
+            )
+        else:
+            lines.append(
+                f"Your vote as {tier} is recorded but does not count towards the total yet - "
+                "Rising Chaos and above carry weight. Playtesting, event ideas, suggestions and bug "
+                "reports are what move you up."
+            )
+        lines.append("The winner here is what the community wants tested next; it goes to Hoops as a signal, not a decision.")
+        return sanitize_post("\n".join(lines), max_chars=1200)
 
     async def on_member_join(self, member: discord.Member) -> None:
         """Every new member starts on the ladder: Calm World until they earn chaos (Hoops 2026-09-23).
@@ -6503,6 +6549,82 @@ async def post_approved_event_idea(
     raise TypeError(f"Unsupported event idea channel type: {type(channel).__name__}")
 
 
+class TestingVoteOptionsView(discord.ui.View):
+    """Which event gets playtested next - the community vote, weighted by chaos tier.
+
+    The slots are fixed (chaosx_vote_slot1..5) so the buttons keep working after a restart; what each
+    slot points at lives in the database and is refreshed from the catalog's `Needs Testing` queue.
+    """
+
+    def __init__(self, bot: "ChaosXBot", *, labels: list[str] | None = None, timeout: float | None = None) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        labels = labels or [f"Candidate {index}" for index in range(1, 6)]
+        for slot in range(1, 6):
+            label = labels[slot - 1] if slot <= len(labels) else f"Candidate {slot}"
+            button = discord.ui.Button(
+                label=f"🕹️ {label}"[:80],
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"chaosx_vote_slot{slot}",
+                row=(slot - 1) // 3,
+            )
+            button.callback = self._make_callback(slot)
+            self.add_item(button)
+
+    def _make_callback(self, slot: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            options = await self.bot.store.testing_poll_options()
+            choice = options.get(slot)
+            if choice is None:
+                await interaction.response.send_message(
+                    "That option is no longer on the list - reopen the vote with the button below the "
+                    "testing queue.",
+                    ephemeral=True,
+                )
+                return
+            option_key, option_label = choice
+            row = await self.bot.store.member_tier(interaction.user.id)
+            tier = str(row[1]) if row else TIERS[0][0]
+            weight = voting_weight(tier)
+            await self.bot.store.set_testing_vote(interaction.user.id, option_key, option_label, weight)
+            await self.bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="testing vote",
+                summary=f"{option_label} (weight {weight}, tier {tier})",
+            )
+            await interaction.response.send_message(
+                await self.bot._testing_vote_panel_text(interaction.user.id, just_voted=option_label),
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+
+        return callback
+
+
+class TestingVoteOpenView(discord.ui.View):
+    """The single persistent button that opens the poll (sits under the testing queue)."""
+
+    def __init__(self, bot: "ChaosXBot", *, timeout: float | None = None) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="🗳️ Vote what gets tested next",
+        style=discord.ButtonStyle.primary,
+        custom_id="chaosx_vote_open",
+    )
+    async def open_poll(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        labels = await self.bot._refresh_testing_poll_options()
+        await interaction.response.send_message(
+            await self.bot._testing_vote_panel_text(interaction.user.id),
+            view=TestingVoteOptionsView(self.bot, labels=labels),
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+
 class TierPanelView(discord.ui.View):
     """Buttons on the public chaos-tier panel (/tiers and /admin tiers action:panel).
 
@@ -6738,7 +6860,15 @@ def register_commands(bot: ChaosXBot) -> None:
 
     @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
     async def chaosx_testing(interaction: discord.Interaction) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary="queue", render=bot.knowledge.testing_queue)
+        await bot._refresh_testing_poll_options()
+        await send_scripted_response(
+            bot,
+            interaction,
+            command_name="chaosx testing",
+            summary="queue",
+            render=bot.knowledge.testing_queue,
+            view=TestingVoteOpenView(bot, timeout=None),
+        )
 
 
     @bot.tree.command(name="suggestion", description="Draft a clearer review note of your rough suggestion.")

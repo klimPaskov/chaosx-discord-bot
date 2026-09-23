@@ -204,6 +204,24 @@ class Knowledge:
             lines.append(f"- `Event {int(event_id):03d}` **{name}** — {type_ or 'unknown'}; cluster `{cluster_id or 'none'}`; severity `{severity or 'none'}`. {summary}")
         return "\n".join(lines)
 
+    def testing_queue_rows(self, limit: int = 5) -> list[tuple[str, str]]:
+        """(event_id, name) for the events marked `Needs Testing` - the poll's candidates."""
+        self.ensure_index()
+        conn = connect(self.db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT event_id, name FROM catalog_events
+                WHERE status LIKE '%Needs Testing%'
+                ORDER BY CAST(event_id AS INTEGER)
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [(str(event_id), str(name or f"Event {event_id}")) for event_id, name in rows]
+
     def search(self, query: str, scope: str = "all", limit: int = 5, show_evidence: bool = False) -> str:
         self.ensure_index()
         safe_query = _fts_query(query)

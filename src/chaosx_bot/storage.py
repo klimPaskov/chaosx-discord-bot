@@ -157,6 +157,21 @@ CREATE TABLE IF NOT EXISTS automation_config (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS testing_poll_options (
+    slot INTEGER PRIMARY KEY,
+    option_key TEXT NOT NULL DEFAULT '',
+    option_label TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS testing_votes (
+    user_id INTEGER PRIMARY KEY,
+    option_key TEXT NOT NULL,
+    option_label TEXT NOT NULL DEFAULT '',
+    weight INTEGER NOT NULL DEFAULT 0,
+    voted_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS routine_posts (
     name TEXT PRIMARY KEY,
     period_key TEXT NOT NULL DEFAULT '',
@@ -964,6 +979,73 @@ class Store:
             )
             await db.commit()
         return round(grant, 3)
+
+    async def set_testing_poll_options(self, options: list[tuple[str, str]]) -> None:
+        """Fill the poll's fixed slots (1..5). Fixed slots keep the buttons alive across restarts."""
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM testing_poll_options")
+            await db.executemany(
+                "INSERT INTO testing_poll_options(slot, option_key, option_label, updated_at) "
+                "VALUES(?, ?, ?, ?)",
+                [(slot, key, label[:120], now) for slot, (key, label) in enumerate(options[:5], start=1)],
+            )
+            await db.commit()
+
+    async def testing_poll_options(self) -> dict[int, tuple[str, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT slot, option_key, option_label FROM testing_poll_options ORDER BY slot"
+            )
+            rows = await cur.fetchall()
+        return {int(slot): (str(key), str(label)) for slot, key, label in rows}
+
+    async def set_testing_vote(
+        self, user_id: int, option_key: str, option_label: str, weight: int
+    ) -> None:
+        """One vote per member - a new choice replaces the old one; the weight is snapshotted."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO testing_votes(user_id, option_key, option_label, weight, voted_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    option_key = excluded.option_key,
+                    option_label = excluded.option_label,
+                    weight = excluded.weight,
+                    voted_at = excluded.voted_at
+                """,
+                (
+                    int(user_id),
+                    str(option_key),
+                    str(option_label)[:120],
+                    int(weight),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+
+    async def member_testing_vote(self, user_id: int) -> tuple[str, str, int] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT option_key, option_label, weight FROM testing_votes WHERE user_id = ?",
+                (int(user_id),),
+            )
+            row = await cur.fetchone()
+        return (str(row[0]), str(row[1]), int(row[2])) if row else None
+
+    async def testing_vote_tally(self) -> list[tuple[str, str, int, int]]:
+        """(option_key, option_label, voters, weighted_total) per option, strongest first."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT option_key, MAX(option_label), COUNT(*), SUM(weight)
+                FROM testing_votes GROUP BY option_key
+                ORDER BY SUM(weight) DESC, COUNT(*) DESC, option_key
+                """
+            )
+            rows = await cur.fetchall()
+        return [(str(k), str(label), int(voters), int(total or 0)) for k, label, voters, total in rows]
 
     async def member_activity_totals(self, user_id: int) -> tuple[int, int]:
         """(messages, active days) for one member, for the tier-up congratulation."""
