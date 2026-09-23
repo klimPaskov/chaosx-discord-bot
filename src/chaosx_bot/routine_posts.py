@@ -337,25 +337,6 @@ def _bullet(lines: Iterable[str], limit: int = MAX_NOTABLE_COMMITS) -> str:
     return "\n".join(out) if out else "- (none)"
 
 
-def repo_content_counts(repo: Path) -> dict[str, int]:
-    """Approximate content scale of the mod checkout (file counts, tolerant of layout drift).
-
-    Scope, not changelog: the digest tells players how much mod there is, not which files changed.
-    """
-    counts = {"events": 0, "decisions": 0, "focuses": 0}
-    try:
-        counts["events"] = sum(1 for _ in repo.glob("events/**/*.txt"))
-        for path in repo.glob("common/**/*.txt"):
-            lowered = str(path).lower()
-            if "decision" in lowered:
-                counts["decisions"] += 1
-            if "focus" in lowered:
-                counts["focuses"] += 1
-    except OSError:
-        return counts
-    return counts
-
-
 def vault_recent_documents(
     vault: Path, folder: str, *, since_days: int = DIGEST_WINDOW_DAYS, limit: int = 8
 ) -> list[str]:
@@ -388,17 +369,6 @@ def playtest_observation(report_json: str | None) -> str:
     if not isinstance(data, dict):
         return ""
     return str(data.get("observation") or "").strip()
-
-
-def content_facts_line(content: dict[str, Any]) -> str:
-    parts: list[str] = []
-    if content.get("events"):
-        parts.append(f"{content['events']} event files")
-    if content.get("decisions"):
-        parts.append(f"{content['decisions']} decision files")
-    if content.get("focuses"):
-        parts.append(f"{content['focuses']} focus trees")
-    return ", ".join(parts) if parts else "content counts unavailable"
 
 
 def playtest_facts_line(playtests: list[dict[str, Any]]) -> str:
@@ -461,13 +431,11 @@ def build_digest_prompt(*, signals: dict[str, Any], max_chars: int = MAX_POST_CH
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
     server = signals.get("server") or {}
-    content = signals.get("content") or {}
     playtests = signals.get("playtests") or []
     return f"""Write the weekly Chaos Redux community digest. This is a community post, NOT a changelog.
 
 Facts (use only these, invent nothing, no pings/mentions):
 - Mod version: {signals.get('version') or 'unknown'}
-- Content in the mod right now: {content_facts_line(content)}
 - Changes landed in the last {signals.get('window_days', DIGEST_WINDOW_DAYS)} days: {commits.get('count', 0)}
 - Raw commit subjects (translate these into player language — never quote them):
 {_bullet(commits.get('notable') or [])}
@@ -489,7 +457,9 @@ Hard rules:
 Sections (exactly these):
 1. Title line: "**Weekly Chaos Redux digest — <version>**"
 2. "This week in the mod" — 3-5 bullets in plain language about what changed for players, grouping related work.
-3. "The mod right now" — one or two lines on scope and current focus: how much content exists, and which area is being worked on, in plain words.
+3. "The mod right now" — one or two lines naming the area being worked on, in plain words. No counts,
+   no statistics, no repository metrics: Hoops does not want the digest reporting numbers that he cannot
+   verify from the post itself.
 4. "From the community" — playtest observations, reported issues, ideas written up this week, server activity.
    Use 1-3 short lines. If something was quiet, say it was quiet in a few words instead of printing zeros.
 5. "What's next" — the testing focus, plus work already visibly underway in the facts. Never promise
@@ -507,7 +477,6 @@ def digest_fallback(signals: dict[str, Any]) -> str:
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
     server = signals.get("server") or {}
-    content = signals.get("content") or {}
     playtests = signals.get("playtests") or []
     repo = str(signals.get("repo_url") or "").rstrip("/")
     window = signals.get("window_days", DIGEST_WINDOW_DAYS)
@@ -519,7 +488,7 @@ def digest_fallback(signals: dict[str, Any]) -> str:
         "- Details of each change are in the repo history if you want the technical view.",
         "",
         "**The mod right now**",
-        f"- Content: {content_facts_line(content)}.",
+        "- Work this week centred on the mod's events and systems; the change list above has the specifics.",
         "",
         "**From the community**",
         f"- Playtests: {playtest_facts_line(playtests)}",

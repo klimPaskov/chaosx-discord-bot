@@ -260,7 +260,6 @@ from .routine_posts import (
     parse_iso,
     plan_due_posts,
     playtest_observation,
-    repo_content_counts,
     vault_recent_documents,
     release_fallback,
     release_signal_changed,
@@ -2409,13 +2408,12 @@ class ChaosXBot(discord.Client):
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS
         since_iso = (utcnow() - timedelta(days=window)).isoformat()
-        commits, event_files, version, head, issues, content, event_specs, suggestions = await asyncio.gather(
+        commits, event_files, version, head, issues, event_specs, suggestions = await asyncio.gather(
             git_commit_summary(repo, since_days=window),
             git_files_touched(repo, since_days=window, prefix="events"),
             descriptor_version(repo),
             git_head_sha(repo),
             github_issue_activity(self.settings.github_repo, since_days=window),
-            asyncio.to_thread(repo_content_counts, repo),
             asyncio.to_thread(
                 vault_recent_documents,
                 self.settings.obsidian_vault_path,
@@ -2443,7 +2441,6 @@ class ChaosXBot(discord.Client):
             "version": version,
             "head": head,
             "issues": issues,
-            "content": content,
             "playtests": playtests,
             "event_specs": event_specs,
             "suggestions": suggestions,

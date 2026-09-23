@@ -21,13 +21,11 @@ from chaosx_bot.routine_posts import (
     git_head_sha,
     is_interval_due,
     is_weekly_due,
-    content_facts_line,
     ideas_facts_line,
     issues_facts_line,
     plan_due_posts,
     playtest_facts_line,
     playtest_observation,
-    repo_content_counts,
     vault_recent_documents,
     release_fallback,
     release_signal_changed,
@@ -58,7 +56,6 @@ def _signals() -> dict:
             "open_total": 2,
         },
         "server": {"answers": 12, "qa_saved": 3, "warnings": 1, "playtests": 2, "members": 40},
-        "content": {"events": 162, "decisions": 213, "focuses": 53},
         "playtests": [{"target": "event006", "observation": "convoy payments looked correct but the AI stalled"}],
         "event_specs": ["007 - Void Rift"],
         "suggestions": ["Tester: add an Iceland focus tree"],
@@ -193,9 +190,10 @@ def test_digest_prompt_is_player_first_and_wider_scope():
     assert "NEVER use file names, paths, repo hashes, branch names" in prompt
     assert "never quote them" in prompt
     assert "NOT a changelog" in prompt
-    # wider scope: content scale, playtests, community ideas, server
-    assert "162 event files" in prompt and "213 decision files" in prompt
+    # wider scope: playtests, community ideas, server — and no repository statistics
     assert "convoy payments looked correct" in prompt
+    assert "no statistics" in prompt and "repository metrics" in prompt
+    assert "162 event files" not in prompt
     assert "007 - Void Rift" in prompt
     assert "add an Iceland focus tree" in prompt
     # the five sections, in order
@@ -211,7 +209,8 @@ def test_digest_fallback_is_jargon_free_and_wider_scope():
     assert "From the community" in digest
     assert "What's next" in digest
     assert "181 changes landed" in digest
-    assert "162 event files" in digest
+    assert "162 event files" not in digest
+    assert "decision files" not in digest
     assert "convoy payments looked correct" in digest
     assert "007 - Void Rift" in digest
     assert "2 still open" in digest
@@ -336,22 +335,6 @@ async def test_git_signals_degrade_when_repo_is_missing(tmp_path):
 # --- wider scope signals ----------------------------------------------------
 
 
-def test_repo_content_counts_counts_events_decisions_and_focuses(tmp_path):
-    repo = tmp_path / "mod"
-    (repo / "events").mkdir(parents=True)
-    (repo / "events" / "a.txt").write_text("x")
-    (repo / "events" / "nested").mkdir()
-    (repo / "events" / "nested" / "b.txt").write_text("x")
-    (repo / "common" / "decisions").mkdir(parents=True)
-    (repo / "common" / "decisions" / "one.txt").write_text("x")
-    (repo / "common" / "focus").mkdir(parents=True)
-    (repo / "common" / "focus" / "tree.txt").write_text("x")
-    (repo / "common" / "focus" / "notes.md").write_text("x")  # not .txt, ignored
-    counts = repo_content_counts(repo)
-    assert counts == {"events": 2, "decisions": 1, "focuses": 1}
-    assert repo_content_counts(tmp_path / "missing") == {"events": 0, "decisions": 0, "focuses": 0}
-
-
 def test_vault_recent_documents_honours_the_window(tmp_path):
     import os
     from time import time
@@ -377,7 +360,6 @@ def test_playtest_observation_reads_only_real_observations():
 
 
 def test_fact_lines_are_honest_about_quiet_weeks():
-    assert content_facts_line({}) == "content counts unavailable"
     assert "no playtest observations" in playtest_facts_line([])
     assert "no new community ideas" in ideas_facts_line(event_specs=[], suggestions=[])
     assert "event ideas/specs added" in ideas_facts_line(event_specs=["007 - Void Rift"], suggestions=[])
