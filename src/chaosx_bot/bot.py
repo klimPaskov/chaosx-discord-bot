@@ -260,7 +260,6 @@ from .routine_posts import (
     parse_iso,
     plan_due_posts,
     playtest_observation,
-    vault_recent_documents,
     release_fallback,
     release_signal_changed,
     release_state_detail,
@@ -2408,30 +2407,25 @@ class ChaosXBot(discord.Client):
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS
         since_iso = (utcnow() - timedelta(days=window)).isoformat()
-        commits, event_files, version, head, issues, event_specs, suggestions = await asyncio.gather(
+        commits, event_files, version, head, issues = await asyncio.gather(
             git_commit_summary(repo, since_days=window),
             git_files_touched(repo, since_days=window, prefix="events"),
             descriptor_version(repo),
             git_head_sha(repo),
             github_issue_activity(self.settings.github_repo, since_days=window),
-            asyncio.to_thread(
-                vault_recent_documents,
-                self.settings.obsidian_vault_path,
-                self.settings.community_event_specs_folder,
-                since_days=window,
-            ),
-            asyncio.to_thread(
-                vault_recent_documents,
-                self.settings.obsidian_vault_path,
-                self.settings.community_suggestions_folder,
-                since_days=window,
-            ),
         )
         stats = await self.store.routine_stats(since_iso=since_iso)
         playtest_rows = await self.store.list_playtest_reports_since(since_iso=since_iso, limit=6)
         playtests = [
             {"target": str(row[1]), "observation": playtest_observation(row[2])}
             for row in playtest_rows
+        ]
+        # Community write-ups come from the bot's own audit rows (real submissions), never from
+        # vault file mtimes: the vault syncs in bulk, so mtimes are sync time, not authoring time.
+        captures = await self.store.community_captures(since_iso=since_iso, limit=10)
+        community_captures = [
+            {"created_at": str(row[0]), "command": str(row[1]), "summary": str(row[2])}
+            for row in captures
         ]
         guild = self.guilds[0] if self.guilds else None
         return {
@@ -2442,8 +2436,7 @@ class ChaosXBot(discord.Client):
             "head": head,
             "issues": issues,
             "playtests": playtests,
-            "event_specs": event_specs,
-            "suggestions": suggestions,
+            "community_captures": community_captures,
             "repo_url": f"https://github.com/{self.settings.github_repo}",
             "server": {
                 "answers": stats.get("answers", 0),

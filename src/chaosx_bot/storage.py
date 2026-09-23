@@ -688,6 +688,26 @@ class Store:
             )
             return [tuple(row) for row in await cur.fetchall()]
 
+    async def community_captures(self, *, since_iso: str, limit: int = 10) -> list[tuple]:
+        """Community ideas/suggestions written up in the window, straight from the audit log.
+
+        Only the vault-write rows are used (`vault event-idea` / `vault suggestion`), because their
+        summary is the note name the member's submission became. File mtimes are NOT a source: the
+        vault is synced in bulk, so mtime is sync time, not authoring time.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT created_at, command, summary
+                FROM audit_log
+                WHERE created_at >= ? AND command IN ('vault event-idea', 'vault suggestion')
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (since_iso, max(1, min(limit, 50))),
+            )
+            return [tuple(row) for row in await cur.fetchall()]
+
     async def list_playtest_reports_since(self, *, since_iso: str, limit: int = 6) -> list[tuple]:
         """Reports recorded in the window, newest first (community observations for the digest)."""
         async with aiosqlite.connect(self.db_path) as db:

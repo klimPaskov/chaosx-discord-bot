@@ -21,12 +21,11 @@ from chaosx_bot.routine_posts import (
     git_head_sha,
     is_interval_due,
     is_weekly_due,
-    ideas_facts_line,
+    community_facts_line,
     issues_facts_line,
     plan_due_posts,
     playtest_facts_line,
     playtest_observation,
-    vault_recent_documents,
     release_fallback,
     release_signal_changed,
     release_state_detail,
@@ -57,8 +56,18 @@ def _signals() -> dict:
         },
         "server": {"answers": 12, "qa_saved": 3, "warnings": 1, "playtests": 2, "members": 40},
         "playtests": [{"target": "event006", "observation": "convoy payments looked correct but the AI stalled"}],
-        "event_specs": ["007 - Void Rift"],
-        "suggestions": ["Tester: add an Iceland focus tree"],
+        "community_captures": [
+            {
+                "created_at": "2026-09-22T10:00:00+00:00",
+                "command": "vault event-idea",
+                "summary": "/srv/chaosx/chaos-redux-vault/Events/Event Specs/Community Idea - Void Rift.md",
+            },
+            {
+                "created_at": "2026-09-22T11:00:00+00:00",
+                "command": "vault suggestion",
+                "summary": "/srv/chaosx/chaos-redux-vault/Planning/Community Suggestions/namibian content.md",
+            },
+        ],
         "repo_url": "https://github.com/klimPaskov/Chaos-Redux",
     }
 
@@ -194,8 +203,8 @@ def test_digest_prompt_is_player_first_and_wider_scope():
     assert "convoy payments looked correct" in prompt
     assert "no statistics" in prompt and "repository metrics" in prompt
     assert "162 event files" not in prompt
-    assert "007 - Void Rift" in prompt
-    assert "add an Iceland focus tree" in prompt
+    assert "Community Idea - Void Rift" in prompt
+    assert "namibian content" in prompt
     # the five sections, in order
     for section in ("Weekly Chaos Redux digest", "This week in the mod", "The mod right now", "From the community", "What's next"):
         assert section in prompt
@@ -212,7 +221,7 @@ def test_digest_fallback_is_jargon_free_and_wider_scope():
     assert "162 event files" not in digest
     assert "decision files" not in digest
     assert "convoy payments looked correct" in digest
-    assert "007 - Void Rift" in digest
+    assert "Community Idea - Void Rift" in digest
     assert "2 still open" in digest
     assert "https://github.com/klimPaskov/Chaos-Redux/commits" in digest
     # no technical leakage in the fallback path
@@ -335,21 +344,32 @@ async def test_git_signals_degrade_when_repo_is_missing(tmp_path):
 # --- wider scope signals ----------------------------------------------------
 
 
-def test_vault_recent_documents_honours_the_window(tmp_path):
-    import os
-    from time import time
+@pytest.mark.asyncio
+async def test_community_captures_come_from_the_audit_log_not_file_times(tmp_path):
+    """Vault mtimes are sync time, so the digest must count real submissions instead."""
+    from chaosx_bot.storage import Store
 
-    specs = tmp_path / "vault" / "Events" / "Event Specs"
-    specs.mkdir(parents=True)
-    fresh = specs / "007 - Void Rift.md"
-    stale = specs / "002 - Zombie Outbreak.md"
-    fresh.write_text("new idea")
-    stale.write_text("old idea")
-    old = time() - 30 * 86400
-    os.utime(stale, (old, old))
-    names = vault_recent_documents(tmp_path / "vault", "Events/Event Specs", since_days=7)
-    assert names == ["007 - Void Rift"]
-    assert vault_recent_documents(tmp_path / "vault", "Planning/Community Suggestions") == []
+    store = Store(tmp_path / "chaosx.db")
+    await store.init()
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=1)).isoformat()
+    old = (now - timedelta(days=30)).isoformat()
+    for created, command, summary in (
+        (recent, "vault event-idea", "/srv/chaosx/chaosx-redux-vault/Events/Event Specs/Community Idea - Void Rift.md"),
+        (recent, "vault suggestion", "/v/Planning/Community Suggestions/namibian content.md"),
+        (old, "vault event-idea", "/v/Events/Event Specs/Community Idea - Ancient.md"),
+        (recent, "event-idea", "/event-idea idea='raw submission text'"),  # raw row is not a write-up
+    ):
+        await store.audit(actor_id=1, guild_id=9, channel_id=5, command=command, summary=summary)
+        async with __import__("aiosqlite").connect(store.db_path) as db:
+            await db.execute("UPDATE audit_log SET created_at = ? WHERE command = ? AND summary = ?", (created, command, summary))
+            await db.commit()
+    rows = await store.community_captures(since_iso=(now - timedelta(days=7)).isoformat(), limit=10)
+    assert len(rows) == 2
+    line = community_facts_line([{"command": r[1], "summary": r[2]} for r in rows])
+    assert "1 event idea(s) written up: Community Idea - Void Rift" in line
+    assert "1 suggestion(s) captured: namibian content" in line
+    assert "Ancient" not in line
 
 
 def test_playtest_observation_reads_only_real_observations():
@@ -361,8 +381,17 @@ def test_playtest_observation_reads_only_real_observations():
 
 def test_fact_lines_are_honest_about_quiet_weeks():
     assert "no playtest observations" in playtest_facts_line([])
-    assert "no new community ideas" in ideas_facts_line(event_specs=[], suggestions=[])
-    assert "event ideas/specs added" in ideas_facts_line(event_specs=["007 - Void Rift"], suggestions=[])
+    assert "no member event ideas or suggestions" in community_facts_line([])
+    assert "1 event idea(s) written up: Community Idea - Void Rift" in community_facts_line(
+        [{"command": "vault event-idea", "summary": "/v/Events/Event Specs/Community Idea - Void Rift.md"}]
+    )
+    mixed = community_facts_line(
+        [
+            {"command": "vault event-idea", "summary": "/v/Events/Event Specs/Community Idea - A.md"},
+            {"command": "vault suggestion", "summary": "/v/Planning/Community Suggestions/namibian content.md"},
+        ]
+    )
+    assert "1 event idea(s)" in mixed and "1 suggestion(s) captured: namibian content" in mixed
     assert "no GitHub issue activity" in issues_facts_line({"available": True, "opened": [], "closed": []})
     assert "unavailable" in issues_facts_line({"available": False})
     assert "no issue movement (3 open)" in issues_facts_line(

@@ -337,26 +337,6 @@ def _bullet(lines: Iterable[str], limit: int = MAX_NOTABLE_COMMITS) -> str:
     return "\n".join(out) if out else "- (none)"
 
 
-def vault_recent_documents(
-    vault: Path, folder: str, *, since_days: int = DIGEST_WINDOW_DAYS, limit: int = 8
-) -> list[str]:
-    """Names of documents added or edited in the window (community event ideas, suggestions)."""
-    root = vault / folder
-    if not root.exists():
-        return []
-    cutoff = time.time() - since_days * 86400
-    recent: list[tuple[float, str]] = []
-    for path in root.rglob("*.md"):
-        try:
-            modified = path.stat().st_mtime
-        except OSError:
-            continue
-        if modified >= cutoff:
-            recent.append((modified, path.stem))
-    recent.sort(reverse=True)
-    return [name for _, name in recent[:limit]]
-
-
 def playtest_observation(report_json: str | None) -> str:
     """The human observation text from a stored playtest report (skips empty/unreadable reports)."""
     raw = (report_json or "").strip()
@@ -383,13 +363,39 @@ def playtest_facts_line(playtests: list[dict[str, Any]]) -> str:
     return " | ".join(lines) if lines else f"{len(playtests)} playtest observations recorded"
 
 
-def ideas_facts_line(*, event_specs: list[str], suggestions: list[str]) -> str:
+def _capture_name(summary: str) -> str:
+    """Note name from a `vault event-idea` / `vault suggestion` audit row (path -> stem)."""
+    text = (summary or "").strip()
+    if not text:
+        return ""
+    stem = text.rsplit("/", 1)[-1]
+    if stem.endswith(".md"):
+        stem = stem[:-3]
+    return stem.strip()
+
+
+def community_facts_line(captures: list[dict[str, Any]]) -> str:
+    """Community ideas/suggestions written up through ChaosX this week.
+
+    Sourced from the bot's own audit rows, so the count is exactly what members submitted and the bot
+    wrote up. Vault file mtimes are never used — the vault syncs in bulk and rewrites them.
+    """
+    ideas: list[str] = []
+    suggestions: list[str] = []
+    for row in captures:
+        name = _capture_name(str(row.get("summary") or ""))
+        if not name:
+            continue
+        if str(row.get("command") or "") == "vault suggestion":
+            suggestions.append(name)
+        else:
+            ideas.append(name)
     parts: list[str] = []
-    if event_specs:
-        parts.append(f"event ideas/specs added or edited: {', '.join(event_specs)}")
+    if ideas:
+        parts.append(f"{len(ideas)} event idea(s) written up: {', '.join(ideas[:3])}")
     if suggestions:
-        parts.append(f"community suggestions captured: {', '.join(suggestions)}")
-    return "; ".join(parts) if parts else "no new community ideas were written up this week"
+        parts.append(f"{len(suggestions)} suggestion(s) captured: {', '.join(suggestions[:3])}")
+    return "; ".join(parts) if parts else "no member event ideas or suggestions were submitted this week"
 
 
 def server_facts_line(server: dict[str, Any]) -> str:
@@ -441,7 +447,7 @@ Facts (use only these, invent nothing, no pings/mentions):
 {_bullet(commits.get('notable') or [])}
 - GitHub issues: {issues_facts_line(issues)}
 - Playtest observations recorded this week: {playtest_facts_line(playtests)}
-- Community ideas: {ideas_facts_line(event_specs=signals.get('event_specs') or [], suggestions=signals.get('suggestions') or [])}
+- Community ideas/suggestions submitted this week: {community_facts_line(signals.get('community_captures') or [])}
 - Server activity: {server_facts_line(server)}
 
 Audience: players, testers and friends of the mod — not programmers. Someone who has never opened the
@@ -492,7 +498,7 @@ def digest_fallback(signals: dict[str, Any]) -> str:
         "",
         "**From the community**",
         f"- Playtests: {playtest_facts_line(playtests)}",
-        f"- Ideas: {ideas_facts_line(event_specs=signals.get('event_specs') or [], suggestions=signals.get('suggestions') or [])}",
+        f"- Ideas: {community_facts_line(signals.get('community_captures') or [])}",
         f"- Issues: {issues_facts_line(issues)}",
         f"- Server: {server_facts_line(server)}",
         "",
