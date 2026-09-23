@@ -161,6 +161,28 @@ class Settings(BaseSettings):
     intel_digest_hour_utc: int = Field(default=18, ge=0, le=23, description="UTC hour for the private server-intel digest DM")
     playtest_reminder_lead_minutes: int = Field(default=30, ge=5, le=240, description="How long before a playtest the reminder post goes out")
     playtest_result_grace_minutes: int = Field(default=10, ge=0, le=240, description="How long after a playtest window to ask for results")
+    activity_rollup_tick_seconds: int = Field(
+        default=600, ge=120, le=3600,
+        description="How often the chaos-tier activity rollup folds new archive messages in",
+    )
+    idle_banter_excluded_ids: list[int] = Field(
+        default_factory=lambda: [110546365032968192],  # Holly — never a banter target (Hoops, 2026-09-23)
+        description="Members idle banter must never target (the owner is always excluded in code as well)",
+    )
+    idle_banter_enabled: bool = Field(
+        default=False,
+        description="Idle banter: bot may open a conversation in the banter channel after real silence. Off by default (Hoops 2026-09-23).",
+    )
+    idle_banter_channel_id: int = Field(
+        default=1395459672055480344, description="#jazz-and-conversation — the only channel idle banter may post in"
+    )
+    idle_banter_shadow: bool = Field(
+        default=True,
+        description="Idle banter shadow mode: log what it would post without posting anything",
+    )
+    idle_banter_silence_minutes: int = Field(default=45, ge=15, le=360, description="Required silence before an idle banter post")
+    idle_banter_max_per_day: int = Field(default=3, ge=1, le=12, description="Daily cap on idle banter posts")
+    idle_banter_min_gap_minutes: int = Field(default=180, ge=30, le=1440, description="Minimum gap between idle banter posts")
     routine_posts_tick_seconds: int = Field(default=600, ge=60, le=3600, description="How often the bot checks whether a routine post is due")
     release_check_interval_hours: int = Field(default=6, ge=1, le=48, description="How often to check for a new mod version/GitHub release")
     access_reaction_channel_id: Optional[int] = Field(default=1396027815786188890, description="Info channel for the access reaction-role message")

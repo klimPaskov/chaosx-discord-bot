@@ -239,6 +239,17 @@ from .announcements import (
     collect_announcement_facts,
     title_from_body,
 )
+from .activity import (
+    BONUS_XP,
+    DEFAULT_ELIGIBLE_TIER,
+    TIERS,
+    banter_eligible,
+    day_xp,
+    parse_day,
+    select_banter_candidates,
+    tier_for_xp,
+    tier_progress,
+)
 from .guild_stats import GuildCounts, GuildCountsCache
 from .routine_posts import (
     DEV_DIGEST,
@@ -327,7 +338,45 @@ AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
 AUTO_BANTER_AUTOMATION_NAME = "auto_bot_topic_banter"
 # Autonomous routine posts (weekly dev digest / release announcements): the first
 # tick waits a little so startup work (index, members, channels) settles first.
+def _parse_member_reference(value: str) -> int:
+    """Discord id from a <@id> / <@!id> mention or a bare numeric id; 0 when it is a name."""
+    text = (value or "").strip()
+    match = re.fullmatch(r"<@!?(\d+)>", text)
+    if match:
+        return int(match.group(1))
+    return int(text) if text.isdigit() else 0
+
+
+def _display_name_for(bot: object, user_id: int) -> str:
+    known = getattr(bot, "guild_members", None)
+    if known is not None:
+        name = known.name_for(user_id) if hasattr(known, "name_for") else ""
+        if name:
+            return name
+    return f"<@{user_id}>"
+
+
+def tier_threshold_label(tier: str) -> int:
+    for name, threshold in TIERS:
+        if name == tier:
+            return threshold
+    return 0
+
+
+def activity_window_start(days: int) -> str:
+    return (utcnow() - timedelta(days=max(1, days))).date().isoformat()
+
+
+def _tier_standings_lines(rows: list[tuple]) -> list[str]:
+    out: list[str] = []
+    for rank, (user_id, name, xp, messages, days) in enumerate(rows, start=1):
+        progress = tier_progress(float(xp or 0))
+        out.append(f"{rank}. {name or user_id} — {progress.label} ({int(xp)} chaos, {int(messages)} messages/{int(days)} days)")
+    return out or ["(no activity recorded yet)"]
+
+
 ROUTINE_POSTS_WORKER_INITIAL_DELAY_S = 90
+ACTIVITY_WORKER_INITIAL_DELAY_S = 120
 PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
 PUBLIC_ASK_DOMAIN_TERMS = {
     "chaos redux", "chaosx", "hoi4", "hearts of iron", "mod", "event", "scenario", "cluster", "mechanic",
@@ -1537,6 +1586,7 @@ class ChaosXBot(discord.Client):
         )
         self._playtest_synthesis_task: asyncio.Task[None] | None = None
         self._routine_posts_task: asyncio.Task[None] | None = None
+        self._activity_task: asyncio.Task[None] | None = None
         self._mcp_warm_task: asyncio.Task[None] | None = None
         self._memory_maintenance_task: asyncio.Task[None] | None = None
         self._playtest_synthesis_lock = asyncio.Lock()
@@ -2028,6 +2078,10 @@ class ChaosXBot(discord.Client):
             self._mcp_warm_task = asyncio.create_task(
                 self._warm_mcp_session(), name="chaosx-mcp-warmup"
             )
+        if self._activity_task is None or self._activity_task.done():
+            self._activity_task = asyncio.create_task(
+                self._activity_worker(ACTIVITY_WORKER_INITIAL_DELAY_S), name="chaosx-activity-rollup"
+            )
         if self._routine_posts_task is None or self._routine_posts_task.done():
             self._routine_posts_task = asyncio.create_task(
                 self._routine_posts_worker(ROUTINE_POSTS_WORKER_INITIAL_DELAY_S),
@@ -2305,6 +2359,96 @@ class ChaosXBot(discord.Client):
         for outcome in outcomes:
             print(f"[chaosx] {outcome}")
         return outcomes
+
+    async def _rollup_member_activity(self, *, rebuild: bool = False) -> dict[str, int]:
+        """Fold the message archive into the chaos-tier rollup.
+
+        Days are always re-rolled in full (never incrementally added to), so a day that keeps receiving
+        messages is still counted once and correctly. `rebuild=True` re-reads the whole archive.
+        """
+        ignore_ids = await self._activity_ignore_ids()
+        cursor = 0 if rebuild else await self.store.activity_cursor()
+        processed = 0
+        affected: set[tuple[int, str]] = set()
+        while True:
+            rows = await self.store.archive_rows_after(cursor, limit=5000, ignore_ids=ignore_ids)
+            if not rows:
+                break
+            processed += len(rows)
+            cursor = max(int(row[0]) for row in rows)
+            for row in rows:
+                day = parse_day(str(row[2]))
+                if day:
+                    affected.add((int(row[1]), day))
+            await self.store.set_activity_cursor(cursor)
+            if len(rows) < 5000:
+                break
+        rolled: list[tuple[int, str, int, float]] = []
+        affected = {(user_id, day) for user_id, day in affected if user_id not in ignore_ids}
+        for user_id, day in sorted(affected):
+            messages = await self.store.archive_day_rows(user_id, day, ignore_ids=ignore_ids)
+            count, xp = day_xp(messages)
+            rolled.append((user_id, day, count, xp))
+        days = await self.store.upsert_activity_days(rolled)
+        members = await self.store.recompute_member_tiers()
+        return {"messages": processed, "days": days, "members": members}
+
+    async def _activity_ignore_ids(self) -> set[int]:
+        """Bot accounts never earn chaos: ChaosX must not rank on its own leaderboard."""
+        ignore: set[int] = set()
+        if getattr(self, "user", None) is not None:
+            ignore.add(int(self.user.id))
+        if getattr(self.settings, "bot_user_id", 0):
+            ignore.add(int(self.settings.bot_user_id))
+        ignore |= await self.store.known_bot_ids()
+        ignore.discard(0)
+        return ignore
+
+    def _banter_excluded_ids(self) -> set[int]:
+        """Owner plus the configured exclusions can never be targeted.
+
+        Hoops 2026-09-23: "I should never be target as well" — the owner is excluded in code, so it holds
+        even if the config list is edited later.
+        """
+        excluded = {int(self.settings.owner_id or 0)}
+        excluded |= {int(value) for value in (self.settings.idle_banter_excluded_ids or [])}
+        excluded.discard(0)
+        return excluded
+
+    async def _idle_banter_candidates(self) -> list[str]:
+        """Who idle banter could target right now, as display names with their tier.
+
+        Empty is a valid and currently expected answer: until members climb to the tier floor there is
+        nobody to ping, and the bot must stay silent rather than ping the channel.
+        """
+        channel_id = int(self.settings.idle_banter_channel_id)
+        tiers = await self.store.activity_xp_by_member()
+        seen = await self.store.last_seen_in_channel(channel_id)
+        user_ids = select_banter_candidates(
+            tiers=tiers,
+            seen=seen,
+            opted_out=await self.store.opted_out_members("banter_optout"),
+            excluded=self._banter_excluded_ids(),
+            bots=await self.store.known_bot_ids(),
+            now=utcnow(),
+        )
+        return [f"{_display_name_for(self, user_id)} ({tier_for_xp(tiers.get(user_id, 0.0))})" for user_id in user_ids]
+
+    async def _activity_worker(self, delay_seconds: int) -> None:
+        await asyncio.sleep(max(0, delay_seconds))
+        while True:
+            try:
+                summary = await self._rollup_member_activity()
+                if summary["days"]:
+                    print(
+                        f"ChaosX activity rollup: {summary['messages']} message(s), "
+                        f"{summary['days']} day(s), {summary['members']} member tier(s)"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # one bad tick must never kill the loop
+                print(f"ChaosX activity rollup failed: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(max(120, self.settings.activity_rollup_tick_seconds))
 
     async def _routine_posts_worker(self, delay_seconds: int) -> None:
         await asyncio.sleep(max(0, delay_seconds))
@@ -6705,6 +6849,72 @@ def register_commands(bot: ChaosXBot) -> None:
             channel_id=interaction.channel_id,
             command="admin validate-workbook",
             summary=summary,
+        )
+
+    @admin.command(name="tiers", description="Chaos-tier activity standings and rollup control.")
+    async def admin_tiers(interaction: discord.Interaction, action: str = "show", member: str = "") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = (action or "show").lower().strip()
+        if action not in {"show", "rebuild", "member", "banter"}:
+            await interaction.response.send_message(
+                "Use `action:show` (standings), `action:rebuild` (re-roll the whole archive), "
+                "`action:member member:<@user|name>` (one member's tier), or `action:banter` (who idle "
+                "banter could target right now).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lines: list[str] = []
+
+        if action == "rebuild":
+            summary = await bot._rollup_member_activity(rebuild=True)
+            lines.append(
+                f"Re-rolled {summary['messages']} archived messages into {summary['days']} member-days; "
+                f"{summary['members']} member tier row(s)."
+            )
+        if action == "banter":
+            targets = await bot._idle_banter_candidates()
+            lines.append(
+                f"Idle banter: enabled=`{settings.idle_banter_enabled}` shadow=`{settings.idle_banter_shadow}` "
+                f"channel=`{settings.idle_banter_channel_id}` floor=`{DEFAULT_ELIGIBLE_TIER}` "
+                f"({tier_threshold_label(DEFAULT_ELIGIBLE_TIER)} chaos)."
+            )
+            lines.append(
+                "Targets right now: " + (", ".join(targets) if targets else "none")
+            )
+        if action == "member":
+            user_id = _parse_member_reference(member) or None
+            if user_id is None:
+                lines.append("Give me `member:<@user>` or an exact display name.")
+            else:
+                row = await bot.store.member_tier(user_id)
+                prefs = await bot.store.member_prefs(user_id)
+                xp = row[0] if row else 0.0
+                progress = tier_progress(xp)
+                name = _display_name_for(bot, user_id)
+                excluded = "yes" if user_id in bot._banter_excluded_ids() else "no"
+                lines.append(
+                    f"{name}: {progress.label} ({int(xp)} chaos)\n"
+                    f"- excluded from idle banter: {excluded}; banter opt-out: {prefs['banter_optout']}; "
+                    f"leaderboard opt-out: {prefs['leaderboard_optout']}"
+                )
+        if action in {"show", "rebuild"}:
+            lines.append("## Chaos tiers (all time)")
+            lines.extend(bot._tier_standings_lines(await bot.store.top_members(limit=15)))
+            week_start = activity_window_start(7)
+            lines.append(f"\n## Last 7 days (since {week_start})")
+            lines.extend(bot._tier_standings_lines(await bot.store.top_members(limit=10, since_day=week_start)))
+            cursor = await bot.store.activity_cursor()
+            lines.append(f"\nRollup cursor: archive id {cursor}; tiers: " + ", ".join(f"{n} ({t})" for n, t in TIERS))
+        for part in _chunk("\n".join(lines)):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin tiers",
+            summary=f"action={action} member={member or '-'}",
         )
 
     @admin.command(name="automation", description="List/enable/disable automation by name.")

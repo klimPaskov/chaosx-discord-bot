@@ -7,6 +7,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from .activity import tier_for_xp
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +192,34 @@ CREATE TABLE IF NOT EXISTS server_action_plans (
     status TEXT NOT NULL DEFAULT 'planned',
     result TEXT NOT NULL DEFAULT '',
     executed_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS member_activity_daily (
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    messages INTEGER NOT NULL DEFAULT 0,
+    xp REAL NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS member_tiers (
+    user_id INTEGER PRIMARY KEY,
+    xp REAL NOT NULL DEFAULT 0,
+    tier TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS member_prefs (
+    user_id INTEGER PRIMARY KEY,
+    banter_optout INTEGER NOT NULL DEFAULT 0,
+    leaderboard_optout INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS playtest_automation_marks (
@@ -805,6 +835,190 @@ class Store:
             await db.execute(
                 f"UPDATE automation_config SET destination = ?, updated_at = ? WHERE name IN ({placeholders})",
                 (destination, now_iso(), *names),
+            )
+            await db.commit()
+
+    # ---------------------------------------------------------------- member activity / chaos tiers
+    async def activity_cursor(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT value FROM activity_state WHERE key = 'archive_cursor'")
+            row = await cur.fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    async def set_activity_cursor(self, value: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO activity_state(key, value) VALUES('archive_cursor', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(int(value)),),
+            )
+            await db.commit()
+
+    async def archive_rows_after(
+        self, cursor: int, *, limit: int = 5000, ignore_ids: set[int] | None = None
+    ) -> list[tuple]:
+        """(id, author_id, created_at, channel_id, content) beyond the rollup cursor, oldest first.
+
+        `ignore_ids` keeps bot authors out of the rollup — ChaosX must not rank on its own leaderboard.
+        """
+        skip = sorted({int(value) for value in (ignore_ids or set()) if value})
+        clause = f" AND author_id NOT IN ({','.join('?' for _ in skip)})" if skip else ""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                f"""
+                SELECT id, author_id, created_at, channel_id, content
+                FROM message_archive
+                WHERE id > ? AND author_id IS NOT NULL{clause}
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(cursor), *skip, max(1, int(limit))),
+            )
+            return [tuple(row) for row in await cur.fetchall()]
+
+    async def archive_day_rows(
+        self, user_id: int, day: str, *, ignore_ids: set[int] | None = None
+    ) -> list[tuple[str, int | None]]:
+        """(content, channel_id) for one member's day, in order — used to re-roll that day in full."""
+        if int(user_id) in {int(value) for value in (ignore_ids or set()) if value}:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT content, channel_id FROM message_archive WHERE author_id = ? "
+                "AND substr(created_at, 1, 10) = ? ORDER BY created_at ASC, id ASC",
+                (int(user_id), str(day)),
+            )
+            return [(str(row[0] or ""), row[1]) for row in await cur.fetchall()]
+
+    async def upsert_activity_days(self, rows: list[tuple[int, str, int, float]]) -> int:
+        """(user_id, day, messages, xp) rows; recomputed days are replaced, never double-counted."""
+        if not rows:
+            return 0
+        stamp = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                """
+                INSERT INTO member_activity_daily(user_id, day, messages, xp, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, day) DO UPDATE SET
+                    messages = excluded.messages, xp = excluded.xp, updated_at = excluded.updated_at
+                """,
+                [(int(u), str(d), int(m), float(x), stamp) for u, d, m, x in rows],
+            )
+            await db.commit()
+        return len(rows)
+
+    async def recompute_member_tiers(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT user_id, SUM(xp) FROM member_activity_daily GROUP BY user_id HAVING SUM(xp) > 0"
+            )
+            totals = [(int(u), float(x or 0)) for u, x in await cur.fetchall()]
+            stamp = datetime.now(timezone.utc).isoformat()
+            rows = [
+                (user_id, round(xp, 3), tier_for_xp(xp), stamp)
+                for user_id, xp in totals
+            ]
+            await db.executemany(
+                """
+                INSERT INTO member_tiers(user_id, xp, tier, updated_at) VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    xp = excluded.xp, tier = excluded.tier, updated_at = excluded.updated_at
+                """,
+                rows,
+            )
+            await db.commit()
+        return len(rows)
+
+    async def member_tier(self, user_id: int) -> tuple[float, str] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT xp, tier FROM member_tiers WHERE user_id = ?", (int(user_id),))
+            row = await cur.fetchone()
+        return (float(row[0]), str(row[1])) if row else None
+
+    async def top_members(self, *, limit: int = 10, since_day: str | None = None) -> list[tuple]:
+        """(user_id, display_name, xp, messages, active_days) ranked by XP."""
+        async with aiosqlite.connect(self.db_path) as db:
+            if since_day:
+                sql = """
+                    SELECT a.user_id, COALESCE(u.display_name, ''), SUM(a.xp), SUM(a.messages), COUNT(*)
+                    FROM member_activity_daily a
+                    LEFT JOIN users u ON u.user_id = a.user_id
+                    WHERE a.day >= ?
+                    GROUP BY a.user_id ORDER BY SUM(a.xp) DESC, a.user_id LIMIT ?
+                """
+                params: tuple = (str(since_day), max(1, int(limit)))
+            else:
+                sql = """
+                    SELECT a.user_id, COALESCE(u.display_name, ''), SUM(a.xp), SUM(a.messages), COUNT(*)
+                    FROM member_activity_daily a
+                    LEFT JOIN users u ON u.user_id = a.user_id
+                    GROUP BY a.user_id ORDER BY SUM(a.xp) DESC, a.user_id LIMIT ?
+                """
+                params = (max(1, int(limit)),)
+            cur = await db.execute(sql, params)
+            return [tuple(row) for row in await cur.fetchall()]
+
+    async def last_seen_in_channel(self, channel_id: int) -> dict[int, str]:
+        """user_id -> newest archived message timestamp in one channel (banter eligibility)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT author_id, MAX(created_at) FROM message_archive WHERE channel_id = ? "
+                "AND author_id IS NOT NULL GROUP BY author_id",
+                (int(channel_id),),
+            )
+            return {int(row[0]): str(row[1]) for row in await cur.fetchall()}
+
+    async def known_bot_ids(self) -> set[int]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT user_id FROM users WHERE COALESCE(is_bot, 0) = 1")
+            return {int(row[0]) for row in await cur.fetchall()}
+
+    async def activity_xp_by_member(self) -> dict[int, float]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT user_id, xp FROM member_tiers")
+            return {int(row[0]): float(row[1] or 0) for row in await cur.fetchall()}
+
+    async def member_prefs(self, user_id: int) -> dict[str, bool]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT banter_optout, leaderboard_optout FROM member_prefs WHERE user_id = ?", (int(user_id),)
+            )
+            row = await cur.fetchone()
+        if not row:
+            return {"banter_optout": False, "leaderboard_optout": False}
+        return {"banter_optout": bool(row[0]), "leaderboard_optout": bool(row[1])}
+
+    async def set_member_pref(self, user_id: int, field: str, value: bool) -> None:
+        if field not in {"banter_optout", "leaderboard_optout"}:
+            raise ValueError(f"unknown member preference: {field}")
+        stamp = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                f"INSERT INTO member_prefs(user_id, {field}, updated_at) VALUES(?, ?, ?) "
+                f"ON CONFLICT(user_id) DO UPDATE SET {field} = excluded.{field}, updated_at = excluded.updated_at",
+                (int(user_id), 1 if value else 0, stamp),
+            )
+            await db.commit()
+
+    async def opted_out_members(self, field: str = "banter_optout") -> set[int]:
+        if field not in {"banter_optout", "leaderboard_optout"}:
+            raise ValueError(f"unknown member preference: {field}")
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(f"SELECT user_id FROM member_prefs WHERE {field} = 1")
+            return {int(row[0]) for row in await cur.fetchall()}
+
+    async def upsert_member_tier(self, user_id: int, xp: float, tier: str) -> None:
+        stamp = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO member_tiers(user_id, xp, tier, updated_at) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET xp = excluded.xp, tier = excluded.tier, "
+                "updated_at = excluded.updated_at",
+                (int(user_id), float(xp), str(tier), stamp),
             )
             await db.commit()
 
