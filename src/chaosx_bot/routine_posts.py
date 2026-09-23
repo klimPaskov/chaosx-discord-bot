@@ -587,19 +587,23 @@ Hard rules:
   cannot verify from the post itself.
 - No pings, no invented features, versions, dates or release promises.
 
-Sections (exactly these, nothing else, with these emojis so it reads at a glance):
+Sections (exactly these, nothing else, in this order, each heading on its own line):
 1. Title line: "🌟 **Weekly Chaos Redux digest — <version>** 🌟"
-2. "🛠️ This week in the mod" — at most 3 bullets, one line each (roughly 20 words), covering the areas that
-   saw the most work. Group related work into one bullet instead of listing every change. Start each bullet
-   with one fitting emoji (art 🎨, models 🧊, scripting ⚙️, sound 🔊, text ✍️, flags 🚩, balance ⚖️).
-3. "💬 From the community" — one short line: playtests, reported issues, ideas written up, server activity.
+2. Heading "### 🛠️ This week in the mod" followed by at most 3 bullets, one line each (roughly 20 words),
+   covering the areas that saw the most work. Group related work into one bullet instead of listing every
+   change. Every bullet MUST start with "- " and then one fitting emoji (art 🎨, models 🧊, scripting ⚙️,
+   sound 🔊, text ✍️, flags 🚩, balance ⚖️) — a Discord bullet list, never bare emoji lines.
+3. Heading "### 💬 From the community" followed by one short line: playtests, reported issues, ideas
+   written up, server activity.
    Always include the server's member count exactly as the facts give it (Discord's own figure); include
    the online count when the facts give one. If the week was otherwise quiet, say so in a few words
    instead of printing zeros.
-4. "🔎 What's next" — one short line naming the testing focus from the facts, starting with 🔎. Never
+4. Heading "### 🔎 What's next" followed by one short line naming the testing focus from the facts,
+   starting with 🔎. Never
    promise future features, say something is "coming", or give dates/release timelines.
 
 Emoji are for orientation only: one per heading as above, at most one per bullet, never a wall of them.
+Blank line between sections; no section may sit inside another; never end a bullet mid-word.
 Keep the whole post under {max_chars} characters and keep it tight — Hoops called the previous digest
 bloated. Short and concrete beats complete. Plain Discord markdown."""
 
