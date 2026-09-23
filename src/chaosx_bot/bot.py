@@ -23,7 +23,13 @@ import aiohttp
 import discord
 from discord import app_commands
 
-from .auth import owner_deny_reason, public_deny_reason, safe_allowed_mentions, targeted_mentions
+from .auth import (
+    announcement_mentions,
+    owner_deny_reason,
+    public_deny_reason,
+    safe_allowed_mentions,
+    targeted_mentions,
+)
 from .auto_scan import (
     BOT_TOPIC_RE,
     AutoScanDecision,
@@ -2176,6 +2182,21 @@ class ChaosXBot(discord.Client):
             ),
         ]
 
+    def _reserved_channel_reason(self, channel_id: int | None) -> str | None:
+        """Why an automatic poster may not use this channel (None = allowed).
+
+        The announcements channel is reserved for owner-authorized announcements: those messages are
+        always @everyone-directed, and only Hoops can authorize one. Every automatic sender routes
+        through here so automation can never reach it, even if a destination setting is changed later.
+        """
+        announcements = self.settings.announcements_channel_id
+        if announcements and channel_id and int(channel_id) == int(announcements):
+            return (
+                "the announcements channel is reserved for owner-authorized announcements "
+                "(use /admin announce action:post)"
+            )
+        return None
+
     def _routine_post_destination(self, spec: RoutinePostSpec) -> int | None:
         if spec.name == RELEASE_POSTS.name:
             return self.settings.routine_release_channel_id or self.settings.routine_posts_channel_id
@@ -2200,6 +2221,10 @@ class ChaosXBot(discord.Client):
         signals = rows_to_signals(rows)
         now = utcnow()
         channel_id = self.settings.automation_reminder_channel_id
+        blocked = self._reserved_channel_reason(channel_id)
+        if blocked:
+            outcomes.append(f"playtest automation: refused — {blocked}")
+            return outcomes
         channel = self.get_channel(channel_id) if channel_id else None
         if channel is None and channel_id:
             try:
@@ -2470,6 +2495,13 @@ class ChaosXBot(discord.Client):
                     detail=f"channel lookup failed: {type(exc).__name__}",
                     text=text,
                 )
+        if spec.delivery != "owner_dm":
+            blocked = self._reserved_channel_reason(destination_id)
+            if blocked:
+                print(f"ChaosX routine post {spec.name}: refused — {blocked}")
+                return RoutinePostResult(
+                    name=spec.name, action="error", detail=f"refused: {blocked}", text=text
+                )
         send_message = cast(
             Callable[..., Awaitable[discord.Message]],
             getattr(channel, "send", None),
@@ -2671,8 +2703,19 @@ class ChaosXBot(discord.Client):
         )
 
     async def _deliver_announcement(
-        self, result: AnnouncementResult, *, channel_id: int
+        self,
+        result: AnnouncementResult,
+        *,
+        channel_id: int,
+        authorized_by: int | None = None,
     ) -> AnnouncementResult:
+        """Post an announcement. `authorized_by` (the owner id) is what unlocks the @everyone ping.
+
+        Announcements are @everyone-directed by definition, and only Hoops can authorize one — the
+        caller passes his id after `owner_gate`; without it this posts silently like any other message.
+        The body itself stays ping-free (sanitize_post strips mentions), so the ping is added here,
+        once, at send time.
+        """
         channel = self.get_channel(channel_id)
         if channel is None:
             try:
@@ -2689,10 +2732,13 @@ class ChaosXBot(discord.Client):
             result.status = "error"
             result.detail = f"{result.detail}; destination is not messageable".strip("; ")
             return result
+        mentions = announcement_mentions() if authorized_by else safe_allowed_mentions()
         sent: discord.Message | None = None
         try:
-            for part in _chunk(result.body):
-                sent = await send_message(part, allowed_mentions=safe_allowed_mentions())
+            for index, part in enumerate(_chunk(result.body)):
+                if index == 0 and authorized_by and "@everyone" not in part:
+                    part = f"@everyone\n\n{part}"
+                sent = await send_message(part, allowed_mentions=mentions)
         except (discord.Forbidden, discord.HTTPException) as exc:
             result.status = "error"
             result.detail = f"{result.detail}; send failed: {type(exc).__name__}".strip("; ")
@@ -2812,6 +2858,9 @@ class ChaosXBot(discord.Client):
                 channel = resolve_target_channel()
                 if channel is None:
                     return False, f"channel `{params.get('channel')}` not found"
+                blocked = self._reserved_channel_reason(getattr(channel, "id", None))
+                if blocked:
+                    return False, f"refused: {blocked}"
                 message = await channel.send(
                     str(params["text"]), allowed_mentions=safe_allowed_mentions()
                 )
@@ -2826,6 +2875,9 @@ class ChaosXBot(discord.Client):
                 channel = resolve_target_channel()
                 if channel is None:
                     return False, f"channel `{params.get('channel')}` not found"
+                blocked = self._reserved_channel_reason(getattr(channel, "id", None))
+                if blocked:
+                    return False, f"refused: {blocked}"
                 thread = await channel.create_thread(
                     name=str(params["name"]),
                     type=discord.ChannelType.public_thread,
@@ -2840,6 +2892,9 @@ class ChaosXBot(discord.Client):
                 channel = resolve_target_channel()
                 if channel is None:
                     return False, f"channel `{params.get('channel')}` not found"
+                blocked = self._reserved_channel_reason(getattr(channel, "id", None))
+                if blocked:
+                    return False, f"refused: {blocked}"
                 message = await channel.fetch_message(int(str(params["message_id"])))
                 await message.pin(reason=reason)
                 return True, f"pinned {message.jump_url}"
@@ -6764,7 +6819,9 @@ def register_commands(bot: ChaosXBot) -> None:
                 )
             else:
                 result = await bot._build_announcement(topic=topic)
-            result = await bot._deliver_announcement(result, channel_id=destination)
+            result = await bot._deliver_announcement(
+                result, channel_id=destination, authorized_by=interaction.user.id
+            )
             await bot.store.record_announcement(
                 result.announcement_id,
                 actor_id=interaction.user.id,
@@ -6784,7 +6841,8 @@ def register_commands(bot: ChaosXBot) -> None:
                 summary=f"{result.announcement_id}: {result.status} {result.detail}".strip(),
             )
             reply = (
-                f"Posted `{result.announcement_id}` in <#{result.channel_id}> ({result.detail})."
+                f"Posted `{result.announcement_id}` in <#{result.channel_id}> with an @everyone ping "
+                f"({result.detail})."
                 if result.status == "posted"
                 else f"Announcement `{result.announcement_id}` failed: `{result.status}` {result.detail}"
             )
@@ -6811,7 +6869,8 @@ def register_commands(bot: ChaosXBot) -> None:
         )
         header = (
             f"**Announcement draft** `{result.announcement_id}` ({result.detail}, {len(result.body)} chars) — nothing has been posted.\n"
-            f"Post exactly this text with `/admin announce action:post topic:{topic}`.\n\n"
+            f"Post exactly this text with `/admin announce action:post topic:{topic}` "
+            f"— posting adds an **@everyone** ping at the top (that is what makes it an announcement).\n\n"
         )
         for index, part in enumerate(_chunk(header + result.body)):
             await interaction.followup.send(

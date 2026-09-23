@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import types
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -61,10 +62,13 @@ def _self(guild) -> SimpleNamespace:
             None,
         )
 
-    return SimpleNamespace(
+    fake = SimpleNamespace(
         guilds=[guild],
+        settings=SimpleNamespace(announcements_channel_id=None),
         _resolve_channel=resolve_channel,
     )
+    fake._reserved_channel_reason = types.MethodType(ChaosXBot._reserved_channel_reason, fake)
+    return fake
 
 
 def test_parse_action_plan_happy_path():

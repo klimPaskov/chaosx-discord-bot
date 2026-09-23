@@ -36,6 +36,17 @@ def targeted_mentions(user_ids: list[int]) -> discord.AllowedMentions:
     )
 
 
+def announcement_mentions() -> discord.AllowedMentions:
+    """The single deliberate exception to the no-pings rule: owner-authorized announcements.
+
+    ChaosX announcements are always @everyone-directed, and only Hoops can authorize one
+    (`/admin announce action:post`). Every other send path uses `safe_allowed_mentions()`, and
+    automatic posters are additionally blocked from the announcements channel entirely.
+    """
+
+    return discord.AllowedMentions(everyone=True, users=False, roles=False, replied_user=False)
+
+
 def public_deny_reason(guild_id: int | None, allowed_guild_id: int | None) -> str | None:
     if not is_allowed_guild(guild_id, allowed_guild_id):
         return "ChaosX is locked to a different guild."
