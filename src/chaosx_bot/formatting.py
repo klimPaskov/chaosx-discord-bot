@@ -7,6 +7,7 @@ scripted surface and every model-written answer uses the same shapes instead of 
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 
 BULLET = "•"
@@ -48,6 +49,55 @@ def small(text: str) -> str:
 def table(rows: Sequence[tuple[str, str]], emoji: str = "") -> list[str]:
     """A two-column list rendered as labelled bullets (Discord has no real tables)."""
     return [kv(left, right, emoji=emoji) for left, right in rows]
+
+
+_HEADING_RE = re.compile(r"^\s*#{2,3}\s+(?P<text>.*)$")
+_BULLET_RE = re.compile(r"^(?P<indent>\s*)(?P<marker>[-•*]|\d+\.)\s+(?P<text>.*)$")
+
+
+def _leading_emoji(text: str) -> str:
+    parts = text.strip().split(" ", 1)
+    if not parts:
+        return ""
+    candidate = parts[0]
+    return candidate if candidate and not candidate.isascii() else ""
+
+
+def fix_duplicate_emoji(text: str) -> str:
+    """Drop a bullet's emoji when the heading above it already uses that emoji.
+
+    Hoops (2026-09-23): "🔎 What's next / 🔎 Testing focus … Duplicate emojis, this shouldn't happen." The
+    prompt asks for the heading emoji only, but the model repeats it now and then - this makes it
+    impossible rather than merely discouraged.
+    """
+    lines = str(text or "").splitlines()
+    out: list[str] = []
+    heading_emoji = ""
+    for line in lines:
+        match = _HEADING_RE.match(line)
+        if match:
+            heading_emoji = _leading_emoji(match.group("text"))
+            out.append(line)
+            continue
+        if not line.strip():
+            out.append(line)
+            continue
+        bullet = _BULLET_RE.match(line)
+        if heading_emoji:
+            if bullet:
+                text_part = bullet.group("text")
+                if _leading_emoji(text_part) == heading_emoji:
+                    stripped = text_part.split(" ", 1)[1].strip() if " " in text_part else ""
+                    line = f"{bullet.group('indent')}{bullet.group('marker')} {stripped}".rstrip()
+            else:
+                # a plain line under the heading (the model often writes "🔎 Testing focus: …" with no marker)
+                indent = line[: len(line) - len(line.lstrip())]
+                text_part = line.strip()
+                if _leading_emoji(text_part) == heading_emoji:
+                    stripped = text_part.split(" ", 1)[1].strip() if " " in text_part else ""
+                    line = f"{indent}{stripped}".rstrip()
+        out.append(line)
+    return "\n".join(out)
 
 
 def block(*parts: object) -> str:

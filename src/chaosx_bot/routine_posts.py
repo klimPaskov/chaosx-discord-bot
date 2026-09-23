@@ -27,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .formatting import fix_duplicate_emoji
+
 # --------------------------------------------------------------------------------------
 # Post types
 # --------------------------------------------------------------------------------------
@@ -237,6 +239,8 @@ def sanitize_post(text: str, *, max_chars: int = MAX_POST_CHARS) -> str:
     """Strip pings from generated text and cap length (hooked to a line boundary)."""
     cleaned = _MENTION_RE.sub("", text or "").strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    # A heading emoji must not be repeated by the bullet right under it.
+    cleaned = fix_duplicate_emoji(cleaned)
     if len(cleaned) <= max_chars:
         return cleaned
     cut = cleaned[: max(0, max_chars - 1)]
@@ -553,6 +557,40 @@ def issues_facts_line(issues: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def digest_window_note(*, window_days: int = DIGEST_WINDOW_DAYS, now: datetime | None = None) -> str:
+    """The small-print line naming the dates a digest actually covers.
+
+    Hoops (2026-09-23): "what week? What dates does it span to?" The window is a rolling N days ending when
+    the post is built, while the once-a-week guard keys off the ISO week, so the post states its own range
+    and the reader never has to guess.
+    """
+    end = now or utcnow()
+    start = end - timedelta(days=window_days)
+    if start.year == end.year and start.month == end.month:
+        span = f"{start.day}–{end.day} {end.strftime('%B %Y')}"
+    elif start.year == end.year:
+        span = f"{start.strftime('%-d %B')} – {end.strftime('%-d %B %Y')}"
+    else:
+        span = f"{start.strftime('%-d %B %Y')} – {end.strftime('%-d %B %Y')}"
+    return f"-# Covering {span} (the last {window_days} days)"
+
+
+def with_window_note(text: str, *, window_days: int = DIGEST_WINDOW_DAYS, now: datetime | None = None) -> str:
+    """Insert the window note directly under the digest title line."""
+    lines = str(text or "").splitlines()
+    note = digest_window_note(window_days=window_days, now=now)
+    if note in lines:
+        return text
+    for index, line in enumerate(lines):
+        if line.strip():
+            lines.insert(index + 1, "")
+            lines.insert(index + 2, note)
+            break
+    else:
+        return note
+    return "\n".join(lines)
+
+
 def build_digest_prompt(*, signals: dict[str, Any], max_chars: int = DIGEST_MAX_CHARS) -> str:
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
@@ -598,11 +636,14 @@ Sections (exactly these, nothing else, in this order, each heading on its own li
    Always include the server's member count exactly as the facts give it (Discord's own figure); include
    the online count when the facts give one. If the week was otherwise quiet, say so in a few words
    instead of printing zeros.
-4. Heading "### 🔎 What's next" followed by one short line naming the testing focus from the facts,
-   starting with 🔎. Never
+4. Heading "### 🔎 What's next" followed by one short line naming the testing focus from the facts. Do NOT
+   start that line with 🔎 (or any emoji) — the heading already carries it, and a repeated emoji looks like
+   a mistake. Never
    promise future features, say something is "coming", or give dates/release timelines.
 
 Emoji are for orientation only: one per heading as above, at most one per bullet, never a wall of them.
+NEVER repeat a heading's emoji at the start of a line directly under it (no "### 🔎 What's next" followed by
+"🔎 …"); the heading emoji belongs to the heading alone.
 Blank line between sections; no section may sit inside another; never end a bullet mid-word.
 Keep the whole post under {max_chars} characters and keep it tight — Hoops called the previous digest
 bloated. Short and concrete beats complete. Plain Discord markdown."""

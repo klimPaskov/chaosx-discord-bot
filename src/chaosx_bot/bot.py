@@ -278,6 +278,7 @@ from .routine_posts import (
     github_latest_release,
     parse_iso,
     plan_due_posts,
+    with_window_note,
     playtest_observation,
     release_fallback,
     release_signal_changed,
@@ -3171,6 +3172,8 @@ class ChaosXBot(discord.Client):
             activity_label="weekly dev digest",
             fallback=digest_fallback(signals),
         )
+        # Say which dates the post covers: the window is rolling, the guard is the ISO week.
+        text = with_window_note(text, window_days=int(signals.get("window_days") or DIGEST_WINDOW_DAYS))
         result = await self._deliver_routine_post(spec, text=text, preview=preview)
         result.facts = signals
         result.detail = f"{source}; {result.detail}".strip("; ")
