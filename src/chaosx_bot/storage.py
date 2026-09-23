@@ -194,6 +194,17 @@ CREATE TABLE IF NOT EXISTS server_action_plans (
     executed_at TEXT NOT NULL DEFAULT ''
 );
 
+-- Shared with conversation_memory (identical statement, IF NOT EXISTS on both sides): the activity
+-- rollup joins it for display names, so the store owns enough schema to rank members on its own.
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT,
+    last_seen_at TEXT NOT NULL,
+    is_bot INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS member_activity_daily (
     user_id INTEGER NOT NULL,
     day TEXT NOT NULL,
@@ -939,28 +950,46 @@ class Store:
             row = await cur.fetchone()
         return (float(row[0]), str(row[1])) if row else None
 
-    async def top_members(self, *, limit: int = 10, since_day: str | None = None) -> list[tuple]:
-        """(user_id, display_name, xp, messages, active_days) ranked by XP."""
+    async def top_members(
+        self,
+        *,
+        limit: int = 10,
+        since_day: str | None = None,
+        exclude_ids: set[int] | None = None,
+    ) -> list[tuple]:
+        """(user_id, display_name, xp, messages, active_days) ranked by XP.
+
+        `exclude_ids` drops leaderboard opt-outs (and anything else the caller hides) from the rankings.
+        """
+        skip = sorted({int(value) for value in (exclude_ids or set()) if value})
+        clause = f" AND a.user_id NOT IN ({','.join('?' for _ in skip)})" if skip else ""
+        select = (
+            "SELECT a.user_id, COALESCE(u.display_name, ''), SUM(a.xp), SUM(a.messages), COUNT(*) "
+            "FROM member_activity_daily a LEFT JOIN users u ON u.user_id = a.user_id "
+        )
         async with aiosqlite.connect(self.db_path) as db:
             if since_day:
-                sql = """
-                    SELECT a.user_id, COALESCE(u.display_name, ''), SUM(a.xp), SUM(a.messages), COUNT(*)
-                    FROM member_activity_daily a
-                    LEFT JOIN users u ON u.user_id = a.user_id
-                    WHERE a.day >= ?
-                    GROUP BY a.user_id ORDER BY SUM(a.xp) DESC, a.user_id LIMIT ?
-                """
-                params: tuple = (str(since_day), max(1, int(limit)))
+                sql = (
+                    select
+                    + f"WHERE a.day >= ?{clause} GROUP BY a.user_id ORDER BY SUM(a.xp) DESC, a.user_id LIMIT ?"
+                )
+                params: tuple = (str(since_day), *skip, max(1, int(limit)))
             else:
-                sql = """
-                    SELECT a.user_id, COALESCE(u.display_name, ''), SUM(a.xp), SUM(a.messages), COUNT(*)
-                    FROM member_activity_daily a
-                    LEFT JOIN users u ON u.user_id = a.user_id
-                    GROUP BY a.user_id ORDER BY SUM(a.xp) DESC, a.user_id LIMIT ?
-                """
-                params = (max(1, int(limit)),)
+                sql = (
+                    select
+                    + f"WHERE 1=1{clause} GROUP BY a.user_id ORDER BY SUM(a.xp) DESC, a.user_id LIMIT ?"
+                )
+                params = (*skip, max(1, int(limit)))
             cur = await db.execute(sql, params)
             return [tuple(row) for row in await cur.fetchall()]
+
+    async def member_rank(self, user_id: int, *, since_day: str | None = None) -> int | None:
+        """1-based position of a member on the leaderboard, or None when they have no recorded activity."""
+        rows = await self.top_members(limit=1000, since_day=since_day)
+        for position, row in enumerate(rows, start=1):
+            if int(row[0]) == int(user_id):
+                return position
+        return None
 
     async def last_seen_in_channel(self, channel_id: int) -> dict[int, str]:
         """user_id -> newest archived message timestamp in one channel (banter eligibility)."""

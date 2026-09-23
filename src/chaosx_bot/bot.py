@@ -371,7 +371,11 @@ def _tier_standings_lines(rows: list[tuple]) -> list[str]:
     out: list[str] = []
     for rank, (user_id, name, xp, messages, days) in enumerate(rows, start=1):
         progress = tier_progress(float(xp or 0))
-        out.append(f"{rank}. {name or user_id} — {progress.label} ({int(xp)} chaos, {int(messages)} messages/{int(days)} days)")
+        days = int(days)
+        out.append(
+            f"{rank}. {name or user_id} — {progress.label} "
+            f"({int(xp)} chaos, {int(messages)} messages/{days} day{'s' if days != 1 else ''})"
+        )
     return out or ["(no activity recorded yet)"]
 
 
@@ -2010,6 +2014,9 @@ class ChaosXBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await self.store.init()
+        # Persistent chaos-tier panel buttons: custom_id + timeout=None keeps a posted panel clickable
+        # across restarts (the view has no per-message state beyond the scope it is showing).
+        self.add_view(TierPanelView(self, timeout=None))
         asyncio.create_task(self._refresh_rules_background())
         asyncio.create_task(self._refresh_channels_background())
         await self.store.set_automation_destination(["auto_question_answering", "auto_bot_topic_banter"], "source channel")
@@ -2403,6 +2410,58 @@ class ChaosXBot(discord.Client):
         ignore |= await self.store.known_bot_ids()
         ignore.discard(0)
         return ignore
+
+    async def _tier_rows(self, scope: str) -> list[tuple]:
+        """Leaderboard rows for one scope, hiding members who opted out of the leaderboard."""
+        opts = await self.store.opted_out_members("leaderboard_optout")
+        if scope == "week":
+            return await self.store.top_members(limit=10, since_day=activity_window_start(7), exclude_ids=opts)
+        return await self.store.top_members(limit=10, exclude_ids=opts)
+
+    async def _tier_panel_text(self, scope: str = "all") -> str:
+        """The public chaos-tier panel: the ladder, the leaders and the caller-independent state."""
+        tiers = await self.store.activity_xp_by_member()
+        ladder = " → ".join(f"{name} ({threshold})" for name, threshold in TIERS)
+        lines = [
+            "## Chaos tiers",
+            f"Every message you send earns chaos: {ladder}.",
+            "",
+        ]
+        rows = await self._tier_rows(scope)
+        header = "This week" if scope == "week" else "All time"
+        lines.append(f"**{header} — top {len(rows) or 0}**" if rows else f"**{header}** — no activity recorded yet.")
+        lines.extend(_tier_standings_lines(rows))
+        other = "all" if scope == "week" else "week"
+        lines.extend(
+            [
+                "",
+                f"Use the buttons below to switch, or `/tiers scope:{other}`. `My tier` shows your own "
+                "progress privately; `Hide me / show me` takes you off the leaderboard if you prefer.",
+            ]
+        )
+        text = "\n".join(lines)
+        return text if len(text) <= 1900 else text[:1890] + "…"
+
+    async def _tier_self_text(self, user_id: int) -> str:
+        row = await self.store.member_tier(user_id)
+        xp = float(row[0]) if row else 0.0
+        progress = tier_progress(xp)
+        rank = await self.store.member_rank(user_id)
+        week_rank = await self.store.member_rank(user_id, since_day=activity_window_start(7))
+        opts = await self.store.opted_out_members("leaderboard_optout")
+        hidden = "hidden from the leaderboard" if user_id in opts else "shown on the leaderboard"
+        position = f"#{rank} all time" if rank else "not ranked yet (no recorded activity)"
+        weekly = f"#{week_rank} this week" if week_rank else "no activity recorded this week"
+        return (
+            f"## Your chaos tier\n"
+            f"**{progress.label}** — {int(xp)} chaos earned.\n"
+            f"- Ranking: {position}; {weekly}.\n"
+            f"- You are currently {hidden}.\n"
+            f"- Chaos comes from messages (a tenth of each day past ten messages counts less; short "
+            f"messages count half; #bot-spam and #off-topic earn nothing; help channels earn a quarter more).\n"
+            f"- You are only ever mentioned by banter if you are a high-tier active member and haven't "
+            f"opted out."
+        )
 
     def _banter_excluded_ids(self) -> set[int]:
         """Owner plus the configured exclusions can never be targeted.
@@ -5139,6 +5198,7 @@ async def send_scripted_response(
     render,
     after_send=None,
     public: bool = True,
+    view: discord.ui.View | None = None,
 ) -> None:
     if not await public_gate(interaction, bot.settings):
         return
@@ -5162,8 +5222,13 @@ async def send_scripted_response(
     except Exception as exc:
         output = f"ChaosX scripted command failed: `{type(exc).__name__}: {exc}`"
     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)
-    for part in _chunk(output):
-        await interaction.followup.send(part, ephemeral=not public, allowed_mentions=safe_allowed_mentions())
+    for index, part in enumerate(_chunk(output)):
+        await interaction.followup.send(
+            part,
+            ephemeral=not public,
+            allowed_mentions=safe_allowed_mentions(),
+            view=view if index == 0 else None,
+        )
     if after_send:
         try:
             await after_send()
@@ -6134,6 +6199,61 @@ async def post_approved_event_idea(
     raise TypeError(f"Unsupported event idea channel type: {type(channel).__name__}")
 
 
+class TierPanelView(discord.ui.View):
+    """Buttons on the public chaos-tier panel (/tiers and /admin tiers action:panel).
+
+    Views here are session-scoped (they expire); the command can always be re-run. Every button that
+    shows personal data answers ephemerally so a member's own tier is never broadcast for them.
+    """
+
+    def __init__(self, bot: "ChaosXBot", *, scope: str = "all", timeout: float | None = 900.0) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        self.scope = scope
+
+    @discord.ui.button(label="This week", style=discord.ButtonStyle.secondary, custom_id="chaosx_tiers_week")
+    async def show_week(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.scope = "week"
+        await interaction.response.edit_message(
+            content=await self.bot._tier_panel_text("week"), view=self
+        )
+
+    @discord.ui.button(label="All time", style=discord.ButtonStyle.secondary, custom_id="chaosx_tiers_all")
+    async def show_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.scope = "all"
+        await interaction.response.edit_message(
+            content=await self.bot._tier_panel_text("all"), view=self
+        )
+
+    @discord.ui.button(label="My tier", style=discord.ButtonStyle.primary, custom_id="chaosx_tiers_self")
+    async def show_self(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            await self.bot._tier_self_text(interaction.user.id),
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+    @discord.ui.button(label="Hide me / show me", style=discord.ButtonStyle.secondary, custom_id="chaosx_tiers_toggle")
+    async def toggle_visibility(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """Leaderboard opt-out, per member, honoured by every ranking."""
+        prefs = await self.bot.store.member_prefs(interaction.user.id)
+        new_value = not prefs["leaderboard_optout"]
+        await self.bot.store.set_member_pref(interaction.user.id, "leaderboard_optout", new_value)
+        await self.bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="tier leaderboard opt-out",
+            summary=f"leaderboard_optout={new_value}",
+        )
+        note = (
+            "You are now hidden from the chaos-tier leaderboard."
+            if new_value
+            else "You are back on the chaos-tier leaderboard."
+        )
+        await interaction.response.send_message(note, ephemeral=True)
+
+
 class IssueReportModal(discord.ui.Modal):
     def __init__(self, bot: ChaosXBot, issue_type: str):
         super().__init__(title=f"{issue_type.title()} issue report")
@@ -6288,6 +6408,25 @@ def register_commands(bot: ChaosXBot) -> None:
     @bot.tree.command(name="status", description="Show Chaos Redux catalog totals and breakdowns.")
     async def chaosx_status(interaction: discord.Interaction) -> None:
         await send_scripted_response(bot, interaction, command_name="chaosx status", summary="global", render=bot.knowledge.status)
+
+    @bot.tree.command(name="tiers", description="Chaos tiers: the server leaderboard and your own tier.")
+    @app_commands.describe(scope="Which leaderboard to open")
+    @app_commands.choices(
+        scope=[
+            app_commands.Choice(name="All time", value="all"),
+            app_commands.Choice(name="This week", value="week"),
+        ]
+    )
+    async def chaosx_tiers(interaction: discord.Interaction, scope: app_commands.Choice[str] | None = None) -> None:
+        chosen = scope.value if scope else "all"
+        await send_scripted_response(
+            bot,
+            interaction,
+            command_name="chaosx tiers",
+            summary=chosen,
+            render=lambda: bot._tier_panel_text(chosen),
+            view=TierPanelView(bot, scope=chosen),
+        )
 
     @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
     async def chaosx_testing(interaction: discord.Interaction) -> None:
@@ -6856,11 +6995,12 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await owner_gate(interaction, settings):
             return
         action = (action or "show").lower().strip()
-        if action not in {"show", "rebuild", "member", "banter"}:
+        if action not in {"show", "rebuild", "member", "banter", "panel"}:
             await interaction.response.send_message(
                 "Use `action:show` (standings), `action:rebuild` (re-roll the whole archive), "
-                "`action:member member:<@user|name>` (one member's tier), or `action:banter` (who idle "
-                "banter could target right now).",
+                "`action:member member:<@user|name>` (one member's tier), `action:banter` (who idle "
+                "banter could target right now), or `action:panel` (post the public panel in the "
+                "banter channel).",
                 ephemeral=True,
             )
             return
@@ -6873,6 +7013,17 @@ def register_commands(bot: ChaosXBot) -> None:
                 f"Re-rolled {summary['messages']} archived messages into {summary['days']} member-days; "
                 f"{summary['members']} member tier row(s)."
             )
+        if action == "panel":
+            channel = bot.get_channel(int(settings.idle_banter_channel_id))
+            if channel is None:
+                lines.append(f"Panel channel `{settings.idle_banter_channel_id}` is not visible to the bot.")
+            else:
+                sent = await channel.send(
+                    await bot._tier_panel_text("all"),
+                    view=TierPanelView(bot, scope="all", timeout=None),
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                lines.append(f"Posted the chaos-tier panel in <#{settings.idle_banter_channel_id}> (message {sent.id}).")
         if action == "banter":
             targets = await bot._idle_banter_candidates()
             lines.append(
