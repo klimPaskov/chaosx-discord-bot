@@ -251,6 +251,7 @@ from .routine_posts import (
     build_release_prompt,
     descriptor_version,
     digest_fallback,
+    git_change_areas,
     git_commit_summary,
     git_commits_between,
     git_files_touched,
@@ -2407,12 +2408,15 @@ class ChaosXBot(discord.Client):
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS
         since_iso = (utcnow() - timedelta(days=window)).isoformat()
-        commits, event_files, version, head, issues = await asyncio.gather(
+        commits, event_files, version, head, issues, change_areas = await asyncio.gather(
             git_commit_summary(repo, since_days=window),
             git_files_touched(repo, since_days=window, prefix="events"),
             descriptor_version(repo),
             git_head_sha(repo),
             github_issue_activity(self.settings.github_repo, since_days=window),
+            # Weight the digest by where changes landed: commit subjects alone skew towards whichever
+            # single topic was documented most, which made the digest claim one event was the whole week.
+            git_change_areas(repo, since_days=window),
         )
         stats = await self.store.routine_stats(since_iso=since_iso)
         playtest_rows = await self.store.list_playtest_reports_since(since_iso=since_iso, limit=6)
@@ -2435,6 +2439,7 @@ class ChaosXBot(discord.Client):
             "version": version,
             "head": head,
             "issues": issues,
+            "change_areas": change_areas,
             "playtests": playtests,
             "community_captures": community_captures,
             "repo_url": f"https://github.com/{self.settings.github_repo}",

@@ -92,6 +92,64 @@ MAX_NOTABLE_COMMITS = 12
 MAX_PLAYTEST_NOTES = 4
 MAX_ISSUE_TITLES = 8
 MAX_POST_CHARS = 1800
+# The digest is a community post, not a report: Hoops asked for a shorter one (2026-09-23).
+DIGEST_MAX_CHARS = 900
+# Directories that hold internal working material (audits, plans, agent tooling). Work there is real
+# but it is not player-facing, so the digest neither counts nor describes it.
+_INTERNAL_PREFIXES = ("docs/", ".agents/", ".qoder/", ".github/", ".vscode/", "tools/", "mod/")
+# Changed-file paths -> the thing a player would recognise. First match wins.
+_AREA_RULES: tuple[tuple[str, str], ...] = (
+    ("gfx/interface/goals", "focus tree icons"),
+    ("gfx/interface/decisions", "decision icons"),
+    ("gfx/interface/formables", "formable nation art"),
+    ("gfx/interface/ideas", "idea icons"),
+    ("gfx/interface/technologies", "technology icons"),
+    ("gfx/interface/counters", "counter art"),
+    ("gfx/interface/chaos_meter", "the chaos meter"),
+    ("gfx/interface/camp_repression", "camp repression art"),
+    ("gfx/interface", "interface art"),
+    ("gfx/flags", "flags"),
+    ("gfx/achievements", "achievements"),
+    ("gfx/models", "3D models"),
+    ("gfx/entities", "3D models"),
+    ("gfx/particles", "effects and particles"),
+    ("gfx/event_pictures", "event pictures"),
+    ("gfx/leaders", "leader portraits"),
+    ("gfx/texticons", "text icons"),
+    ("gfx/super_events", "super-event art"),
+    ("gfx/loadingscreens", "loading screens"),
+    ("gfx", "other art"),
+    ("events/", "event content"),
+    ("common/decisions/", "decisions"),
+    ("common/focus_trees/", "focus trees"),
+    ("common/national_focus/", "focus trees"),
+    ("common/scripted_effects/", "game scripting"),
+    ("common/scripted_triggers/", "game scripting"),
+    ("common/script_constants/", "game scripting"),
+    ("common/on_actions/", "game scripting"),
+    ("common/scripted_localisation/", "game scripting"),
+    ("common/ideas/", "national ideas"),
+    ("common/dynamic_modifiers/", "national ideas"),
+    ("common/characters/", "characters"),
+    ("common/countries/", "countries"),
+    ("common/units/", "units"),
+    ("common/abilities/", "units"),
+    ("common", "game rules"),
+    ("localisation/", "text and tooltips"),
+    ("history/", "starting setup"),
+    ("sound/", "sound"),
+    ("music/", "music"),
+    ("map/", "map"),
+    ("interface/", "interface files"),
+    ("descriptor.mod", "mod metadata"),
+)
+# Commit subjects that describe internal record-keeping rather than a change to the mod itself.
+_BOOKKEEPING_RE = re.compile(
+    r"^(docs(\(|:)|doc |record |document |align |clarify |reconcile |guard |gate |link |keep |promote |"
+    r"preserve |refresh |crosswalk |accept |audit |research |describe |rename |point the |fold the |"
+    r"scope the |merge the |update$|wip$|cleanup$|typo)",
+    re.IGNORECASE,
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -221,7 +279,7 @@ async def git_commit_summary(repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS
     rows = [line for line in out.splitlines() if line.strip()]
     subjects = [row.split("|", 3)[3].strip() for row in rows if row.count("|") >= 3]
     authors = sorted({row.split("|", 3)[2].strip() for row in rows if row.count("|") >= 3})
-    notable = [s for s in subjects if s and s.lower() not in {"update", "fix", "wip", "cleanup"}]
+    notable = [s for s in subjects if s and not _BOOKKEEPING_RE.match(s)]
     return {
         "available": True,
         "count": len(rows),
@@ -230,6 +288,58 @@ async def git_commit_summary(repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS
         "authors": authors,
         "latest": subjects[0] if subjects else "",
     }
+
+
+def area_label(path: str) -> str | None:
+    """Player-facing area for a changed file, or None when the path is internal working material."""
+    cleaned = (path or "").strip().lstrip("/")
+    if not cleaned or cleaned.startswith(_INTERNAL_PREFIXES):
+        return None
+    for prefix, label in _AREA_RULES:
+        if cleaned.startswith(prefix):
+            return label
+    return "other content"
+
+
+def size_band(files: int) -> str:
+    """Plain-language weight of an area, so the model can order emphasis without quoting statistics."""
+    if files >= 1000:
+        return "took most of the week's work"
+    if files >= 250:
+        return "took a large share of the week"
+    if files >= 50:
+        return "saw solid work"
+    if files >= 10:
+        return "saw a few changes"
+    return "was touched lightly"
+
+
+async def git_change_areas(
+    repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS, limit: int = 8
+) -> list[dict[str, Any]]:
+    """Where the week's changes actually landed, biggest first.
+
+    Commit subjects skew towards whatever the committer documented most (this project's log is full of
+    internal audit commits naming one event), so the digest weights its story by changed files instead.
+    """
+    code, out, _ = await _run(
+        ["git", "log", f"--since={since_days} days ago", "--name-only", "--pretty=format:"], cwd=repo
+    )
+    if code != 0:
+        return []
+    counts: dict[str, int] = {}
+    for line in out.splitlines():
+        label = area_label(line)
+        if label:
+            counts[label] = counts.get(label, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[: max(1, limit)]
+    return [{"area": label, "files": files, "band": size_band(files)} for label, files in ranked]
+
+
+def change_area_facts_line(areas: list[dict[str, Any]]) -> str:
+    if not areas:
+        return "change areas unavailable"
+    return "; ".join(f"{row.get('area')} ({row.get('band')})" for row in areas)
 
 
 async def git_files_touched(repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS, prefix: str = "") -> int:
@@ -433,17 +543,19 @@ def issues_facts_line(issues: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def build_digest_prompt(*, signals: dict[str, Any], max_chars: int = MAX_POST_CHARS) -> str:
+def build_digest_prompt(*, signals: dict[str, Any], max_chars: int = DIGEST_MAX_CHARS) -> str:
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
     server = signals.get("server") or {}
     playtests = signals.get("playtests") or []
-    return f"""Write the weekly Chaos Redux community digest. This is a community post, NOT a changelog.
+    areas = signals.get("change_areas") or []
+    return f"""Write the weekly Chaos Redux community digest. It is a short community post, not a report.
 
 Facts (use only these, invent nothing, no pings/mentions):
 - Mod version: {signals.get('version') or 'unknown'}
-- Changes landed in the last {signals.get('window_days', DIGEST_WINDOW_DAYS)} days: {commits.get('count', 0)}
-- Raw commit subjects (translate these into player language — never quote them):
+- Work completed in the last {signals.get('window_days', DIGEST_WINDOW_DAYS)} days: {commits.get('count', 0)} changes
+- Where that work landed, biggest share first: {change_area_facts_line(areas)}
+- Work worth naming, in the committer's own shorthand (translate it, never quote it): 
 {_bullet(commits.get('notable') or [])}
 - GitHub issues: {issues_facts_line(issues)}
 - Playtest observations recorded this week: {playtest_facts_line(playtests)}
@@ -454,60 +566,67 @@ Audience: players, testers and friends of the mod — not programmers. Someone w
 repo must understand every line.
 
 Hard rules:
-- Describe what a player would notice ("the zombie outbreak event now…", "convoys pay out correctly now").
+- Weight the post by where the work landed, not by which subject lines are noisiest. If a large share of
+  the week went into art, sound, text or scripting, say that. NEVER describe the whole week as one event
+  or one task unless the facts really are that narrow. Spread the bullets over the areas that saw work.
+- Describe what a player would notice ("the zombie outbreak now…", "convoys pay out correctly now").
 - NEVER use file names, paths, repo hashes, branch names, commit counts as the headline, code blocks, or
-  internal shorthand/acronyms (FSM, SCN-xxx, IW-xxx, "descriptor", "catalog files"). If a term is internal,
-  describe the effect instead. Event names and their numbers are fine — players know those.
+  internal shorthand/acronyms (FSM, SCN-xxx, IW-xxx, FORM-xx, MCP, receipts, audits, crosswalks). If a term
+  is internal, describe the effect instead. Event names and their numbers are fine — players know those.
+- No statistics, no repository metrics, no counts of files or commits. Hoops does not want numbers he
+  cannot verify from the post itself.
 - No pings, no invented features, versions, dates or release promises.
 
-Sections (exactly these):
+Sections (exactly these, nothing else):
 1. Title line: "**Weekly Chaos Redux digest — <version>**"
-2. "This week in the mod" — 3-5 bullets in plain language about what changed for players, grouping related work.
-3. "The mod right now" — one or two lines naming the area being worked on, in plain words. No counts,
-   no statistics, no repository metrics: Hoops does not want the digest reporting numbers that he cannot
-   verify from the post itself.
-4. "From the community" — playtest observations, reported issues, ideas written up this week, server activity.
-   Use 1-3 short lines. If something was quiet, say it was quiet in a few words instead of printing zeros.
-5. "What's next" — the testing focus, plus work already visibly underway in the facts. Never promise
-   future features, say something is "coming", or give dates/release timelines.
+2. "This week in the mod" — at most 3 bullets, one line each (roughly 20 words), covering the areas that
+   saw the most work. Group related work into one bullet instead of listing every change.
+3. "From the community" — one short line: playtests, reported issues, ideas written up, server activity.
+   If the week was quiet, say it was quiet in a few words instead of printing zeros.
+4. "What's next" — one short line naming the testing focus from the facts. Never promise future features,
+   say something is "coming", or give dates/release timelines.
 
-Keep it under {max_chars} characters, plain Discord markdown."""
+Keep the whole post under {max_chars} characters and keep it tight — Hoops called the previous digest
+bloated. Short and concrete beats complete. Plain Discord markdown."""
 
 
 def digest_fallback(signals: dict[str, Any]) -> str:
     """Facts-only digest used when the model is unavailable.
 
-    Deliberately jargon-free: counts, community signals and a pointer to the raw history, so the
-    fallback never reads worse than the model version (no commit subjects, hashes or file names).
+    Deliberately jargon-free and short: areas that saw work, community signals and a pointer to the raw
+    history, so the fallback never reads worse than the model version (no commit subjects or hashes).
     """
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
     server = signals.get("server") or {}
     playtests = signals.get("playtests") or []
+    areas = signals.get("change_areas") or []
     repo = str(signals.get("repo_url") or "").rstrip("/")
     window = signals.get("window_days", DIGEST_WINDOW_DAYS)
+    area_names = [str(row.get("area")) for row in areas[:3] if row.get("area")]
+    if area_names:
+        work_line = f"- Work in the last {window} days went into {', '.join(area_names)}."
+    else:
+        work_line = f"- {commits.get('count', 0)} changes landed in the last {window} days."
     lines = [
         f"**Weekly Chaos Redux digest** — {signals.get('version') or 'in development'}",
         "",
         "**This week in the mod**",
-        f"- {commits.get('count', 0)} changes landed over the last {window} days across the mod's events and systems.",
-        "- Details of each change are in the repo history if you want the technical view.",
-        "",
-        "**The mod right now**",
-        "- Work this week centred on the mod's events and systems; the change list above has the specifics.",
+        work_line,
+        "- Details are in the repo history if you want the technical view.",
         "",
         "**From the community**",
-        f"- Playtests: {playtest_facts_line(playtests)}",
-        f"- Ideas: {community_facts_line(signals.get('community_captures') or [])}",
-        f"- Issues: {issues_facts_line(issues)}",
-        f"- Server: {server_facts_line(server)}",
+        (
+            f"- {playtest_facts_line(playtests)}; {community_facts_line(signals.get('community_captures') or [])}; "
+            f"{issues_facts_line(issues)}; {server_facts_line(server)}"
+        ),
         "",
         "**What's next**",
         "- Testing focus stays open until the current area is confirmed; the digest updates weekly.",
     ]
     if repo:
         lines.append(f"- Full change list: {repo}/commits")
-    return sanitize_post("\n".join(lines))
+    return sanitize_post("\n".join(lines), max_chars=DIGEST_MAX_CHARS)
 
 
 def build_release_prompt(*, signals: dict[str, Any], max_chars: int = MAX_POST_CHARS) -> str:

@@ -21,7 +21,12 @@ from chaosx_bot.routine_posts import (
     git_head_sha,
     is_interval_due,
     is_weekly_due,
+    DIGEST_MAX_CHARS,
+    area_label,
+    change_area_facts_line,
     community_facts_line,
+    git_change_areas,
+    size_band,
     issues_facts_line,
     plan_due_posts,
     playtest_facts_line,
@@ -56,6 +61,12 @@ def _signals() -> dict:
         },
         "server": {"answers": 12, "qa_saved": 3, "warnings": 1, "playtests": 2, "members": 40},
         "playtests": [{"target": "event006", "observation": "convoy payments looked correct but the AI stalled"}],
+        "change_areas": [
+            {"area": "focus tree icons", "files": 3662, "band": "took most of the week's work"},
+            {"area": "flags", "files": 3543, "band": "took most of the week's work"},
+            {"area": "game scripting", "files": 900, "band": "took a large share of the week"},
+            {"area": "event content", "files": 40, "band": "saw a few changes"},
+        ],
         "community_captures": [
             {
                 "created_at": "2026-09-22T10:00:00+00:00",
@@ -197,16 +208,16 @@ def test_digest_prompt_is_player_first_and_wider_scope():
     # audience + hard rules against repo/technical language
     assert "not programmers" in prompt
     assert "NEVER use file names, paths, repo hashes, branch names" in prompt
-    assert "never quote them" in prompt
-    assert "NOT a changelog" in prompt
+    assert "never quote it" in prompt
+    assert "not a report" in prompt
     # wider scope: playtests, community ideas, server — and no repository statistics
     assert "convoy payments looked correct" in prompt
-    assert "no statistics" in prompt and "repository metrics" in prompt
+    assert "No statistics, no repository metrics" in prompt
     assert "162 event files" not in prompt
     assert "Community Idea - Void Rift" in prompt
     assert "namibian content" in prompt
     # the five sections, in order
-    for section in ("Weekly Chaos Redux digest", "This week in the mod", "The mod right now", "From the community", "What's next"):
+    for section in ("Weekly Chaos Redux digest", "This week in the mod", "From the community", "What's next"):
         assert section in prompt
 
 
@@ -214,10 +225,9 @@ def test_digest_fallback_is_jargon_free_and_wider_scope():
     digest = digest_fallback(_signals())
     assert "Weekly Chaos Redux digest" in digest
     assert "This week in the mod" in digest
-    assert "The mod right now" in digest
     assert "From the community" in digest
     assert "What's next" in digest
-    assert "181 changes landed" in digest
+    assert "The mod right now" not in digest  # dropped as bloat; the areas carry the same news
     assert "162 event files" not in digest
     assert "decision files" not in digest
     assert "convoy payments looked correct" in digest
@@ -246,7 +256,7 @@ def test_digest_fallback_is_jargon_free_and_wider_scope():
 
 def test_fallbacks_render_only_supplied_facts():
     digest = digest_fallback(_signals())
-    assert "181" in digest
+    assert "work in the last 7 days went into" in digest.lower()
     assert "#12 Crash on load" in digest
 
     release = release_fallback(
@@ -400,3 +410,60 @@ def test_fact_lines_are_honest_about_quiet_weeks():
     moved = issues_facts_line({"available": True, "opened": ["#9 crash"], "closed": [], "open_total": 3})
     assert "#9 crash" in moved and "3 still open" in moved
     assert "convoy" in playtest_facts_line([{"target": "event006", "observation": "convoy stalled"}])
+
+
+def test_area_label_maps_paths_to_player_areas_and_hides_internal_work():
+    assert area_label("gfx/interface/goals/chaos_1.dds") == "focus tree icons"
+    assert area_label("gfx/flags/banat.tga") == "flags"
+    assert area_label("common/scripted_effects/006_effects.txt") == "game scripting"
+    assert area_label("localisation/english/chaos_l_english.yml") == "text and tooltips"
+    assert area_label("gfx/models/zombie.mesh") == "3D models"
+    # internal working material is never reported to players
+    assert area_label("docs/plans/event006_audit.md") is None
+    assert area_label(".agents/skills/thing.md") is None
+    assert area_label("") is None
+
+
+def test_size_band_orders_emphasis_without_numbers():
+    assert size_band(8802) == "took most of the week's work"
+    assert size_band(500) == "took a large share of the week"
+    assert size_band(60) == "saw solid work"
+    assert size_band(20) == "saw a few changes"
+    assert size_band(2) == "was touched lightly"
+
+
+def test_change_area_facts_line_lists_areas_with_weights():
+    line = change_area_facts_line(
+        [
+            {"area": "focus tree icons", "files": 3662, "band": "took most of the week's work"},
+            {"area": "flags", "files": 3543, "band": "took most of the week's work"},
+        ]
+    )
+    assert line == "focus tree icons (took most of the week's work); flags (took most of the week's work)"
+    assert change_area_facts_line([]) == "change areas unavailable"
+
+
+def test_digest_prompt_weights_work_by_areas_and_demands_brevity():
+    prompt = build_digest_prompt(signals=_signals())
+    # the fix for "all work on event 006 is not entirely correct"
+    assert "Where that work landed, biggest share first" in prompt
+    assert "focus tree icons (took most of the week's work)" in prompt
+    assert "NEVER describe the whole week as one event" in prompt
+    assert "at most 3 bullets" in prompt
+    assert f"under {DIGEST_MAX_CHARS} characters" in prompt
+    assert "bloated" in prompt
+
+
+def test_digest_fallback_is_short_and_names_real_areas():
+    digest = digest_fallback(_signals())
+    assert "Work in the last 7 days went into focus tree icons, flags, game scripting." in digest
+    assert len(digest) <= DIGEST_MAX_CHARS
+    assert "162 event files" not in digest
+    assert "abc1234" not in digest
+
+def test_digest_fallback_states_change_count_when_areas_are_unavailable():
+    signals = _signals()
+    signals["change_areas"] = []
+    digest = digest_fallback(signals)
+    assert "181 changes landed in the last 7 days" in digest
+    assert len(digest) <= DIGEST_MAX_CHARS
