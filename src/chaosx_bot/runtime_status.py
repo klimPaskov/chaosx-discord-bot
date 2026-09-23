@@ -2,11 +2,48 @@ from __future__ import annotations
 
 import os
 import re
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 _SAFE_TEXT_RE = re.compile(r"[^A-Za-z0-9 _./:+()\-]+")
+
+
+# Command latency: what the bot spent, per command, so "why is this slow" is answerable from the bot
+# itself instead of from guesswork (Hoops 2026-09-23). Kept in memory, newest first, ring-buffered.
+_COMMAND_TIMINGS: deque[tuple[str, float, str]] = deque(maxlen=60)
+
+
+def record_command_timing(name: str, seconds: float, *, path: str = "") -> None:
+    """Remember how long one command took and which model path it used."""
+    try:
+        _COMMAND_TIMINGS.appendleft((str(name), float(seconds), str(path)))
+    except Exception:  # instrumentation must never break a command
+        pass
+
+
+def command_timings_lines(*, slow_seconds: float = 5.0, limit: int = 5) -> list[str]:
+    """A short latency summary: the slowest recent commands and the count over the threshold."""
+    if not _COMMAND_TIMINGS:
+        return ["No command timings recorded yet."]
+    per_command: dict[str, list[float]] = {}
+    for name, seconds, _path in _COMMAND_TIMINGS:
+        per_command.setdefault(name, []).append(seconds)
+    ranked = sorted(per_command.items(), key=lambda item: -max(item[1]))
+    lines = []
+    for name, values in ranked[:limit]:
+        last = values[0]
+        worst = max(values)
+        lines.append(
+            f"- `{name}`: last {last:.1f}s, slowest {worst:.1f}s "
+            f"({len(values)} run{'s' if len(values) != 1 else ''})"
+        )
+    slow = sum(1 for _name, seconds, _path in _COMMAND_TIMINGS if seconds >= slow_seconds)
+    lines.append(
+        f"-# {len(_COMMAND_TIMINGS)} recent command(s) timed; {slow} took {slow_seconds:.0f}s or more."
+    )
+    return lines
 
 
 @dataclass(frozen=True)

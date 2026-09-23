@@ -325,11 +325,20 @@ from .routine_posts import (
     weekly_slot,
 )
 from .runtime_status import (
+    command_timings_lines,
+    record_command_timing,
     collect_process_tree,
     format_hermes_progress,
     format_process_panel,
 )
 from .server_rules import ServerRules
+from .suggestions import (
+    MAX_SUGGESTIONS,
+    SUGGESTION_KEYS,
+    Suggestion,
+    build_suggestions,
+    render_suggestions,
+)
 from .storage import Store
 from .tier_roles import ensure_tier_roles, sync_tier_role, tier_role_name
 from .webhook_server import GitHubWebhookServer
@@ -2120,6 +2129,18 @@ class ChaosXBot(discord.Client):
         self.add_view(TestingVoteOpenView(self, timeout=None))
         self.add_view(TestingVoteOptionsView(self, timeout=None))
         self.add_view(IdeaBoardView(self))
+        # Suggested-next buttons are keyed by the action alone (`chaosx:suggest:<key>`), so this single
+        # persistent registration keeps every footer the bot has ever posted clickable (Hoops,
+        # 2026-09-23). Per-member relevance is recomputed on press, not baked into the button.
+        self.add_view(
+            SuggestedActionsView(
+                self,
+                [
+                    Suggestion(key=key, label=key.replace("_", " "), emoji="\u2022")
+                    for key in SUGGESTION_KEYS
+                ],
+            )
+        )
         # Every filed idea keeps its status buttons working across restarts.
         try:
             await self._register_idea_views()
@@ -6953,6 +6974,47 @@ def reasoning_effort_for_path(
     return settings.ask_reasoning_effort
 
 
+async def _no_context() -> str:
+    """A blank context block, for `asyncio.gather` branches that must return a string."""
+    return ""
+
+
+async def _public_channel_context(
+    bot: "ChaosXBot", interaction: discord.Interaction, request: str
+) -> str:
+    """Read-only channel context for public /ask (GET-only; never modifies)."""
+    try:
+        main_context = await bot.channel_reader.recent_context(interaction.channel_id)
+        linked_context = await bot.channel_reader.referenced_channels_context(request)
+        return "\n".join(part for part in (main_context, linked_context) if part)
+    except Exception:
+        return ""
+
+
+# Questions that genuinely need the outside world; everything else tries the local knowledge first.
+_WEB_INTENT_RE = re.compile(
+    r"\b(latest|newest|news|recent(?:ly)?|today|tomorrow|this (?:week|month|year)|release[sd]?|patch|"
+    r"update[sd]?|steam|workshop|download|version \d|changelog|roadmap|announcement|premiere|"
+    r"search|google|web|internet|source[s]?|cite|202[5-9])\b",
+    re.IGNORECASE,
+)
+WEB_EVIDENCE_MIN_LOCAL_CHARS = 700
+
+
+def needs_web_evidence(request: str, *, reference_context: str = "") -> bool:
+    """Whether this ask should reach out to the web at all.
+
+    Web evidence costs a network round trip on every ask, so it is now a fallback: explicit
+    outside-world intent always searches, and otherwise the local knowledge base has to come up
+    thin before the bot looks outside. A catalog lookup never searches.
+    """
+    if looks_like_catalog_lookup(request):
+        return False
+    if _WEB_INTENT_RE.search(request or ""):
+        return True
+    return len(reference_context or "") < WEB_EVIDENCE_MIN_LOCAL_CHARS
+
+
 async def run_hermes_command(
     bot: ChaosXBot,
     interaction: discord.Interaction,
@@ -6968,6 +7030,10 @@ async def run_hermes_command(
     send_output: bool = True,
     postprocess: Any = None,
 ) -> tuple[HermesResult, str] | None:
+    _started_at = time.perf_counter()
+    _model_path = (
+        "operator" if use_operator_model else ("ask-api" if use_ask_model else "hermes-subprocess")
+    )
     rate = None
     source_paths_allowed = False
     reference_context = ""
@@ -7044,10 +7110,17 @@ async def run_hermes_command(
     guild_name, channel_name = _guild_channel(interaction)
     owner_context = ""
     if owner_only:
-        if command_name == "admin ask":
-            owner_context = await fetch_admin_ask_memory_context(bot, interaction)
-        owner_context += await fetch_admin_member_context(bot, interaction, request)
-        owner_context += await fetch_admin_message_context(bot, interaction, request)
+        # These lookups are independent and together they were the largest serial cost on the slowest
+        # path (owner commands), so they now run concurrently (Hoops 2026-09-23: "why do commands take
+        # such a long time?").
+        memory_context, member_context, message_context = await asyncio.gather(
+            fetch_admin_ask_memory_context(bot, interaction)
+            if command_name == "admin ask"
+            else _no_context(),
+            fetch_admin_member_context(bot, interaction, request),
+            fetch_admin_message_context(bot, interaction, request),
+        )
+        owner_context = f"{memory_context}{member_context}{message_context}"
     # Background records ride in the memory block, not the request slot (see
     # _owner_memory_block): the prompt must end on the current owner request.
     owner_request = request
@@ -7059,23 +7132,31 @@ async def run_hermes_command(
             scope="admin",
         )
     # Read-only channel context for public /ask (GET-only; never modifies).
+    user_context = ""
+    known_users = ""
+    referenced_users = ""
     channel_context = ""
     if not owner_only:
-        try:
-            main_context = await bot.channel_reader.recent_context(interaction.channel_id)
-            linked_context = await bot.channel_reader.referenced_channels_context(request)
-            channel_context = "\n".join(part for part in (main_context, linked_context) if part)
-        except Exception:
-            channel_context = ""
+        # Same on the public path: channel context, the asker's own context, the known-user block and
+        # referenced members are four independent reads, so they happen together.
+        channel_context, user_context, known_users, referenced_users = await asyncio.gather(
+            _public_channel_context(bot, interaction, request),
+            bot.user_context_for(interaction.user.id),
+            bot.known_users_block(),
+            bot.referenced_user_contexts_block(request),
+        )
     # Web grounding: always available so the model can reach the web when it
     # needs it (public asks only; never for catalog lookups — a miss must be
     # a plain "not found", not a dump).
     web_context = ""
     evidence: EvidenceImage | None = None
+    # The web search is the only stage that leaves the box, so it became a fallback instead of a
+    # default: it runs when the question asks for outside information or when the local knowledge base
+    # had little to offer. Most asks skip it entirely now.
     if (
         not owner_only
         and bot.settings.web_search_enabled
-        and not looks_like_catalog_lookup(request)
+        and needs_web_evidence(request, reference_context=reference_context)
     ):
         web_context, evidence = await bot.web.search_evidence(
             request,
@@ -7103,13 +7184,13 @@ async def run_hermes_command(
             reference_context=reference_context if rate_bucket == "ask" else "",
             source_paths_allowed=source_paths_allowed,
             memory_context=memory_context if rate_bucket == "ask" else "",
-            user_context=await bot.user_context_for(interaction.user.id),
+            user_context=user_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
             server_facts=bot.server_facts_for_request(request),
-            known_users=await bot.known_users_block(),
+            known_users=known_users,
             server_members=bot.members_block(),
-            referenced_users=await bot.referenced_user_contexts_block(request),
+            referenced_users=referenced_users,
             channel_context=channel_context,
             model_name=bot.settings.ask_model if looks_like_model_identity_question(request) else "",
             cost_context=_cost_lookup_block(settings=bot.settings, text=request),
@@ -7296,6 +7377,9 @@ async def run_hermes_command(
             output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
             keep_last=bot.settings.reply_memory_keep_last,
         )
+    record_command_timing(
+        command_name, time.perf_counter() - _started_at, path=_model_path
+    )
     return result, output
 
 
@@ -7507,6 +7591,193 @@ class IdeaStatusView(discord.ui.View):
             )
 
         return callback
+
+
+class SuggestedActionsView(discord.ui.View):
+    """Dynamic "suggested next" buttons under a command footer (Hoops, 2026-09-23).
+
+    Callbacks depend only on the action key (``chaosx:suggest:<key>``), never on the message that
+    carried them, so one instance registered at startup keeps working after a restart and every press
+    recomputes its content for whoever pressed it.
+    """
+
+    def __init__(self, bot: "ChaosXBot", suggestions: list[Suggestion]) -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+        for suggestion in suggestions[:MAX_SUGGESTIONS]:
+            button: discord.ui.Button = discord.ui.Button(
+                label=suggestion.label[:80],
+                emoji=suggestion.emoji,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"chaosx:suggest:{suggestion.key}",
+            )
+            button.callback = _suggested_callback(bot, suggestion.key)
+            self.add_item(button)
+
+
+def _suggested_callback(bot: "ChaosXBot", key: str):
+    async def callback(interaction: discord.Interaction) -> None:
+        await run_suggestion(bot, interaction, key)
+
+    return callback
+
+
+def _is_owner_id(bot: "ChaosXBot", user_id: int) -> bool:
+    return int(user_id) == int(bot.settings.owner_id)
+
+
+async def run_suggestion(bot: "ChaosXBot", interaction: discord.Interaction, key: str) -> None:
+    """Run the action behind a suggested-next button.
+
+    Owner-only actions re-check ownership here rather than trusting the footer that rendered them.
+    """
+    ephemeral = True
+    try:
+        if key in {"idea_pipeline", "command_latency", "server_health"} and not _is_owner_id(
+            bot, interaction.user.id
+        ):
+            await interaction.response.send_message(
+                "That one is owner-only.", ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+
+        if key == "submit_idea":
+            await interaction.response.send_modal(EventIdeaModal(bot))
+            return
+        if key == "report_bug":
+            await interaction.response.send_modal(IssueReportModal(bot, "bug"))
+            return
+
+        await interaction.response.defer(ephemeral=ephemeral, thinking=False)
+        text_out: str
+        view: discord.ui.View | None = None
+        if key == "testing_vote":
+            await bot._refresh_testing_poll_options()
+            text_out = await bot._testing_vote_panel_text(interaction.user.id)
+            view = TestingVoteOptionsView(bot, timeout=None)
+        elif key == "idea_board":
+            text_out = await bot._idea_board_text("open")
+            view = IdeaBoardView(bot)
+        elif key == "my_ideas":
+            text_out = await bot._idea_board_text("mine", user_id=interaction.user.id)
+            view = IdeaBoardView(bot)
+        elif key == "my_tier":
+            text_out = await bot._tier_self_text(interaction.user.id)
+            view = TierPanelView(bot, timeout=None)
+        elif key == "ask_question":
+            text_out = block(
+                small("Use `/ask` and phrase it as a question about the mod or the server."),
+                bullets(
+                    [
+                        "`/ask question:how does the death pipeline work?`",
+                        "`/ask question:what changed in the convoy system?`",
+                        "-# Answers come from the mod files, this server and the vault.",
+                    ]
+                ),
+            )
+        elif key == "idea_pipeline":
+            text_out = await bot._idea_board_text("open") + "\n" + block(
+                small("Use `/admin ideas` for the status buttons, or press one on an idea post.")
+            )
+        elif key == "command_latency":
+            text_out = block(section("Command latency"), bullets(command_timings_lines()))
+        elif key == "server_health":
+            guilds = ", ".join(g.name for g in bot.guilds) or "none"
+            text_out = block(
+                section("Health"),
+                bullets(
+                    [
+                        f"Visible guilds: {guilds}",
+                        f"Profile: `{bot.settings.hermes_profile}`",
+                        *command_timings_lines(limit=3),
+                    ]
+                ),
+            )
+        else:
+            text_out = "That suggestion is no longer available."
+        await interaction.followup.send(
+            text_out, view=view, ephemeral=ephemeral, allowed_mentions=safe_allowed_mentions()
+        )
+    except Exception as exc:  # a footer button must never leave the member with a dead interaction
+        logger.warning("suggested action %s failed: %s", key, exc)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Sorry, that did not work. Try the slash command instead.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+            else:
+                await interaction.response.send_message(
+                    "Sorry, that did not work. Try the slash command instead.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+        except Exception:
+            pass
+
+
+def _suggested_view(bot: "ChaosXBot", suggestions: list[Suggestion]) -> discord.ui.View | None:
+    return SuggestedActionsView(bot, suggestions) if suggestions else None
+
+
+async def send_suggested_followup(
+    bot: "ChaosXBot", interaction: discord.Interaction, *, owner: bool | None = None
+) -> None:
+    """Post the personal suggestions as their own ephemeral follow-up.
+
+    A Discord message carries exactly one view, so a command that already owns its buttons (or is
+    public) gets the suggestions as a private extra message instead of fighting for the same row.
+    """
+    footer, view = await suggested_footer(bot, interaction, owner=owner)
+    if not footer:
+        return
+    try:
+        await interaction.followup.send(
+            footer, view=view, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+        )
+    except Exception as exc:
+        logger.warning("suggested followup failed: %s", exc)
+
+
+async def suggested_footer(
+    bot: "ChaosXBot", interaction: discord.Interaction, *, owner: bool | None = None
+) -> tuple[str, discord.ui.View | None]:
+    """Live next-step suggestions for the bottom of a command reply.
+
+    Everything here is derived from current state (queue depth, the member's own ideas and tier), so
+    the footer never advertises something that is not actually there. Failures degrade to "no footer"
+    rather than breaking the command that called it.
+    """
+    try:
+        user_id = int(interaction.user.id)
+        is_owner = _is_owner_id(bot, user_id) if owner is None else bool(owner)
+        tier_name = ""
+        tier_row = await bot.store.member_tier(user_id)
+        if tier_row:
+            tier_name = str(tier_row[1])
+        counts = await bot.store.idea_status_counts()
+        open_ideas = sum(int(counts.get(status, 0)) for status in OPEN_STATUSES)
+        mine = await bot.store.idea_submissions(user_id=user_id, limit=50)
+        my_open = [row for row in mine if str(row.get("status")) in OPEN_STATUSES]
+        reviewed = [row for row in mine if str(row.get("status")) not in OPEN_STATUSES]
+        # Exactly the vote panel's own slot count (it shows the top 5), so the button label cannot
+        # promise more options than pressing it delivers.
+        testing_options = len(bot.knowledge.testing_queue_rows(5))
+        has_voted = (await bot.store.member_testing_vote(user_id)) is not None
+        suggestions = build_suggestions(
+            is_owner=is_owner,
+            tier_name=tier_name,
+            testing_options=testing_options,
+            has_voted=has_voted,
+            open_ideas=open_ideas,
+            my_ideas=len(my_open),
+            reviewed_ideas=len(reviewed),
+        )
+        return render_suggestions(suggestions), _suggested_view(bot, suggestions)
+    except Exception as exc:
+        logger.warning("suggested footer failed: %s", exc)
+        return "", None
 
 
 class IdeaBoardView(discord.ui.View):
@@ -7727,8 +7998,16 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await public_gate(interaction, settings):
             return
         await interaction.response.defer(ephemeral=False, thinking=False)
-        for part in _chunk(community_help_text()):
-            await interaction.followup.send(part, allowed_mentions=safe_allowed_mentions())
+        footer, view = await suggested_footer(bot, interaction)
+        parts = _chunk(community_help_text())
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            body = f"{part}\n\n{footer}" if last and footer else part
+            await interaction.followup.send(
+                body,
+                view=view if last else None,
+                allowed_mentions=safe_allowed_mentions(),
+            )
 
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
@@ -7850,6 +8129,9 @@ def register_commands(bot: ChaosXBot) -> None:
             render=render_panel,
             view=TierPanelView(bot, scope=chosen),
         )
+        # The panel owns its own button row, so the dynamic suggestions ride in a private follow-up
+        # (Hoops, 2026-09-23: options at the bottom, suggested by the bot).
+        await send_suggested_followup(bot, interaction)
 
     @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
     async def chaosx_testing(interaction: discord.Interaction) -> None:
@@ -7862,11 +8144,20 @@ def register_commands(bot: ChaosXBot) -> None:
             render=bot.knowledge.testing_queue,
             view=TestingVoteOpenView(bot, timeout=None),
         )
+        await send_suggested_followup(bot, interaction)
 
 
     @bot.tree.command(name="suggestion", description="Draft a clearer review note of your rough suggestion.")
     async def chaosx_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
-        result = await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
+        # `use_ask_model=True` routes this to the direct API: it is pure text formatting, so paying the
+        # ~4.3s Hermes CLI subprocess startup for it was pure waste (measured 2026-09-23).
+        result = await run_hermes_command(
+            bot,
+            interaction,
+            f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.",
+            command_name="suggestion",
+            use_ask_model=True,
+        )
         if result and result[0].ok and settings.community_notes_enabled:
             try:
                 note = write_suggestion_note(
@@ -7908,6 +8199,7 @@ def register_commands(bot: ChaosXBot) -> None:
         await interaction.followup.send(
             text_out, view=IdeaBoardView(bot), allowed_mentions=safe_allowed_mentions()
         )
+        await send_suggested_followup(bot, interaction)
         await bot.store.audit(
             actor_id=interaction.user.id,
             guild_id=interaction.guild_id,
@@ -8066,8 +8358,17 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await owner_gate(interaction, settings):
             return
         await interaction.response.defer(ephemeral=True, thinking=False)
-        for part in _chunk(operator_help_text(settings)):
-            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        footer, view = await suggested_footer(bot, interaction, owner=True)
+        parts = _chunk(operator_help_text(settings))
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            body = f"{part}\n\n{footer}" if last and footer else part
+            await interaction.followup.send(
+                body,
+                view=view if last else None,
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
 
     @admin.command(name="ask", description="Protected project/server request through Hermes.")
     async def admin_ask(interaction: discord.Interaction, request: str) -> None:
@@ -8383,6 +8684,7 @@ def register_commands(bot: ChaosXBot) -> None:
             f"Repo: `{settings.chaos_redux_repo}`\n"
             f"Visible guilds: {guilds}"
         )
+        text += block(section("Command latency"), bullets(command_timings_lines()))
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin health", summary="health check")
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
