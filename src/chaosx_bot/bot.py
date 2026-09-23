@@ -278,6 +278,7 @@ from .routine_posts import (
     github_latest_release,
     parse_iso,
     plan_due_posts,
+    strip_online_count,
     with_window_note,
     playtest_observation,
     release_fallback,
@@ -3172,7 +3173,9 @@ class ChaosXBot(discord.Client):
             activity_label="weekly dev digest",
             fallback=digest_fallback(signals),
         )
-        # Say which dates the post covers: the window is rolling, the guard is the ISO week.
+        # Say which dates the post covers: the window is rolling, the guard is the ISO week. The online
+        # count is stripped: it is stale minutes after posting (Hoops, 2026-09-23).
+        text = strip_online_count(text)
         text = with_window_note(text, window_days=int(signals.get("window_days") or DIGEST_WINDOW_DAYS))
         result = await self._deliver_routine_post(spec, text=text, preview=preview)
         result.facts = signals

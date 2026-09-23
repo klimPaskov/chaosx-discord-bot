@@ -512,7 +512,7 @@ def community_facts_line(captures: list[dict[str, Any]]) -> str:
     return "; ".join(parts) if parts else "no member event ideas or suggestions were submitted this week"
 
 
-def server_facts_line(server: dict[str, Any]) -> str:
+def server_facts_line(server: dict[str, Any], *, include_online: bool = True) -> str:
     """Server-side facts, skipping zeros so a quiet week does not read as a wall of 0s.
 
     The member count comes from Discord (`GuildCounts`), never from the bot's `users` table: that table
@@ -533,7 +533,10 @@ def server_facts_line(server: dict[str, Any]) -> str:
     if members and str(server.get("members_source") or "discord") == "discord":
         online = server.get("online")
         label = f"{members} members in the server"
-        if isinstance(online, int) and online >= 0:
+        # Public posts never name the online count: Hoops, 2026-09-23 - "the how many online information
+        # will get outdated very quick so it shouldnt be included." The member count moves slowly; the
+        # online count is stale within minutes.
+        if include_online and isinstance(online, int) and online >= 0:
             label += f" ({online} online right now)"
         parts.append(label)
     return ", ".join(parts) if parts else "no tracked server activity in this window"
@@ -555,6 +558,39 @@ def issues_facts_line(issues: dict[str, Any]) -> str:
     if open_total:
         parts.append(f"{open_total} still open")
     return "; ".join(parts)
+
+
+_ONLINE_RE = re.compile(
+    r"(?P<pre>[,.\s]|\band\b|\bwith\b|\bwhile\b)*(?P<count>\d[\d,]*)\s*(?:members?|people|users)?\s*"
+    r"online(?:\s+right\s+now)?(?P<post>[).,])?",
+    re.IGNORECASE,
+)
+
+
+def strip_online_count(text: str) -> str:
+    """Remove any "N online right now" figure from a public post.
+
+    Belt-and-braces for Hoops' rule that the online count is too volatile for a weekly digest: the facts
+    line no longer carries it and the prompt forbids it, and this catches the model adding it anyway.
+    """
+    lines_out: list[str] = []
+    for line in str(text or "").splitlines():
+        cleaned = _ONLINE_RE.sub("", line)
+        # tidy what the removal leaves behind: stray brackets, doubled separators, dangling dashes
+        if cleaned.count("(") != cleaned.count(")"):
+            excess = cleaned.count("(") - cleaned.count(")")
+            if excess > 0:
+                cleaned = cleaned.replace("(", "", excess)
+            else:
+                cleaned = cleaned.replace(")", "", -excess)
+        cleaned = re.sub(r"\(\s*\)", "", cleaned)
+        cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
+        cleaned = re.sub(r"([,;:])\s*(?=[,;:.!?])", "", cleaned)
+        cleaned = re.sub(r"\s+-\s*-\s+", " - ", cleaned)
+        cleaned = re.sub(r"\s+-\s+(?=[.,;:]|$)", "", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        lines_out.append(cleaned)
+    return "\n".join(lines_out)
 
 
 def digest_window_note(*, window_days: int = DIGEST_WINDOW_DAYS, now: datetime | None = None) -> str:
@@ -608,7 +644,7 @@ Facts (use only these, invent nothing, no pings/mentions):
 - GitHub issues: {issues_facts_line(issues)}
 - Playtest observations recorded this week: {playtest_facts_line(playtests)}
 - Community ideas/suggestions submitted this week: {community_facts_line(signals.get('community_captures') or [])}
-- Server activity: {server_facts_line(server)}
+- Server activity: {server_facts_line(server, include_online=False)}
 
 Audience: players, testers and friends of the mod — not programmers. Someone who has never opened the
 repo must understand every line.
@@ -633,9 +669,10 @@ Sections (exactly these, nothing else, in this order, each heading on its own li
    sound 🔊, text ✍️, flags 🚩, balance ⚖️) — a Discord bullet list, never bare emoji lines.
 3. Heading "### 💬 From the community" followed by one short line: playtests, reported issues, ideas
    written up, server activity.
-   Always include the server's member count exactly as the facts give it (Discord's own figure); include
-   the online count when the facts give one. If the week was otherwise quiet, say so in a few words
-   instead of printing zeros.
+   Always include the server's member count exactly as the facts give it (Discord's own figure). NEVER
+   mention how many members are online right now - that number is stale within minutes of posting, so the
+   public digest never carries it. If the week was otherwise quiet, say so in a few words instead of
+   printing zeros.
 4. Heading "### 🔎 What's next" followed by one short line naming the testing focus from the facts. Do NOT
    start that line with 🔎 (or any emoji) — the heading already carries it, and a repeated emoji looks like
    a mistake. Never
@@ -677,7 +714,7 @@ def digest_fallback(signals: dict[str, Any]) -> str:
         "**💬 From the community**",
         (
             f"- {playtest_facts_line(playtests)}; {community_facts_line(signals.get('community_captures') or [])}; "
-            f"{issues_facts_line(issues)}; {server_facts_line(server)}"
+            f"{issues_facts_line(issues)}; {server_facts_line(server, include_online=False)}"
         ),
         "",
         "**What's next**",
