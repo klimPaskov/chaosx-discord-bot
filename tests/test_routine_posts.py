@@ -452,6 +452,7 @@ def test_digest_prompt_weights_work_by_areas_and_demands_brevity():
     assert "at most 3 bullets" in prompt
     assert f"under {DIGEST_MAX_CHARS} characters" in prompt
     assert "bloated" in prompt
+    assert "Always include the server's member count exactly as the facts give it" in prompt
 
 
 def test_digest_fallback_is_short_and_names_real_areas():

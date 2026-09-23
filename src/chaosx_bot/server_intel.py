@@ -58,7 +58,11 @@ class IntelFacts:
     channels_active: int = 0
     new_members: int = 0
     active_members: int = 0
+    # Server size, from Discord. Distinct from `known_members`, which is how many people the bot's own
+    # users table has seen (a smaller, different thing that must never be reported as the member count).
     member_count: int = 0
+    online_members: int = 0
+    known_members: int = 0
     admin_actions: list[dict[str, Any]] = field(default_factory=list)
     failed_runs: int = 0
     summaries: list[dict[str, Any]] = field(default_factory=list)
@@ -148,7 +152,9 @@ def collect_intel(db_path: Path, *, window_days: int = WINDOW_DAYS) -> IntelFact
         facts.active_members = _scalar(
             db, "SELECT COUNT(*) FROM users WHERE last_seen_at >= ?", (since,)
         )
-        facts.member_count = _scalar(db, "SELECT COUNT(*) FROM users")
+        # People the bot has seen. NOT the server size — `_build_server_intel` overwrites member_count
+        # with Discord's own count and keeps this figure here under an honest label.
+        facts.known_members = _scalar(db, "SELECT COUNT(*) FROM users")
         facts.admin_actions = _rows(
             db,
             "SELECT created_at, actor_id, command, summary FROM audit_log WHERE created_at >= ? "
@@ -255,7 +261,8 @@ Window: last {facts.window_days} days (since {facts.since[:16]}).
 Traffic
 - Messages archived: {facts.archived_messages} across {facts.channels_active} channels
 - Busiest channels: {top_channels}
-- Members: {facts.member_count} known, {facts.active_members} active this window, {facts.new_members} new
+- Server size (Discord): {facts.member_count} members{f", {facts.online_members} online now" if facts.online_members else ""}
+- Bot-side: {facts.known_members} people have interacted with the bot, {facts.active_members} active this window, {facts.new_members} new
 
 Bot answers
 - Auto-scan answers: {facts.answers}; banter replies: {facts.banter}

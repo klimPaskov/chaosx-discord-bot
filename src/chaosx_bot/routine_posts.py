@@ -509,7 +509,12 @@ def community_facts_line(captures: list[dict[str, Any]]) -> str:
 
 
 def server_facts_line(server: dict[str, Any]) -> str:
-    """Server-side facts, skipping zeros so a quiet week does not read as a wall of 0s."""
+    """Server-side facts, skipping zeros so a quiet week does not read as a wall of 0s.
+
+    The member count comes from Discord (`GuildCounts`), never from the bot's `users` table: that table
+    counts people who talked to the bot (36) and is not the server's size (69). When Discord did not
+    answer, the count is left out entirely rather than replaced with a plausible-looking local number.
+    """
     parts: list[str] = []
     if server.get("answers"):
         parts.append(f"{server['answers']} questions auto-answered by the bot")
@@ -520,8 +525,13 @@ def server_facts_line(server: dict[str, Any]) -> str:
         parts.append(f"{server['warnings']} soft moderation warnings")
     if server.get("playtests"):
         parts.append(f"{server['playtests']} playtests logged")
-    if server.get("members"):
-        parts.append(f"{server['members']} members in the server")
+    members = server.get("members")
+    if members and str(server.get("members_source") or "discord") == "discord":
+        online = server.get("online")
+        label = f"{members} members in the server"
+        if isinstance(online, int) and online >= 0:
+            label += f" ({online} online right now)"
+        parts.append(label)
     return ", ".join(parts) if parts else "no tracked server activity in this window"
 
 
@@ -582,7 +592,9 @@ Sections (exactly these, nothing else):
 2. "This week in the mod" — at most 3 bullets, one line each (roughly 20 words), covering the areas that
    saw the most work. Group related work into one bullet instead of listing every change.
 3. "From the community" — one short line: playtests, reported issues, ideas written up, server activity.
-   If the week was quiet, say it was quiet in a few words instead of printing zeros.
+   Always include the server's member count exactly as the facts give it (Discord's own figure); include
+   the online count when the facts give one. If the week was otherwise quiet, say so in a few words
+   instead of printing zeros.
 4. "What's next" — one short line naming the testing focus from the facts. Never promise future features,
    say something is "coming", or give dates/release timelines.
 

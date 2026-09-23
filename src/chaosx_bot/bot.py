@@ -239,6 +239,7 @@ from .announcements import (
     collect_announcement_facts,
     title_from_body,
 )
+from .guild_stats import GuildCounts, GuildCountsCache
 from .routine_posts import (
     DEV_DIGEST,
     DIGEST_WINDOW_DAYS,
@@ -2372,10 +2373,13 @@ class ChaosXBot(discord.Client):
         # so it wins on names the diagnostic cache cannot resolve.
         stored_names = await asyncio.to_thread(load_display_names, self.settings.db_path)
         member_names = {**stored_names, **member_names}
-        guild = self.guilds[0] if self.guilds else None
-        discord_members = int(getattr(guild, "member_count", 0) or 0)
-        if discord_members:
-            facts.member_count = max(facts.member_count, discord_members)
+        # `collect_intel` fills member_count from the users table, which only counts people the bot has
+        # seen. Server size must come from Discord; the local number is kept separately, labelled.
+        facts.known_members = facts.member_count
+        counts = await self._discord_counts()
+        if counts and counts.members:
+            facts.member_count = counts.members
+            facts.online_members = counts.online or 0
         text, source = await self._routine_post_text(
             prompt=build_intel_prompt(
                 facts=facts, member_names=member_names, channel_names=channel_names
@@ -2399,11 +2403,23 @@ class ChaosXBot(discord.Client):
         await self._record_weekly_routine_post(spec, result)
         return result
 
-    async def _collect_digest_signals(self) -> dict[str, Any]:
-        """Real facts only: live mod checkout, vault, GitHub issues, and the bot's own DB.
+    async def _discord_counts(self) -> GuildCounts | None:
+        """Server size from Discord, cached. None when Discord cannot be reached (never guessed)."""
+        if not self.settings.allowed_guild_id or not self.settings.discord_token:
+            return None
+        cache = getattr(self, "_guild_counts_cache", None)
+        if cache is None:
+            cache = GuildCountsCache()
+            self._guild_counts_cache = cache
+        return await cache.get(self.settings.allowed_guild_id, token=self.settings.discord_token)
 
-        Scope is deliberately wider than "what changed this week": content scale, community testing
-        observations and community idea write-ups all feed the digest, because the post is for players.
+    async def _collect_digest_signals(self) -> dict[str, Any]:
+        """Real facts only: live mod checkout, GitHub issues, Discord, and the bot's own DB.
+
+        Scope is deliberately wider than "what changed this week": community testing observations and
+        community idea write-ups feed the digest too, because the post is for players. Server size comes
+        from Discord (`GuildCountsCache`), never from the `users` table, which counts only people the bot
+        has seen — reporting that as "members" is what produced a wrong "36 members" post.
         """
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS
@@ -2419,6 +2435,7 @@ class ChaosXBot(discord.Client):
             git_change_areas(repo, since_days=window),
         )
         stats = await self.store.routine_stats(since_iso=since_iso)
+        counts = await self._discord_counts()
         playtest_rows = await self.store.list_playtest_reports_since(since_iso=since_iso, limit=6)
         playtests = [
             {"target": str(row[1]), "observation": playtest_observation(row[2])}
@@ -2448,7 +2465,10 @@ class ChaosXBot(discord.Client):
                 "qa_saved": stats.get("asks", 0),
                 "warnings": stats.get("warnings", 0),
                 "playtests": stats.get("playtests", 0),
-                "members": int(getattr(guild, "member_count", 0) or 0),
+                # Discord's own count (cached); community numbers never come from the users table.
+                "members": (counts.members if counts else None),
+                "members_source": (counts.source if counts else "unavailable"),
+                "online": (counts.online if counts else None),
             },
         }
 

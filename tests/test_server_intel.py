@@ -140,7 +140,8 @@ def test_collect_intel_counts_window(tmp_path):
     assert dict(facts.top_channels)[100] == 1
     assert dict(facts.top_channels)[101] == 1
     assert facts.new_members == 1
-    assert facts.member_count == 1
+    assert facts.known_members == 1  # people the bot has seen; server size comes from Discord
+    assert facts.member_count == 0  # no Discord counts injected in a pure collect_intel run
     assert facts.failed_runs == 1
     assert len(facts.admin_actions) == 1
     assert facts.summaries and facts.summaries[0]["channel_id"] == 100
