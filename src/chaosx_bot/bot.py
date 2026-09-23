@@ -193,7 +193,36 @@ from .playtest_synthesis import (
     MAX_SYNTHESIS_OUTPUT_CHARS,
     build_playtest_synthesis_prompt,
 )
+from .playtest_reminders import (
+    PlaytestTiming,
+    format_reminder,
+    format_result_request,
+    parse_schedule_json,
+    reminder_due,
+    result_request_due,
+    rows_to_signals,
+    strip_schedule_json,
+)
 from .rate_limit import FixedWindowRateLimiter, RateLimitResult
+from .server_intel import (
+    IntelFacts,
+    archive_fallback,
+    build_archive_prompt,
+    build_intel_prompt,
+    collect_intel,
+    intel_fallback,
+    load_display_names,
+    search_archive,
+)
+from .server_actions import (
+    ACTIONS as SERVER_ACTIONS,
+    ActionPlan,
+    build_plan_prompt,
+    describe_plan,
+    parse_action_plan,
+    plan_detail,
+    unresolvable_params,
+)
 from .announcements import (
     AnnouncementFacts,
     AnnouncementResult,
@@ -209,6 +238,7 @@ from .routine_posts import (
     DIGEST_WINDOW_DAYS,
     RELEASE_POSTS,
     ROUTINE_POSTS,
+    SERVER_INTEL,
     RoutinePostResult,
     RoutinePostSpec,
     build_digest_prompt,
@@ -221,6 +251,7 @@ from .routine_posts import (
     git_head_sha,
     github_issue_activity,
     github_latest_release,
+    parse_iso,
     plan_due_posts,
     release_fallback,
     release_signal_changed,
@@ -1354,6 +1385,10 @@ Return a concise private owner-facing playtest draft with exactly these sections
 5. Missing info / assumptions — only important unknowns.
 6. Next step — say that this command stored a local draft only and did not create a Discord Scheduled Event or public post. If Hoops wants a public Scheduled Event/post/reminders, tell him to confirm the exact action.
 
+After the six sections, add exactly one final line containing a machine-readable timing block, formatted as strict JSON on one line and nothing else on that line:
+{{"start_iso": "<ISO-8601 UTC timestamp>", "duration_minutes": <int>, "voice": "<voice/channel name or empty>", "build": "<build/version or empty>"}}
+Use an empty string for start_iso only if the request contains no usable timing at all. Convert local (UTC+3) times to UTC in start_iso.
+
 Do not actually create Discord Scheduled Events, public posts, GitHub issues, files, or reminders from this command. Draft only.
 """
 
@@ -2134,12 +2169,114 @@ class ChaosXBot(discord.Client):
                 hour_utc=self.settings.dev_digest_hour_utc,
             ),
             replace(RELEASE_POSTS, interval_hours=self.settings.release_check_interval_hours),
+            replace(
+                SERVER_INTEL,
+                weekday=self.settings.intel_digest_weekday,
+                hour_utc=self.settings.intel_digest_hour_utc,
+            ),
         ]
 
     def _routine_post_destination(self, spec: RoutinePostSpec) -> int | None:
         if spec.name == RELEASE_POSTS.name:
             return self.settings.routine_release_channel_id or self.settings.routine_posts_channel_id
+        if spec.name == SERVER_INTEL.name:
+            # Not a public destination: where the intel DM falls back to in a DM-blocked guild.
+            return self.settings.automation_reminder_channel_id
         return self.settings.routine_posts_channel_id
+
+    async def _run_playtest_automation(self) -> list[str]:
+        """Playtest reminder + result-request senders (the two preset automations that never had code)."""
+        outcomes: list[str] = []
+        guild_id = self.settings.allowed_guild_id or self.settings.command_guild_id
+        if not guild_id:
+            return outcomes
+        reminders_on = await self.store.automation_enabled("playtest_reminders")
+        results_on = await self.store.automation_enabled("post_playtest_result_request")
+        if not reminders_on and not results_on:
+            return outcomes
+        rows = await self.store.list_scheduled_playtests(guild_id=guild_id, limit=25)
+        if not rows:
+            return outcomes
+        signals = rows_to_signals(rows)
+        now = utcnow()
+        channel_id = self.settings.automation_reminder_channel_id
+        channel = self.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                outcomes.append(f"playtest automation: channel lookup failed ({type(exc).__name__})")
+                return outcomes
+        if channel is None:
+            outcomes.append("playtest automation: no destination channel configured")
+            return outcomes
+        if not isinstance(channel, discord.abc.Messageable):
+            outcomes.append("playtest automation: destination channel cannot receive messages")
+            return outcomes
+        if reminders_on:
+            already = await self.store.playtest_automation_marks(kind="reminder")
+            for signal in signals:
+                playtest_id = signal["playtest_id"]
+                start = signal["start"]
+                if not playtest_id or playtest_id in already:
+                    continue
+                if not reminder_due(
+                    start=start,
+                    now=now,
+                    lead_minutes=self.settings.playtest_reminder_lead_minutes,
+                ):
+                    continue
+                assert start is not None
+                text = format_reminder(
+                    target=signal["target"],
+                    start=start,
+                    duration_minutes=signal["duration_minutes"],
+                    voice=signal["voice"],
+                    build=signal["build"],
+                )
+                message = await channel.send(text, allowed_mentions=safe_allowed_mentions())
+                await self.store.mark_playtest_automation(playtest_id=playtest_id, kind="reminder")
+                await self.store.audit(
+                    actor_id=self.settings.owner_id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    command="playtest reminder",
+                    summary=f"{playtest_id} -> {getattr(message, 'id', '')}",
+                )
+                outcomes.append(f"playtest reminder {playtest_id}: sent")
+        if results_on:
+            already = await self.store.playtest_automation_marks(kind="results")
+            for signal in signals:
+                playtest_id = signal["playtest_id"]
+                start = signal["start"]
+                if not playtest_id or playtest_id in already:
+                    continue
+                if not result_request_due(
+                    start=start,
+                    duration_minutes=signal["duration_minutes"],
+                    now=now,
+                    grace_minutes=self.settings.playtest_result_grace_minutes,
+                ):
+                    continue
+                assert start is not None
+                text = format_result_request(
+                    target=signal["target"],
+                    start=start,
+                    duration_minutes=signal["duration_minutes"],
+                )
+                message = await channel.send(text, allowed_mentions=safe_allowed_mentions())
+                await self.store.mark_playtest_automation(playtest_id=playtest_id, kind="results")
+                await self.store.audit(
+                    actor_id=self.settings.owner_id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    command="playtest result request",
+                    summary=f"{playtest_id} -> {getattr(message, 'id', '')}",
+                )
+                outcomes.append(f"playtest result request {playtest_id}: sent")
+        for outcome in outcomes:
+            print(f"[chaosx] {outcome}")
+        return outcomes
 
     async def _routine_posts_worker(self, delay_seconds: int) -> None:
         await asyncio.sleep(max(0, delay_seconds))
@@ -2148,6 +2285,7 @@ class ChaosXBot(discord.Client):
                 for result in await self._run_due_routine_posts():
                     if result.action not in {"skipped", "unchanged"}:
                         print(f"ChaosX routine post {result.name}: {result.action} {result.detail}".rstrip())
+                await self._run_playtest_automation()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # one bad tick must never kill the loop
@@ -2178,10 +2316,61 @@ class ChaosXBot(discord.Client):
                 continue
             state = states.get(spec.name) or {}
             if spec.kind == "weekly":
-                results.append(await self._post_dev_digest(spec, state=state, preview=preview))
+                if spec.name == SERVER_INTEL.name:
+                    results.append(await self._post_server_intel(spec, preview=preview))
+                else:
+                    results.append(await self._post_dev_digest(spec, state=state, preview=preview))
             else:
                 results.append(await self._post_release_if_changed(spec, state=state, preview=preview))
         return results
+
+    def _guild_name_maps(self) -> tuple[dict[int, str], dict[int, str]]:
+        """Live channel + member display names for readable intel output (no API calls)."""
+        guild = self.guilds[0] if self.guilds else None
+        channel_names = {
+            channel.id: str(getattr(channel, "name", "") or channel.id)
+            for channel in (getattr(guild, "channels", None) or [])
+        }
+        member_names = {
+            member.id: (getattr(member, "display_name", "") or getattr(member, "name", "") or str(member.id))
+            for member in (getattr(guild, "members", None) or [])
+        }
+        return channel_names, member_names
+
+    async def _build_server_intel(self) -> tuple[str, str, IntelFacts]:
+        """Build the private intel digest text from the bot's own tables."""
+        facts = await asyncio.to_thread(collect_intel, self.settings.db_path)
+        channel_names, member_names = self._guild_name_maps()
+        # The users table outlives the member cache (and works for members who left),
+        # so it wins on names the diagnostic cache cannot resolve.
+        stored_names = await asyncio.to_thread(load_display_names, self.settings.db_path)
+        member_names = {**stored_names, **member_names}
+        guild = self.guilds[0] if self.guilds else None
+        discord_members = int(getattr(guild, "member_count", 0) or 0)
+        if discord_members:
+            facts.member_count = max(facts.member_count, discord_members)
+        text, source = await self._routine_post_text(
+            prompt=build_intel_prompt(
+                facts=facts, member_names=member_names, channel_names=channel_names
+            ),
+            activity_label="server intel digest",
+            fallback=intel_fallback(
+                facts=facts, member_names=member_names, channel_names=channel_names
+            ),
+        )
+        return text, source, facts
+
+    async def _post_server_intel(
+        self, spec: RoutinePostSpec, *, preview: bool
+    ) -> RoutinePostResult:
+        text, source, facts = await self._build_server_intel()
+        result = await self._deliver_routine_post(spec, text=text, preview=preview)
+        result.facts = {"facts": facts.__dict__}
+        result.detail = f"{source}; {result.detail}".strip("; ")
+        if preview:
+            return result
+        await self._record_weekly_routine_post(spec, result)
+        return result
 
     async def _collect_digest_signals(self) -> dict[str, Any]:
         """Real facts only: live mod checkout, GitHub issues, and the bot's own DB."""
@@ -2241,16 +2430,37 @@ class ChaosXBot(discord.Client):
             return sanitize_post(fallback), "model-fallback"
         return text, "model"
 
+    async def _owner_dm_channel(self) -> discord.abc.Messageable | None:
+        """The owner's DM channel (None when Discord refuses DMs)."""
+        try:
+            user = self.get_user(self.settings.owner_id) or await self.fetch_user(self.settings.owner_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+            print(f"ChaosX routine DM user lookup failed: {type(exc).__name__}")
+            return None
+        try:
+            return user.dm_channel or await user.create_dm()
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"ChaosX routine DM channel failed: {type(exc).__name__}")
+            return None
+
     async def _deliver_routine_post(
         self, spec: RoutinePostSpec, *, text: str, preview: bool
     ) -> RoutinePostResult:
         destination_id = self._routine_post_destination(spec)
-        if not destination_id:
+        channel: Any = None
+        if spec.delivery == "owner_dm":
+            channel = await self._owner_dm_channel()
+            if channel is None:
+                print(
+                    f"ChaosX routine post {spec.name}: DM unavailable, falling back to channel {destination_id}"
+                )
+        if channel is None and not destination_id:
             return RoutinePostResult(
                 name=spec.name, action="error", detail="no destination channel configured", text=text
             )
-        channel = self.get_channel(destination_id)
-        if channel is None:
+        if channel is None and destination_id:
+            channel = self.get_channel(destination_id)
+        if channel is None and destination_id:
             try:
                 channel = await self.fetch_channel(destination_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
@@ -2311,11 +2521,19 @@ class ChaosXBot(discord.Client):
         result.detail = f"{source}; {result.detail}".strip("; ")
         if preview:
             return result
+        await self._record_weekly_routine_post(spec, result)
+        return result
+
+    async def _record_weekly_routine_post(
+        self, spec: RoutinePostSpec, result: RoutinePostResult
+    ) -> None:
+        """Persist a weekly post's period key (only when it really posted) plus an audit row."""
         now = utcnow().isoformat()
+        posted = result.action == "posted"
         await self.store.record_routine_post(
             spec.name,
-            period_key=weekly_period_key(utcnow()) if result.action == "posted" else "",
-            posted_at=now if result.action == "posted" else "",
+            period_key=weekly_period_key(utcnow()) if posted else "",
+            posted_at=now if posted else "",
             checked_at=now,
             channel_id=str(result.channel_id or ""),
             message_id=str(result.message_id or ""),
@@ -2329,7 +2547,6 @@ class ChaosXBot(discord.Client):
             command=f"automation {spec.name}",
             summary=f"{result.action}: {result.detail}",
         )
-        return result
 
     async def _post_release_if_changed(
         self, spec: RoutinePostSpec, *, state: dict[str, Any], preview: bool
@@ -2488,6 +2705,196 @@ class ChaosXBot(discord.Client):
         result.channel_id = channel_id
         result.message_id = sent.id
         return result
+
+    # ------------------------------------------------------------------
+    # Owner-requested server actions (plan → confirm → execute)
+    # ------------------------------------------------------------------
+
+    def _action_resolvers(self) -> dict[str, dict[str, str]]:
+        """Name → id maps for channels, members and roles (live guild cache, lowercased keys)."""
+        guild = self.guilds[0] if self.guilds else None
+        channels: dict[str, str] = {}
+        members: dict[str, str] = {}
+        roles: dict[str, str] = {}
+        for channel in getattr(guild, "channels", None) or []:
+            name = str(getattr(channel, "name", "") or "").strip()
+            if not name:
+                continue
+            channels[name.lower()] = str(channel.id)
+            channels[f"#{name.lower()}"] = str(channel.id)
+        for member in getattr(guild, "members", None) or []:
+            identifier = str(member.id)
+            for candidate in (
+                str(getattr(member, "display_name", "") or "").strip(),
+                str(getattr(member, "name", "") or "").strip(),
+            ):
+                if candidate:
+                    members[candidate.lower()] = identifier
+            members[identifier] = identifier
+        for role in getattr(guild, "roles", None) or []:
+            name = str(getattr(role, "name", "") or "").strip()
+            if not name:
+                continue
+            roles[name.lower()] = str(role.id)
+            roles[f"@{name.lower()}"] = str(role.id)
+        return {"channel": channels, "member": members, "role": roles}
+
+    def _resolve_channel(self, guild: discord.Guild, name: str) -> Any:
+        key = str(name or "").strip().lower().lstrip("#")
+        for channel in getattr(guild, "channels", None) or []:
+            if str(getattr(channel, "name", "") or "").strip().lower() == key:
+                return channel
+        return None
+
+    def _resolve_member(self, guild: discord.Guild, name: str) -> Any:
+        key = str(name or "").strip().lstrip("@").lower()
+        for member in getattr(guild, "members", None) or []:
+            if str(member.id) == key:
+                return member
+            if str(getattr(member, "display_name", "") or "").strip().lower() == key:
+                return member
+            if str(getattr(member, "name", "") or "").strip().lower() == key:
+                return member
+        return None
+
+    def _resolve_role(self, guild: discord.Guild, name: str) -> Any:
+        key = str(name or "").strip().lstrip("@").lower()
+        for role in getattr(guild, "roles", None) or []:
+            if str(getattr(role, "name", "") or "").strip().lower() == key:
+                return role
+        return None
+
+    async def _plan_server_action(self, request: str) -> tuple[ActionPlan | None, str]:
+        guild = self.guilds[0] if self.guilds else None
+        resolvers = self._action_resolvers()
+        prompt = build_plan_prompt(
+            request=request,
+            channel_names=[c.name for c in (getattr(guild, "channels", None) or [])],
+            role_names=[r.name for r in (getattr(guild, "roles", None) or [])],
+            member_names=[
+                (getattr(m, "display_name", "") or getattr(m, "name", ""))
+                for m in (getattr(guild, "members", None) or [])
+            ],
+        )
+        result = await _public_model_completion(
+            bot=self,
+            system=SYSTEM_BOUNDARY,
+            prompt=prompt,
+            model=self.settings.operator_model,
+            reasoning_effort=self.settings.operator_reasoning_effort,
+            timeout_seconds=min(self.settings.hermes_timeout_seconds, 180),
+            activity_label="server action plan",
+            actor_id=self.settings.owner_id,
+            fallback_toolsets=None,
+        )
+        raw = (result.stdout or "").strip()
+        plan, error = parse_action_plan(raw, request=request)
+        if plan is None:
+            return None, error
+        problems = unresolvable_params(plan, resolvers=resolvers)
+        if problems:
+            return None, "; ".join(problems)
+        return plan, ""
+
+    async def _execute_action_plan(self, plan: ActionPlan) -> tuple[bool, str]:
+        """Run a confirmed plan. Every branch is owner-triggered and non-destructive."""
+        guild = self.guilds[0] if self.guilds else None
+        if guild is None:
+            return False, "no guild available"
+        params = plan.params
+        reason = f"ChaosX /admin do by owner ({plan.plan_id})"
+
+        def resolve_target_channel() -> Any:
+            return self._resolve_channel(guild, str(params.get("channel") or ""))
+
+        try:
+            if plan.action == "post_message":
+                channel = resolve_target_channel()
+                if channel is None:
+                    return False, f"channel `{params.get('channel')}` not found"
+                message = await channel.send(
+                    str(params["text"]), allowed_mentions=safe_allowed_mentions()
+                )
+                return True, f"posted in #{channel.name} — {message.jump_url}"
+            if plan.action == "update_channel_topic":
+                channel = resolve_target_channel()
+                if channel is None:
+                    return False, f"channel `{params.get('channel')}` not found"
+                await channel.edit(topic=str(params["topic"]), reason=reason)
+                return True, f"topic updated in #{channel.name}"
+            if plan.action == "create_thread":
+                channel = resolve_target_channel()
+                if channel is None:
+                    return False, f"channel `{params.get('channel')}` not found"
+                thread = await channel.create_thread(
+                    name=str(params["name"]),
+                    type=discord.ChannelType.public_thread,
+                    reason=reason,
+                )
+                if params.get("message"):
+                    await thread.send(
+                        str(params["message"]), allowed_mentions=safe_allowed_mentions()
+                    )
+                return True, f"thread {getattr(thread, 'mention', thread.id)} created in #{channel.name}"
+            if plan.action == "pin_message":
+                channel = resolve_target_channel()
+                if channel is None:
+                    return False, f"channel `{params.get('channel')}` not found"
+                message = await channel.fetch_message(int(str(params["message_id"])))
+                await message.pin(reason=reason)
+                return True, f"pinned {message.jump_url}"
+            if plan.action in {"grant_role", "revoke_role"}:
+                member = self._resolve_member(guild, str(params.get("member") or ""))
+                role = self._resolve_role(guild, str(params.get("role") or ""))
+                if member is None:
+                    return False, f"member `{params.get('member')}` not found"
+                if role is None:
+                    return False, f"role `{params.get('role')}` not found"
+                bot_member = guild.me
+                allowed, why = _can_manage_role(guild, guild.owner or bot_member, bot_member, role)
+                if not allowed:
+                    return False, why
+                if plan.action == "grant_role":
+                    if role in member.roles:
+                        return True, f"{member.display_name} already has {role.name} (nothing to do)"
+                    await member.add_roles(role, reason=reason)
+                    return True, f"granted {role.name} to {member.display_name}"
+                if role not in member.roles:
+                    return True, f"{member.display_name} does not have {role.name} (nothing to do)"
+                await member.remove_roles(role, reason=reason)
+                return True, f"removed {role.name} from {member.display_name}"
+            if plan.action == "create_scheduled_event":
+                start = datetime.fromisoformat(str(params["start"]).replace("Z", "+00:00"))
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                duration = int(params.get("duration_minutes") or 60)
+                end = start + timedelta(minutes=max(5, duration))
+                voice = self._resolve_channel(guild, str(params.get("voice_channel") or ""))
+                description = str(params.get("description") or "")
+                if voice is not None:
+                    event = await guild.create_scheduled_event(
+                        name=str(params["name"]),
+                        start_time=start,
+                        end_time=end,
+                        description=description,
+                        entity_type=discord.EntityType.voice,
+                        channel=voice,
+                        reason=reason,
+                    )
+                else:
+                    event = await guild.create_scheduled_event(
+                        name=str(params["name"]),
+                        start_time=start,
+                        end_time=end,
+                        description=description,
+                        entity_type=discord.EntityType.external,
+                        location=str(params.get("location") or "Discord"),
+                        reason=reason,
+                    )
+                return True, f"scheduled event “{event.name}” created for {start.isoformat()}"
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound, ValueError, TypeError) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        return False, f"unsupported action `{plan.action}`"
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         allowed = self.settings.allowed_guild_id or self.settings.command_guild_id
@@ -5071,6 +5478,7 @@ async def run_hermes_command(
     use_operator_model: bool = False,
     max_chars_override: int | None = None,
     send_output: bool = True,
+    postprocess: Any = None,
 ) -> tuple[HermesResult, str] | None:
     rate = None
     source_paths_allowed = False
@@ -5297,6 +5705,11 @@ async def run_hermes_command(
         if progress_task is not None:
             await progress_task
     output = result.stdout.strip() or result.stderr.strip() or "No output."
+    if postprocess is not None:
+        try:
+            output = postprocess(output)
+        except Exception as exc:  # a broken postprocess must never swallow the answer
+            print(f"[chaosx] postprocess failed for {command_name}: {type(exc).__name__}: {exc}")
     if result.timed_out:
         output = (
             f"Hermes run timed out after {hermes_timeout}s. "
@@ -5807,6 +6220,14 @@ def register_commands(bot: ChaosXBot) -> None:
             voice="AI draft",
             build="",
         )
+        timing_box: list[PlaytestTiming] = []
+
+        def _capture_timing(text: str) -> str:
+            # Keep the draft readable and keep the parsed timing for the reminder automation.
+            timing = parse_schedule_json(text)
+            timing_box.append(timing)
+            return strip_schedule_json(text)
+
         await run_hermes_command(
             bot,
             interaction,
@@ -5815,7 +6236,24 @@ def register_commands(bot: ChaosXBot) -> None:
             public=False,
             owner_only=True,
             use_operator_model=True,
+            postprocess=_capture_timing,
         )
+        if timing_box and timing_box[0].parsed:
+            timing = timing_box[0]
+            assert timing.start is not None
+            await bot.store.update_playtest_schedule(
+                playtest_id=playtest_id,
+                start_time=timing.start.isoformat(),
+                duration_minutes=timing.duration_minutes,
+                voice=timing.voice,
+                build=timing.build,
+            )
+            print(
+                f"[chaosx] playtest schedule {playtest_id}: timing parsed "
+                f"{timing.start.isoformat()} ({timing.duration_minutes}m)"
+            )
+        elif timing_box:
+            print(f"[chaosx] playtest schedule {playtest_id}: no parsable timing in the draft")
 
     @playtest.command(name="report", description="Record informal playtest observations.")
     async def playtest_report(interaction: discord.Interaction, observation: str, event_id: str = "") -> None:
@@ -6381,6 +6819,239 @@ def register_commands(bot: ChaosXBot) -> None:
             )
             if index >= 3:
                 break
+
+    @admin.command(name="intel", description="Server intel: private digest or an archive answer.")
+    async def admin_intel(interaction: discord.Interaction, action: str = "digest", question: str = "") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = (action or "digest").lower().strip()
+        if action not in {"digest", "query", "send"}:
+            await interaction.response.send_message(
+                "Use `action:digest` (show the weekly briefing here), `action:send` (DM it now), or "
+                "`action:query question:what did we decide about X`.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if action == "query":
+            question = (question or "").strip()
+            if not question:
+                await interaction.followup.send(
+                    "Give me a question, e.g. `action:query question:what did we decide about the FSM decisions`.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+            hits = await asyncio.to_thread(
+                search_archive, bot.settings.db_path, question=question
+            )
+            channel_names, _ = bot._guild_name_maps()
+            text, source = await bot._routine_post_text(
+                prompt=build_archive_prompt(
+                    question=question,
+                    hits=hits,
+                    channel_names=channel_names,
+                    guild_id=interaction.guild_id,
+                ),
+                activity_label="archive query",
+                fallback=archive_fallback(
+                    question=question,
+                    hits=hits,
+                    channel_names=channel_names,
+                    guild_id=interaction.guild_id,
+                ),
+            )
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin intel query",
+                summary=f"{len(hits)} archive hits: {question[:120]}",
+            )
+            header = f"**Archive answer** — {len(hits)} matching archived messages ({source})\n\n"
+            for index, part in enumerate(_chunk(header + text)):
+                await interaction.followup.send(
+                    part, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+                )
+                if index >= 3:
+                    break
+            return
+        if action == "digest":
+            text, source, facts = await bot._build_server_intel()
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin intel digest",
+                summary=f"{source}; {len(facts.asks)} asks, {facts.archived_messages} messages",
+            )
+            header = (
+                f"**Server intel digest** (preview — nothing sent; `action:send` DMs it)\n\n"
+            )
+            for index, part in enumerate(_chunk(header + text)):
+                await interaction.followup.send(
+                    part, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+                )
+                if index >= 3:
+                    break
+            return
+        spec = next(
+            (item for item in bot._routine_post_specs() if item.name == SERVER_INTEL.name), SERVER_INTEL
+        )
+        result = await bot._post_server_intel(spec, preview=False)
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin intel send",
+            summary=f"{result.action}: {result.detail}",
+        )
+        reply = (
+            f"Intel digest sent (`{result.action}`); this week's slot is now marked as used."
+            if result.action == "posted"
+            else f"Intel digest failed: `{result.action}` {result.detail}"
+        )
+        await interaction.followup.send(
+            reply, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+        )
+
+    @admin.command(name="do", description="Plan or confirm a server action from a plain-English request.")
+    async def admin_do(interaction: discord.Interaction, action: str = "plan", request: str = "", plan: str = "") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = (action or "plan").lower().strip()
+        if action not in {"plan", "confirm", "list"}:
+            await interaction.response.send_message(
+                "Use `action:plan request:<plain English>`, `action:confirm plan:<plan-id>`, or `action:list`.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        if action == "list":
+            rows = await bot.store.list_action_plans(limit=10)
+            lines = ["## Server action plans"]
+            if not rows:
+                lines.append("Nothing planned yet.")
+            for row in rows:
+                lines.append(
+                    f"- `{row['plan_id']}` — `{row['status']}` — `{row['action']}` — {row['created_at'][:16]}\n"
+                    f"  - request: {str(row.get('request') or '')[:120]}\n"
+                    f"  - result: {str(row.get('result') or '')[:120]}"
+                )
+            await interaction.response.send_message(
+                "\n".join(lines)[:1900], ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if action == "plan":
+            request = (request or "").strip()
+            if not request:
+                await interaction.followup.send(
+                    "Tell me what to do, e.g. `action:plan request:open a thread in event-ideas called Zombie outbreak feedback`.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+            plan_obj, error = await bot._plan_server_action(request)
+            if plan_obj is None:
+                supported = ", ".join(f"`{name}`" for name in sorted(SERVER_ACTIONS))
+                await interaction.followup.send(
+                    f"I could not map that to a supported action: {error}.\nSupported actions: {supported}",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                await bot.store.audit(
+                    actor_id=interaction.user.id,
+                    guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                    command="admin do plan",
+                    summary=f"unmapped: {request[:120]} ({error[:120]})",
+                )
+                return
+            resolvers = bot._action_resolvers()
+            await bot.store.record_action_plan(
+                plan_obj.plan_id,
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                request=request,
+                action=plan_obj.action,
+                params_json=plan_detail(plan_obj),
+            )
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin do plan",
+                summary=f"{plan_obj.plan_id}: {plan_obj.action}",
+            )
+            header = (
+                f"**Action plan** `{plan_obj.plan_id}` — nothing has run yet.\n\n"
+                f"{describe_plan(plan_obj, resolvers=resolvers)}\n\n"
+                f"Confirm with `/admin do action:confirm plan:{plan_obj.plan_id}` (expires in 24h)."
+            )
+            for index, part in enumerate(_chunk(header)):
+                await interaction.followup.send(
+                    part, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+                )
+                if index >= 3:
+                    break
+            return
+        plan_id = (plan or "").strip()
+        if not plan_id:
+            await interaction.followup.send(
+                "Give me the plan id, e.g. `action:confirm plan:plan-1a2b3c4d5e6f`.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        row = await bot.store.get_action_plan(plan_id)
+        if not row:
+            await interaction.followup.send(
+                f"No plan `{plan_id}` found.", ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+        if str(row.get("status")) != "planned":
+            await interaction.followup.send(
+                f"Plan `{plan_id}` is already `{row.get('status')}` ({str(row.get('result') or '')[:200]}).",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        created = parse_iso(str(row.get("created_at") or ""))
+        if created is not None and (utcnow() - created) > timedelta(hours=24):
+            await bot.store.finish_action_plan(plan_id, status="expired", result="older than 24h")
+            await interaction.followup.send(
+                f"Plan `{plan_id}` expired (planned more than 24h ago). Plan it again.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        try:
+            stored = json.loads(str(row.get("params_json") or "{}"))
+        except json.JSONDecodeError:
+            stored = {}
+        plan_obj = ActionPlan(
+            plan_id=plan_id,
+            action=str(row.get("action") or ""),
+            params=stored.get("params") if isinstance(stored.get("params"), dict) else {},
+            reason=str(stored.get("reason") or ""),
+            request=str(row.get("request") or ""),
+        )
+        ok, summary = await bot._execute_action_plan(plan_obj)
+        await bot.store.finish_action_plan(plan_id, status="done" if ok else "failed", result=summary)
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin do confirm",
+            summary=f"{plan_id}: {'done' if ok else 'failed'} — {summary[:150]}",
+        )
+        reply = f"{'✅' if ok else '⚠️'} `{plan_id}` → {summary}"
+        for part in _chunk(reply):
+            await interaction.followup.send(
+                part, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
 
     @admin.command(name="autoscan", description="List recent ChaosX auto-scan actions.")
     async def admin_autoscan(interaction: discord.Interaction, action: str = "list", limit: int = 10) -> None:

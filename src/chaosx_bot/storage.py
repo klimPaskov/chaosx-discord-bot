@@ -178,6 +178,26 @@ CREATE TABLE IF NOT EXISTS announcements (
     message_id TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS server_action_plans (
+    plan_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    actor_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    request TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    params_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'planned',
+    result TEXT NOT NULL DEFAULT '',
+    executed_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS playtest_automation_marks (
+    playtest_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (playtest_id, kind)
+);
 """
 
 DEFAULT_AUTOMATIONS = {
@@ -193,6 +213,7 @@ DEFAULT_AUTOMATIONS = {
     "release_announcement_posting": 0,
     "routine_dev_digest": 1,
     "routine_release_posts": 1,
+    "routine_server_intel": 1,
 }
 
 AUTOMATION_DESCRIPTIONS = {
@@ -205,9 +226,10 @@ AUTOMATION_DESCRIPTIONS = {
     "post_playtest_result_request": "Asks testers for results/observations after a playtest window.",
     "playtest_result_synthesis": "Batches new playtest observations into a private model-generated report with bugs, balance concerns, successful checks, uncertain findings, and next actions.",
     "weekly_content_dump": "Image-led weekly content-dump post. Posts only when enough fresh visuals/assets exist.",
-    "release_announcement_posting": "Reserved for release announcement posting; should stay off until explicitly used.",
+    "release_announcement_posting": "DEPRECATED and superseded by routine_release_posts, which posts release announcements from the live mod version. Kept only so the registry row stays visible; safe to leave disabled.",
     "routine_dev_digest": "Autonomous weekly dev digest: real commit/catalog/issue/Q&A facts, posted once a week to the routine posts channel.",
     "routine_release_posts": "Autonomous release announcements: posts when the mod version in descriptor.mod changes (or a GitHub release appears).",
+    "routine_server_intel": "Private weekly server-intel DM to the owner: what people asked, where ChaosX could not help, activity, moderation, and his admin actions.",
 }
 
 
@@ -585,6 +607,52 @@ class Store:
             cur = await db.execute("SELECT draft_id, created_at, summary, status FROM issue_drafts ORDER BY created_at DESC LIMIT ?", (limit,))
             return [tuple(row) for row in await cur.fetchall()]
 
+    async def update_playtest_schedule(
+        self,
+        *,
+        playtest_id: str,
+        start_time: str,
+        duration_minutes: int = 0,
+        voice: str = "",
+        build: str = "",
+    ) -> None:
+        """Store the parsed timing block of a playtest draft (reminder/result automation reads it)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE playtest_records SET start_time = ?, duration_minutes = ?, voice = ?, build = ? "
+                "WHERE playtest_id = ?",
+                (start_time, max(0, int(duration_minutes)), voice[:200], build[:200], playtest_id),
+            )
+            await db.commit()
+
+    async def list_scheduled_playtests(self, *, guild_id: int, limit: int = 25) -> list[dict]:
+        """Playtests that carry a real parsed start time (placeholders excluded)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT playtest_id, created_at, guild_id, channel_id, target, start_time, "
+                "duration_minutes, voice, build, status FROM playtest_records "
+                "WHERE guild_id = ? AND start_time NOT IN ('', 'AI draft', 'draft') "
+                "ORDER BY start_time DESC LIMIT ?",
+                (guild_id, max(1, min(limit, 100))),
+            )
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def mark_playtest_automation(self, *, playtest_id: str, kind: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO playtest_automation_marks(playtest_id, kind, created_at) VALUES (?, ?, ?)",
+                (playtest_id, kind, now_iso()),
+            )
+            await db.commit()
+
+    async def playtest_automation_marks(self, *, kind: str) -> set[str]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT playtest_id FROM playtest_automation_marks WHERE kind = ?", (kind,)
+            )
+            return {str(row[0]) for row in await cur.fetchall()}
+
     async def create_playtest(self, *, playtest_id: str, actor_id: int, guild_id: int | None, channel_id: int | None, target: str, start_time: str, duration_minutes: int, voice: str, build: str) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
@@ -867,3 +935,57 @@ class Store:
                 )
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def record_action_plan(
+        self,
+        plan_id: str,
+        *,
+        actor_id: int,
+        guild_id: int | None,
+        request: str = "",
+        action: str = "",
+        params_json: str = "{}",
+        status: str = "planned",
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO server_action_plans(plan_id, created_at, actor_id, guild_id, request, action, params_json, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    action = excluded.action,
+                    params_json = excluded.params_json,
+                    status = excluded.status
+                """,
+                (plan_id, now_iso(), actor_id, guild_id, request[:500], action, params_json[:4000], status),
+            )
+            await db.commit()
+
+    async def get_action_plan(self, plan_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT plan_id, created_at, actor_id, guild_id, request, action, params_json, status, result, executed_at "
+                "FROM server_action_plans WHERE plan_id = ?",
+                (plan_id,),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def finish_action_plan(self, plan_id: str, *, status: str, result: str = "") -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE server_action_plans SET status = ?, result = ?, executed_at = ? WHERE plan_id = ?",
+                (status, result[:2000], now_iso(), plan_id),
+            )
+            await db.commit()
+
+    async def list_action_plans(self, *, limit: int = 10) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT plan_id, created_at, action, status, request, result FROM server_action_plans "
+                "ORDER BY created_at DESC LIMIT ?",
+                (max(1, limit),),
+            )
+            return [dict(row) for row in await cur.fetchall()]

@@ -43,6 +43,7 @@ class RoutinePostSpec:
     hour_utc: int = 12  # slot hour in UTC
     interval_hours: int = 6  # how often to look for new signal (release posts)
     channel_setting: str = "routine_posts_channel_id"
+    delivery: str = "channel"  # "channel" | "owner_dm"
 
 
 DEV_DIGEST = RoutinePostSpec(
@@ -69,7 +70,21 @@ RELEASE_POSTS = RoutinePostSpec(
     channel_setting="routine_release_channel_id",
 )
 
-ROUTINE_POSTS: tuple[RoutinePostSpec, ...] = (DEV_DIGEST, RELEASE_POSTS)
+SERVER_INTEL = RoutinePostSpec(
+    name="routine_server_intel",
+    label="Weekly server intel digest",
+    description=(
+        "Private weekly briefing to Hoops: what people asked, where ChaosX could not help, "
+        "activity, moderation, and his own admin actions. Delivered by DM."
+    ),
+    kind="weekly",
+    weekday=6,  # Sunday
+    hour_utc=18,
+    channel_setting="owner_dm",
+    delivery="owner_dm",
+)
+
+ROUTINE_POSTS: tuple[RoutinePostSpec, ...] = (DEV_DIGEST, RELEASE_POSTS, SERVER_INTEL)
 
 DIGEST_WINDOW_DAYS = 7
 MAX_NOTABLE_COMMITS = 12
