@@ -769,7 +769,7 @@ class Store:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 """
-                SELECT created_at, command, summary
+                SELECT created_at, command, summary, COALESCE(actor_id, 0)
                 FROM audit_log
                 WHERE created_at >= ? AND command IN ('vault event-idea', 'vault suggestion')
                 ORDER BY created_at DESC

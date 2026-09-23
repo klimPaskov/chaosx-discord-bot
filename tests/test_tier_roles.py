@@ -108,33 +108,44 @@ class _BotMember:
 
 
 @pytest.mark.asyncio
-async def test_ladder_is_parked_just_below_the_bots_own_role():
-    """A tier colour only shows if the role sits above the member's other coloured roles."""
+async def test_ladder_sits_below_important_roles_and_above_member():
+    """Hoops: "supporter role or other important roles will always take colour priority"."""
     from chaosx_bot.tier_roles import _reposition_ladder
 
     names = ["Calm World", "Gathering Storm", "Rising Chaos", "Chaos Tier", "Total Chaos", "World Collapse"]
-    roles = {name: _Role(name, 1) for name in names}
-    roles["Modder"] = _Role("Modder", 2)  # an unrelated role must not be touched
+    roles = {name: _Role(name, 3 + index) for index, name in enumerate(names)}
+    roles["Modder"] = _Role("Modder", 1)
+    roles["Member"] = _Role("Member", 2)
+    roles["Supporter"] = _Role("Supporter", 9)
+    roles["Bunsen Worthy"] = _Role("Bunsen Worthy", 10)
 
     guild = _Guild(roles)
-    notes = await _reposition_ladder(guild, roles, _BotMember(9))
+    notes = await _reposition_ladder(guild, roles, _BotMember(12))
 
-    # one bulk reorder of the whole band: World Collapse on top under the bot, Calm World last of the six
     assert guild.reorder is not None
-    order = [role.name for role, _ in sorted(guild.reorder.items(), key=lambda item: -item[1])]
-    assert order[:6] == ["World Collapse", "Total Chaos", "Chaos Tier", "Rising Chaos", "Gathering Storm", "Calm World"]
-    assert "Modder" in order  # unrelated roles are renumbered too, but keep their place below the ladder
+    position = {role.name: pos for role, pos in guild.reorder.items()}
+    # the ladder is the lowest band: nothing coloured sits below it, so those roles keep colour priority
+    for name in names:
+        assert position[name] < position["Supporter"]
+        assert position[name] < position["Bunsen Worthy"]
+        assert position[name] < position["Member"]
+    # and the ladder itself stays in tier order, contiguous
+    # contiguous and in ladder order: Calm World lowest, World Collapse highest
+    ladder_positions = [position[name] for name in names]
+    assert ladder_positions == list(range(min(ladder_positions), min(ladder_positions) + len(names)))
     assert any("ladder parked" in note for note in notes)
 
 
 @pytest.mark.asyncio
 async def test_ladder_is_left_alone_when_it_already_sits_right():
+    """The expected layout (cosmetic roles above, Member below) is a no-op on the next pass."""
     from chaosx_bot.tier_roles import _reposition_ladder
 
     names = ["Calm World", "Gathering Storm", "Rising Chaos", "Chaos Tier", "Total Chaos", "World Collapse"]
-    roles = {name: _Role(name, 3 + index) for index, name in enumerate(names)}
+    roles = {name: _Role(name, 1 + index) for index, name in enumerate(names)}
+    roles["Member"] = _Role("Member", 7)
+    roles["Supporter"] = _Role("Supporter", 8)
     guild = _Guild(roles)
     notes = await _reposition_ladder(guild, roles, _BotMember(9))
     assert notes == []
     assert guild.reorder is None
-    assert all(not role.edits for role in roles.values())

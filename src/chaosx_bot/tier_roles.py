@@ -99,34 +99,36 @@ async def _reposition_ladder(
     roles: Mapping[str, discord.Role],
     bot_member: discord.Member,
 ) -> list[str]:
-    """Park the ladder directly under the bot's own role, in tier order, in one bulk reorder.
+    """Park the ladder at the bottom of the manageable range, just above `Member`.
 
-    A member's name colour comes from their HIGHEST positioned coloured role, so a tier role sitting at
-    the bottom of the list never shows: whatever coloured role sits higher wins. Keeping the ladder at the
-    top of the manageable range (just below the bot's role) makes the tier the colour people see.
+    A member's name colour comes from their HIGHEST positioned coloured role. Hoops (2026-09-23):
+    "supporter role or other important roles will always take colour priority" - so the tier roles sit
+    BELOW every other role the bot can move (Supporter, Bunsen Worthy, ZIN Fan Club Member, bot roles) and
+    only colour members who hold none of those. Roles above the bot (e.g. Custerdome) always win anyway,
+    which is why the owner keeps his own colour.
 
-    Positions are sent in a single `edit_role_positions` call: moving roles one at a time shifts the
-    others, and a per-role loop scattered the ladder across the list (2026-09-23).
+    Positions are sent in a single `edit_role_positions` call covering the whole band: moving roles one at
+    a time shifts the others, and a per-role loop scattered the ladder across the list (2026-09-23).
     """
     ladder = [tier for tier, _ in TIERS if tier in roles]
     bot_position = bot_member.top_role.position
     if not ladder or bot_position <= 1:
         return []
-    # Every movable role gets an explicit position in the same request: Discord shifts the other roles to
-    # make room for each move, so naming only the six tier roles left them interleaved with Member,
-    # supporters and bot roles (2026-09-23). Naming the whole band keeps the ladder contiguous and on top.
     ladder_names = {tier_role_name(tier) for tier in ladder}
-    band = [
+    movable = [
         role
         for role in guild.roles
         if 0 < role.position < bot_position and role.name not in ladder_names
     ]
+    # Every other movable role keeps its relative order ABOVE the ladder, so Supporter, Bunsen Worthy, ZIN
+    # Fan Club Member and the bot roles keep colour priority; the ladder sits at the bottom of the range.
+    others = [role for role in movable if role.name not in ladder_names]
+    layout = sorted(others, key=lambda item: -item.position) + [
+        roles[tier] for tier in reversed(ladder)  # World Collapse first: highest tier at the top
+    ]
     wanted: dict[discord.Role, int] = {}
     position = bot_position - 1
-    for tier in reversed(ladder):  # highest tier at the top of the band
-        wanted[roles[tier]] = position
-        position -= 1
-    for role in sorted(band, key=lambda item: -item.position):
+    for role in layout:
         if position < 1:
             break
         wanted[role] = position

@@ -12,7 +12,6 @@ from chaosx_bot.routine_posts import (  # noqa: E402
     iso_week_key,
     iso_week_start,
     last_complete_week,
-    thanks_facts_line,
     with_window_note,
 )
 
@@ -75,8 +74,9 @@ def test_note_sits_under_the_title_and_is_idempotent():
     assert with_window_note(text, window_start=start, window_end=end) == text
 
 
-def test_thanks_line_names_members_and_their_chaos():
-    line = thanks_facts_line([{"name": "Hoops McCann", "xp": 690}, {"name": "Holly", "xp": 520}])
-    assert line == "Hoops McCann (690 chaos), Holly (520 chaos)"
-    assert thanks_facts_line([]) == "no member activity to thank this week"
-    assert thanks_facts_line([{"name": "", "xp": 10}]) == "no member activity to thank this week"
+def test_digest_prompt_never_names_members():
+    from chaosx_bot.routine_posts import build_digest_prompt
+
+    prompt = build_digest_prompt(signals={})
+    assert "never names members" in prompt
+    assert "Thanks this week" not in prompt

@@ -255,7 +255,7 @@ from .activity import (
     tier_progress,
     voting_weight,
 )
-from .formatting import block, bullets, heading, kv, numbered, section, small
+from .formatting import block, bullets, heading, kv, numbered, scrub_names, section, small
 from .guild_stats import GuildCountsCache
 from .routine_posts import (
     DEV_DIGEST,
@@ -2640,6 +2640,8 @@ class ChaosXBot(discord.Client):
             "mentions, no invented facts, no dates or promises, no internal jargon or file names.\n\n"
             f"Facts (use only these):\n{facts}"
         )
+        if user_id in self._never_mention_ids():
+            return ""
         fallback = (
             f"{tier_emoji(new_tier)} <@{user_id}> has climbed from **{old_tier}** to **{new_tier}** with "
             f"{int(xp)} chaos ({int(chat)} from chatting, {int(bonus)} from contributions).\n"
@@ -2662,6 +2664,7 @@ class ChaosXBot(discord.Client):
         # HermesResult carries stdout/ok, not `.text` - reading the wrong field silently returned the
         # facts-only fallback for every climb (2026-09-23).
         text = sanitize_post((getattr(result, "stdout", "") or "").strip(), max_chars=700)
+        text = self._scrub_never_mention(text)
         if not getattr(result, "ok", False) or len(text) < 40:
             print(
                 "ChaosX tier-up congratulation used the facts-only fallback: "
@@ -2679,6 +2682,8 @@ class ChaosXBot(discord.Client):
         if channel is None:
             return None
         text = await self._tier_up_message(member=member, old_tier=old_tier, new_tier=new_tier)
+        if not text:
+            return None  # a never-mention member gets no public congratulation
         sent = await channel.send(text, allowed_mentions=safe_allowed_mentions())
         await self.store.audit(
             actor_id=int(member.id),
@@ -2753,6 +2758,19 @@ class ChaosXBot(discord.Client):
             tier_logger.info("tier roles: %s", report)
             print(f"ChaosX tier roles: {report}")
         return report
+
+    def _never_mention_ids(self) -> set[int]:
+        """Members the bot never names in its own writing (Hoops: "holly must never be mentioned")."""
+        return {int(value) for value in (self.settings.never_mention_user_ids or []) if int(value)}
+
+    def _never_mention_names(self) -> list[str]:
+        """Display names scrubbed from generated posts, as a last line of defence."""
+        names = [str(name) for name in (self.settings.never_mention_names or []) if str(name).strip()]
+        return names
+
+    def _scrub_never_mention(self, text: str) -> str:
+        names = self._never_mention_names()
+        return scrub_names(text, names) if names else text
 
     async def _activity_ignore_ids(self) -> set[int]:
         """Bot accounts never earn chaos: ChaosX must not rank on its own leaderboard."""
@@ -3023,8 +3041,11 @@ class ChaosXBot(discord.Client):
         stats = await self.store.routine_stats(since_iso=since_iso)
         # The thank-you names: top chaos earners in the covered week, minus leaderboard opt-outs (and bots).
         opted_out = await self.store.opted_out_members("leaderboard_optout")
+        never_mention = self._never_mention_ids()
         top_rows = await self.store.top_members(
-            limit=3, since_day=window_start.date().isoformat(), exclude_ids=opted_out
+            limit=3,
+            since_day=window_start.date().isoformat(),
+            exclude_ids=opted_out | never_mention,
         )
         top_members = [
             {"name": str(name), "xp": int(xp or 0)}
@@ -3043,6 +3064,7 @@ class ChaosXBot(discord.Client):
         community_captures = [
             {"created_at": str(row[0]), "command": str(row[1]), "summary": str(row[2])}
             for row in captures
+            if len(row) < 4 or int(row[3] or 0) not in never_mention
         ]
         guild = self.guilds[0] if self.guilds else None
         return {
@@ -3196,6 +3218,7 @@ class ChaosXBot(discord.Client):
         # Say which dates the post covers (the last complete ISO week) and drop the online count: it is
         # stale minutes after posting (Hoops, 2026-09-23).
         text = strip_online_count(text)
+        text = self._scrub_never_mention(text)
         window_start, window_end = last_complete_week()
         text = with_window_note(text, window_start=window_start, window_end=window_end)
         result = await self._deliver_routine_post(spec, text=text, preview=preview)

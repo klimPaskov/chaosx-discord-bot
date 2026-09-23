@@ -100,6 +100,23 @@ def fix_duplicate_emoji(text: str) -> str:
     return "\n".join(out)
 
 
+def scrub_names(text: str, names: Iterable[str], replacement: str = "a member") -> str:
+    """Replace configured display names in generated text.
+
+    Hoops (2026-09-23): "holly must never be mentioned." The facts are already filtered, so this is the
+    last line of defence for a model that writes a name from elsewhere in its context. Whole-name matching
+    only, so a longer name containing the configured text is untouched; IDs and mentions are left to the
+    mention stripper.
+    """
+    cleaned = str(text or "")
+    for name in names:
+        name = str(name).strip()
+        if len(name) < 2:
+            continue
+        cleaned = re.sub(rf"(?<![\w@]){re.escape(name)}(?![\w])", replacement, cleaned)
+    return cleaned
+
+
 def block(*parts: object) -> str:
     """Join message parts with a blank line between them, dropping anything empty.
 

@@ -177,6 +177,17 @@ class Settings(BaseSettings):
         default=True,
         description="Give each member a coloured chaos-tier role (the mod's tier colours)",
     )
+    never_mention_user_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Members the bot must never name in its own writing (digest, release posts, tier-up posts). "
+            "Their activity still counts in the numbers; only the name is withheld."
+        ),
+    )
+    never_mention_names: list[str] = Field(
+        default_factory=list,
+        description="Display names scrubbed from generated posts, as a last line of defence.",
+    )
     idle_banter_excluded_ids: list[int] = Field(
         default_factory=lambda: [110546365032968192],  # Holly — never a banter target (Hoops, 2026-09-23)
         description="Members idle banter must never target (the owner is always excluded in code as well)",

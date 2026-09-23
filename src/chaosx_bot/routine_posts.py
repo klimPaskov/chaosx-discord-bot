@@ -533,20 +533,6 @@ def _capture_name(summary: str) -> str:
     return stem.strip()
 
 
-def thanks_facts_line(top_members: list[dict[str, Any]]) -> str:
-    """The week's most active members, by chaos earned, for the thank-you line.
-
-    Hoops (2026-09-23): "it should mention like thank you for big contributors etc." Names only come from
-    `top_members`, which already excludes leaderboard opt-outs and bots - a member who hid themselves is
-    never named here either.
-    """
-    if not top_members:
-        return "no member activity to thank this week"
-    return ", ".join(
-        f"{row.get('name')} ({int(row.get('xp') or 0)} chaos)" for row in top_members if row.get("name")
-    ) or "no member activity to thank this week"
-
-
 def community_facts_line(captures: list[dict[str, Any]]) -> str:
     """Community ideas/suggestions written up through ChaosX this week.
 
@@ -727,12 +713,13 @@ Facts (use only these, invent nothing, no pings/mentions):
 - Playtest observations recorded this week: {playtest_facts_line(playtests)}
 - Community ideas/suggestions submitted this week: {community_facts_line(signals.get('community_captures') or [])}
 - Server activity: {server_facts_line(server, include_online=False)}
-- Most active members this week, by chaos earned (the thank-you names, in this order): {thanks_facts_line(signals.get('top_members') or [])}
 
 Audience: players, testers and friends of the mod — not programmers. Someone who has never opened the
 repo must understand every line.
 
 Hard rules:
+- The digest never names members. No thank-you list, no "most active" shout-outs, no player names - only the
+  server's member count from the facts. (Hoops, 2026-09-23: the thank-you line was removed outright.)
 - Weight the post by where the work landed, not by which subject lines are noisiest. If a large share of
   the week went into art, sound, text or scripting, say that. NEVER describe the whole week as one event
   or one task unless the facts really are that narrow. Spread the bullets over the areas that saw work.
@@ -756,11 +743,7 @@ Sections (exactly these, nothing else, in this order, each heading on its own li
    mention how many members are online right now - that number is stale within minutes of posting, so the
    public digest never carries it. If the week was otherwise quiet, say so in a few words instead of
    printing zeros.
-4. Heading "### 🙌 Thanks this week" followed by one warm line that thanks the members named in the
-   facts, by name, in the order given - for example "Thank you <a>, <b> and <c> for keeping the chaos going
-   this week." Name at most three, never a member the facts do not name, and never invent a name, a
-   contribution or a number. If the facts name nobody, leave the whole section out.
-5. Heading "### 🔎 What's next" followed by one short line naming the testing focus from the facts. Do NOT
+4. Heading "### 🔎 What's next" followed by one short line naming the testing focus from the facts. Do NOT
    start that line with 🔎 (or any emoji) — the heading already carries it, and a repeated emoji looks like
    a mistake. Never
    promise future features, say something is "coming", or give dates/release timelines.
@@ -791,12 +774,6 @@ def digest_fallback(signals: dict[str, Any]) -> str:
         work_line = f"- Work in the last {window} days went into {', '.join(area_names)}."
     else:
         work_line = f"- {commits.get('count', 0)} changes landed in the last {window} days."
-    thanks = thanks_facts_line(signals.get("top_members") or [])
-    thanks_lines = (
-        ["", "**🙌 Thanks this week**", f"- {thanks} - thank you for keeping the chaos going."]
-        if "no member activity" not in thanks
-        else []
-    )
     lines = [
         f"🌟 **Weekly Chaos Redux digest** — {signals.get('version') or 'in development'} 🌟",
         "",
@@ -809,7 +786,6 @@ def digest_fallback(signals: dict[str, Any]) -> str:
             f"- {playtest_facts_line(playtests)}; {community_facts_line(signals.get('community_captures') or [])}; "
             f"{issues_facts_line(issues)}; {server_facts_line(server, include_online=False)}"
         ),
-        *thanks_lines,
         "",
         "**🔎 What's next**",
         "- Testing focus stays open until the current area is confirmed; the digest updates weekly.",
