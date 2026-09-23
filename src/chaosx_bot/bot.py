@@ -248,7 +248,7 @@ from .activity import (
     banter_eligible,
     day_xp,
     parse_day,
-    perks_for_tier,
+    cumulative_perks,
     select_banter_candidates,
     tier_emoji,
     tier_for_xp,
@@ -2482,6 +2482,152 @@ class ChaosXBot(discord.Client):
         tier_logger.info("bonus xp: %s +%s (%s) -> %s", user_id, granted, kind, tier_for_xp(xp))
         return granted
 
+    async def on_member_join(self, member: discord.Member) -> None:
+        """Every new member starts on the ladder: Calm World until they earn chaos (Hoops 2026-09-23).
+
+        `on_member_join` is a normal gateway event, so this works without the privileged members intent
+        (the intent only gates the full member list, which is why a backfill of older silent members needs
+        either that intent or a manual pass).
+        """
+        if member.guild is None or int(member.guild.id) != int(self.settings.allowed_guild_id):
+            return
+        if not self.settings.tier_roles_enabled:
+            return
+        try:
+            roles, _notes = await ensure_tier_roles(member.guild, bot_member=member.guild.me)
+            calm = roles.get(TIERS[0][0])
+            if calm is None or not await self._member_has_no_tier(member):
+                return
+            await member.add_roles(calm, reason="ChaosX chaos tier: new member starts at Calm World")
+            await self.store.set_tier_role_state(int(member.id), TIERS[0][0], utcnow().isoformat())
+            tier_logger.info("new member %s -> %s", member.display_name, TIERS[0][0])
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            tier_logger.warning("new member tier role failed for %s: %s", member.id, exc)
+
+    async def _backfill_calm_world(self, guild: discord.Guild, roles: dict[str, Any], when: str) -> int:
+        """Put every member who has never earned chaos on the ladder at Calm World.
+
+        Enumerating a guild needs the privileged Server Members Intent; without it Discord answers 403 and
+        this is skipped (new arrivals are still covered by `on_member_join`, which is a normal gateway
+        event). With the intent enabled the whole server is backfilled, capped per pass.
+        """
+        calm = roles.get(TIERS[0][0])
+        if calm is None:
+            return 0
+        try:
+            members = [member async for member in guild.fetch_members(limit=None)]
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            tier_logger.info("calm-world backfill skipped (member list unavailable): %s", exc)
+            return 0
+        placed = 0
+        for member in members:
+            if member.bot or placed >= 50:
+                continue
+            if await self.store.member_tier(int(member.id)) is not None:
+                continue
+            try:
+                await member.add_roles(calm, reason="ChaosX chaos tier: no chaos yet, Calm World")
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            await self.store.set_tier_role_state(int(member.id), TIERS[0][0], when)
+            placed += 1
+        if placed:
+            tier_logger.info("calm-world backfill placed %d member(s)", placed)
+        return placed
+
+    async def _member_has_no_tier(self, member: discord.Member) -> bool:
+        row = await self.store.member_tier(int(member.id))
+        return row is None
+
+    async def _tier_up_message(self, *, member: discord.Member, old_tier: str, new_tier: str) -> str:
+        """A written congratulation for a member who just reached a new tier.
+
+        The model is asked for it because Hoops wants something personal (why they earned it, what it
+        means); every fact in the prompt is real and the facts-only fallback still reads like a
+        congratulation, so a model outage never silences the moment.
+        """
+        user_id = int(member.id)
+        row = await self.store.member_tier(user_id)
+        xp = float(row[0]) if row else 0.0
+        bonus_rows = await self.store.bonus_xp_breakdown(user_id)
+        bonus = sum(amount for _kind, amount, _when in bonus_rows)
+        chat = max(0.0, xp - bonus)
+        messages, days = await self.store.member_activity_totals(user_id)
+        contributions = ", ".join(
+            f"{kind.replace('_', ' ')} (+{amount:g})" for kind, amount, _when in bonus_rows
+        ) or "none yet"
+        joined = getattr(member, "joined_at", None)
+        joined_text = joined.date().isoformat() if joined else "unknown"
+        perk_line = "; ".join(cumulative_perks(new_tier)[-2:]) or "none yet"
+        facts = (
+            f"Member: {member.display_name}\n"
+            f"New tier: {new_tier} (previous: {old_tier})\n"
+            f"Total chaos: {int(xp)} ({int(chat)} from chat, {int(bonus)} from contributions)\n"
+            f"Messages seen: {messages} across {days} active days\n"
+            f"Contributions: {contributions}\n"
+            f"Joined the server: {joined_text}\n"
+            f"Perks unlocked by this tier: {perk_line}"
+        )
+        prompt = (
+            "Write a short public congratulation for a Chaos Redux community member who just reached a new "
+            "chaos tier. Two or three sentences, warm and specific, celebratory but not cheesy.\n"
+            "Say what tier they reached and what that tier means on the server's chaos ladder (the ladder "
+            "runs Calm World, Gathering Storm, Rising Chaos, Chaos Tier, Total Chaos, World Collapse), why "
+            "they earned it, and what unlocks for them now. If they have contributions, name them; if they "
+            "have none yet, speak about their activity instead. Use the tier emoji once. No pings, no "
+            "mentions, no invented facts, no dates or promises, no internal jargon or file names.\n\n"
+            f"Facts (use only these):\n{facts}"
+        )
+        fallback = (
+            f"{tier_emoji(new_tier)} <@{user_id}> has climbed from **{old_tier}** to **{new_tier}** with "
+            f"{int(xp)} chaos ({int(chat)} from chatting, {int(bonus)} from contributions).\n"
+            f"That is the ladder's next rung up from {old_tier}. Congrats, and thank you for being here."
+        )
+        try:
+            result = await _public_model_completion(
+                bot=self,
+                system=SYSTEM_BOUNDARY,
+                prompt=prompt,
+                model=self.settings.ask_model,
+                reasoning_effort=self.settings.ask_reasoning_effort,
+                timeout_seconds=min(self.settings.hermes_timeout_seconds, 120),
+                activity_label="tier up congratulation",
+                actor_id=user_id,
+            )
+        except Exception as exc:
+            print(f"ChaosX tier-up model call failed: {type(exc).__name__}")
+            return fallback
+        # HermesResult carries stdout/ok, not `.text` - reading the wrong field silently returned the
+        # facts-only fallback for every climb (2026-09-23).
+        text = sanitize_post((getattr(result, "stdout", "") or "").strip(), max_chars=700)
+        if not getattr(result, "ok", False) or len(text) < 40:
+            print(
+                "ChaosX tier-up congratulation used the facts-only fallback: "
+                f"ok={getattr(result, 'ok', False)} chars={len(text)}"
+            )
+            return fallback
+        return text
+
+    async def _post_tier_up(self, *, member: discord.Member, old_tier: str, new_tier: str) -> str | None:
+        """Post the congratulation; returns the text sent, or None when it was skipped."""
+        if not self.settings.tier_up_posts_enabled:
+            return None
+        channel_id = int(self.settings.tier_up_channel_id or self.settings.idle_banter_channel_id or 0)
+        channel = self.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            return None
+        text = await self._tier_up_message(member=member, old_tier=old_tier, new_tier=new_tier)
+        sent = await channel.send(text, allowed_mentions=safe_allowed_mentions())
+        await self.store.audit(
+            actor_id=int(member.id),
+            guild_id=getattr(member.guild, "id", None),
+            channel_id=channel_id,
+            command="tier up congrats",
+            summary=f"{old_tier} -> {new_tier} (message {sent.id})",
+        )
+        tier_logger.info("tier up: %s %s -> %s", member.display_name, old_tier, new_tier)
+        return text
+
     async def _sync_member_tier_roles(self, *, force: bool = False) -> dict[str, Any]:
         """Give members their chaos-tier colour role.
 
@@ -2489,7 +2635,7 @@ class ChaosXBot(discord.Client):
         ten-minute rollup does not hammer the Discord API. Returns a small report for `/admin tiers
         action:roles`; every failure is reported rather than swallowed.
         """
-        report: dict[str, Any] = {"assigned": 0, "gone": 0, "created": [], "failed": [], "skipped": ""}
+        report: dict[str, Any] = {"assigned": 0, "gone": 0, "congrats": 0, "created": [], "failed": [], "skipped": ""}
         if not self.settings.tier_roles_enabled:
             report["skipped"] = "tier roles are disabled (tier_roles_enabled=False)"
             return report
@@ -2503,6 +2649,8 @@ class ChaosXBot(discord.Client):
             report["skipped"] = "no tier roles could be managed"
             return report
         when = utcnow().isoformat()
+        ladder = [name for name, _threshold in TIERS]
+        upgrades: list[tuple[discord.Member, str, str]] = []
         for user_id, _xp, tier in await self.store.all_member_tiers():
             previous = await self.store.tier_role_state(user_id)
             if not force and previous == tier:
@@ -2525,6 +2673,20 @@ class ChaosXBot(discord.Client):
             await self.store.set_tier_role_state(user_id, tier, when)
             if status != "unchanged":
                 report["assigned"] += 1
+            # A real climb (not a re-roll, not a first assignment) earns a written congratulation.
+            if previous in ladder and tier in ladder and ladder.index(tier) > ladder.index(previous):
+                upgrades.append((member, previous, tier))
+        if force and guild is not None:
+            try:
+                report["calm_default"] = await self._backfill_calm_world(guild, roles, when)
+            except Exception as exc:  # a backfill failure must never break the role sync
+                report["failed"].append(f"calm backfill failed ({type(exc).__name__})")
+        for member, old_tier, new_tier in upgrades[:3]:  # never flood the channel from one pass
+            try:
+                await self._post_tier_up(member=member, old_tier=old_tier, new_tier=new_tier)
+                report["congrats"] += 1
+            except Exception as exc:  # a failed congratulation must not stop the role sync
+                report["failed"].append(f"{member.display_name}: congrats failed ({type(exc).__name__})")
         if report["created"] or report["assigned"] or report["failed"] or report["skipped"] or report["gone"]:
             tier_logger.info("tier roles: %s", report)
             print(f"ChaosX tier roles: {report}")
@@ -2584,7 +2746,7 @@ class ChaosXBot(discord.Client):
         weekly = f"#{week_rank} this week" if week_rank else "no activity recorded this week"
         bonus = await self.store.bonus_xp_total(user_id)
         chat_xp = max(0.0, xp - bonus)
-        perks = perks_for_tier(progress.tier)
+        perks = cumulative_perks(progress.tier)
         perk_lines = "\n".join(f"- 🎁 {perk}" for perk in perks) or "- 🎁 No perks yet - gather chaos to unlock them."
         return (
             f"## {tier_emoji(progress.tier)} Your chaos tier\n"

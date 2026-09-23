@@ -965,6 +965,26 @@ class Store:
             await db.commit()
         return round(grant, 3)
 
+    async def member_activity_totals(self, user_id: int) -> tuple[int, int]:
+        """(messages, active days) for one member, for the tier-up congratulation."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(SUM(messages), 0), COUNT(*) FROM member_activity_daily WHERE user_id = ?",
+                (int(user_id),),
+            )
+            row = await cur.fetchone()
+        return (int(row[0] or 0), int(row[1] or 0))
+
+    async def bonus_xp_breakdown(self, user_id: int) -> list[tuple[str, float, str]]:
+        """(kind, xp, awarded_at) for one member's contributions, newest first."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT kind, xp, awarded_at FROM member_bonus_xp WHERE user_id = ? "
+                "ORDER BY awarded_at DESC",
+                (int(user_id),),
+            )
+            return [(str(kind), float(xp), str(when)) for kind, xp, when in await cur.fetchall()]
+
     async def bonus_xp_total(self, user_id: int) -> float:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(

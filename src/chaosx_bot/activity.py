@@ -40,14 +40,15 @@ TIER_COLORS: dict[str, int] = {
     "World Collapse": 0x3B0B0B,
 }
 
-# The mod's own ramp, one emoji per tier (green → yellow → orange → red → dark → collapse).
+# The mod's own ramp, one emoji per tier (green → storm → fire → whirlwind → eruption → eclipse).
+# Hoops rejected the skulls (2026-09-23), so the escalation stays elemental all the way up.
 TIER_EMOJI: dict[str, str] = {
     "Calm World": "🌿",
     "Gathering Storm": "🌩️",
     "Rising Chaos": "🔥",
-    "Chaos Tier": "⚠️",
-    "Total Chaos": "☠️",
-    "World Collapse": "💀",
+    "Chaos Tier": "🌪️",
+    "Total Chaos": "🌋",
+    "World Collapse": "🌑",
 }
 
 # "High level active members" (Hoops 2026-09-23): only these can ever be picked for idle banter.
@@ -91,35 +92,53 @@ BONUS_XP: dict[str, float] = {
 # priority"). Each tier inherits everything below it. Only perks the bot can actually honour are listed -
 # no promises about things no code implements.
 PERKS: dict[str, tuple[str, ...]] = {
-    "Calm World": (),
-    "Gathering Storm": ("your tier emoji shows next to your name on the leaderboard",),
-    "Rising Chaos": (
+    "Calm World": (
+        "your name carries the Calm World colour",
+        "a written congratulation from ChaosX when you reach a new tier",
+    ),
+    "Gathering Storm": (
         "your tier emoji shows next to your name on the leaderboard",
+    ),
+    "Rising Chaos": (
         "event ideas and suggestions you post are flagged priority for review",
     ),
     "Chaos Tier": (
-        "your tier emoji shows next to your name on the leaderboard",
-        "event ideas and suggestions you post are flagged priority for review",
         "you are named in the weekly community round-up when you contribute",
     ),
     "Total Chaos": (
-        "everything from Chaos Tier",
         "your ideas go to the top of the captured list",
     ),
     "World Collapse": (
-        "everything from Total Chaos",
-        "you keep a permanent place at the top of the tier panel while you stay active",
+        "a permanent place at the top of the tier panel while you stay active",
     ),
 }
 
 PERK_KEYS: dict[str, set[str]] = {
-    "Calm World": set(),
-    "Gathering Storm": {"panel_emoji"},
-    "Rising Chaos": {"panel_emoji", "idea_priority"},
-    "Chaos Tier": {"panel_emoji", "idea_priority", "digest_shoutout"},
-    "Total Chaos": {"panel_emoji", "idea_priority", "digest_shoutout", "idea_top"},
-    "World Collapse": {"panel_emoji", "idea_priority", "digest_shoutout", "idea_top"},
+    "Calm World": {"color", "tier_up_post"},
+    "Gathering Storm": {"color", "tier_up_post", "panel_emoji"},
+    "Rising Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority"},
+    "Chaos Tier": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout"},
+    "Total Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout", "idea_top"},
+    "World Collapse": {
+        "color",
+        "tier_up_post",
+        "panel_emoji",
+        "idea_priority",
+        "digest_shoutout",
+        "idea_top",
+        "panel_pinned",
+    },
 }
+
+# Everything below a member's tier, in ladder order, so `My tier` reads as a running list of what they
+# have collected (Hoops: "perks should have more a bit" - each tier adds one, nothing is taken away).
+def cumulative_perks(tier: str) -> tuple[str, ...]:
+    collected: list[str] = []
+    for name, _threshold in TIERS:
+        collected.extend(PERKS.get(name, ()))
+        if name == tier:
+            break
+    return tuple(collected)
 
 
 def perks_for_tier(tier: str) -> tuple[str, ...]:

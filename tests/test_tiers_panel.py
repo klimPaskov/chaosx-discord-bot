@@ -73,7 +73,8 @@ async def test_panel_text_lists_the_tiers_and_hides_opted_out_members():
     assert store.calls[0]["exclude_ids"] == {2}
     assert "Chaos Tier" in text and "Calm World" in text
     # every row carries its tier emoji, and the ladder itself is emoji-labelled
-    assert "🔥" in text and "🌿" in text and "💀" in text
+    assert "🔥" in text and "🌿" in text and "🌑" in text  # no skulls anywhere (Hoops)
+    assert "💀" not in text and "☠️" not in text
     assert "contributions earn a lot" in text
 
 
@@ -109,7 +110,8 @@ async def test_self_text_reports_tier_rank_and_visibility():
     assert "shown on the leaderboard" in plain
     # the self view explains the chat cap, the contribution reward and the perks of this tier
     assert "Chat is capped at" in plain and "from contributions" in plain
-    assert "No perks yet" in plain
+    # Calm World perks: the colour plus the written congratulation on every climb
+    assert "Calm World colour" in plain and "congratulation" in plain
 
 
 @pytest.mark.asyncio

@@ -165,6 +165,14 @@ class Settings(BaseSettings):
         default=600, ge=120, le=3600,
         description="How often the chaos-tier activity rollup folds new archive messages in",
     )
+    tier_up_posts_enabled: bool = Field(
+        default=True,
+        description="Post a written congratulation when a member reaches a new chaos tier",
+    )
+    tier_up_channel_id: int = Field(
+        default=0,
+        description="Channel for tier-up congratulations (0 = the banter channel)",
+    )
     tier_roles_enabled: bool = Field(
         default=True,
         description="Give each member a coloured chaos-tier role (the mod's tier colours)",
