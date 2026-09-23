@@ -48,24 +48,27 @@ TIER_EMOJI: dict[str, str] = {
     "Rising Chaos": "🔥",
     "Chaos Tier": "🌪️",
     "Total Chaos": "🌋",
-    "World Collapse": "🌑",
+    "World Collapse": "🎆",  # Hoops: "a little bit more colorful" and no skulls
 }
 
 # "High level active members" (Hoops 2026-09-23): only these can ever be picked for idle banter.
 DEFAULT_ELIGIBLE_TIER = "Rising Chaos"
 
 # XP rules. Chat is regulated so volume cannot buy rank (Hoops 2026-09-23: "you shouldn't level up from
-# spamming, there should be regulation for everything"): each message is worth 1, drops to 0.2 after ten
-# in a day, and the whole chat side is capped at CHAT_DAILY_XP_CAP so even a long chatty day cannot
-# out-earn a real contribution.
+# spamming, there should be regulation for everything"): each message is worth 1, drops to 0.15 after six
+# in a day, and the whole chat side is capped by a DYNAMIC ceiling - the base below, raised by the
+# member's own contributions (Hoops 2026-09-23: "12 a day also a little generous, it should be dynamic").
 XP_PER_MESSAGE = 1.0
-DIMINISHING_AFTER = 10  # messages per day that count at full value
-DIMINISHED_VALUE = 0.2
+DIMINISHING_AFTER = 6  # messages per day that count at full value
+DIMINISHED_VALUE = 0.15
 SHORT_MESSAGE_CHARS = 12
 SHORT_MESSAGE_VALUE = 0.5
-BURST_MESSAGES_PER_MINUTE = 20  # beyond this in one minute, a message scores nothing (raid guard)
-CHAT_DAILY_XP_CAP = 12.0  # the most chat alone can ever pay in one day
-BONUS_DAILY_CAP = 80.0  # and the most contributions can pay in one day (three event ideas' worth)
+BURST_MESSAGES_PER_MINUTE = 15  # beyond this in one minute, a message scores nothing (raid guard)
+CHAT_DAILY_XP_CAP = 6.0  # base ceiling for chat alone, for a member who has contributed nothing
+CHAT_DAILY_XP_CAP_MAX = 10.0  # never more than this, however much anyone contributes
+CHAT_CAP_PER_CONTRIBUTION = 0.5  # each distinct recent contribution raises the ceiling by this
+CHAT_CAP_WINDOW_DAYS = 30  # contributions inside this window still lift the chat ceiling
+BONUS_DAILY_CAP = 30.0  # and the most contributions can pay in one day
 
 # Channel weights. Channel ids are the Chaos Redux channels (see the chaosx-discord-facts reference).
 CHANNEL_WEIGHTS: dict[int, float] = {
@@ -81,12 +84,43 @@ DEFAULT_CHANNEL_WEIGHT = 1.0
 # producing a good event idea, playtesting, etc should also all grant more points"). One accepted idea is
 # worth more than three weeks of a full chat cap, so rank tracks contribution, not message count.
 BONUS_XP: dict[str, float] = {
-    "playtest_report": 40.0,  # a real observation from a playtest
-    "event_idea": 40.0,  # an idea captured into Events/Event Specs
-    "suggestion": 40.0,  # a community suggestion captured for review
-    "bug_report": 25.0,  # a formatted issue that reached GitHub
-    "docs_contribution": 15.0,
+    "playtest_report": 20.0,  # a real observation from a playtest
+    "event_idea": 20.0,  # an idea captured into Events/Event Specs
+    "suggestion": 20.0,  # a community suggestion captured for review
+    "bug_report": 12.0,  # a formatted issue that reached GitHub
+    "docs_contribution": 8.0,
 }
+
+# Contribution value is dynamic too: the first few in a calendar month pay the full amount, further ones
+# pay a repeat rate, so a member cannot farm the same credit over and over (Hoops 2026-09-23: "40 is a bit
+# too generous ... it should be dynamic also").
+BONUS_FULL_PER_MONTH = 3
+BONUS_REPEAT_MULTIPLIER = 0.5
+
+
+def contribution_xp(base: float, *, this_month: int) -> float:
+    """The value of a contribution given how many the member already has this calendar month."""
+    value = float(base)
+    if int(this_month) >= BONUS_FULL_PER_MONTH:
+        value *= BONUS_REPEAT_MULTIPLIER
+    return round(value, 3)
+
+
+def chat_daily_cap(contributions_recent: int = 0) -> float:
+    """The day's chat ceiling for a member: base, lifted by their recent contributions.
+
+    Hoops (2026-09-23): the flat cap was "a little generous" and "it should be dynamic also". A member who
+    has contributed nothing gets `CHAT_DAILY_XP_CAP`; every distinct contribution in the last
+    `CHAT_CAP_WINDOW_DAYS` days raises it by `CHAT_CAP_PER_CONTRIBUTION`, never past `CHAT_DAILY_XP_CAP_MAX`.
+    """
+    raised = CHAT_DAILY_XP_CAP + max(0, int(contributions_recent)) * CHAT_CAP_PER_CONTRIBUTION
+    return float(min(raised, CHAT_DAILY_XP_CAP_MAX))
+
+
+# Hoops (2026-09-23): "since we are going with the chaos is a ladder, include the littlefinger's quote
+# there (in smaller text like a quote, like where you say how points are earned)".
+LADDER_QUOTE = "\"Chaos isn't a pit. Chaos is a ladder.\" — Littlefinger"
+LADDER_QUOTE_LINE = f"-# {LADDER_QUOTE}"
 
 # Perks (Hoops 2026-09-23: "the higher tier you are, the more perks you get. Like your ideas take higher
 # priority"). Each tier inherits everything below it. Only perks the bot can actually honour are listed -
@@ -104,7 +138,7 @@ PERKS: dict[str, tuple[str, ...]] = {
         "your vote on what gets tested next carries extra weight (double from Chaos Tier)",
     ),
     "Chaos Tier": (
-        "you are named in the weekly community round-up when you contribute",
+        "your contributions get a public shout-out in the channel where you made them",
     ),
     "Total Chaos": (
         "your ideas go to the top of the captured list",
@@ -118,14 +152,14 @@ PERK_KEYS: dict[str, set[str]] = {
     "Calm World": {"color", "tier_up_post"},
     "Gathering Storm": {"color", "tier_up_post", "panel_emoji"},
     "Rising Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "voting_weight"},
-    "Chaos Tier": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout", "voting_weight"},
-    "Total Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "digest_shoutout", "idea_top", "voting_weight"},
+    "Chaos Tier": {"color", "tier_up_post", "panel_emoji", "idea_priority", "credit_shoutout", "voting_weight"},
+    "Total Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "credit_shoutout", "idea_top", "voting_weight"},
     "World Collapse": {
         "color",
         "tier_up_post",
         "panel_emoji",
         "idea_priority",
-        "digest_shoutout",
+        "credit_shoutout",
         "idea_top",
         "panel_pinned",
         "voting_weight",
@@ -255,8 +289,14 @@ def message_xp(content: str, *, channel_id: int | None, index_in_day: int) -> fl
     return round(base * weight, 3)
 
 
-def day_xp(messages: Sequence[tuple[str, int | None]]) -> tuple[int, float]:
-    """(message_count, xp) for one member's day, in order, with the burst guard applied."""
+def day_xp(
+    messages: Sequence[tuple[str, int | None]], *, daily_cap: float = CHAT_DAILY_XP_CAP
+) -> tuple[int, float]:
+    """(message_count, xp) for one member's day, in order, with the burst guard applied.
+
+    `daily_cap` is the member's own ceiling (`chat_daily_cap`), so contributors are allowed more chat
+    credit than someone who has never contributed.
+    """
     count = 0
     total = 0.0
     for position, (content, channel_id) in enumerate(messages):
@@ -266,7 +306,7 @@ def day_xp(messages: Sequence[tuple[str, int | None]]) -> tuple[int, float]:
             continue
         total += message_xp(content, channel_id=channel_id, index_in_day=position)
     # Hard daily ceiling on chat XP: quantity alone can never rank someone up.
-    return count, round(min(total, CHAT_DAILY_XP_CAP), 3)
+    return count, round(min(total, float(daily_cap)), 3)
 
 
 def parse_day(timestamp: str) -> str:
@@ -280,7 +320,11 @@ def parse_day(timestamp: str) -> str:
         return text[:10]
 
 
-def rollup_days(rows: Iterable[tuple[int, str, int | None, str]]) -> list[tuple[int, str, int, float]]:
+def rollup_days(
+    rows: Iterable[tuple[int, str, int | None, str]],
+    *,
+    cap_by_user: dict[int, float] | None = None,
+) -> list[tuple[int, str, int, float]]:
     """Group archive rows into (user_id, day, messages, xp).
 
     Rows are `(user_id, created_at, channel_id, content)` and are grouped per member per day, preserving
@@ -290,9 +334,10 @@ def rollup_days(rows: Iterable[tuple[int, str, int | None, str]]) -> list[tuple[
     for user_id, created_at, channel_id, content in rows:
         key = (int(user_id), parse_day(created_at))
         grouped.setdefault(key, []).append((content or "", channel_id))
+    caps = cap_by_user or {}
     out: list[tuple[int, str, int, float]] = []
     for (user_id, day), messages in grouped.items():
-        count, xp = day_xp(messages)
+        count, xp = day_xp(messages, daily_cap=caps.get(int(user_id), CHAT_DAILY_XP_CAP))
         out.append((user_id, day, count, xp))
     out.sort(key=lambda row: (row[1], row[0]))
     return out

@@ -240,9 +240,24 @@ from .announcements import (
     collect_announcement_facts,
     title_from_body,
 )
+from .titles import (
+    MAX_TITLE_WORDS,
+    TITLE_PROMPT,
+    clean_title,
+    fallback_title,
+    title_facts_line,
+)
 from .activity import (
+    BONUS_FULL_PER_MONTH,
+    has_perk,
     BONUS_XP,
+    CHAT_CAP_WINDOW_DAYS,
     CHAT_DAILY_XP_CAP,
+    CHAT_DAILY_XP_CAP_MAX,
+    DIMINISHED_VALUE,
+    DIMINISHING_AFTER,
+    LADDER_QUOTE_LINE,
+    chat_daily_cap,
     DEFAULT_ELIGIBLE_TIER,
     TIERS,
     banter_eligible,
@@ -398,13 +413,16 @@ async def tier_report_lines(bot: "ChaosXBot") -> list[str]:
     ]
 
 
-def _tier_standings_lines(rows: list[tuple]) -> list[str]:
+def _tier_standings_lines(rows: list[tuple], titles: dict[int, str] | None = None) -> list[str]:
     out: list[str] = []
+    known = titles or {}
     for rank, (user_id, name, xp, messages, days) in enumerate(rows, start=1):
         progress = tier_progress(float(xp or 0))
         days = int(days)
+        title = known.get(int(user_id))
+        titled = f" — *{title}*" if title else ""
         out.append(
-            f"{rank}. {tier_emoji(progress.tier)} **{name or user_id}** — {progress.label} "
+            f"{rank}. {tier_emoji(progress.tier)} **{name or user_id}**{titled} — {progress.label} "
             f"({int(xp)} chaos, {int(messages)} messages/{days} day{'s' if days != 1 else ''})"
         )
     return out or ["(no activity recorded yet)"]
@@ -1515,8 +1533,8 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/status` — project catalog totals and event breakdowns.
 - `/testing` — show events currently marked as needing testing.
 - `/tiers [scope:all|week]` — the server's chaos tiers and leaderboard: the chaos ladder, the most active members, and buttons for your own tier (private, only you see it) and to take yourself off the leaderboard.
-  - Chat earns a little and is capped, so nobody levels up by spamming. Contributions earn far more: an accepted event idea, a suggestion write-up or a playtest observation is worth 40 chaos, a formatted bug report 25.
-  - Each tier unlocks perks as you climb: your tier emoji on the leaderboard, priority review for ideas you post, named in the weekly round-up, and more. `My tier` lists your own perks.
+  - Chat earns a little and is capped, so nobody levels up by spamming: 1 per message, 0.15 after 6 messages in a day, and the day's ceiling starts at 6 and rises with your contributions (up to 10). Contributions earn far more: an accepted event idea, a suggestion write-up or a playtest observation is worth 20 chaos, a formatted bug report 12, and the first 3 in a month pay full value.
+  - Each tier unlocks perks as you climb: your tier emoji on the leaderboard, a written member title, priority review for ideas you post, a public credit when you contribute (Chaos Tier and up), and more. `My tier` lists your own perks.
   - Reaching a tier also colours your name in the server with that tier's colour (the mod's own tier colours).
 
 ### Report or draft feedback
@@ -1565,7 +1583,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 - `/admin tiers action:banter` — the banter switches and exactly who idle banter could target right now (banter itself is off and in shadow mode).
 - `/admin tiers action:panel` — post the public chaos-tier panel with live buttons into `{banter_channel}`. The panel keeps working across restarts, and members can hide themselves from it individually.
 - `/admin tiers action:roles` — create or recolour the six chaos-tier roles (the mod's own tier colours) and move every member to their tier's role. Reports anything Discord refused, e.g. when the bot's role sits below the tier roles. Tier colours only show for members whose highest coloured role is their tier, so the ChaosX role has to sit above cosmetic roles like Custerdome.
-- Chaos for contributions is credited automatically when a playtest observation is recorded, an event idea or suggestion is captured, or an issue reaches GitHub. Each contribution is credited once (`ref`), capped at 80 chaos a day; chat is capped at 12 a day so typing volume cannot out-earn contribution.
+- Chaos for contributions is credited automatically when a playtest observation is recorded, an event idea or suggestion is captured, or an issue reaches GitHub. Each contribution is credited once (`ref`), capped at 30 chaos a day; the value drops to half after the first three in a calendar month so the same credit cannot be farmed. Chat is capped dynamically (6 a day, up to 10 for members who contribute) so typing volume cannot out-earn contribution.
 
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
@@ -2442,9 +2460,12 @@ class ChaosXBot(discord.Client):
                 break
         rolled: list[tuple[int, str, int, float]] = []
         affected = {(user_id, day) for user_id, day in affected if user_id not in ignore_ids}
+        # The chat ceiling is dynamic: a member's recent contributions lift it (see `chat_daily_cap`).
+        since_day = (utcnow() - timedelta(days=CHAT_CAP_WINDOW_DAYS)).date().isoformat()
+        recent = await self.store.contribution_counts(since_day=since_day)
         for user_id, day in sorted(affected):
             messages = await self.store.archive_day_rows(user_id, day, ignore_ids=ignore_ids)
-            count, xp = day_xp(messages)
+            count, xp = day_xp(messages, daily_cap=chat_daily_cap(recent.get(int(user_id), 0)))
             rolled.append((user_id, day, count, xp))
         days = await self.store.upsert_activity_days(rolled)
         members = await self.store.recompute_member_tiers()
@@ -2453,7 +2474,53 @@ class ChaosXBot(discord.Client):
             await self._sync_member_tier_roles()
         except Exception as exc:  # role colours must never break the rollup itself
             tier_logger.warning("tier role sync failed: %s", exc)
+        try:
+            titled = await self._fill_missing_member_titles(limit=3)
+            if titled:
+                summary["titles"] = titled
+        except Exception as exc:  # a title is decoration; it must never break the rollup
+            tier_logger.warning("member title pass failed: %s", exc)
         return summary
+
+    async def _fill_missing_member_titles(self, *, limit: int = 3) -> int:
+        """Write titles for members who have none yet, a few per pass (owner excluded, never-mention too).
+
+        Titles are deliberately over-the-top and generated from activity plus the member's own public
+        tone. They are decoration: no pings, no authority, and the bot only ever names them like a rank.
+        """
+        guild = self.get_guild(int(self.settings.allowed_guild_id))
+        if guild is None:
+            tier_logger.info("member title pass skipped: guild not cached")
+            return 0
+        existing = await self.store.member_titles()
+        rows = await self.store.top_members(limit=25)
+        written = 0
+        for row in rows:
+            if written >= limit:
+                break
+            user_id = int(row[0])
+            if user_id in existing or user_id == int(self.settings.owner_id):
+                continue
+            if user_id in self._never_mention_ids():
+                continue
+            member = guild.get_member(user_id)
+            if member is not None and member.bot:
+                continue
+            # The name comes from the archive, so titles work even without the members intent (which
+            # leaves the guild member cache nearly empty).
+            if member is not None and getattr(member, "display_name", None):
+                name = str(member.display_name)
+            else:
+                name = str(row[1]) if row[1] else str(user_id)
+            if await self._ensure_member_title(user_id=user_id, name=name):
+                written += 1
+        tier_logger.info(
+            "member title pass: wrote %d (candidates=%d, cached members=%d)",
+            written,
+            len(rows),
+            len(getattr(guild, "members", []) or []),
+        )
+        return written
 
     async def _award_contribution(
         self,
@@ -2487,8 +2554,35 @@ class ChaosXBot(discord.Client):
         )
         row = await self.store.member_tier(int(user_id))
         xp = float(row[0]) if row else 0.0
-        tier_logger.info("bonus xp: %s +%s (%s) -> %s", user_id, granted, kind, tier_for_xp(xp))
+        tier = str(row[1]) if row else tier_for_xp(xp)
+        tier_logger.info("bonus xp: %s +%s (%s) -> %s", user_id, granted, kind, tier)
+        # Chaos Tier+ perk: the contribution is credited in public, in the channel it came from.
+        if channel_id and has_perk(tier, "credit_shoutout") and int(user_id) not in self._never_mention_ids():
+            await self._credit_contribution(
+                user_id=int(user_id), kind=kind, granted=granted, channel_id=int(channel_id)
+            )
         return granted
+
+    async def _credit_contribution(self, *, user_id: int, kind: str, granted: float, channel_id: int) -> None:
+        """A short public thank-you for a contribution, only for members who unlocked the perk."""
+        channel = self.get_channel(int(channel_id))
+        if channel is None:
+            return
+        title = ""
+        row = await self.store.member_title(int(user_id))
+        if row and row[0]:
+            title = f" — *{row[0]}*"
+        label = str(kind).replace("_", " ")
+        # No ping: the credit names the member, it never notifies them.
+        name = _display_name_for(self, int(user_id))
+        text = (
+            f"🎖️ **{name}**{title} — **+{granted:g} chaos** for the {label}. "
+            "Thank you for keeping the chaos going."
+        )
+        try:
+            await channel.send(text, allowed_mentions=safe_allowed_mentions())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            tier_logger.info("contribution credit skipped: %s", exc)
 
     async def _refresh_testing_poll_options(self) -> list[str]:
         """Point the poll's slots at the current `Needs Testing` queue; returns the slot labels."""
@@ -2621,6 +2715,12 @@ class ChaosXBot(discord.Client):
         joined = getattr(member, "joined_at", None)
         joined_text = joined.date().isoformat() if joined else "unknown"
         perk_line = "; ".join(cumulative_perks(new_tier)[-2:]) or "none yet"
+        member_title = await self._ensure_member_title(
+            user_id=int(member.id),
+            name=member.display_name,
+            contributions=[str(kind).replace("_", " ") for kind, _amount, _when in bonus_rows],
+        )
+        title_fact = f"\nTheir title on the ladder: {member_title}" if member_title else ""
         facts = (
             f"Member: {member.display_name}\n"
             f"New tier: {new_tier} (previous: {old_tier})\n"
@@ -2628,7 +2728,7 @@ class ChaosXBot(discord.Client):
             f"Messages seen: {messages} across {days} active days\n"
             f"Contributions: {contributions}\n"
             f"Joined the server: {joined_text}\n"
-            f"Perks unlocked by this tier: {perk_line}"
+            f"Perks unlocked by this tier: {perk_line}{title_fact}"
         )
         prompt = (
             "Write a short public congratulation for a Chaos Redux community member who just reached a new "
@@ -2636,7 +2736,8 @@ class ChaosXBot(discord.Client):
             "Say what tier they reached and what that tier means on the server's chaos ladder (the ladder "
             "runs Calm World, Gathering Storm, Rising Chaos, Chaos Tier, Total Chaos, World Collapse), why "
             "they earned it, and what unlocks for them now. If they have contributions, name them; if they "
-            "have none yet, speak about their activity instead. Use the tier emoji once. No pings, no "
+            "have none yet, speak about their activity instead. If a title is given in the facts, use it "
+            "once, exactly as written. Use the tier emoji once. No pings, no "
             "mentions, no invented facts, no dates or promises, no internal jargon or file names.\n\n"
             f"Facts (use only these):\n{facts}"
         )
@@ -2672,6 +2773,82 @@ class ChaosXBot(discord.Client):
             )
             return fallback
         return text
+
+    async def _ensure_member_title(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        force: bool = False,
+        contributions: list[str] | None = None,
+    ) -> str:
+        """The member's title, generated once from their activity and public tone (owner: configured).
+
+        Titles are display decoration: they never ping, never grant authority, and a never-mention member
+        gets none at all.
+        """
+        user_id = int(user_id)
+        if user_id == int(self.settings.owner_id):
+            title = str(self.settings.owner_title or "").strip()
+            if title:
+                await self.store.set_member_title(
+                    user_id=user_id, title=title, blurb="Creator of everything.", source="configured"
+                )
+            return title
+        if user_id in self._never_mention_ids():
+            return ""
+        if not force:
+            existing = await self.store.member_title(user_id)
+            if existing and existing[0]:
+                return existing[0]
+        xp, tier_row, bonus_rows, messages, days = await self._title_facts_inputs(user_id)
+        tier = tier_row or tier_for_xp(xp)
+        facts = title_facts_line(
+            name=str(name),
+            tier=tier,
+            chaos=xp,
+            messages=messages,
+            active_days=days,
+            contributions=contributions
+            or [str(kind).replace("_", " ") for kind, _amount, _when in bonus_rows],
+            style=" | ".join(
+                line[:80] for line in await self.store.recent_member_messages(user_id, limit=5)
+            ),
+        )
+        prompt = TITLE_PROMPT.format(name=str(name), facts=facts, words=MAX_TITLE_WORDS)
+        title = ""
+        try:
+            result = await _public_model_completion(
+                bot=self,
+                system=SYSTEM_BOUNDARY,
+                prompt=prompt,
+                model=self.settings.ask_model,
+                reasoning_effort=self.settings.ask_reasoning_effort,
+                timeout_seconds=min(self.settings.hermes_timeout_seconds, 90),
+                activity_label="member title",
+                actor_id=user_id,
+            )
+            if getattr(result, "ok", False):
+                title = clean_title(getattr(result, "stdout", "") or "")
+        except Exception as exc:
+            print(f"ChaosX title model call failed: {type(exc).__name__}")
+        if not title:
+            title = fallback_title(
+                tier=tier, messages=int(messages), contributions=len(bonus_rows), active_days=int(days)
+            )
+        await self.store.set_member_title(
+            user_id=user_id, title=title, blurb=f"Earned at {tier} with {int(xp)} chaos."
+        )
+        return title
+
+    async def _title_facts_inputs(self, user_id: int) -> tuple[float, str, list, int, int]:
+        """(chaos, tier, bonus rows, messages, active days) - the facts a title is written from."""
+        row = await self.store.member_tier(int(user_id))
+        xp = float(row[0]) if row else 0.0
+        tier = str(row[1]) if row else tier_for_xp(xp)
+        bonus_rows = await self.store.bonus_xp_breakdown(int(user_id))
+        messages, days = await self.store.member_activity_totals(int(user_id))
+        return xp, tier, bonus_rows, int(messages), int(days)
 
     async def _post_tier_up(self, *, member: discord.Member, old_tier: str, new_tier: str) -> str | None:
         """Post the congratulation; returns the text sent, or None when it was skipped."""
@@ -2784,33 +2961,50 @@ class ChaosXBot(discord.Client):
         return ignore
 
     async def _tier_rows(self, scope: str) -> list[tuple]:
-        """Leaderboard rows for one scope, hiding members who opted out of the leaderboard."""
-        opts = await self.store.opted_out_members("leaderboard_optout")
+        """Leaderboard rows for one scope, hiding members who opted out and the owner.
+
+        Hoops (2026-09-23): "i shouldn't be included in the list" - the owner is a host, not a competitor,
+        so he is filtered out of the standings and out of everyone else's rank arithmetic.
+        """
+        opts = set(await self.store.opted_out_members("leaderboard_optout")) | {int(self.settings.owner_id)}
         if scope == "week":
             return await self.store.top_members(limit=10, since_day=activity_window_start(7), exclude_ids=opts)
         return await self.store.top_members(limit=10, exclude_ids=opts)
 
     async def _tier_panel_text(self, scope: str = "all") -> str:
         """The public chaos-tier panel: the ladder, the leaders and the caller-independent state."""
-        ladder = " → ".join(f"{tier_emoji(name)} {name} ({threshold})" for name, threshold in TIERS)
+        # The top of the ladder is open-ended: chaos keeps counting past 1000, there is simply no tier
+        # above it (Hoops 2026-09-23).
+        top_name, top_threshold = TIERS[-1]
+        ladder = " → ".join(
+            f"{tier_emoji(name)} {name} ({threshold}{'+' if name == top_name else ''})"
+            for name, threshold in TIERS
+        )
         rows = await self._tier_rows(scope)
         header = "This week" if scope == "week" else "All time"
         other = "all" if scope == "week" else "week"
-        standings = _tier_standings_lines(rows)
+        standings = _tier_standings_lines(rows, await self.store.member_titles())
+        host_title = str(self.settings.owner_title or "").strip()
+        host_name = getattr(getattr(self, "user", None), "display_name", "") or ""
+        host_line = small(f"Hosted by {host_name} — {host_title}") if host_title and host_name else None
         text = block(
-            heading("Chaos tiers", "🌪️"),
-            section("The ladder", "🪜"),
+            heading("Chaos tiers"),
+            section("The ladder"),
             ladder,
             small(
-                f"Chat earns a little and is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day; contributions "
-                f"earn far more (an event idea, a suggestion or a playtest note is {int(BONUS_XP['event_idea'])})."
+                f"Chat earns a little and is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day, less once you "
+                f"pass {DIMINISHING_AFTER} messages, and the cap rises as you contribute. Contributions "
+                f"earn far more: an event idea, a suggestion or a playtest note is "
+                f"{int(BONUS_XP['event_idea'])} chaos."
             ),
-            section(f"{header} — top {len(rows)}" if rows else header, "🏆"),
+            LADDER_QUOTE_LINE,
+            section(f"{header} — top {len(rows)}" if rows else header),
             standings or small("No activity recorded for this period yet."),
             small(
                 f"Switch with the buttons below or `/tiers scope:{other}`. `My tier` shows your own progress "
                 "privately; `Hide me / show me` takes you off this leaderboard."
             ),
+            host_line,
         )
         return text if len(text) <= 1900 else text[:1890] + "…"
 
@@ -2818,8 +3012,16 @@ class ChaosXBot(discord.Client):
         row = await self.store.member_tier(user_id)
         xp = float(row[0]) if row else 0.0
         progress = tier_progress(xp)
-        rank = await self.store.member_rank(user_id)
-        week_rank = await self.store.member_rank(user_id, since_day=activity_window_start(7))
+        # Ranks are computed on the same basis as the panel, so a member's "#3" cannot disagree with
+        # the list they see (owner and opted-out members are not in the standings).
+        rank_excluded = set(await self.store.opted_out_members("leaderboard_optout"))
+        if int(user_id) != int(self.settings.owner_id):
+            # everyone else's rank matches the public list; the owner sees his own true rank here
+            rank_excluded.add(int(self.settings.owner_id))
+        rank = await self.store.member_rank(user_id, exclude_ids=rank_excluded)
+        week_rank = await self.store.member_rank(
+            user_id, since_day=activity_window_start(7), exclude_ids=rank_excluded
+        )
         opts = await self.store.opted_out_members("leaderboard_optout")
         hidden = "hidden from the leaderboard" if user_id in opts else "shown on the leaderboard"
         position = f"#{rank} all time" if rank else "not ranked yet (no recorded activity)"
@@ -2828,36 +3030,52 @@ class ChaosXBot(discord.Client):
         chat_xp = max(0.0, xp - bonus)
         perks = cumulative_perks(progress.tier)
         perk_lines = bullets(f"🎁 {perk}" for perk in perks) or [f"- 🎁 No perks yet - gather chaos to unlock them."]
+        recent = await self.store.contribution_counts(
+            since_day=(utcnow() - timedelta(days=CHAT_CAP_WINDOW_DAYS)).date().isoformat()
+        )
+        cap = chat_daily_cap(recent.get(int(user_id), 0))
+        own = await self.store.member_title(int(user_id))
+        if own is None and int(user_id) == int(self.settings.owner_id):
+            own = (str(self.settings.owner_title), "")
+        title_line = f"### *{own[0]}*" if own and own[0] else None
         return block(
-            heading("Your chaos tier", tier_emoji(progress.tier)),
-            f"**{progress.label}**",
-            section("Where you stand", "📊"),
+            heading("Your chaos tier"),
+            f"{tier_emoji(progress.tier)} **{progress.label}**",
+            title_line,
+            section("Where you stand"),
             bullets(
                 [
-                    kv("Chaos earned", f"{int(xp)} ({int(chat_xp)} from chat, **{int(bonus)} from contributions**)", "💠"),
-                    kv("Ranking", f"{position}; {weekly}", "🥇"),
-                    kv("Leaderboard", hidden, "👁️"),
+                    kv("Chaos earned", f"{int(xp)} ({int(chat_xp)} from chat, {int(bonus)} from contributions)"),
+                    kv("Ranking", f"{position}; {weekly}"),
+                    kv("Leaderboard", hidden),
                     kv(
                         "Testing vote",
                         f"counts {voting_weight(progress.tier)}"
                         if voting_weight(progress.tier)
-                        else "recorded, not counted yet (Rising Chaos+ carries weight)",
-                        "🗳️",
+                        else "recorded, not counted yet (Rising Chaos and above carry weight)",
                     ),
                 ]
             ),
-            section(f"Perks at {progress.tier}", "🎁"),
+            section(f"Perks at {progress.tier}"),
             perk_lines,
-            section("How chaos works", "⚙️"),
+            section("How chaos works"),
             bullets(
                 [
-                    f"Chat is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day no matter how much you post.",
-                    f"Contributions pay far more — an event idea, a suggestion or a playtest note is "
-                    f"{int(BONUS_XP['event_idea'])} chaos, a bug report {int(BONUS_XP['bug_report'])}.",
+                    f"Chat earns 1 per message, {DIMINISHED_VALUE} after {DIMINISHING_AFTER} messages in a day, "
+                    f"and is capped at {cap:g} chaos today"
+                    + (
+                        f" — your ceiling, lifted by your {recent.get(int(user_id), 0)} recent contribution(s)."
+                        if recent.get(int(user_id), 0)
+                        else f" — the base ceiling; contributions raise it, up to {CHAT_DAILY_XP_CAP_MAX:g}."
+                    ),
+                    f"Contributions pay far more: an event idea, a suggestion or a playtest note is "
+                    f"{int(BONUS_XP['event_idea'])} chaos, a bug report {int(BONUS_XP['bug_report'])}, and the "
+                    f"first {BONUS_FULL_PER_MONTH} in a month pay the full amount.",
                     "You are only ever mentioned by banter if you are a high-tier active member and haven't "
                     "opted out.",
                 ]
             ),
+            LADDER_QUOTE_LINE,
         )
 
     def _banter_excluded_ids(self) -> set[int]:
@@ -7539,13 +7757,13 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await owner_gate(interaction, settings):
             return
         action = (action or "show").lower().strip()
-        if action not in {"show", "rebuild", "member", "banter", "panel", "roles"}:
+        if action not in {"show", "rebuild", "member", "banter", "panel", "roles", "titles"}:
             await interaction.response.send_message(
                 "Use `action:show` (standings), `action:rebuild` (re-roll the whole archive), "
                 "`action:member member:<@user|name>` (one member's tier), `action:banter` (who idle "
                 "banter could target right now), `action:panel` (post the public panel in the "
-                "banter channel), or `action:roles` (create/recolour the chaos-tier roles and sync "
-                "every member to their tier).",
+                "banter channel), `action:titles` (write member titles for the current top 10), or "
+                "`action:roles` (create/recolour the chaos-tier roles and sync every member to their tier).",
                 ephemeral=True,
             )
             return
@@ -7579,6 +7797,23 @@ def register_commands(bot: ChaosXBot) -> None:
                     allowed_mentions=safe_allowed_mentions(),
                 )
                 lines.append(f"Posted the chaos-tier panel in <#{settings.idle_banter_channel_id}> (message {sent.id}).")
+        if action == "titles":
+            rows = await bot.store.top_members(limit=10)
+            written: list[str] = []
+            for row in rows:
+                user_id = int(row[0])
+                member = interaction.guild.get_member(user_id) if interaction.guild else None
+                if member is not None and member.bot:
+                    continue
+                name = member.display_name if member is not None else str(row[1] or user_id)
+                title = await bot._ensure_member_title(user_id=user_id, name=name, force=True)
+                if title:
+                    written.append(f"{name}: *{title}*")
+            lines.append(
+                "Titles written:\n" + "\n".join(f"- {line}" for line in written)
+                if written
+                else "No members to title yet."
+            )
         if action == "banter":
             targets = await bot._idle_banter_candidates()
             lines.append(

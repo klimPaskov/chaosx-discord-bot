@@ -188,6 +188,15 @@ class Settings(BaseSettings):
         default_factory=list,
         description="Display names scrubbed from generated posts, as a last line of defence.",
     )
+    owner_title: str = Field(
+        default=(
+            "The One and Only, First of His Name, Creator of Everything, Sovereign of the Chaos Ladder"
+        ),
+        description=(
+            "The owner's member title. Deliberately over-the-top royalty, because he is the creator of "
+            "everything (Hoops 2026-09-23); it is never model-generated, so it cannot drift."
+        ),
+    )
     idle_banter_excluded_ids: list[int] = Field(
         default_factory=lambda: [110546365032968192],  # Holly — never a banter target (Hoops, 2026-09-23)
         description="Members idle banter must never target (the owner is always excluded in code as well)",

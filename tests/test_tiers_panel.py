@@ -40,8 +40,18 @@ class _FakeStore:
     async def member_tier(self, user_id):
         return self.tier
 
-    async def member_rank(self, user_id, *, since_day=None):
+    async def member_rank(self, user_id, *, since_day=None, exclude_ids=None):
+        self.calls.append({"rank_exclude_ids": set(exclude_ids or set())})
         return self.week_rank if since_day else self.rank
+
+    async def contribution_counts(self, *, since_day, month=None):
+        return dict(getattr(self, "contributions", {}) or {})
+
+    async def member_titles(self):
+        return dict(getattr(self, "titles", {}) or {})
+
+    async def member_title(self, user_id):
+        return (dict(getattr(self, "titles", {}) or {}).get(int(user_id)), "") or None
 
     async def bonus_xp_total(self, user_id):
         return float(self.bonus or 0.0)
@@ -50,10 +60,14 @@ class _FakeStore:
         self.prefs[field] = value
 
 
-def _bot(store):
+def _bot(store, *, owner_id=4242):
     """A real instance so unbound methods can call each other, without running __init__ (no gateway)."""
     bot = ChaosXBot.__new__(ChaosXBot)
     bot.store = store
+    bot.settings = SimpleNamespace(
+        owner_id=owner_id,
+        owner_title="The One and Only, First of His Name, Creator of Everything",
+    )
     return bot
 
 
@@ -66,17 +80,24 @@ async def test_panel_text_lists_the_tiers_and_hides_opted_out_members():
     ]
     store = _FakeStore(rows, opted_out={2})
     text = await ChaosXBot._tier_panel_text(_bot(store), "all")
-    assert "🌪️ Chaos tiers" in text
-    assert "Calm World (0)" in text and "World Collapse (1000)" in text
+    # Hoops 2026-09-23: the main title does not need an emoji, and the ladder quote belongs here.
+    assert "## Chaos tiers" in text and "🌪️ Chaos tiers" not in text
+    assert "Chaos is a ladder" in text
+    assert "World Collapse (1000+)" in text  # chaos keeps counting past the top tier
+    assert "### The ladder" in text and "### 🪜" not in text
+    assert "Calm World (0)" in text and "World Collapse (1000+)" in text
     assert "Hoops McCann" in text and "Cristi756" in text
     assert "Holly" not in text  # opted out of the leaderboard
-    assert store.calls[0]["exclude_ids"] == {2}
+    # opted-out members and the owner are both filtered out of the standings
+    assert store.calls[0]["exclude_ids"] == {2, 4242}  # opted-out member + the owner
     assert "Chaos Tier" in text and "Calm World" in text
     # every row carries its tier emoji, and the ladder itself is emoji-labelled
-    assert "🔥" in text and "🌿" in text and "🌑" in text  # no skulls anywhere (Hoops)
+    assert "🔥" in text and "🌿" in text and "🎆" in text  # no skulls anywhere (Hoops)
     assert "💀" not in text and "☠️" not in text
-    assert "contributions earn far more" in text
-    assert "### 🪜 The ladder" in text and "### 🏆 All time" in text  # structure, not flat prose
+    assert "contributions earn far more" in text.lower()
+    # structure without emoji clutter (Hoops 2026-09-23: "the main title doesn't need it")
+    assert "### The ladder" in text and "### All time" in text
+    assert "🪜" not in text and "🏆" not in text and "📊" not in text
 
 
 @pytest.mark.asyncio
@@ -110,7 +131,8 @@ async def test_self_text_reports_tier_rank_and_visibility():
     assert "not ranked yet" in plain and "no activity recorded this week" in plain
     assert "shown on the leaderboard" in plain
     # the self view explains the chat cap, the contribution reward and the perks of this tier
-    assert "Chat is capped at" in plain and "from contributions" in plain
+    assert "Chat earns 1 per message" in plain and "from contributions" in plain
+    assert "ceiling" in plain  # the cap is described as dynamic, not a fixed number
     # Calm World perks: the colour plus the written congratulation on every climb
     assert "Calm World colour" in plain and "congratulation" in plain
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from .activity import BONUS_DAILY_CAP, parse_day, tier_for_xp
+from .activity import BONUS_DAILY_CAP, contribution_xp, parse_day, tier_for_xp
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -237,6 +237,14 @@ CREATE TABLE IF NOT EXISTS member_bonus_xp (
     awarded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_member_bonus_user ON member_bonus_xp(user_id);
+
+CREATE TABLE IF NOT EXISTS member_titles (
+    user_id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    blurb TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'model',
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS member_role_state (
     user_id INTEGER PRIMARY KEY,
@@ -970,7 +978,16 @@ class Store:
                 (int(user_id), today),
             )
             already = float((await cur.fetchone())[0] or 0)
-            grant = max(0.0, min(float(xp), BONUS_DAILY_CAP - already))
+            # Dynamic value: the first few contributions of a calendar month pay full, later ones the
+            # repeat rate (Hoops 2026-09-23: "40 is a bit too generous ... it should be dynamic also").
+            month = today[:7]
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM member_bonus_xp WHERE user_id = ? AND substr(awarded_at, 1, 7) = ?",
+                (int(user_id), month),
+            )
+            this_month = int((await cur.fetchone())[0] or 0)
+            value = contribution_xp(float(xp), this_month=this_month)
+            grant = max(0.0, min(value, BONUS_DAILY_CAP - already))
             if grant <= 0:
                 return 0.0
             await db.execute(
@@ -1046,6 +1063,47 @@ class Store:
             )
             rows = await cur.fetchall()
         return [(str(k), str(label), int(voters), int(total or 0)) for k, label, voters, total in rows]
+
+    async def contribution_counts(self, *, since_day: str, month: str | None = None) -> dict[int, int]:
+        """user_id -> distinct contribution count, for the dynamic chat ceiling (and month for value)."""
+        clauses = ["substr(awarded_at, 1, 10) >= ?"]
+        params: list[object] = [str(since_day)]
+        if month:
+            clauses.append("substr(awarded_at, 1, 7) = ?")
+            params.append(str(month))
+        sql = (
+            "SELECT user_id, COUNT(*) FROM member_bonus_xp WHERE "
+            + " AND ".join(clauses)
+            + " GROUP BY user_id"
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(sql, tuple(params))
+            return {int(user_id): int(count) for user_id, count in await cur.fetchall()}
+
+    # --- member titles (deliberately over-the-top, generated from activity + personality) -------------
+
+    async def set_member_title(self, *, user_id: int, title: str, blurb: str = "", source: str = "model") -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO member_titles (user_id, title, blurb, source, updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET title = excluded.title, blurb = excluded.blurb, "
+                "source = excluded.source, updated_at = excluded.updated_at",
+                (int(user_id), str(title)[:120], str(blurb)[:400], str(source), now_iso()),
+            )
+            await db.commit()
+
+    async def member_title(self, user_id: int) -> tuple[str, str] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT title, blurb FROM member_titles WHERE user_id = ?", (int(user_id),)
+            )
+            row = await cur.fetchone()
+            return (str(row[0]), str(row[1] or "")) if row else None
+
+    async def member_titles(self) -> dict[int, str]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT user_id, title FROM member_titles")
+            return {int(row[0]): str(row[1]) for row in await cur.fetchall()}
 
     async def member_activity_totals(self, user_id: int) -> tuple[int, int]:
         """(messages, active days) for one member, for the tier-up congratulation."""
@@ -1160,13 +1218,26 @@ class Store:
             cur = await db.execute(sql, params)
             return [tuple(row) for row in await cur.fetchall()]
 
-    async def member_rank(self, user_id: int, *, since_day: str | None = None) -> int | None:
+    async def member_rank(
+        self, user_id: int, *, since_day: str | None = None, exclude_ids: Iterable[int] | None = None
+    ) -> int | None:
         """1-based position of a member on the leaderboard, or None when they have no recorded activity."""
-        rows = await self.top_members(limit=1000, since_day=since_day)
+        rows = await self.top_members(limit=1000, since_day=since_day, exclude_ids=exclude_ids)
         for position, row in enumerate(rows, start=1):
             if int(row[0]) == int(user_id):
                 return position
         return None
+
+    async def recent_member_messages(self, user_id: int, *, limit: int = 6) -> list[str]:
+        """The member's own most recent public messages, for a title's style hint (public archive only)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT content FROM message_archive WHERE author_id = ? AND content IS NOT NULL "
+                "AND length(trim(content)) > 0 ORDER BY created_at DESC LIMIT ?",
+                (int(user_id), int(limit)),
+            )
+            rows = await cur.fetchall()
+        return [str(row[0]).strip() for row in rows if str(row[0] or "").strip()]
 
     async def last_seen_in_channel(self, channel_id: int) -> dict[int, str]:
         """user_id -> newest archived message timestamp in one channel (banter eligibility)."""

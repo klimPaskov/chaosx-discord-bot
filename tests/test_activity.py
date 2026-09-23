@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from chaosx_bot.activity import (
+    CHAT_DAILY_XP_CAP,
     DEFAULT_ELIGIBLE_TIER,
+    DIMINISHED_VALUE,
+    DIMINISHING_AFTER,
     TIERS,
     banter_eligible,
     channel_weight,
@@ -77,16 +80,22 @@ def test_message_xp_rules():
     # helping channels are worth more than chatting
     assert message_xp("here is how you fix it", channel_id=ISSUES, index_in_day=0) == 1.25
     # diminishing returns after the tenth message of a day
-    assert message_xp("this is long enough", channel_id=GENERAL, index_in_day=9) == 1.0
-    assert message_xp("this is long enough", channel_id=GENERAL, index_in_day=10) == 0.2
+    assert message_xp("this is long enough", channel_id=GENERAL, index_in_day=DIMINISHING_AFTER - 1) == 1.0
+    assert message_xp(
+        "this is long enough", channel_id=GENERAL, index_in_day=DIMINISHING_AFTER
+    ) == DIMINISHED_VALUE
+    assert message_xp("this is long enough", channel_id=GENERAL, index_in_day=DIMINISHING_AFTER + 4) == DIMINISHED_VALUE
 
 
 def test_day_xp_applies_diminishing_returns_and_the_burst_guard():
     messages = [("a normal chat message", GENERAL)] * 30
     count, xp = day_xp(messages)
     assert count == 30
-    # first 10 full, next 10 at 0.2, then nothing from the burst guard
-    assert xp == 10 * 1.0 + 10 * 0.2
+    # chat alone can never pass the day's ceiling, however many messages are sent
+    assert xp == CHAT_DAILY_XP_CAP
+    # ... but the ceiling is dynamic: a contributor's day is allowed to earn past the base cap
+    _count, raised = day_xp(messages, daily_cap=10.0)
+    assert CHAT_DAILY_XP_CAP < raised <= 10.0
 
 
 def test_rollup_groups_per_member_per_day_and_keeps_order():
