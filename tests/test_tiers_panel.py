@@ -17,10 +17,11 @@ GENERAL = 1395459672055480344
 class _FakeStore:
     """Only the calls the panel makes, with the opt-out set recorded so we can assert on it."""
 
-    def __init__(self, rows, *, opted_out=None, tier=None, rank=None, week_rank=None):
+    def __init__(self, rows, *, opted_out=None, tier=None, rank=None, week_rank=None, bonus=0.0):
         self.rows = rows
         self.opted_out = set(opted_out or set())
         self.tier = tier
+        self.bonus = bonus
         self.rank = rank
         self.week_rank = week_rank
         self.calls: list[dict] = []
@@ -42,6 +43,9 @@ class _FakeStore:
     async def member_rank(self, user_id, *, since_day=None):
         return self.week_rank if since_day else self.rank
 
+    async def bonus_xp_total(self, user_id):
+        return float(self.bonus or 0.0)
+
     async def set_member_pref(self, user_id, field, value):
         self.prefs[field] = value
 
@@ -62,12 +66,15 @@ async def test_panel_text_lists_the_tiers_and_hides_opted_out_members():
     ]
     store = _FakeStore(rows, opted_out={2})
     text = await ChaosXBot._tier_panel_text(_bot(store), "all")
-    assert "## Chaos tiers" in text
+    assert "🌪️ Chaos tiers" in text
     assert "Calm World (0)" in text and "World Collapse (1000)" in text
     assert "Hoops McCann" in text and "Cristi756" in text
     assert "Holly" not in text  # opted out of the leaderboard
     assert store.calls[0]["exclude_ids"] == {2}
     assert "Chaos Tier" in text and "Calm World" in text
+    # every row carries its tier emoji, and the ladder itself is emoji-labelled
+    assert "🔥" in text and "🌿" in text and "💀" in text
+    assert "contributions earn a lot" in text
 
 
 @pytest.mark.asyncio
@@ -91,15 +98,18 @@ async def test_empty_leaderboard_says_so_instead_of_printing_nothing():
 async def test_self_text_reports_tier_rank_and_visibility():
     store = _FakeStore([], opted_out={7}, tier=(690.0, tier_for_xp(690.0)), rank=1, week_rank=2)
     text = await ChaosXBot._tier_self_text(_bot(store), 7)
-    assert "Chaos Tier - 90/200 to Critical" in text
+    assert "Chaos Tier - 90/200 to Total Chaos" in text
     assert "#1 all time" in text and "#2 this week" in text
     assert "hidden from the leaderboard" in text
 
-    store2 = _FakeStore([], tier=None, rank=None, week_rank=None)
+    store2 = _FakeStore([], tier=None, rank=None, week_rank=None, bonus=0.0)
     plain = await ChaosXBot._tier_self_text(_bot(store2), 8)
     assert "Calm World" in plain
     assert "not ranked yet" in plain and "no activity recorded this week" in plain
     assert "shown on the leaderboard" in plain
+    # the self view explains the chat cap, the contribution reward and the perks of this tier
+    assert "Chat is capped at" in plain and "from contributions" in plain
+    assert "No perks yet" in plain
 
 
 @pytest.mark.asyncio
@@ -185,10 +195,58 @@ async def test_command_attaches_the_view_to_the_first_chunk_only():
         interaction,
         command_name="chaosx tiers",
         summary="all",
-        render=lambda: "x" * 2500,  # forces two chunks
+        render=lambda: "Chaos tiers panel line\n" * 300,  # over 1900 chars, so two chunks
         view=view,
     )
-    assert len(followup.sent) == 2
+    assert len(followup.sent) >= 2  # long output is sent as several messages
     assert followup.sent[0]["view"] is view
-    assert followup.sent[1]["view"] is None
+    assert all(call["view"] is None for call in followup.sent[1:])
     assert all(call["allowed_mentions"] is not None for call in followup.sent)
+
+
+@pytest.mark.asyncio
+async def test_sync_callable_returning_a_coroutine_is_awaited():
+    """Regression: `render=lambda: bot._tier_panel_text(x)` must not raise.
+
+    The lambda is not a coroutine function, so it ran in a thread and returned a coroutine object;
+    `len()` on it raised "object of type 'coroutine' has no len()" and /tiers failed for every user
+    (2026-09-23).
+    """
+    from chaosx_bot.bot import send_scripted_response
+    from chaosx_bot.config import Settings
+
+    followup = _Followup()
+    bot = SimpleNamespace(
+        settings=Settings(discord_token="dummy", allowed_guild_id=2, owner_id=99),
+        rate_limiter=_RateLimiter(),
+        store=_AuditStore(),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1),
+        guild_id=2,
+        channel_id=3,
+        response=_Response(),
+        followup=followup,
+    )
+
+    async def render_panel() -> str:
+        return "## Chaos tiers\npanel body"
+
+    await send_scripted_response(
+        bot,
+        interaction,
+        command_name="chaosx tiers",
+        summary="all",
+        render=lambda: render_panel(),  # sync callable, async result
+    )
+    assert followup.sent[0]["content"].startswith("## Chaos tiers")
+    assert "scripted command failed" not in followup.sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_self_text_lists_perks_and_splits_chat_from_contributions():
+    store = _FakeStore([], tier=(690.0, tier_for_xp(690.0)), rank=1, week_rank=1, bonus=190.0)
+    text = await ChaosXBot._tier_self_text(_bot(store), 7)
+    assert "500 from chat" in text and "190 from contributions" in text
+    assert "priority" in text.lower()  # Rising Chaos and up get the idea priority perk
+    assert "🎁" in text

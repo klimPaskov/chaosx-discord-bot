@@ -7,7 +7,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from .activity import tier_for_xp
+from .activity import BONUS_DAILY_CAP, parse_day, tier_for_xp
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -212,6 +212,21 @@ CREATE TABLE IF NOT EXISTS member_activity_daily (
     xp REAL NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (user_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS member_bonus_xp (
+    ref TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    xp REAL NOT NULL DEFAULT 0,
+    awarded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_member_bonus_user ON member_bonus_xp(user_id);
+
+CREATE TABLE IF NOT EXISTS member_role_state (
+    user_id INTEGER PRIMARY KEY,
+    tier TEXT NOT NULL DEFAULT '',
+    synced_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS member_tiers (
@@ -922,10 +937,48 @@ class Store:
             await db.commit()
         return len(rows)
 
+    async def award_bonus_xp(
+        self, *, ref: str, user_id: int, kind: str, xp: float, when: str
+    ) -> float:
+        """Credit one contribution once. Returns the XP granted (0.0 when it was already credited).
+
+        `ref` is the contribution's identity (the spec filename, the playtest row, the issue number), so
+        re-running the capture can never pay twice. The day's bonus total is capped (`BONUS_DAILY_CAP`).
+        """
+        today = parse_day(when) or str(when)[:10]
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT 1 FROM member_bonus_xp WHERE ref = ?", (str(ref),))
+            if await cur.fetchone() is not None:
+                return 0.0
+            cur = await db.execute(
+                "SELECT COALESCE(SUM(xp), 0) FROM member_bonus_xp WHERE user_id = ? AND substr(awarded_at, 1, 10) = ?",
+                (int(user_id), today),
+            )
+            already = float((await cur.fetchone())[0] or 0)
+            grant = max(0.0, min(float(xp), BONUS_DAILY_CAP - already))
+            if grant <= 0:
+                return 0.0
+            await db.execute(
+                "INSERT INTO member_bonus_xp(ref, user_id, kind, xp, awarded_at) VALUES(?, ?, ?, ?, ?)",
+                (str(ref), int(user_id), str(kind), round(grant, 3), str(when)),
+            )
+            await db.commit()
+        return round(grant, 3)
+
+    async def bonus_xp_total(self, user_id: int) -> float:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(SUM(xp), 0) FROM member_bonus_xp WHERE user_id = ?", (int(user_id),)
+            )
+            return float((await cur.fetchone())[0] or 0)
+
     async def recompute_member_tiers(self) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
-                "SELECT user_id, SUM(xp) FROM member_activity_daily GROUP BY user_id HAVING SUM(xp) > 0"
+                "SELECT user_id, SUM(xp) FROM ("
+                "SELECT user_id, xp FROM member_activity_daily "
+                "UNION ALL SELECT user_id, xp FROM member_bonus_xp"
+                ") GROUP BY user_id HAVING SUM(xp) > 0"
             )
             totals = [(int(u), float(x or 0)) for u, x in await cur.fetchall()]
             stamp = datetime.now(timezone.utc).isoformat()
@@ -943,6 +996,28 @@ class Store:
             )
             await db.commit()
         return len(rows)
+
+    async def all_member_tiers(self) -> list[tuple[int, float, str]]:
+        """Every member with recorded activity: (user_id, xp, tier)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT user_id, xp, tier FROM member_tiers ORDER BY xp DESC")
+            return [(int(user_id), float(xp), str(tier)) for user_id, xp, tier in await cur.fetchall()]
+
+    async def tier_role_state(self, user_id: int) -> str | None:
+        """The tier the member's role was last synced to, or None if never synced."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT tier FROM member_role_state WHERE user_id = ?", (int(user_id),))
+            row = await cur.fetchone()
+        return str(row[0]) if row else None
+
+    async def set_tier_role_state(self, user_id: int, tier: str, when: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO member_role_state(user_id, tier, synced_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET tier = excluded.tier, synced_at = excluded.synced_at",
+                (int(user_id), str(tier), str(when)),
+            )
+            await db.commit()
 
     async def member_tier(self, user_id: int) -> tuple[float, str] | None:
         async with aiosqlite.connect(self.db_path) as db:

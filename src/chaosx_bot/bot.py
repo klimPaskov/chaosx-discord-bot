@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -241,12 +242,15 @@ from .announcements import (
 )
 from .activity import (
     BONUS_XP,
+    CHAT_DAILY_XP_CAP,
     DEFAULT_ELIGIBLE_TIER,
     TIERS,
     banter_eligible,
     day_xp,
     parse_day,
+    perks_for_tier,
     select_banter_candidates,
+    tier_emoji,
     tier_for_xp,
     tier_progress,
 )
@@ -288,15 +292,23 @@ from .runtime_status import (
 )
 from .server_rules import ServerRules
 from .storage import Store
+from .tier_roles import ensure_tier_roles, sync_tier_role, tier_role_name
 from .webhook_server import GitHubWebhookServer
 
 logger = logging.getLogger("chaosx.attachments")
+tier_logger = logging.getLogger("chaosx.tiers")
 if not logger.handlers:  # bot.py configures no logging of its own, so attach our own
     _attachments_handler = logging.StreamHandler()  # stderr → journald
     _attachments_handler.setFormatter(logging.Formatter("[attachments] %(message)s"))
     logger.addHandler(_attachments_handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+if not tier_logger.handlers:  # tier-role work is otherwise invisible in the journal
+    _tier_handler = logging.StreamHandler()
+    _tier_handler.setFormatter(logging.Formatter("[tiers] %(message)s"))
+    tier_logger.addHandler(_tier_handler)
+    tier_logger.setLevel(logging.INFO)
+    tier_logger.propagate = False
 
 # Words that suggest the user is referring to an attachment they posted earlier
 # ("get it from an earlier message"). Deliberately concrete: pronoun-only
@@ -367,13 +379,26 @@ def activity_window_start(days: int) -> str:
     return (utcnow() - timedelta(days=max(1, days))).date().isoformat()
 
 
+async def tier_report_lines(bot: "ChaosXBot") -> list[str]:
+    """The owner-facing tier report: all-time, last seven days, and the rollup state."""
+    week_start = activity_window_start(7)
+    cursor = await bot.store.activity_cursor()
+    return [
+        "## Chaos tiers (all time)",
+        *_tier_standings_lines(await bot.store.top_members(limit=15)),
+        f"\n## Last 7 days (since {week_start})",
+        *_tier_standings_lines(await bot.store.top_members(limit=10, since_day=week_start)),
+        f"\nRollup cursor: archive id {cursor}; tiers: " + ", ".join(f"{name} ({threshold})" for name, threshold in TIERS),
+    ]
+
+
 def _tier_standings_lines(rows: list[tuple]) -> list[str]:
     out: list[str] = []
     for rank, (user_id, name, xp, messages, days) in enumerate(rows, start=1):
         progress = tier_progress(float(xp or 0))
         days = int(days)
         out.append(
-            f"{rank}. {name or user_id} — {progress.label} "
+            f"{rank}. {tier_emoji(progress.tier)} **{name or user_id}** — {progress.label} "
             f"({int(xp)} chaos, {int(messages)} messages/{days} day{'s' if days != 1 else ''})"
         )
     return out or ["(no activity recorded yet)"]
@@ -1336,6 +1361,9 @@ async def submit_validated_issue(
     )
     ok, result = await create_github_issue(bot.settings.github_repo, title=issue_title, body=body)
     await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="issue", summary=issue_title)
+    await bot._award_contribution(
+        user_id=actor_id, kind="bug_report", ref=f"issue:{issue_title}", guild_id=guild_id, channel_id=channel_id
+    )
     return ok, result, issue_title
 
 
@@ -1480,6 +1508,10 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/cluster cluster:<id or name>` — event cluster summary with member event names.
 - `/status` — project catalog totals and event breakdowns.
 - `/testing` — show events currently marked as needing testing.
+- `/tiers [scope:all|week]` — the server's chaos tiers and leaderboard: the chaos ladder, the most active members, and buttons for your own tier (private, only you see it) and to take yourself off the leaderboard.
+  - Chat earns a little and is capped, so nobody levels up by spamming. Contributions earn far more: an accepted event idea, a suggestion write-up or a playtest observation is worth 40 chaos, a formatted bug report 25.
+  - Each tier unlocks perks as you climb: your tier emoji on the leaderboard, priority review for ideas you post, named in the weekly round-up, and more. `My tier` lists your own perks.
+  - Reaching a tier also colours your name in the server with that tier's colour (the mod's own tier colours).
 
 ### Report or draft feedback
 - `/issue` — uses AI to review a report form; if approved, ChaosX formats it and sends it to GitHub Issues. Bug/crash forms ask for relevant `error.log` lines.
@@ -1495,6 +1527,7 @@ Tip: use `/ask` when you need a flexible explanation; use exact lookup commands 
 
 def operator_help_text(settings: Settings) -> str:
     reminder_channel = settings.automation_reminder_channel_id or "unset"
+    banter_channel = f"<#{settings.idle_banter_channel_id}>" if settings.idle_banter_channel_id else "unset"
     return f"""## ChaosX admin help
 Use this only for private owner tools. If you are unsure, use `/admin ask` and write the request normally.
 
@@ -1518,6 +1551,15 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
   - Example: `/playtest schedule request:Test Fury tomorrow 8pm for 90 minutes in voice, latest Steam build`
   - Example: `/playtest schedule request:Plan a weekend multiplayer test for zombie outbreak and Soviet collapse, ask testers to report crashes and balance issues`
   - If you like the draft, confirm the exact action through `/admin ask`, e.g. `create the Discord Scheduled Event from this playtest draft and post the reminder in <channel>`.
+
+### Chaos tiers / activity
+- `/admin tiers action:show` — current chaos-tier standings (all time plus the last seven days) with the rollup cursor and the tier ladder.
+- `/admin tiers action:rebuild` — re-roll the whole activity archive from scratch. Safe and repeatable: each member-day is replaced, never added to.
+- `/admin tiers action:member member:<@user|name>` — one member's tier, XP, active days, banter exclusion and both opt-outs.
+- `/admin tiers action:banter` — the banter switches and exactly who idle banter could target right now (banter itself is off and in shadow mode).
+- `/admin tiers action:panel` — post the public chaos-tier panel with live buttons into `{banter_channel}`. The panel keeps working across restarts, and members can hide themselves from it individually.
+- `/admin tiers action:roles` — create or recolour the six chaos-tier roles (the mod's own tier colours) and move every member to their tier's role. Reports anything Discord refused, e.g. when the bot's role sits below the tier roles. Tier colours only show for members whose highest coloured role is their tier, so the ChaosX role has to sit above cosmetic roles like Custerdome.
+- Chaos for contributions is credited automatically when a playtest observation is recorded, an event idea or suggestion is captured, or an issue reaches GitHub. Each contribution is credited once (`ref`), capped at 80 chaos a day; chat is capped at 12 a day so typing volume cannot out-earn contribution.
 
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
@@ -2398,7 +2440,95 @@ class ChaosXBot(discord.Client):
             rolled.append((user_id, day, count, xp))
         days = await self.store.upsert_activity_days(rolled)
         members = await self.store.recompute_member_tiers()
-        return {"messages": processed, "days": days, "members": members}
+        summary: dict[str, int] = {"messages": processed, "days": days, "members": members}
+        try:
+            await self._sync_member_tier_roles()
+        except Exception as exc:  # role colours must never break the rollup itself
+            tier_logger.warning("tier role sync failed: %s", exc)
+        return summary
+
+    async def _award_contribution(
+        self,
+        *,
+        user_id: int,
+        kind: str,
+        ref: str,
+        guild_id: int | None = None,
+        channel_id: int | None = None,
+    ) -> float:
+        """Pay chaos for a real contribution (Hoops: contributions should grant more than chat).
+
+        `ref` is the contribution's identity, so this is safe to call from any capture path more than once:
+        the store refuses a second credit for the same reference. Returns the XP actually granted.
+        """
+        amount = BONUS_XP.get(kind)
+        if not amount or not user_id or int(user_id) <= 0:
+            return 0.0
+        granted = await self.store.award_bonus_xp(
+            ref=str(ref), user_id=int(user_id), kind=kind, xp=float(amount), when=utcnow().isoformat()
+        )
+        if granted <= 0:
+            return 0.0
+        await self.store.recompute_member_tiers()
+        await self.store.audit(
+            actor_id=int(user_id),
+            guild_id=guild_id,
+            channel_id=channel_id,
+            command=f"chaos bonus {kind}",
+            summary=f"+{granted:g} for {ref}",
+        )
+        row = await self.store.member_tier(int(user_id))
+        xp = float(row[0]) if row else 0.0
+        tier_logger.info("bonus xp: %s +%s (%s) -> %s", user_id, granted, kind, tier_for_xp(xp))
+        return granted
+
+    async def _sync_member_tier_roles(self, *, force: bool = False) -> dict[str, Any]:
+        """Give members their chaos-tier colour role.
+
+        Only members whose tier actually changed are touched (the last synced tier is remembered), so the
+        ten-minute rollup does not hammer the Discord API. Returns a small report for `/admin tiers
+        action:roles`; every failure is reported rather than swallowed.
+        """
+        report: dict[str, Any] = {"assigned": 0, "gone": 0, "created": [], "failed": [], "skipped": ""}
+        if not self.settings.tier_roles_enabled:
+            report["skipped"] = "tier roles are disabled (tier_roles_enabled=False)"
+            return report
+        guild = self.get_guild(int(self.settings.allowed_guild_id))
+        if guild is None:
+            report["skipped"] = "guild not available"
+            return report
+        roles, notes = await ensure_tier_roles(guild, bot_member=guild.me)
+        report["created"] = notes
+        if not roles:
+            report["skipped"] = "no tier roles could be managed"
+            return report
+        when = utcnow().isoformat()
+        for user_id, _xp, tier in await self.store.all_member_tiers():
+            previous = await self.store.tier_role_state(user_id)
+            if not force and previous == tier:
+                continue
+            try:
+                member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+            except discord.NotFound:
+                # Left the server: their archived messages keep their chaos, but there is no one to
+                # colour. Remembered so the ten-minute pass stops re-asking (and re-reporting) forever.
+                await self.store.set_tier_role_state(user_id, "left", when)
+                report["gone"] += 1
+                continue
+            except discord.HTTPException as exc:
+                report["failed"].append(f"{user_id}: lookup failed ({exc.status})")
+                continue
+            status = await sync_tier_role(member, tier, roles)
+            if status.startswith(("forbidden", "failed", "skipped")):
+                report["failed"].append(f"{member.display_name}: {status}")
+                continue
+            await self.store.set_tier_role_state(user_id, tier, when)
+            if status != "unchanged":
+                report["assigned"] += 1
+        if report["created"] or report["assigned"] or report["failed"] or report["skipped"] or report["gone"]:
+            tier_logger.info("tier roles: %s", report)
+            print(f"ChaosX tier roles: {report}")
+        return report
 
     async def _activity_ignore_ids(self) -> set[int]:
         """Bot accounts never earn chaos: ChaosX must not rank on its own leaderboard."""
@@ -2421,10 +2551,10 @@ class ChaosXBot(discord.Client):
     async def _tier_panel_text(self, scope: str = "all") -> str:
         """The public chaos-tier panel: the ladder, the leaders and the caller-independent state."""
         tiers = await self.store.activity_xp_by_member()
-        ladder = " → ".join(f"{name} ({threshold})" for name, threshold in TIERS)
+        ladder = " → ".join(f"{tier_emoji(name)} {name} ({threshold})" for name, threshold in TIERS)
         lines = [
-            "## Chaos tiers",
-            f"Every message you send earns chaos: {ladder}.",
+            "## 🌪️ Chaos tiers",
+            f"Chat earns a little, **contributions earn a lot**: {ladder}.",
             "",
         ]
         rows = await self._tier_rows(scope)
@@ -2452,14 +2582,21 @@ class ChaosXBot(discord.Client):
         hidden = "hidden from the leaderboard" if user_id in opts else "shown on the leaderboard"
         position = f"#{rank} all time" if rank else "not ranked yet (no recorded activity)"
         weekly = f"#{week_rank} this week" if week_rank else "no activity recorded this week"
+        bonus = await self.store.bonus_xp_total(user_id)
+        chat_xp = max(0.0, xp - bonus)
+        perks = perks_for_tier(progress.tier)
+        perk_lines = "\n".join(f"- 🎁 {perk}" for perk in perks) or "- 🎁 No perks yet - gather chaos to unlock them."
         return (
-            f"## Your chaos tier\n"
-            f"**{progress.label}** — {int(xp)} chaos earned.\n"
-            f"- Ranking: {position}; {weekly}.\n"
-            f"- You are currently {hidden}.\n"
-            f"- Chaos comes from messages (a tenth of each day past ten messages counts less; short "
-            f"messages count half; #bot-spam and #off-topic earn nothing; help channels earn a quarter more).\n"
-            f"- You are only ever mentioned by banter if you are a high-tier active member and haven't "
+            f"## {tier_emoji(progress.tier)} Your chaos tier\n"
+            f"**{progress.label}** — {int(xp)} chaos earned "
+            f"({int(chat_xp)} from chat, **{int(bonus)} from contributions**).\n"
+            f"- 📊 Ranking: {position}; {weekly}.\n"
+            f"- 👁️ You are currently {hidden}.\n"
+            f"- ⚙️ Chat is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day no matter how much you post; "
+            f"contributions pay far more (an event idea, a suggestion or a playtest observation is "
+            f"{int(BONUS_XP['event_idea'])}).\n"
+            f"**Perks at {progress.tier}**\n{perk_lines}\n"
+            f"- 🔔 You are only ever mentioned by banter if you are a high-tier active member and haven't "
             f"opted out."
         )
 
@@ -5219,6 +5356,11 @@ async def send_scripted_response(
             output = await render()
         else:
             output = await asyncio.to_thread(render)
+            if inspect.isawaitable(output):
+                # A sync callable can still return a coroutine (e.g. `lambda: bot._tier_panel_text(x)`).
+                # Without this, len() on the coroutine raised "object of type 'coroutine' has no len()"
+                # and /tiers failed for every user (2026-09-23).
+                output = await output
     except Exception as exc:
         output = f"ChaosX scripted command failed: `{type(exc).__name__}: {exc}`"
     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)
@@ -6419,12 +6561,16 @@ def register_commands(bot: ChaosXBot) -> None:
     )
     async def chaosx_tiers(interaction: discord.Interaction, scope: app_commands.Choice[str] | None = None) -> None:
         chosen = scope.value if scope else "all"
+
+        async def render_panel() -> str:
+            return await bot._tier_panel_text(chosen)
+
         await send_scripted_response(
             bot,
             interaction,
             command_name="chaosx tiers",
             summary=chosen,
-            render=lambda: bot._tier_panel_text(chosen),
+            render=render_panel,
             view=TierPanelView(bot, scope=chosen),
         )
 
@@ -6457,6 +6603,13 @@ def register_commands(bot: ChaosXBot) -> None:
                             changed_path=note.path,
                         )
                     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion", summary=str(note.path))
+                    await bot._award_contribution(
+                        user_id=interaction.user.id,
+                        kind="suggestion",
+                        ref=f"suggestion:{note.path}",
+                        guild_id=interaction.guild_id,
+                        channel_id=interaction.channel_id,
+                    )
             except Exception as exc:
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion error", summary=type(exc).__name__)
 
@@ -6556,6 +6709,13 @@ def register_commands(bot: ChaosXBot) -> None:
                             except Exception as exc:
                                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post error", summary=type(exc).__name__)
                         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
+                        await bot._award_contribution(
+                            user_id=interaction.user.id,
+                            kind="event_idea",
+                            ref=f"event_idea:{note.path}",
+                            guild_id=interaction.guild_id,
+                            channel_id=interaction.channel_id,
+                        )
                 except Exception as exc:
                     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)
 
@@ -6646,9 +6806,21 @@ def register_commands(bot: ChaosXBot) -> None:
         report = {"event_id": event_id.strip() or None, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
         await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=target, start_time="", duration_minutes=0, voice="", build="")
         await bot.store.add_playtest_report(playtest_id=playtest_id, report=report)
+        granted = await bot._award_contribution(
+            user_id=interaction.user.id,
+            kind="playtest_report",
+            ref=f"playtest:{playtest_id}",
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+        )
+        reward = f"\n🎉 **+{granted:g} chaos** for playtesting." if granted else ""
         bot.schedule_playtest_result_synthesis()
-        heading = f"Recorded playtest observation for {label}." if event_id.strip() else "Recorded general playtest observation."
-        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id or "general", render=lambda: f"{heading}\nUse `/issue` instead if this should become a tracked GitHub bug/crash/request.\n```text\n{observation[:1500]}\n```")
+        heading = (
+            f"✅ Recorded playtest observation for {label}."
+            if event_id.strip()
+            else "✅ Recorded general playtest observation."
+        )
+        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id or "general", render=lambda: f"{heading}{reward}\nUse `/issue` instead if this should become a tracked GitHub bug/crash/request.\n```text\n{observation[:1500]}\n```")
 
     @playtest.command(name="summary", description="Show recent recorded playtest observations.")
     async def playtest_summary(interaction: discord.Interaction, limit: int = 10) -> None:
@@ -6995,12 +7167,13 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await owner_gate(interaction, settings):
             return
         action = (action or "show").lower().strip()
-        if action not in {"show", "rebuild", "member", "banter", "panel"}:
+        if action not in {"show", "rebuild", "member", "banter", "panel", "roles"}:
             await interaction.response.send_message(
                 "Use `action:show` (standings), `action:rebuild` (re-roll the whole archive), "
                 "`action:member member:<@user|name>` (one member's tier), `action:banter` (who idle "
-                "banter could target right now), or `action:panel` (post the public panel in the "
-                "banter channel).",
+                "banter could target right now), `action:panel` (post the public panel in the "
+                "banter channel), or `action:roles` (create/recolour the chaos-tier roles and sync "
+                "every member to their tier).",
                 ephemeral=True,
             )
             return
@@ -7013,6 +7186,16 @@ def register_commands(bot: ChaosXBot) -> None:
                 f"Re-rolled {summary['messages']} archived messages into {summary['days']} member-days; "
                 f"{summary['members']} member tier row(s)."
             )
+        if action == "roles":
+            report = await bot._sync_member_tier_roles(force=True)
+            if report["skipped"]:
+                lines.append(f"Tier roles: {report['skipped']}")
+            else:
+                lines.append(f"Tier roles: {report['assigned']} member(s) moved to their tier's colour.")
+            if report["created"]:
+                lines.append("Role changes: " + "; ".join(report["created"]))
+            if report["failed"]:
+                lines.append("Problems: " + "; ".join(report["failed"][:10]))
         if action == "panel":
             channel = bot.get_channel(int(settings.idle_banter_channel_id))
             if channel is None:
@@ -7051,13 +7234,7 @@ def register_commands(bot: ChaosXBot) -> None:
                     f"leaderboard opt-out: {prefs['leaderboard_optout']}"
                 )
         if action in {"show", "rebuild"}:
-            lines.append("## Chaos tiers (all time)")
-            lines.extend(bot._tier_standings_lines(await bot.store.top_members(limit=15)))
-            week_start = activity_window_start(7)
-            lines.append(f"\n## Last 7 days (since {week_start})")
-            lines.extend(bot._tier_standings_lines(await bot.store.top_members(limit=10, since_day=week_start)))
-            cursor = await bot.store.activity_cursor()
-            lines.append(f"\nRollup cursor: archive id {cursor}; tiers: " + ", ".join(f"{n} ({t})" for n, t in TIERS))
+            lines.extend(await tier_report_lines(bot))
         for part in _chunk("\n".join(lines)):
             await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
         await bot.store.audit(

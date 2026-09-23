@@ -1,9 +1,11 @@
 """Chaos-tier member activity.
 
 Members are ranked on the mod's own chaos meter: XP accumulates from real activity in the archive and the
-tier names are the mod's chaos tiers, thresholds and all (taken from the mod's meter tooltip:
-Calm World (0), Gathering Storm (200), Rising Chaos (400), Chaos Tier (600), Critical (800),
-World Collapse (1000+)). Hoops asked for "chaos tiers named levels" - this is that ladder.
+tier names are the mod's chaos tiers, thresholds and all. Source of truth in the mod repo:
+`common/script_constants/chaos_meter_constants.txt` (`chaos_meter_tier_range`: 0/200/400/600/800/1000)
+and `localisation/english/chaosx_chaos_meter_l_english.yml` (`chaos_tier_0`..`chaos_tier_final`):
+Calm World, Gathering Storm, Rising Chaos, Chaos Tier, Total Chaos, World Collapse.
+Hoops asked for "chaos tiers named levels" - this is that ladder.
 
 Everything here is pure: the rollup reads `message_archive`, so results are recomputable and a formula
 change never needs a migration.
@@ -15,26 +17,54 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 
-# The mod's chaos meter, in order. Thresholds are the mod's own values.
+# The mod's chaos meter, in order: names and thresholds are the mod's own values.
 TIERS: tuple[tuple[str, int], ...] = (
     ("Calm World", 0),
     ("Gathering Storm", 200),
     ("Rising Chaos", 400),
     ("Chaos Tier", 600),
-    ("Critical", 800),
+    ("Total Chaos", 800),
     ("World Collapse", 1000),
 )
+
+# The mod colours each tier in its meter localisation with HOI4 colour codes:
+# chaos_tier_0 = §G, tier_1 = §Y, tier_2 = §O, tier_3 = §R, tier_4/tier_final = §0 (dark), and the
+# meter value follows the same ramp. These are the Discord equivalents, kept readable as a name
+# colour (the mod's §0 is near-black, so the two darkest tiers use dark reds instead).
+TIER_COLORS: dict[str, int] = {
+    "Calm World": 0x4C9C2E,
+    "Gathering Storm": 0xE3C000,
+    "Rising Chaos": 0xF08C1F,
+    "Chaos Tier": 0xD6453C,
+    "Total Chaos": 0x7A1B1B,
+    "World Collapse": 0x3B0B0B,
+}
+
+# The mod's own ramp, one emoji per tier (green → yellow → orange → red → dark → collapse).
+TIER_EMOJI: dict[str, str] = {
+    "Calm World": "🌿",
+    "Gathering Storm": "🌩️",
+    "Rising Chaos": "🔥",
+    "Chaos Tier": "⚠️",
+    "Total Chaos": "☠️",
+    "World Collapse": "💀",
+}
 
 # "High level active members" (Hoops 2026-09-23): only these can ever be picked for idle banter.
 DEFAULT_ELIGIBLE_TIER = "Rising Chaos"
 
-# XP rules
+# XP rules. Chat is regulated so volume cannot buy rank (Hoops 2026-09-23: "you shouldn't level up from
+# spamming, there should be regulation for everything"): each message is worth 1, drops to 0.2 after ten
+# in a day, and the whole chat side is capped at CHAT_DAILY_XP_CAP so even a long chatty day cannot
+# out-earn a real contribution.
 XP_PER_MESSAGE = 1.0
 DIMINISHING_AFTER = 10  # messages per day that count at full value
 DIMINISHED_VALUE = 0.2
 SHORT_MESSAGE_CHARS = 12
 SHORT_MESSAGE_VALUE = 0.5
 BURST_MESSAGES_PER_MINUTE = 20  # beyond this in one minute, a message scores nothing (raid guard)
+CHAT_DAILY_XP_CAP = 12.0  # the most chat alone can ever pay in one day
+BONUS_DAILY_CAP = 80.0  # and the most contributions can pay in one day (three event ideas' worth)
 
 # Channel weights. Channel ids are the Chaos Redux channels (see the chaosx-discord-facts reference).
 CHANNEL_WEIGHTS: dict[int, float] = {
@@ -46,14 +76,63 @@ CHANNEL_WEIGHTS: dict[int, float] = {
 }
 DEFAULT_CHANNEL_WEIGHT = 1.0
 
-# Bonus XP, deliberately small next to chat so typing volume stays the main driver.
+# Contributions are what actually move you (Hoops 2026-09-23: "for more meaningful contributions, like
+# producing a good event idea, playtesting, etc should also all grant more points"). One accepted idea is
+# worth more than three weeks of a full chat cap, so rank tracks contribution, not message count.
 BONUS_XP: dict[str, float] = {
-    "playtest_report": 40.0,
-    "event_idea": 40.0,
-    "suggestion": 40.0,
-    "bug_report": 25.0,
+    "playtest_report": 40.0,  # a real observation from a playtest
+    "event_idea": 40.0,  # an idea captured into Events/Event Specs
+    "suggestion": 40.0,  # a community suggestion captured for review
+    "bug_report": 25.0,  # a formatted issue that reached GitHub
     "docs_contribution": 15.0,
 }
+
+# Perks (Hoops 2026-09-23: "the higher tier you are, the more perks you get. Like your ideas take higher
+# priority"). Each tier inherits everything below it. Only perks the bot can actually honour are listed -
+# no promises about things no code implements.
+PERKS: dict[str, tuple[str, ...]] = {
+    "Calm World": (),
+    "Gathering Storm": ("your tier emoji shows next to your name on the leaderboard",),
+    "Rising Chaos": (
+        "your tier emoji shows next to your name on the leaderboard",
+        "event ideas and suggestions you post are flagged priority for review",
+    ),
+    "Chaos Tier": (
+        "your tier emoji shows next to your name on the leaderboard",
+        "event ideas and suggestions you post are flagged priority for review",
+        "you are named in the weekly community round-up when you contribute",
+    ),
+    "Total Chaos": (
+        "everything from Chaos Tier",
+        "your ideas go to the top of the captured list",
+    ),
+    "World Collapse": (
+        "everything from Total Chaos",
+        "you keep a permanent place at the top of the tier panel while you stay active",
+    ),
+}
+
+PERK_KEYS: dict[str, set[str]] = {
+    "Calm World": set(),
+    "Gathering Storm": {"panel_emoji"},
+    "Rising Chaos": {"panel_emoji", "idea_priority"},
+    "Chaos Tier": {"panel_emoji", "idea_priority", "digest_shoutout"},
+    "Total Chaos": {"panel_emoji", "idea_priority", "digest_shoutout", "idea_top"},
+    "World Collapse": {"panel_emoji", "idea_priority", "digest_shoutout", "idea_top"},
+}
+
+
+def perks_for_tier(tier: str) -> tuple[str, ...]:
+    """What this tier gets, newest perk last."""
+    return PERKS.get(tier, ())
+
+
+def has_perk(tier: str, key: str) -> bool:
+    return key in PERK_KEYS.get(tier, set())
+
+
+def tier_emoji(tier: str) -> str:
+    return TIER_EMOJI.get(tier, "🎲")
 
 
 def _utcnow_iso() -> str:
@@ -148,7 +227,8 @@ def day_xp(messages: Sequence[tuple[str, int | None]]) -> tuple[int, float]:
         if position >= BURST_MESSAGES_PER_MINUTE:
             continue
         total += message_xp(content, channel_id=channel_id, index_in_day=position)
-    return count, round(total, 3)
+    # Hard daily ceiling on chat XP: quantity alone can never rank someone up.
+    return count, round(min(total, CHAT_DAILY_XP_CAP), 3)
 
 
 def parse_day(timestamp: str) -> str:

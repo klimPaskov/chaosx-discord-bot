@@ -587,17 +587,19 @@ Hard rules:
   cannot verify from the post itself.
 - No pings, no invented features, versions, dates or release promises.
 
-Sections (exactly these, nothing else):
-1. Title line: "**Weekly Chaos Redux digest — <version>**"
-2. "This week in the mod" — at most 3 bullets, one line each (roughly 20 words), covering the areas that
-   saw the most work. Group related work into one bullet instead of listing every change.
-3. "From the community" — one short line: playtests, reported issues, ideas written up, server activity.
+Sections (exactly these, nothing else, with these emojis so it reads at a glance):
+1. Title line: "🌟 **Weekly Chaos Redux digest — <version>** 🌟"
+2. "🛠️ This week in the mod" — at most 3 bullets, one line each (roughly 20 words), covering the areas that
+   saw the most work. Group related work into one bullet instead of listing every change. Start each bullet
+   with one fitting emoji (art 🎨, models 🧊, scripting ⚙️, sound 🔊, text ✍️, flags 🚩, balance ⚖️).
+3. "💬 From the community" — one short line: playtests, reported issues, ideas written up, server activity.
    Always include the server's member count exactly as the facts give it (Discord's own figure); include
    the online count when the facts give one. If the week was otherwise quiet, say so in a few words
    instead of printing zeros.
-4. "What's next" — one short line naming the testing focus from the facts. Never promise future features,
-   say something is "coming", or give dates/release timelines.
+4. "🔎 What's next" — one short line naming the testing focus from the facts, starting with 🔎. Never
+   promise future features, say something is "coming", or give dates/release timelines.
 
+Emoji are for orientation only: one per heading as above, at most one per bullet, never a wall of them.
 Keep the whole post under {max_chars} characters and keep it tight — Hoops called the previous digest
 bloated. Short and concrete beats complete. Plain Discord markdown."""
 
@@ -621,13 +623,13 @@ def digest_fallback(signals: dict[str, Any]) -> str:
     else:
         work_line = f"- {commits.get('count', 0)} changes landed in the last {window} days."
     lines = [
-        f"**Weekly Chaos Redux digest** — {signals.get('version') or 'in development'}",
+        f"🌟 **Weekly Chaos Redux digest** — {signals.get('version') or 'in development'} 🌟",
         "",
-        "**This week in the mod**",
+        "**🛠️ This week in the mod**",
         work_line,
-        "- Details are in the repo history if you want the technical view.",
+        "- 📜 Details are in the repo history if you want the technical view.",
         "",
-        "**From the community**",
+        "**💬 From the community**",
         (
             f"- {playtest_facts_line(playtests)}; {community_facts_line(signals.get('community_captures') or [])}; "
             f"{issues_facts_line(issues)}; {server_facts_line(server)}"

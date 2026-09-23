@@ -165,6 +165,10 @@ class Settings(BaseSettings):
         default=600, ge=120, le=3600,
         description="How often the chaos-tier activity rollup folds new archive messages in",
     )
+    tier_roles_enabled: bool = Field(
+        default=True,
+        description="Give each member a coloured chaos-tier role (the mod's tier colours)",
+    )
     idle_banter_excluded_ids: list[int] = Field(
         default_factory=lambda: [110546365032968192],  # Holly — never a banter target (Hoops, 2026-09-23)
         description="Members idle banter must never target (the owner is always excluded in code as well)",

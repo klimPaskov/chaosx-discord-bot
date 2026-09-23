@@ -32,7 +32,7 @@ def test_tiers_are_the_mods_chaos_meter():
         "Gathering Storm",
         "Rising Chaos",
         "Chaos Tier",
-        "Critical",
+        "Total Chaos",
         "World Collapse",
     ]
     assert [threshold for _, threshold in TIERS] == [0, 200, 400, 600, 800, 1000]
@@ -41,7 +41,7 @@ def test_tiers_are_the_mods_chaos_meter():
     assert tier_for_xp(200) == "Gathering Storm"
     assert tier_for_xp(400) == "Rising Chaos"
     assert tier_for_xp(600) == "Chaos Tier"
-    assert tier_for_xp(800) == "Critical"
+    assert tier_for_xp(800) == "Total Chaos"
     assert tier_for_xp(1000) == "World Collapse"
     assert tier_for_xp(99999) == "World Collapse"
     assert tier_for_xp(-5) == "Calm World"
@@ -122,7 +122,7 @@ def test_banter_eligibility_requires_every_clause():
 def test_standings_and_rollup_formatting():
     progress = tier_progress(650)
     line = standings_line(1, "Hoops McCann", progress, messages=277, days=28)
-    assert line == "1. Hoops McCann - Chaos Tier - 50/200 to Critical (650 chaos, 277 messages/28 days)"
+    assert line == "1. Hoops McCann - Chaos Tier - 50/200 to Total Chaos (650 chaos, 277 messages/28 days)"
     assert tier_rollup([(5, 650.4), (6, 0)]) == [(5, 650.4, "Chaos Tier"), (6, 0.0, "Calm World")]
 
 
