@@ -165,6 +165,19 @@ CREATE TABLE IF NOT EXISTS routine_posts (
     status TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS announcements (
+    announcement_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    actor_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    topic TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    destination_channel_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
+);
 """
 
 DEFAULT_AUTOMATIONS = {
@@ -771,3 +784,86 @@ class Store:
                 ),
                 "playtests_total": await scalar("SELECT COUNT(*) FROM playtest_records"),
             }
+
+    async def record_announcement(
+        self,
+        announcement_id: str,
+        *,
+        actor_id: int,
+        guild_id: int | None = None,
+        topic: str = "",
+        body: str = "",
+        status: str = "draft",
+        destination_channel_id: str = "",
+        message_id: str = "",
+        detail: str = "",
+    ) -> None:
+        """Upsert one announcement; empty fields never clobber stored values."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO announcements(
+                    announcement_id, created_at, actor_id, guild_id, topic, body, status,
+                    destination_channel_id, message_id, detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(announcement_id) DO UPDATE SET
+                    body = CASE WHEN excluded.body != '' THEN excluded.body ELSE announcements.body END,
+                    status = CASE WHEN excluded.status != '' THEN excluded.status ELSE announcements.status END,
+                    destination_channel_id = CASE WHEN excluded.destination_channel_id != '' THEN excluded.destination_channel_id ELSE announcements.destination_channel_id END,
+                    message_id = CASE WHEN excluded.message_id != '' THEN excluded.message_id ELSE announcements.message_id END,
+                    detail = CASE WHEN excluded.detail != '' THEN excluded.detail ELSE announcements.detail END
+                """,
+                (
+                    announcement_id,
+                    now_iso(),
+                    actor_id,
+                    guild_id,
+                    topic[:200],
+                    body[:8000],
+                    status,
+                    destination_channel_id,
+                    message_id,
+                    detail[:4000],
+                ),
+            )
+            await db.commit()
+
+    async def list_announcements(self, *, limit: int = 10) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT announcement_id, created_at, status, topic, destination_channel_id, message_id "
+                "FROM announcements ORDER BY created_at DESC LIMIT ?",
+                (max(1, limit),),
+            )
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def last_announcement(self, *, status: str = "posted") -> dict | None:
+        """Most recent announcement in the given status (used for 'since the last announcement' facts)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT announcement_id, created_at, topic, body, status, detail FROM announcements "
+                "WHERE status = ? ORDER BY created_at DESC LIMIT 1",
+                (status,),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def latest_draft_announcement(self, *, topic: str = "") -> dict | None:
+        """Newest stored draft (optionally for an exact topic) so review→post keeps the same text."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if topic.strip():
+                cur = await db.execute(
+                    "SELECT announcement_id, created_at, topic, body, status, detail FROM announcements "
+                    "WHERE status = 'draft' AND lower(topic) = lower(?) ORDER BY created_at DESC LIMIT 1",
+                    (topic.strip(),),
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT announcement_id, created_at, topic, body, status, detail FROM announcements "
+                    "WHERE status = 'draft' ORDER BY created_at DESC LIMIT 1"
+                )
+            row = await cur.fetchone()
+            return dict(row) if row else None

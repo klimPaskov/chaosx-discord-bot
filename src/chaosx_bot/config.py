@@ -79,6 +79,7 @@ class Settings(BaseSettings):
                 "content_dump_channel_id",
                 "routine_posts_channel_id",
                 "routine_release_channel_id",
+                "announcements_channel_id",
                 "community_event_ideas_channel_id",
                 "access_reaction_channel_id",
                 "access_reaction_message_id",
@@ -152,6 +153,7 @@ class Settings(BaseSettings):
     content_dump_channel_id: Optional[int] = Field(default=1516054706286235768, description="Discord channel for weekly image-led content dumps")
     routine_posts_channel_id: Optional[int] = Field(default=1516054706286235768, description="Discord channel for autonomous routine posts (weekly dev digest)")
     routine_release_channel_id: Optional[int] = Field(default=None, description="Discord channel for autonomous release announcements; blank reuses routine_posts_channel_id")
+    announcements_channel_id: Optional[int] = Field(default=1395467364916662392, description="Discord announcements channel where owner-requested announcements are posted")
     routine_posts_enabled: bool = Field(default=True, description="Master switch for autonomous routine posts (weekly dev digest + release announcements)")
     dev_digest_weekday: int = Field(default=0, ge=0, le=6, description="Weekday for the weekly dev digest post (0=Monday)")
     dev_digest_hour_utc: int = Field(default=12, ge=0, le=23, description="UTC hour for the weekly dev digest post")

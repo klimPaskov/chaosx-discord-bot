@@ -194,6 +194,16 @@ from .playtest_synthesis import (
     build_playtest_synthesis_prompt,
 )
 from .rate_limit import FixedWindowRateLimiter, RateLimitResult
+from .announcements import (
+    AnnouncementFacts,
+    AnnouncementResult,
+    announcement_detail,
+    announcement_id as new_announcement_id,
+    build_announcement_fallback,
+    build_announcement_prompt,
+    collect_announcement_facts,
+    title_from_body,
+)
 from .routine_posts import (
     DEV_DIGEST,
     DIGEST_WINDOW_DAYS,
@@ -1415,6 +1425,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
 - `/admin routine action:list|preview|run [name:<routine_dev_digest|routine_release_posts>]` — owner-only control for the autonomous routine posts. `list` shows schedule, destination, last run and whether this week's post is still due; `preview` builds and posts it now without counting toward the period; `run` posts it for real. Disable any of them with `/admin automation action:disable name:<...>`.
+- `/admin announce action:draft|post|list [topic:<plain English>]` — owner-only announcements. `draft` writes the copy from your brief plus verified repo facts (current version, commits since the last announcement, closed issues) and shows it to you privately without posting; `post` publishes the reviewed draft to the announcements channel (or writes a new one if no draft matches the brief); `list` shows recent drafts and posts.
 - `/admin autoscan action:list|answers|warnings [limit:<n>]` — owner-only viewer for model-generated auto-scan answers, warnings, shadow decisions, and rate-limited scan events.
 - `/admin user-memory [user:<name or ID>] [public:<bool>]` — owner-only viewer for saved per-user memory (profile summarizations only; recent raw messages stay internal). With no user, dumps summaries for every user in the database that has memory saved (users who have never sent messages are skipped, always ephemeral). With a specific user, the optional `public:true` posts the answer as a normal channel message instead of ephemeral; user mentions are clickable so you can open their profile.
 - `/admin scan-history [limit:<n>]` — owner-only backfill: reads all readable channel/thread history in the server, captures it into conversation memory, and force-builds user profiles in the background (deduped, so it is safe to rerun). Results are posted to the command channel when finished.
@@ -2398,6 +2409,84 @@ class ChaosXBot(discord.Client):
             await self.store.record_routine_post(
                 spec.name, checked_at=now, status=result.action
             )
+        return result
+
+    # ------------------------------------------------------------------
+    # Owner-requested announcements (brief + verified facts, draft → post)
+    # ------------------------------------------------------------------
+
+    async def _announcement_facts(self, topic: str) -> AnnouncementFacts:
+        repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
+        previous = await self.store.last_announcement(status="posted") or {}
+        previous_head = ""
+        previous_version = ""
+        try:
+            parsed = json.loads(str(previous.get("detail") or "{}"))
+            previous_head = str(parsed.get("head") or "")
+            previous_version = str(parsed.get("version") or "")
+        except json.JSONDecodeError:
+            previous_head = previous_version = ""
+        return await collect_announcement_facts(
+            repo=repo,
+            github_repo=self.settings.github_repo,
+            topic=topic,
+            previous_head=previous_head,
+            previous_version=previous_version,
+        )
+
+    async def _build_announcement(self, *, topic: str) -> AnnouncementResult:
+        """Draft announcement copy from the owner brief plus verified repo facts."""
+        facts = await self._announcement_facts(topic)
+        text, source = await self._routine_post_text(
+            prompt=build_announcement_prompt(facts=facts),
+            activity_label="announcement draft",
+            fallback=build_announcement_fallback(facts),
+        )
+        return AnnouncementResult(
+            announcement_id=new_announcement_id(
+                topic=facts.topic, version=facts.version, head=facts.head
+            ),
+            status="drafted",
+            body=text,
+            title=title_from_body(text),
+            detail=source,
+            facts=facts,
+        )
+
+    async def _deliver_announcement(
+        self, result: AnnouncementResult, *, channel_id: int
+    ) -> AnnouncementResult:
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                result.status = "error"
+                result.detail = f"{result.detail}; channel lookup failed: {type(exc).__name__}".strip("; ")
+                return result
+        send_message = cast(
+            Callable[..., Awaitable[discord.Message]],
+            getattr(channel, "send", None),
+        )
+        if not callable(send_message):
+            result.status = "error"
+            result.detail = f"{result.detail}; destination is not messageable".strip("; ")
+            return result
+        sent: discord.Message | None = None
+        try:
+            for part in _chunk(result.body):
+                sent = await send_message(part, allowed_mentions=safe_allowed_mentions())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            result.status = "error"
+            result.detail = f"{result.detail}; send failed: {type(exc).__name__}".strip("; ")
+            return result
+        if sent is None:
+            result.status = "error"
+            result.detail = f"{result.detail}; nothing sent".strip("; ")
+            return result
+        result.status = "posted"
+        result.channel_id = channel_id
+        result.message_id = sent.id
         return result
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -6187,6 +6276,111 @@ def register_commands(bot: ChaosXBot) -> None:
             else f"`{result.name}`: `{result.action}` {result.detail}"
         )
         await interaction.followup.send(summary, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    @admin.command(name="announce", description="Draft or post an announcement from a plain-English brief.")
+    async def admin_announce(interaction: discord.Interaction, action: str = "draft", topic: str = "") -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = (action or "draft").lower().strip()
+        if action not in {"draft", "post", "list"}:
+            await interaction.response.send_message(
+                "Use `action:draft topic:<plain English>`, `action:post topic:<...>` (posts the reviewed draft when one exists), or `action:list`.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        if action == "list":
+            rows = await bot.store.list_announcements(limit=10)
+            lines = ["## Announcements"]
+            if not rows:
+                lines.append("Nothing drafted or posted yet.")
+            for row in rows:
+                destination = row.get("destination_channel_id") or ""
+                where = f" -> <#{destination}>" if destination and row.get("status") == "posted" else ""
+                lines.append(
+                    f"- `{row['announcement_id']}` — `{row['status']}`{where} — {row['created_at'][:16]} — {row.get('topic') or '(no brief)'}"
+                )
+            await interaction.response.send_message(
+                "\n".join(lines)[:1900], ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if action == "post":
+            destination = bot.settings.announcements_channel_id
+            if not destination:
+                await interaction.followup.send(
+                    "No announcements channel is configured (`CHAOSX_ANNOUNCEMENTS_CHANNEL_ID`).",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+            draft = await bot.store.latest_draft_announcement(topic=topic)
+            if draft and draft.get("body"):
+                body = str(draft["body"])
+                result = AnnouncementResult(
+                    announcement_id=str(draft["announcement_id"]),
+                    status="posted",
+                    body=body,
+                    title=title_from_body(body),
+                    detail="posted from the reviewed draft",
+                )
+            else:
+                result = await bot._build_announcement(topic=topic)
+            result = await bot._deliver_announcement(result, channel_id=destination)
+            await bot.store.record_announcement(
+                result.announcement_id,
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                topic=topic,
+                body=result.body,
+                status=result.status,
+                destination_channel_id=str(result.channel_id or ""),
+                message_id=str(result.message_id or ""),
+                detail=announcement_detail(result.facts) if result.facts else "",
+            )
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin announce post",
+                summary=f"{result.announcement_id}: {result.status} {result.detail}".strip(),
+            )
+            reply = (
+                f"Posted `{result.announcement_id}` in <#{result.channel_id}> ({result.detail})."
+                if result.status == "posted"
+                else f"Announcement `{result.announcement_id}` failed: `{result.status}` {result.detail}"
+            )
+            await interaction.followup.send(
+                reply, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+        result = await bot._build_announcement(topic=topic)
+        await bot.store.record_announcement(
+            result.announcement_id,
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            topic=topic,
+            body=result.body,
+            status="draft",
+            detail=announcement_detail(result.facts) if result.facts else "",
+        )
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin announce draft",
+            summary=f"{result.announcement_id}: {result.title}",
+        )
+        header = (
+            f"**Announcement draft** `{result.announcement_id}` ({result.detail}, {len(result.body)} chars) — nothing has been posted.\n"
+            f"Post exactly this text with `/admin announce action:post topic:{topic}`.\n\n"
+        )
+        for index, part in enumerate(_chunk(header + result.body)):
+            await interaction.followup.send(
+                part, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            if index >= 3:
+                break
 
     @admin.command(name="autoscan", description="List recent ChaosX auto-scan actions.")
     async def admin_autoscan(interaction: discord.Interaction, action: str = "list", limit: int = 10) -> None:
