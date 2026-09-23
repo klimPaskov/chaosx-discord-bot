@@ -112,6 +112,7 @@ from .conversation_memory import (
 )
 from .catalog_validation import format_workbook_validation, validate_workbook
 from .community_notes import (
+    promote_community_idea,
     format_event_idea_post_body,
     format_event_idea_post_title,
     is_vague_event_idea,
@@ -240,6 +241,23 @@ from .announcements import (
     collect_announcement_facts,
     title_from_body,
 )
+from .ideas import (
+    IDEA_STATUSES,
+    MAX_SUBMISSIONS_PER_WEEK,
+    OPEN_STATUSES,
+    PLANNED,
+    REVIEW_BUTTONS,
+    SHIPPED,
+    award_for_status,
+    board_line,
+    board_summary,
+    find_duplicate,
+    preview_text,
+    priority_marker,
+    rate_limit_message,
+    status_label,
+    status_line,
+)
 from .titles import (
     MAX_TITLE_WORDS,
     TITLE_PROMPT,
@@ -318,6 +336,7 @@ from .webhook_server import GitHubWebhookServer
 
 logger = logging.getLogger("chaosx.attachments")
 tier_logger = logging.getLogger("chaosx.tiers")
+idea_logger = logging.getLogger("chaosx.ideas")
 if not logger.handlers:  # bot.py configures no logging of its own, so attach our own
     _attachments_handler = logging.StreamHandler()  # stderr → journald
     _attachments_handler.setFormatter(logging.Formatter("[attachments] %(message)s"))
@@ -411,6 +430,17 @@ async def tier_report_lines(bot: "ChaosXBot") -> list[str]:
         *_tier_standings_lines(await bot.store.top_members(limit=10, since_day=week_start)),
         f"\nRollup cursor: archive id {cursor}; tiers: " + ", ".join(f"{name} ({threshold})" for name, threshold in TIERS),
     ]
+
+
+def _idea_age_days(created_at: str) -> int:
+    """Whole days since an idea was filed (0 when the timestamp is unusable)."""
+    try:
+        created = datetime.fromisoformat(str(created_at))
+    except ValueError:
+        return 0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0, (utcnow() - created).days)
 
 
 def _tier_standings_lines(rows: list[tuple], titles: dict[int, str] | None = None) -> list[str]:
@@ -1540,7 +1570,10 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 ### Report or draft feedback
 - `/issue` — uses AI to review a report form; if approved, ChaosX formats it and sends it to GitHub Issues. Bug/crash forms ask for relevant `error.log` lines.
 - `/suggestion suggestion:<idea>` — uses AI to turn a rough suggestion into a clearer review note.
-- `/event-idea idea:<idea>` — uses AI to format an event idea with a name, ID placeholder, type, baseline description, evolutions, and scenario hooks.
+- `/event-idea` — opens a short form (the idea plus optional type, cluster, world-end link and evolution stages). The bot drafts it and shows you a private **preview**: `Post to forum` files it, `Edit` reopens the form with your text, `Discard` throws it away. Nothing is saved or posted until you press a button.
+  - Filing earns a little chaos; if the idea is accepted into the plan or reaches the mod, the author earns more.
+  - Near-duplicates are flagged in the preview, and there is a limit of 5 submissions a week so the queue stays reviewable.
+- `/ideas` — the idea pipeline: how many ideas are waiting, what is planned, what is in the mod, and your own submissions. Buttons switch the view.
 
 ### Playtest notes
 - `/playtest report observation:<text>` — record testing observations, quick notes, balance feel, weird behavior, or unclear feedback that is not ready to become a GitHub issue. Add `event_id` if the note is about one event.
@@ -1560,6 +1593,7 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Event idea tools
 - `/admin event-idea` — use the stronger private model to mine the repo and Chaos Redux vault for connections, generate one structured event idea, assign the next available numeric event ID, and save `<id> - <event name>.md` under `Events/Event Specs/`. It refreshes vault indexes but does **not** post the idea to the public event-ideas forum.
+- `/admin ideas action:<list|counts|panel|status|promote>` — the community idea pipeline. `list` shows the queue, `counts` the health line, `panel` posts the public board in the ideas channel, `status submission_id:<n> status:<planned|building|shipped|declined> note:<text>` moves an idea (and pays the staged chaos), and `promote submission_id:<n>` turns an accepted community idea into the next numbered spec under `Events/Event Specs/`. The same status moves are available as owner-only buttons on each idea's own forum post.
 - `/admin event-improvement event_id:<id>` — autonomously improve an existing event note while keeping it as a rough idea collection. It mines the repo and vault to expand thin sections and draw relevant connections, but it does not turn the note into a full specification or add planning/coding guidance.
 
 ### Useful shortcuts
@@ -2085,6 +2119,12 @@ class ChaosXBot(discord.Client):
         self.add_view(TierPanelView(self, timeout=None))
         self.add_view(TestingVoteOpenView(self, timeout=None))
         self.add_view(TestingVoteOptionsView(self, timeout=None))
+        self.add_view(IdeaBoardView(self))
+        # Every filed idea keeps its status buttons working across restarts.
+        try:
+            await self._register_idea_views()
+        except Exception as _exc:  # registration must never block startup
+            idea_logger.warning("idea view registration at startup failed: %s", type(_exc).__name__)
         asyncio.create_task(self._refresh_rules_background())
         asyncio.create_task(self._refresh_channels_background())
         await self.store.set_automation_destination(["auto_question_answering", "auto_bot_topic_banter"], "source channel")
@@ -2623,6 +2663,451 @@ class ChaosXBot(discord.Client):
             await channel.send(text, allowed_mentions=safe_allowed_mentions())
         except (discord.Forbidden, discord.HTTPException) as exc:
             tier_logger.info("contribution credit skipped: %s", exc)
+
+    # --- event idea pipeline (Hoops 2026-09-23: "implement the plans") --------------------------------
+
+    async def _idea_error(self, interaction: discord.Interaction, prefix: str, error: Exception) -> None:
+        """Report an idea-pipeline failure in the channel without leaking internals."""
+        idea_logger.warning("%s: %s", prefix, type(error).__name__)
+        message = f"{prefix} (`{type(error).__name__}`). Nothing was saved."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            else:
+                await interaction.response.send_message(
+                    message, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+                )
+        except (discord.HTTPException, discord.InteractionResponded):
+            pass
+
+    @staticmethod
+    def _idea_fields(payload: dict[str, str]) -> dict[str, str]:
+        """Map the modal fields onto the note writer's keyword arguments."""
+        evolutions = [line.strip() for line in str(payload.get("evolutions", "")).splitlines() if line.strip()]
+        fields = {
+            "event_type": payload.get("event_type", ""),
+            "cluster": payload.get("cluster", ""),
+            "world_end": payload.get("world_end", ""),
+        }
+        for index, name in enumerate(("evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v")):
+            fields[name] = evolutions[index] if index < len(evolutions) else ""
+        return fields
+
+    async def _handle_event_idea_submission(
+        self, interaction: discord.Interaction, *, payload: dict[str, str]
+    ) -> None:
+        """Draft the idea, then show a preview. Nothing is written or posted at this point."""
+        idea = str(payload.get("idea", "")).strip()
+        if not idea:
+            await interaction.response.send_message(
+                "Give me the idea itself and I will draft it.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user_id = int(interaction.user.id)
+        # Rate limit: a member cannot flood the queue.
+        since = (utcnow() - timedelta(days=7)).isoformat()
+        recent = await self.store.idea_submissions_since(user_id=user_id, since_iso=since)
+        if recent >= MAX_SUBMISSIONS_PER_WEEK:
+            await interaction.followup.send(
+                rate_limit_message(recent=recent), ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            await self.store.audit(
+                actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+                command="event-idea", summary=f"rate limited ({recent} in 7 days)",
+            )
+            return
+        # Duplicate check against what has already been filed.
+        existing = [
+            (int(row["id"]), str(row["title"]), str(row["status"]))
+            for row in await self.store.idea_submissions(limit=60)
+        ]
+        duplicate = find_duplicate(idea, existing)
+        vague_hint = ""
+        if is_vague_event_idea(idea):
+            vague_hint = (
+                "This reads more like a topic than an event. Add what happens, what triggers it and what "
+                "it changes - or post it anyway and it will be reviewed as a loose concept."
+            )
+        draft = ""
+        try:
+            draft = await self._draft_event_idea(idea=idea, payload=payload)
+        except Exception as exc:
+            await self._idea_error(interaction, "The draft could not be written", exc)
+            return
+        if draft.upper().startswith("VAGUE"):
+            hint = draft.split(":", 1)[1].strip() if ":" in draft else "It needs a concrete concept."
+            vague_hint = vague_hint or f"{hint} You can add it, or post it anyway."
+            draft = ""
+        if not draft:
+            draft = (
+                "**Draft pending** - the model declined to format this one.\n\n"
+                f"{idea}"
+            )
+        tier_row = await self.store.member_tier(user_id)
+        priority = bool(tier_row and has_perk(str(tier_row[1]), "idea_priority"))
+        text = preview_text(
+            draft=draft, raw_idea=idea, duplicate=duplicate, vague_hint=vague_hint, priority=priority
+        )
+        view = EventIdeaPreviewView(self, payload={**payload, "draft": draft}, priority=priority)
+        await interaction.followup.send(
+            text[:1900], view=view, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+        )
+        await self.store.audit(
+            actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            command="event-idea preview",
+            summary=f"previewed (priority={priority}, duplicate={duplicate.submission_id if duplicate else '-'})",
+        )
+
+    async def _draft_event_idea(self, *, idea: str, payload: dict[str, str]) -> str:
+        """The single light-reasoning formatting call, shared by the modal flow."""
+        fields = self._idea_fields(payload)
+        request = (
+            f"/event-idea idea={idea!r} fields={fields!r}. First decide whether this idea is specific "
+            "enough to become a real event: it needs a concrete concept (what happens, when or how it "
+            "triggers, what it affects, and a gameplay effect). If it is too vague — just a topic, country, "
+            "or theme with no real event concept — reply with exactly `VAGUE: <one short sentence saying what "
+            "is missing and what to add>`. Otherwise format a Chaos Redux event idea draft with name, TBD ID, "
+            "type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, "
+            "easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use "
+            "placeholders for missing parts. Do not assign a real ID or claim acceptance."
+        )
+        result = await _public_model_completion(
+            bot=self,
+            system=SYSTEM_BOUNDARY,
+            prompt=request,
+            model=self.settings.ask_model,
+            reasoning_effort=self.settings.ask_reasoning_effort,
+            timeout_seconds=min(self.settings.hermes_timeout_seconds, 150),
+            activity_label="event idea draft",
+            actor_id=None,
+        )
+        if not getattr(result, "ok", False):
+            raise RuntimeError("model call failed")
+        text = sanitize_post((getattr(result, "stdout", "") or "").strip(), max_chars=2200)
+        # The model sometimes opens with its own verdict line ("**Specific enough** - ..."); that belongs in
+        # the preview, not in the draft that gets filed.
+        lines = text.splitlines()
+        while lines and re.match(r"^\s*(\*\*)?(specific enough|vague|verdict)\b", lines[0], re.IGNORECASE):
+            lines.pop(0)
+        return "\n".join(lines).strip()
+
+    async def _file_event_idea(
+        self, interaction: discord.Interaction, *, payload: dict[str, str], priority: bool
+    ) -> None:
+        """Confirm step: write the note, post the thread, award chaos - all only after a button press."""
+        idea = str(payload.get("idea", "")).strip()
+        draft = str(payload.get("draft", "")).strip()
+        user_id = int(interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        title = format_event_idea_post_title(raw_idea=idea, draft=draft)
+        try:
+            submission_id = await self.store.create_idea_submission(
+                user_id=user_id, title=title, raw_idea=idea, draft=draft, priority=priority
+            )
+        except Exception as exc:
+            await self._idea_error(interaction, "The idea could not be filed", exc)
+            return
+        fields = self._idea_fields(payload)
+        note_path = ""
+        try:
+            if self.settings.community_notes_enabled:
+                note = write_event_idea_note(
+                    vault_path=self.settings.obsidian_vault_path,
+                    event_specs_folder=self.settings.community_event_specs_folder,
+                    raw_idea=idea,
+                    draft=draft,
+                    actor_id=user_id,
+                    guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                    **fields,
+                )
+                if note is not None:
+                    note_path = str(note.path)
+                    if note.created:
+                        refresh_vault_indexes(
+                            vault_path=self.settings.obsidian_vault_path,
+                            event_specs_folder=self.settings.community_event_specs_folder,
+                            suggestions_folder=self.settings.community_suggestions_folder,
+                            reason="ChaosX filed a community event idea.",
+                            changed_path=note.path,
+                        )
+        except Exception as exc:
+            await self.store.audit(
+                actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+                command="vault event-idea error", summary=type(exc).__name__,
+            )
+        posted: tuple[int, int] | None = None
+        try:
+            posted = await self._post_idea_to_forum(
+                submission_id=submission_id,
+                actor_id=user_id,
+                title=title,
+                raw_idea=idea,
+                draft=draft,
+                priority=priority,
+                note_path=note_path,
+                **fields,
+            )
+        except Exception as exc:
+            await self.store.audit(
+                actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+                command="event-idea channel post error", summary=type(exc).__name__,
+            )
+        if posted:
+            await self.store.set_idea_post_location(
+                submission_id=submission_id, channel_id=posted[0], message_id=posted[1], vault_path=note_path
+            )
+        granted = await self._award_contribution(
+            user_id=user_id,
+            kind="idea_filed",
+            ref=f"idea:{submission_id}:filed",
+            guild_id=interaction.guild_id,
+            channel_id=self.settings.community_event_ideas_channel_id,
+        )
+        link = f"<#{posted[0]}>" if posted else "the ideas forum"
+        await interaction.followup.send(
+            "📮 Filed as submission "
+            f"`#{submission_id}` - it is in {link}"
+            + (f" and saved to the vault." if note_path else ".")
+            + (f" **+{granted:g} chaos** for a real contribution." if granted else "")
+            + "\nThe status buttons on the post are for the owner; you will see the status change there.",
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        await self.store.audit(
+            actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            command="event-idea filed",
+            summary=f"#{submission_id} forum={posted[1] if posted else '-'} vault={note_path or '-'}",
+        )
+
+    async def _post_idea_to_forum(
+        self,
+        *,
+        submission_id: int,
+        actor_id: int,
+        title: str,
+        raw_idea: str,
+        draft: str,
+        priority: bool,
+        note_path: str,
+        **fields: str,
+    ) -> tuple[int, int]:
+        """Post the idea as its own forum thread with the status buttons and a status line."""
+        channel_id = self.settings.community_event_ideas_channel_id
+        if not channel_id:
+            raise RuntimeError("no community ideas channel configured")
+        channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+        body = format_event_idea_post_body(raw_idea=raw_idea, draft=draft, actor_id=actor_id)
+        header = (
+            f"{status_line(status='filed')}\n"
+            f"-# Submission `#{submission_id}`"
+            + (f" · priority review ⭐" if priority else "")
+            + (f" · vault note saved" if note_path else "")
+        )
+        chunks = _chunk(header + "\n\n" + body, limit=1850)
+        post_title = f"{priority_marker(priority)}{title}"[:95]
+        if isinstance(channel, discord.ForumChannel):
+            created = await channel.create_thread(
+                name=post_title,
+                content=chunks[0],
+                applied_tags=event_idea_forum_tags(
+                    channel,
+                    event_type=fields.get("event_type", ""),
+                    cluster=fields.get("cluster", ""),
+                    world_end=fields.get("world_end", ""),
+                ),
+                view=IdeaStatusView(submission_id),
+                allowed_mentions=safe_allowed_mentions(),
+                reason=f"ChaosX filed community idea #{submission_id}",
+            )
+            thread = created.thread
+            for part in chunks[1:]:
+                await thread.send(part, allowed_mentions=safe_allowed_mentions())
+            return int(thread.id), int(created.message.id)
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            message = await channel.send(
+                chunks[0], view=IdeaStatusView(submission_id), allowed_mentions=safe_allowed_mentions()
+            )
+            for part in chunks[1:]:
+                await channel.send(part, allowed_mentions=safe_allowed_mentions())
+            return int(message.channel.id), int(message.id)
+        raise TypeError(f"Unsupported event idea channel type: {type(channel).__name__}")
+
+    async def _apply_idea_status(
+        self, interaction: discord.Interaction, *, submission_id: int, status: str, note: str
+    ) -> None:
+        """Move an idea through the pipeline: record it, pay the staged chaos, tell the author (no ping)."""
+        if int(interaction.user.id) != int(self.settings.owner_id):
+            await interaction.response.send_message(
+                "Only Hoops McCann can move an idea through the pipeline.", ephemeral=True
+            )
+            return
+        row = await self.store.idea_submission(submission_id)
+        if row is None:
+            await interaction.response.send_message(
+                f"There is no idea submission `#{submission_id}`.", ephemeral=True
+            )
+            return
+        if str(row.get("status")) == str(status):
+            await interaction.response.send_message(
+                f"`#{submission_id}` is already {status_label(status).lower()}.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.store.set_idea_status(
+            submission_id=submission_id, status=status, note=note, reviewer_id=int(interaction.user.id)
+        )
+        line = status_line(status=status, note=note)
+        announced = ""
+        channel_id, message_id = row.get("forum_channel_id"), row.get("forum_message_id")
+        if channel_id and message_id:
+            try:
+                channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+                await channel.send(line, allowed_mentions=safe_allowed_mentions())
+                announced = "announced on the idea's post"
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                announced = f"could not announce ({type(exc).__name__})"
+        author_id = int(row.get("user_id") or 0)
+        author_notified = ""
+        if author_id:
+            try:
+                author = self.get_user(author_id) or await self.fetch_user(author_id)
+                await author.send(
+                    f"Your event idea `#{submission_id}` is now **{status_label(status)}**"
+                    + (f" — {note}" if note else "")
+                    + "."
+                )
+                author_notified = "author told privately"
+            except (discord.Forbidden, discord.HTTPException, AttributeError):
+                author_notified = "author could not be messaged"
+        awarded = 0.0
+        if award_for_status(status):
+            awarded = await self._award_contribution(
+                user_id=author_id,
+                kind=f"idea_{status}",
+                ref=f"idea:{submission_id}:{status}",
+                guild_id=interaction.guild_id,
+                channel_id=self.settings.community_event_ideas_channel_id,
+            )
+        await self.store.audit(
+            actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            command="idea status", summary=f"#{submission_id} -> {status} (award {awarded:g})",
+        )
+        parts = [f"`#{submission_id}` → **{status_label(status)}**"]
+        if note:
+            parts.append(f"note: {note}")
+        if announced:
+            parts.append(announced)
+        if author_notified:
+            parts.append(author_notified)
+        if awarded:
+            parts.append(f"+{awarded:g} chaos to the author")
+        await interaction.followup.send("\n".join(parts), ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    async def _idea_board_text(self, scope: str, *, user_id: int | None = None) -> str:
+        """One slice of the idea pipeline, as a message."""
+        scope = (scope or "open").lower().strip()
+        if scope == "open":
+            rows = await self.store.idea_submissions(statuses=OPEN_STATUSES, limit=12)
+            heading_text = "Needs review"
+        elif scope == "planned":
+            rows = await self.store.idea_submissions(statuses=(PLANNED, BUILDING), limit=12)
+            heading_text = "Planned and being built"
+        elif scope == "shipped":
+            rows = await self.store.idea_submissions(statuses=(SHIPPED,), limit=12)
+            heading_text = "In the mod"
+        elif scope == "mine":
+            rows = await self.store.idea_submissions(user_id=user_id, limit=12)
+            heading_text = "Your ideas"
+        else:
+            rows = await self.store.idea_submissions(limit=12)
+            heading_text = "Newest ideas"
+        counts = await self.store.idea_status_counts()
+        oldest = await self.store.oldest_open_idea_days()
+        lines = [
+            board_line(
+                submission_id=int(row["id"]),
+                title=str(row["title"] or "untitled"),
+                status=str(row["status"]),
+                author=_display_name_for(self, int(row["user_id"])),
+                age_days=_idea_age_days(str(row["created_at"] or "")),
+                priority=bool(row.get("priority")),
+            )
+            for row in rows
+        ]
+        return block(
+            heading("Event ideas"),
+            small(board_summary(counts, oldest_open_days=oldest)),
+            section(heading_text),
+            bullets(lines) if lines else small("Nothing here yet."),
+            small(
+                "Buttons switch the view. Ideas are filed with `/event-idea`; the owner moves them through "
+                "the pipeline with the buttons on each idea's own post. ⭐ marks priority review."
+            ),
+        )
+
+    async def _register_idea_views(self) -> int:
+        """Re-register the persistent idea components after a restart."""
+        registered = 0
+        try:
+            self.add_view(IdeaBoardView(self))
+            registered += 1
+        except Exception as exc:
+            idea_logger.warning("idea board view registration failed: %s", type(exc).__name__)
+        try:
+            for row in await self.store.idea_submissions(limit=200):
+                self.add_view(IdeaStatusView(int(row["id"])))
+                registered += 1
+        except Exception as exc:
+            idea_logger.warning("idea status view registration failed: %s", type(exc).__name__)
+        idea_logger.info("registered %d persistent idea view(s)", registered)
+        return registered
+
+    async def _promote_idea(self, submission_id: int) -> str:
+        """Turn an accepted community idea into a numbered event spec (the missing bridge)."""
+        row = await self.store.idea_submission(submission_id)
+        if row is None:
+            return f"There is no idea submission `#{submission_id}`."
+        async with self._event_note_lock:
+            event_id = next_available_event_id(
+                self.settings.obsidian_vault_path, self.settings.community_event_specs_folder
+            )
+            note = promote_community_idea(
+                vault_path=self.settings.obsidian_vault_path,
+                event_specs_folder=self.settings.community_event_specs_folder,
+                event_id=event_id,
+                title=str(row.get("title") or "Community Event Idea"),
+                draft=str(row.get("draft") or ""),
+                raw_idea=str(row.get("raw_idea") or ""),
+                submission_id=int(submission_id),
+            )
+        await self.store.set_idea_promoted(submission_id=int(submission_id), promoted_path=str(note.path))
+        await self.store.set_idea_status(
+            submission_id=int(submission_id), status=PLANNED, note=f"promoted to event {event_id:03d}"
+        )
+        refresh_vault_indexes(
+            vault_path=self.settings.obsidian_vault_path,
+            event_specs_folder=self.settings.community_event_specs_folder,
+            suggestions_folder=self.settings.community_suggestions_folder,
+            reason=f"ChaosX promoted idea #{submission_id} to event {event_id:03d}.",
+            changed_path=note.path,
+        )
+        awarded = await self._award_contribution(
+            user_id=int(row.get("user_id") or 0),
+            kind="idea_planned",
+            ref=f"idea:{submission_id}:planned",
+            guild_id=None,
+            channel_id=self.settings.community_event_ideas_channel_id,
+        )
+        spec_title = note.path.stem.split(" - ", 1)[-1] if " - " in note.path.stem else note.path.stem
+        return (
+            f"Promoted `#{submission_id}` to event **{event_id:03d} - {spec_title}** "
+            f"(`{note.path.name}`), status set to Planned"
+            + (f", +{awarded:g} chaos to the author." if awarded else ".")
+        )
 
     async def _refresh_testing_poll_options(self) -> list[str]:
         """Point the poll's slots at the current `Needs Testing` queue; returns the slot labels."""
@@ -6893,6 +7378,170 @@ async def post_approved_event_idea(
     raise TypeError(f"Unsupported event idea channel type: {type(channel).__name__}")
 
 
+class EventIdeaModal(discord.ui.Modal, title="Submit an event idea"):
+    """The intake form (Hoops 2026-09-23): a modal, not eleven slash options.
+
+    Long text is possible here, every field is optional except the idea itself, and the submission is not
+    written anywhere until the submitter confirms the preview.
+    """
+
+    idea = discord.ui.TextInput(
+        label="The idea",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1500,
+        placeholder="What happens, when or how it triggers, what it affects, and the gameplay effect.",
+    )
+    event_type = discord.ui.TextInput(label="Type (optional)", required=False, max_length=80)
+    cluster = discord.ui.TextInput(label="Cluster / tags (optional)", required=False, max_length=120)
+    world_end = discord.ui.TextInput(label="World-end scenario link (optional)", required=False, max_length=200)
+    evolutions = discord.ui.TextInput(
+        label="Evolution stages (optional, one per line)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=900,
+    )
+
+    def __init__(self, bot: "ChaosXBot", *, prefill: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self.bot = bot
+        if prefill:
+            self.idea.default = str(prefill.get("idea", ""))[:1500]
+            self.event_type.default = str(prefill.get("event_type", ""))[:80]
+            self.cluster.default = str(prefill.get("cluster", ""))[:120]
+            self.world_end.default = str(prefill.get("world_end", ""))[:200]
+            self.evolutions.default = str(prefill.get("evolutions", ""))[:900]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        payload = {
+            "idea": str(self.idea.value or "").strip(),
+            "event_type": str(self.event_type.value or "").strip(),
+            "cluster": str(self.cluster.value or "").strip(),
+            "world_end": str(self.world_end.value or "").strip(),
+            "evolutions": str(self.evolutions.value or "").strip(),
+        }
+        await self.bot._handle_event_idea_submission(interaction, payload=payload)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await self.bot._idea_error(interaction, "The idea form failed", error)
+
+
+class EventIdeaPreviewView(discord.ui.View):
+    """Ephemeral preview with Post / Edit / Discard - nothing is saved or posted before a button press."""
+
+    def __init__(self, bot: "ChaosXBot", *, payload: dict[str, str], priority: bool) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.payload = dict(payload)
+        self.priority = bool(priority)
+
+    @discord.ui.button(label="Post to forum", style=discord.ButtonStyle.primary, emoji="📮")
+    async def post(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self.bot._file_event_idea(interaction, payload=self.payload, priority=self.priority)
+        self.stop()
+
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.secondary, emoji="✏️")
+    async def edit(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(EventIdeaModal(self.bot, prefill=self.payload))
+        self.stop()
+
+    @discord.ui.button(label="Discard", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def discard(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content="🗑️ Discarded - nothing was saved and nothing was posted.",
+            view=None,
+        )
+        self.stop()
+
+
+class IdeaStatusNoteModal(discord.ui.Modal):
+    """The optional one-line reason that travels with a status change."""
+
+    def __init__(self, bot: "ChaosXBot", *, submission_id: int, status: str) -> None:
+        super().__init__(title=f"Idea #{submission_id} - {status_label(status)}"[:45])
+        self.bot = bot
+        self.submission_id = int(submission_id)
+        self.status = str(status)
+        self.note = discord.ui.TextInput(
+            label="Reason / note (optional)",
+            required=False,
+            max_length=200,
+            placeholder="e.g. fits the 1948 cluster, needs art first",
+        )
+        self.add_item(self.note)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.bot._apply_idea_status(
+            interaction,
+            submission_id=self.submission_id,
+            status=self.status,
+            note=str(self.note.value or "").strip(),
+        )
+
+
+class IdeaStatusView(discord.ui.View):
+    """Owner-only status buttons, attached to an idea's own forum post (persistent)."""
+
+    def __init__(self, submission_id: int) -> None:
+        super().__init__(timeout=None)
+        self.submission_id = int(submission_id)
+        for status, label, style in REVIEW_BUTTONS:
+            button = discord.ui.Button(
+                label=label,
+                style=getattr(discord.ButtonStyle, style),
+                custom_id=f"chaosx:idea:{self.submission_id}:{status}",
+            )
+            button.callback = self._callback_for(status)
+            self.add_item(button)
+
+    def _callback_for(self, status: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            settings = getattr(interaction.client, "settings", None)
+            if settings is None or int(interaction.user.id) != int(settings.owner_id):
+                await interaction.response.send_message(
+                    "Only Hoops McCann can move an idea through the pipeline.", ephemeral=True
+                )
+                return
+            await interaction.response.send_modal(
+                IdeaStatusNoteModal(interaction.client, submission_id=self.submission_id, status=status)
+            )
+
+        return callback
+
+
+class IdeaBoardView(discord.ui.View):
+    """The idea board: buttons switch which slice of the pipeline is shown (persistent)."""
+
+    SCOPES: tuple[tuple[str, str, str], ...] = (
+        ("open", "Needs review", "📥"),
+        ("newest", "Newest", "🆕"),
+        ("planned", "Planned", "🗺️"),
+        ("shipped", "In the mod", "✅"),
+        ("mine", "My ideas", "👤"),
+    )
+
+    def __init__(self, bot: "ChaosXBot") -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+        for scope, label, emoji in self.SCOPES:
+            button = discord.ui.Button(
+                label=label, emoji=emoji, style=discord.ButtonStyle.secondary,
+                custom_id=f"chaosx:ideas:{scope}",
+            )
+            button.callback = self._callback_for(scope)
+            self.add_item(button)
+
+    def _callback_for(self, scope: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            user_id = int(interaction.user.id) if scope == "mine" else None
+            text = await self.bot._idea_board_text(scope, user_id=user_id)
+            await interaction.response.send_message(
+                text, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+
+        return callback
+
+
 class TestingVoteOptionsView(discord.ui.View):
     """Which event gets playtested next - the community vote, weighted by chaos tier.
 
@@ -7249,111 +7898,37 @@ def register_commands(bot: ChaosXBot) -> None:
             except Exception as exc:
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion error", summary=type(exc).__name__)
 
-    @bot.tree.command(name="event-idea", description="Format a Chaos Redux event idea into a structured review draft.")
-    async def chaosx_event_idea(
-        interaction: discord.Interaction,
-        idea: str,
-        event_type: str = "",
-        cluster: str = "",
-        evo_i: str = "",
-        evo_ii: str = "",
-        evo_iii: str = "",
-        evo_iv: str = "",
-        evo_v: str = "",
-        world_end: str = "",
-        triggerable_scenario: str = "",
-        easter_egg: str = "",
-    ) -> None:
-        extra = {
-            "event_type": event_type,
-            "cluster": cluster,
-            "evo_i": evo_i,
-            "evo_ii": evo_ii,
-            "evo_iii": evo_iii,
-            "evo_iv": evo_iv,
-            "evo_v": evo_v,
-            "world_end": world_end,
-            "triggerable_scenario": triggerable_scenario,
-            "easter_egg": easter_egg,
-        }
-        request = f"/event-idea idea={idea!r} fields={extra!r}. First decide whether this idea is specific enough to become a real event: it needs a concrete concept (what happens, when or how it triggers, what it affects, and a gameplay effect). If it is too vague — just a topic, country, or theme with no real event concept — reply with exactly `VAGUE: <one short sentence saying what is missing and what to add>`. Otherwise format a Chaos Redux event idea draft with name, TBD ID, type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use placeholders for missing parts. Do not assign a real ID or claim acceptance."
-        if is_vague_event_idea(idea):
-            await interaction.response.send_message(
-                "⚠️ That submission is too vague for an event idea, so I didn't format or post it. "
-                "Give me a concrete concept: what happens, when or how it triggers, what it affects, and the gameplay effect. "
-                'Example: "A military coup in Namibia after the civil war ends — if the country is in the western bloc, '
-                'it triggers a stability collapse, removes the old leader, and spawns a new warlord state."',
-                ephemeral=True,
-                allowed_mentions=safe_allowed_mentions(),
-            )
-            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea", summary="rejected as too vague (pre-check)")
+    @bot.tree.command(name="ideas", description="The event idea pipeline: what is filed, planned, shipped.")
+    async def chaosx_ideas(interaction: discord.Interaction) -> None:
+        """The public idea board: queue health plus buttons to switch views."""
+        if not await public_gate(interaction, settings):
             return
-        result = await run_hermes_command(
-            bot,
-            interaction,
-            request,
-            command_name="event-idea",
-            max_chars_override=2200,
+        await interaction.response.defer(thinking=True)
+        text_out = await bot._idea_board_text("open")
+        await interaction.followup.send(
+            text_out, view=IdeaBoardView(bot), allowed_mentions=safe_allowed_mentions()
         )
-        if result and result[0].ok:
-            if result[1].strip().upper().startswith("VAGUE"):
-                # Model judged the idea too vague: reject without saving or posting.
-                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea", summary="rejected as too vague (model)")
-                return
-            if settings.community_notes_enabled:
-                try:
-                    note = write_event_idea_note(
-                        vault_path=settings.obsidian_vault_path,
-                        event_specs_folder=settings.community_event_specs_folder,
-                        raw_idea=idea,
-                        draft=result[1],
-                        actor_id=interaction.user.id,
-                        guild_id=interaction.guild_id,
-                        channel_id=interaction.channel_id,
-                        event_type=event_type,
-                        cluster=cluster,
-                        evo_i=evo_i,
-                        evo_ii=evo_ii,
-                        evo_iii=evo_iii,
-                        evo_iv=evo_iv,
-                        evo_v=evo_v,
-                        world_end=world_end,
-                        triggerable_scenario=triggerable_scenario,
-                        easter_egg=easter_egg,
-                    )
-                    if note:
-                        if note.created:
-                            refresh_vault_indexes(
-                                vault_path=settings.obsidian_vault_path,
-                                event_specs_folder=settings.community_event_specs_folder,
-                                suggestions_folder=settings.community_suggestions_folder,
-                                reason="ChaosX approved community event idea captured.",
-                                changed_path=note.path,
-                            )
-                            try:
-                                post_url = await post_approved_event_idea(
-                                    bot,
-                                    actor_id=interaction.user.id,
-                                    raw_idea=idea,
-                                    draft=result[1],
-                                    event_type=event_type,
-                                    cluster=cluster,
-                                    world_end=world_end,
-                                )
-                                if post_url:
-                                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post", summary=post_url)
-                            except Exception as exc:
-                                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post error", summary=type(exc).__name__)
-                        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
-                        await bot._award_contribution(
-                            user_id=interaction.user.id,
-                            kind="event_idea",
-                            ref=f"event_idea:{note.path}",
-                            guild_id=interaction.guild_id,
-                            channel_id=interaction.channel_id,
-                        )
-                except Exception as exc:
-                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="ideas",
+            summary="board opened",
+        )
+
+    @bot.tree.command(
+        name="event-idea",
+        description="Submit a Chaos Redux event idea: a short form, then a preview before anything posts.",
+    )
+    async def chaosx_event_idea(interaction: discord.Interaction) -> None:
+        """Open the idea form.
+
+        Hoops 2026-09-23 ("implement the plans"): the eleven-option slash command became a modal, and the
+        draft is previewed with Post / Edit / Discard before anything is written or posted.
+        """
+        if not await public_gate(interaction, settings):
+            return
+        await interaction.response.send_modal(EventIdeaModal(bot))
 
     @bot.tree.command(name="issue", description="AI-review a report form, then create a GitHub issue if approved.")
     @app_commands.choices(issue_type=[
@@ -7512,6 +8087,109 @@ def register_commands(bot: ChaosXBot) -> None:
             )
             return
         await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_operator_model=True)
+
+    @admin.command(
+        name="ideas",
+        description="Idea pipeline control: list, post the board, move an idea, promote it to a spec.",
+    )
+    async def admin_ideas(
+        interaction: discord.Interaction,
+        action: str = "list",
+        submission_id: int = 0,
+        status: str = "",
+        note: str = "",
+    ) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = (action or "list").lower().strip()
+        if action not in {"list", "panel", "status", "promote", "counts"}:
+            await interaction.response.send_message(
+                "Use `action:list` (the pipeline), `action:counts` (queue health), `action:panel` (post the "
+                "public board in the ideas channel), `action:status submission_id:<n> status:<status>` "
+                "(move an idea), or `action:promote submission_id:<n>` (turn an accepted idea into a numbered "
+                "spec).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lines: list[str] = []
+        if action == "counts":
+            counts = await bot.store.idea_status_counts()
+            oldest = await bot.store.oldest_open_idea_days()
+            lines.append(board_summary(counts, oldest_open_days=oldest))
+            lines.extend(
+                f"- {status_label(name)}: {counts.get(name, 0)}" for name in IDEA_STATUSES
+            )
+        if action == "list":
+            rows = await bot.store.idea_submissions(limit=15)
+            lines.append(
+                "\n".join(
+                    board_line(
+                        submission_id=int(row["id"]),
+                        title=str(row["title"] or "untitled"),
+                        status=str(row["status"]),
+                        author=_display_name_for(bot, int(row["user_id"])),
+                        age_days=_idea_age_days(str(row["created_at"] or "")),
+                        priority=bool(row.get("priority")),
+                    )
+                    for row in rows
+                )
+                or "No ideas filed yet."
+            )
+        if action == "status":
+            if not submission_id or status not in IDEA_STATUSES:
+                lines.append(
+                    "Give `submission_id:<n>` and one of: " + ", ".join(IDEA_STATUSES) + "."
+                )
+            else:
+                await bot.store.set_idea_status(
+                    submission_id=int(submission_id),
+                    status=status,
+                    note=note,
+                    reviewer_id=interaction.user.id,
+                )
+                awarded = 0.0
+                row = await bot.store.idea_submission(int(submission_id))
+                if award_for_status(status) and row:
+                    awarded = await bot._award_contribution(
+                        user_id=int(row.get("user_id") or 0),
+                        kind=f"idea_{status}",
+                        ref=f"idea:{int(submission_id)}:{status}",
+                        guild_id=interaction.guild_id,
+                        channel_id=settings.community_event_ideas_channel_id,
+                    )
+                lines.append(
+                    f"`#{submission_id}` set to {status_label(status)}"
+                    + (f" (+{awarded:g} chaos)" if awarded else "")
+                )
+        if action == "promote":
+            if not submission_id:
+                lines.append("Give `submission_id:<n>`.")
+            else:
+                try:
+                    lines.append(await bot._promote_idea(int(submission_id)))
+                except Exception as exc:
+                    lines.append(f"Promotion failed (`{type(exc).__name__}`): {exc}")
+        if action == "panel":
+            channel_id = settings.community_event_ideas_channel_id
+            channel = bot.get_channel(int(channel_id)) if channel_id else None
+            if channel is None:
+                lines.append("The ideas channel is not visible to the bot.")
+            else:
+                board = await bot._idea_board_text("open")
+                sent = await channel.send(
+                    board, view=IdeaBoardView(bot), allowed_mentions=safe_allowed_mentions()
+                )
+                lines.append(f"Posted the idea board (message {sent.id}).")
+        for part in _chunk("\n".join(lines)):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin ideas",
+            summary=f"action={action} submission={submission_id or '-'} status={status or '-'}",
+        )
 
     @admin.command(
         name="event-idea",

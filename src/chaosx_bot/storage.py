@@ -238,6 +238,35 @@ CREATE TABLE IF NOT EXISTS member_bonus_xp (
 );
 CREATE INDEX IF NOT EXISTS idx_member_bonus_user ON member_bonus_xp(user_id);
 
+CREATE TABLE IF NOT EXISTS idea_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    raw_idea TEXT NOT NULL DEFAULT '',
+    draft TEXT NOT NULL DEFAULT '',
+    vault_path TEXT NOT NULL DEFAULT '',
+    forum_channel_id INTEGER,
+    forum_message_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'filed',
+    priority INTEGER NOT NULL DEFAULT 0,
+    reviewer_note TEXT NOT NULL DEFAULT '',
+    promoted_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_idea_user ON idea_submissions(user_id);
+CREATE INDEX IF NOT EXISTS idx_idea_status ON idea_submissions(status);
+
+CREATE TABLE IF NOT EXISTS idea_status_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    submission_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    reviewer_id INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_idea_log_submission ON idea_status_log(submission_id);
+
 CREATE TABLE IF NOT EXISTS member_titles (
     user_id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
@@ -1079,6 +1108,122 @@ class Store:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(sql, tuple(params))
             return {int(user_id): int(count) for user_id, count in await cur.fetchall()}
+
+    # --- event idea pipeline --------------------------------------------------------------------------
+
+    async def create_idea_submission(
+        self, *, user_id: int, title: str, raw_idea: str, draft: str, priority: bool = False
+    ) -> int:
+        """File a new idea submission and return its id."""
+        when = now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "INSERT INTO idea_submissions (user_id, title, raw_idea, draft, status, priority, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, 'filed', ?, ?, ?)",
+                (int(user_id), str(title)[:150], str(raw_idea)[:4000], str(draft)[:12000],
+                 1 if priority else 0, when, when),
+            )
+            await db.commit()
+            submission_id = int(cur.lastrowid or 0)
+            await db.execute(
+                "INSERT INTO idea_status_log (submission_id, status, note, created_at) VALUES (?, 'filed', '', ?)",
+                (submission_id, when),
+            )
+            await db.commit()
+        return submission_id
+
+    async def idea_submission(self, submission_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM idea_submissions WHERE id = ?", (int(submission_id),))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def idea_submissions(
+        self, *, statuses: tuple[str, ...] | None = None, user_id: int | None = None, limit: int = 25
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if statuses:
+            clauses.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+            params.extend(statuses)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(int(user_id))
+        sql = "SELECT * FROM idea_submissions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, tuple(params))
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def idea_submissions_since(self, *, user_id: int, since_iso: str) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM idea_submissions WHERE user_id = ? AND created_at >= ?",
+                (int(user_id), str(since_iso)),
+            )
+            return int((await cur.fetchone())[0] or 0)
+
+    async def idea_status_counts(self) -> dict[str, int]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT status, COUNT(*) FROM idea_submissions GROUP BY status")
+            return {str(status): int(count) for status, count in await cur.fetchall()}
+
+    async def oldest_open_idea_days(self) -> int | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT MIN(created_at) FROM idea_submissions WHERE status IN ('filed', 'reviewing', "
+                "'planned', 'building')"
+            )
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            created = datetime.fromisoformat(str(row[0]))
+        except ValueError:
+            return None
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return max(0, (datetime.now(timezone.utc) - created).days)
+
+    async def set_idea_status(
+        self, *, submission_id: int, status: str, note: str = "", reviewer_id: int | None = None
+    ) -> None:
+        when = now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE idea_submissions SET status = ?, reviewer_note = ?, updated_at = ? WHERE id = ?",
+                (str(status), str(note)[:400], when, int(submission_id)),
+            )
+            await db.execute(
+                "INSERT INTO idea_status_log (submission_id, status, note, reviewer_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (int(submission_id), str(status), str(note)[:400], reviewer_id, when),
+            )
+            await db.commit()
+
+    async def set_idea_post_location(
+        self, *, submission_id: int, channel_id: int, message_id: int, vault_path: str = ""
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE idea_submissions SET forum_channel_id = ?, forum_message_id = ?, "
+                "vault_path = COALESCE(NULLIF(?, ''), vault_path), updated_at = ? WHERE id = ?",
+                (int(channel_id), int(message_id), str(vault_path or ""), now_iso(), int(submission_id)),
+            )
+            await db.commit()
+
+    async def set_idea_promoted(self, *, submission_id: int, promoted_path: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE idea_submissions SET promoted_path = ?, updated_at = ? WHERE id = ?",
+                (str(promoted_path), now_iso(), int(submission_id)),
+            )
+            await db.commit()
 
     # --- member titles (deliberately over-the-top, generated from activity + personality) -------------
 

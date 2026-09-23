@@ -290,6 +290,43 @@ def write_event_idea_note(
     return write_unique_note(vault_path, event_specs_folder, filename, content)
 
 
+def promote_community_idea(
+    *,
+    vault_path: Path,
+    event_specs_folder: str,
+    event_id: int,
+    title: str,
+    draft: str,
+    raw_idea: str,
+    submission_id: int,
+) -> NoteWriteResult:
+    """Write an accepted community idea as a numbered event spec.
+
+    This is the bridge that was missing: a community idea used to stay a vague note forever, while
+    `/admin event-idea` generated numbered specs that had never seen the community. The original draft is
+    preserved verbatim; only the identity changes from `TBD` to the allocated id, and the promoted note
+    says where it came from.
+    """
+    slug = slugify(title, fallback="Community Event Idea", limit=80)
+    filename = f"{int(event_id):03d} - {slug}.md"
+    promoted_body = sanitize_text(draft, limit=9000).replace("`TBD`", f"`{int(event_id):03d}`")
+    content = (
+        f"# {int(event_id):03d} - {sanitize_text(title, limit=120)}\n\n"
+        "## Catalog entry\n\n"
+        f"- Event ID: `{int(event_id):03d}`\n"
+        f"- Promoted from community submission `#{int(submission_id)}`\n"
+        f"- Promoted: {now_iso()[:10]}\n"
+        "- Status: Planned\n\n"
+        "## Original community idea\n\n"
+        f"{discord_quote(raw_idea, limit=1200)}\n\n"
+        "## Draft\n\n"
+        f"{promoted_body}\n\n"
+        "## Notes\n\n"
+        "- Promoted by ChaosX from an accepted community idea. Still needs the normal review before release.\n"
+    )
+    return write_unique_note(vault_path, event_specs_folder, filename, content)
+
+
 def format_suggestion_note(
     *,
     title: str,

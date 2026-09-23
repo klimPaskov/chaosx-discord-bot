@@ -84,6 +84,11 @@ DEFAULT_CHANNEL_WEIGHT = 1.0
 # producing a good event idea, playtesting, etc should also all grant more points"). One accepted idea is
 # worth more than three weeks of a full chat cap, so rank tracks contribution, not message count.
 BONUS_XP: dict[str, float] = {
+    # The idea pipeline pays in stages (Hoops 2026-09-23): a little for filing, more when it is accepted
+    # into the plan, most when it actually ships. Chaos rewards quality instead of volume.
+    "idea_filed": 8.0,
+    "idea_planned": 12.0,
+    "idea_shipped": 20.0,
     "playtest_report": 20.0,  # a real observation from a playtest
     "event_idea": 20.0,  # an idea captured into Events/Event Specs
     "suggestion": 20.0,  # a community suggestion captured for review
