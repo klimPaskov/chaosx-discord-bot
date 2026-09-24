@@ -3191,8 +3191,8 @@ class ChaosXBot(discord.Client):
         candidates = families.get(kind, [])
         mine = await self.store.member_testing_vote(user_id)
         lines = [
-            f"- {family_emoji(kind)} {clamp_label(label, 92)}"
-            for _key, label in candidates
+            f"- {family_emoji(kind)} {clamp_label(label, 92)} - {detail}"
+            for _key, label, detail in candidates
         ]
         return sanitize_post(
             block(
@@ -8020,9 +8020,9 @@ class TestingCandidateSelectView(discord.ui.View):
             discord.SelectOption(
                 label=clamp_label(label, 100),
                 value=key,
-                description=family_label(kind)[:100],
+                description=clamp_label(detail, 100),
             )
-            for key, label in self.pages[self.page]
+            for key, label, detail in self.pages[self.page]
         ]
         select: discord.ui.Select = discord.ui.Select(
             placeholder=f"{family_emoji(kind)} Pick a {FAMILY_SINGULAR.get(kind, kind)} to vote for",
@@ -8077,7 +8077,8 @@ class TestingCandidateSelectView(discord.ui.View):
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
         key = self.select.values[0] if self.select.values else ""
-        label = next((text for candidate, text in self.candidates if candidate == key), key)
+        # the stored vote label keeps the ID, so a tally line identifies the exact candidate
+        label = next((text for candidate, text, _detail in self.candidates if candidate == key), key)
         await self.bot._cast_testing_vote(interaction, key=key, label=label)
 
     async def _on_back(self, interaction: discord.Interaction) -> None:

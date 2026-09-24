@@ -240,17 +240,20 @@ class Knowledge:
         except Exception:
             return 0
 
-    def testing_candidates(self) -> dict[str, list[tuple[str, str]]]:
+    def testing_candidates(self) -> dict[str, list[tuple[str, str, str]]]:
         """Every object currently marked `Needs Testing`, grouped by family.
 
         Hoops (2026-09-24): the poll used to show only the first five events. This returns the whole
         ballot - all events, scenarios and clusters whose catalog status says Needs Testing - and the
         caller pages it because Discord allows 25 options per select.
+
+        Each entry is ``(vote key, label carrying the catalog ID, detail line)``: the ID has to be on
+        screen because a tester quotes it in `/playtest report`.
         """
-        from .testing_poll import candidate_key
+        from .testing_poll import candidate_detail, candidate_key, candidate_label
 
         self.ensure_index()
-        grouped: dict[str, list[tuple[str, str]]] = {"event": [], "scenario": [], "cluster": []}
+        grouped: dict[str, list[tuple[str, str, str]]] = {"event": [], "scenario": [], "cluster": []}
         queries = {
             "event": ("catalog_events", "event_id", "name"),
             "scenario": ("catalog_scenarios", "scenario_id", "name"),
@@ -259,18 +262,31 @@ class Knowledge:
         conn = connect(self.db_path)
         try:
             for kind, (table, id_column, name_column) in queries.items():
+                extra_columns = ", type, cluster_id" if kind == "event" else ""
                 try:
                     rows = conn.execute(
-                        f"SELECT {id_column}, {name_column} FROM {table} "
+                        f"SELECT {id_column}, {name_column}{extra_columns} FROM {table} "
                         f"WHERE status LIKE '%Needs Testing%' "
                         f"ORDER BY CAST({id_column} AS INTEGER), {name_column}"
                     ).fetchall()
                 except sqlite3.Error:
                     continue
-                grouped[kind] = [
-                    (candidate_key(kind, str(ident)), str(label or f"{kind.title()} {ident}"))
-                    for ident, label in rows
-                ]
+                for row in rows:
+                    ident, name = row[0], row[1]
+                    detail = ""
+                    if kind == "event":
+                        type_ = str(row[2] or "").strip() if len(row) > 2 else ""
+                        cluster_id = str(row[3] or "").strip() if len(row) > 3 else ""
+                        detail = " · ".join(
+                            part for part in (type_, f"cluster {cluster_id}" if cluster_id else "") if part
+                        )
+                    grouped[kind].append(
+                        (
+                            candidate_key(kind, str(ident)),
+                            candidate_label(kind, ident, name),
+                            candidate_detail(kind, detail),
+                        )
+                    )
         finally:
             conn.close()
         return grouped

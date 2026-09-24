@@ -13,14 +13,34 @@ from chaosx_bot.testing_poll import (  # noqa: E402
     FAMILIES,
     MAX_NOMINATIONS_PER_MEMBER,
     MAX_SELECT_OPTIONS,
+    candidate_detail,
     candidate_key,
     candidate_kind,
+    candidate_label,
     clamp_label,
     family_label,
     is_safe_nomination,
     nomination_slug,
     split_pages,
 )
+
+
+def test_candidate_labels_lead_with_the_catalog_id():
+    """Hoops (2026-09-24): "The IDs should be visible for what you want to set for testing." """
+    assert candidate_label("event", 3, "The Holy Realm") == "Event 003: The Holy Realm"
+    assert candidate_label("event", "39", "Murder Mystery") == "Event 039: Murder Mystery"
+    assert candidate_label("scenario", 1, "Zombie Apocalypse") == "SCN-001: Zombie Apocalypse"
+    assert candidate_label("scenario", "SCN-007", "Named") == "SCN-007: Named"
+    assert candidate_label("cluster", 11, "Various Anomalies") == "Cluster 11: Various Anomalies"
+    assert candidate_label("nomination", None, "Convoy payouts") == "Nomination: Convoy payouts"
+    # a label with no name still identifies the candidate
+    assert candidate_label("event", 12, "") == "Event 012"
+
+
+def test_candidate_detail_says_what_it_is():
+    assert candidate_detail("event", "Minor Fire-Once · cluster 16") == "Minor Fire-Once · cluster 16 - needs testing"
+    assert candidate_detail("scenario") == "scenario needs testing"
+    assert candidate_detail("nomination") == "nominated by a member"
 
 
 def test_candidate_keys_are_family_scoped():
@@ -75,18 +95,23 @@ def test_catalog_candidates_cover_all_three_families(tmp_path):
     conn = sqlite3.connect(db_path)
     conn.executescript(
         """
-        CREATE TABLE catalog_events (event_id TEXT, name TEXT, status TEXT);
+        CREATE TABLE catalog_events (event_id TEXT, name TEXT, status TEXT, type TEXT, cluster_id TEXT);
         CREATE TABLE catalog_scenarios (scenario_id TEXT, name TEXT, status TEXT);
         CREATE TABLE catalog_clusters (cluster_id TEXT, name TEXT, status TEXT);
         """
     )
     rows = {
         "catalog_events": [("1", "Communist Insurgency", "Needs Testing"), ("2", "Zombie Outbreak", "Implemented")],
+        # type/cluster are supplied by the executemany below (the event table carries them)
         "catalog_scenarios": [("1", "Zombie Apocalypse", "Needs Testing")],
         "catalog_clusters": [("11", "Various Anomalies", "Needs Testing"), ("12", "Pacts", "Planned")],
     }
-    for table, values in rows.items():
-        conn.executemany(f"INSERT INTO {table} VALUES (?, ?, ?)", values)
+    conn.executemany(
+        "INSERT INTO catalog_events VALUES (?, ?, ?, 'Minor Fire-Once', '16')",
+        [row for row in rows["catalog_events"]],
+    )
+    for table in ("catalog_scenarios", "catalog_clusters"):
+        conn.executemany(f"INSERT INTO {table} VALUES (?, ?, ?)", rows[table])
     conn.commit()
     conn.close()
 
@@ -96,11 +121,12 @@ def test_catalog_candidates_cover_all_three_families(tmp_path):
     object.__setattr__(knowledge, "ensure_index", lambda: None)
 
     grouped = knowledge.testing_candidates()
-    assert grouped["event"] == [("event:1", "Communist Insurgency")]
-    assert grouped["scenario"] == [("scenario:1", "Zombie Apocalypse")]
-    assert grouped["cluster"] == [("cluster:11", "Various Anomalies")]
+    # every entry carries the ID in the label a member actually reads
+    assert grouped["event"] == [("event:1", "Event 001: Communist Insurgency", "Minor Fire-Once · cluster 16 - needs testing")]
+    assert grouped["scenario"] == [("scenario:1", "SCN-001: Zombie Apocalypse", "scenario needs testing")]
+    assert grouped["cluster"] == [("cluster:11", "Cluster 11: Various Anomalies", "cluster needs testing")]
     # nothing that is not marked for testing leaks onto the ballot
-    flat = [key for items in grouped.values() for key, _label in items]
+    flat = [key for items in grouped.values() for key, _label, _detail in items]
     assert "event:2" not in flat and "cluster:12" not in flat
 
 
@@ -128,10 +154,16 @@ def test_select_view_pages_candidates(tmp_path):
     from chaosx_bot.config import Settings
 
     bot = ChaosXBot(Settings(discord_token="dummy"))
-    candidates = [(candidate_key("event", str(index)), f"Event {index}") for index in range(1, 30)]
+    candidates = [
+        (candidate_key("event", str(index)), f"Event {index:03d}: Name {index}", "Minor Fire-Once - needs testing")
+        for index in range(1, 30)
+    ]
     view = TestingCandidateSelectView(bot, kind="event", candidates=candidates)
     select = next(child for child in view.children if child.custom_id.startswith("chaosx_test_pick"))
     assert len(select.options) == MAX_SELECT_OPTIONS
+    # the ID is on the option a member picks, and the detail is the option's second line
+    assert select.options[0].label == "Event 001: Name 1"
+    assert select.options[0].description == "Minor Fire-Once - needs testing"
     assert len(view.pages) == 2 and "page 1/2" in view.page_note
     second = TestingCandidateSelectView(bot, kind="event", candidates=candidates, page=1)
     assert len(next(c for c in second.children if c.custom_id.startswith("chaosx_test_pick")).options) == 4

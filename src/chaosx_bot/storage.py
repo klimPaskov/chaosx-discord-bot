@@ -1099,7 +1099,10 @@ class Store:
             )
             await db.commit()
 
-    async def testing_nominations(self, *, active_only: bool = True) -> list[tuple[str, str]]:
+    async def testing_nominations(self, *, active_only: bool = True) -> list[tuple[str, str, str]]:
+        """`(key, label, detail)` for the member-nominated candidates on the ballot."""
+        from .testing_poll import candidate_detail, candidate_label
+
         sql = "SELECT key, label FROM testing_nominations"
         if active_only:
             sql += " WHERE active = 1"
@@ -1107,7 +1110,10 @@ class Store:
         async with self._connect() as db:
             cur = await db.execute(sql)
             rows = await cur.fetchall()
-        return [(str(key), str(label)) for key, label in rows]
+        return [
+            (str(key), candidate_label("nomination", None, str(label)), candidate_detail("nomination"))
+            for key, label in rows
+        ]
 
     async def count_testing_nominations(self, *, user_id: int) -> int:
         async with self._connect() as db:

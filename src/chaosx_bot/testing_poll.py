@@ -81,9 +81,49 @@ def split_pages(items: list, size: int = MAX_SELECT_OPTIONS) -> list[list]:
     return [items[index : index + size] for index in range(0, len(items), size)] or [[]]
 
 
-def clamp_label(label: str, limit: int = 100) -> str:
+FAMILY_DETAIL = {
+    "event": "needs testing",
+    "scenario": "scenario needs testing",
+    "cluster": "cluster needs testing",
+    "nomination": "nominated by a member",
+}
+
+
+def candidate_label(kind: str, ident: object = None, name: str = "") -> str:
+    """Display label that leads with the catalog ID, matching the render conventions.
+
+    Hoops (2026-09-24): "The IDs should be visible for what you want to set for testing. Right now there
+    are only event names. Ids are also important" - a tester quotes the ID in `/playtest report`, so the
+    ballot, the ballot text and the vote record all carry it. `Event 003`, `SCN-001`, `Cluster 11`.
+    """
+    clean_name = " ".join(str(name or "").split())
+    raw = str(ident or "").strip()
+    if kind == "event":
+        prefix = f"Event {int(raw):03d}" if raw.isdigit() else (f"Event {raw}" if raw else "Event")
+    elif kind == "scenario":
+        if raw.isdigit():
+            prefix = f"SCN-{int(raw):03d}"
+        elif raw:
+            prefix = raw if raw.upper().startswith("SCN") else f"SCN-{raw}"
+        else:
+            prefix = "Scenario"
+    elif kind == "cluster":
+        prefix = f"Cluster {raw}" if raw else "Cluster"
+    else:
+        prefix = "Nomination"
+    return f"{prefix}: {clean_name}" if clean_name else prefix
+
+
+def candidate_detail(kind: str, extra: str = "") -> str:
+    """Second line of a select option: what the candidate is, beyond its name."""
+    extra = " ".join(str(extra or "").split())
+    base = FAMILY_DETAIL.get(kind, "needs testing")
+    return f"{extra} - {base}" if extra else base
+
+
+def clamp_label(text: str, limit: int = 100) -> str:
     """Discord select option labels are capped; trim on a word boundary so nothing reads as cut off."""
-    text = " ".join(str(label or "").split())
+    text = " ".join(str(text or "").split())
     if len(text) <= limit:
         return text
     cut = text[:limit]
@@ -91,10 +131,6 @@ def clamp_label(label: str, limit: int = 100) -> str:
         cut = cut[: cut.rfind(" ")]
     return cut.rstrip(" ,.;:-") or text[:limit]
 
-
-def format_candidate(kind: str, ident: str, label: str) -> str:
-    """How a candidate reads on the ballot."""
-    return f"{family_emoji(kind)} {clamp_label(label, 92)}"
 
 
 # Words that must never reach a public label (same policy as every other public surface).

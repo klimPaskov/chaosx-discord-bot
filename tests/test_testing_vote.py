@@ -65,11 +65,14 @@ async def test_nominations_round_trip(tmp_path):
     await store.init()
     await store.add_testing_nomination(key="nomination:convoy-payouts", label="Convoy payouts", user_id=7)
     await store.add_testing_nomination(key="nomination:borders", label="Border gore", user_id=7)
-    assert [label for _key, label in await store.testing_nominations()] == ["Convoy payouts", "Border gore"]
+    assert [label for _key, label, _detail in await store.testing_nominations()] == [
+        "Nomination: Convoy payouts",
+        "Nomination: Border gore",
+    ]
     assert await store.count_testing_nominations(user_id=7) == 2
     assert await store.count_testing_nominations(user_id=8) == 0
     await store.deactivate_testing_nomination(key="nomination:borders")
-    assert [label for _key, label in await store.testing_nominations()] == ["Convoy payouts"]
+    assert [label for _key, label, _detail in await store.testing_nominations()] == ["Nomination: Convoy payouts"]
 
 
 class _PollStore(Store):
@@ -82,8 +85,11 @@ class _PollStore(Store):
 class _Knowledge:
     def testing_candidates(self):
         return {
-            "event": [("event:1", "Communist Insurgency"), ("event:2", "Zombie Outbreak")],
-            "scenario": [("scenario:1", "Zombie Apocalypse")],
+            "event": [
+                ("event:1", "Event 001: Communist Insurgency", "Minor Fire-Once - needs testing"),
+                ("event:2", "Event 002: Zombie Outbreak", "Major - needs testing"),
+            ],
+            "scenario": [("scenario:1", "SCN-001: Zombie Apocalypse", "scenario needs testing")],
             "cluster": [],
         }
 
@@ -92,7 +98,7 @@ class _Knowledge:
 async def test_panel_text_lists_families_and_never_prints_weights(tmp_path):
     store = _PollStore(tmp_path / "panel.db")
     await store.init()
-    await store.set_testing_vote(2000, "event:2", "Zombie Outbreak", 2)
+    await store.set_testing_vote(2000, "event:2", "Event 002: Zombie Outbreak", 2)
     await store.add_testing_nomination(key="nomination:convoys", label="Convoy payouts", user_id=5)
     # a real bot instance with a stubbed catalog and database, so the real methods run
     bot = ChaosXBot(Settings(discord_token="dummy"))
@@ -102,7 +108,7 @@ async def test_panel_text_lists_families_and_never_prints_weights(tmp_path):
     text = await bot._testing_vote_panel_text(2000)
     assert "What should we test next?" in text
     assert "Events" in text and "Scenarios" in text and "Nominated" in text
-    assert "Zombie Outbreak" in text and "1 vote" in text
+    assert "Event 002: Zombie Outbreak" in text and "1 vote" in text  # IDs are visible (Hoops)
     assert "extra weight" in text
     # the exact weight never appears in member-facing text
     assert "weight 2" not in text and "counts 2" not in text and "2 weighted" not in text
