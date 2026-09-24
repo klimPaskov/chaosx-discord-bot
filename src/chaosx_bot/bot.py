@@ -5695,6 +5695,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         interaction=None,
         raw=True,
         dm_user=message.author,
+        enabled=bot.settings.owner_thinking_feed,
     )
     await feed.start()
 
@@ -5828,12 +5829,17 @@ class _ThinkingFeed:
         interaction: discord.Interaction | None,
         raw: bool = False,
         dm_user: discord.User | discord.Member | None = None,
+        enabled: bool = True,
     ) -> None:
         self.bot = bot
         self.label = label
         self.interaction = interaction
         self.raw = raw
         self.dm_user = dm_user
+        # A disabled feed still exists as an object so every call site keeps working, but it starts
+        # nothing, streams nothing and never opens a DM (Hoops, 2026-09-24: "disable the thinking
+        # function right now").
+        self.enabled = bool(enabled)
         self.message: discord.Message | None = None
         self.messages: list[discord.Message] = []
         self.reasoning = ""
@@ -5843,6 +5849,8 @@ class _ThinkingFeed:
         self._last_edit = 0.0
 
     async def start(self) -> bool:
+        if not self.enabled:
+            return False
         try:
             if self.dm_user is not None:
                 channel = await self.dm_user.create_dm()
@@ -7265,6 +7273,8 @@ async def run_hermes_command(
                     interaction=interaction,
                     raw=is_owner,
                     dm_user=interaction.user if is_owner else None,
+                    # Owner-only switch: everyone else's dismissable feed keeps its own setting.
+                    enabled=bot.settings.owner_thinking_feed if is_owner else True,
                 )
             if feed is not None:
                 await feed.start()

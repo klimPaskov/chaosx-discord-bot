@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     web_evidence_enabled: bool = Field(default=True, description="Fetch the top web-search result pages and use their real page text/tables; attaches a source-table image when one is found")
     web_evidence_max_pages: int = Field(default=2, ge=0, le=3, description="How many search-result pages to fetch as source evidence; 0 disables page fetching")
     thinking_feed_enabled: bool = Field(default=False, description="Show a per-user dismissable thinking feed to the user the bot is answering (owner always gets the raw ephemeral feed); False hides thinking from everyone else")
+    owner_thinking_feed: bool = Field(default=True, description="Stream the owner's live reasoning (raw) while ChaosX answers an owner surface: a live-edited DM for /admin ask, owner /ask and owner mentions. False disables the thinking feed for the owner entirely (Hoops 2026-09-24)")
     server_owner_name: str = Field(default="Hoops McCann", description="Display name of the Discord server owner")
     bot_maker_name: str = Field(default="Hoops McCann", description="Who made/maintains the ChaosX bot")
     main_dev_name: str = Field(default="Hoops McCann", description="Main developer of Chaos Redux")
