@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 import subprocess
@@ -9,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .formatting import block, bullets, heading, section, small
+from .vault_index import refresh_vault_indexes, vault_indexes_are_stale
+
+LOGGER = logging.getLogger("chaosx.knowledge")
 from .indexer import (
     CatalogReadError,
     INDEX_SCHEMA_VERSION,
@@ -103,8 +107,30 @@ class Knowledge:
         finally:
             object.__setattr__(self, "_refresh_in_flight", False)
 
+    def _refresh_vault_indexes_if_stale(self) -> bool:
+        """Regenerate the vault's index files when a deletion left stale listings behind.
+
+        Hoops (2026-09-24): "the bot shouldn't use deleted information ever". Note-level rows are pruned
+        by the rebuild (it deletes and re-reads), but the index files are only regenerated on a capture,
+        so a human deleting notes in Obsidian used to leave listings the bot then quoted as fact.
+        """
+        if not self.vault_path or not Path(self.vault_path).exists():
+            return False
+        try:
+            if not vault_indexes_are_stale(vault_path=Path(self.vault_path)):
+                return False
+            refresh_vault_indexes(
+                vault_path=Path(self.vault_path),
+                reason="Regenerated automatically: an index listed notes that no longer exist.",
+            )
+        except Exception as exc:  # never block a lookup on vault housekeeping
+            LOGGER.warning("vault index refresh skipped: %s", exc)
+            return False
+        return True
+
     def _ensure_index_sync(self) -> None:
         now = datetime.now(tz=timezone.utc).timestamp()
+        vault_indexes_refreshed = self._refresh_vault_indexes_if_stale()
         conn = connect(self.db_path)
         try:
             meta = dict(conn.execute("SELECT key, value FROM index_meta").fetchall())
@@ -132,6 +158,7 @@ class Knowledge:
             or meta.get("commit_sha") != current_commit
             or meta.get("catalog_fingerprint") != current_catalog_fingerprint
             or (latest_source_mtime > indexed_at)
+            or vault_indexes_refreshed
         )
         if needs_rebuild:
             try:
