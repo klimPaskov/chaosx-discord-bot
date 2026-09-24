@@ -332,6 +332,19 @@ from .runtime_status import (
     format_process_panel,
 )
 from .server_rules import ServerRules
+from .testing_poll import (
+    FAMILIES,
+    FAMILY_SINGULAR,
+    MAX_NOMINATIONS_PER_MEMBER,
+    MAX_NOMINATION_CHARS,
+    candidate_key,
+    clamp_label,
+    family_emoji,
+    family_label,
+    is_safe_nomination,
+    nomination_slug,
+    split_pages,
+)
 from .suggestions import (
     MAX_SUGGESTIONS,
     SUGGESTION_KEYS,
@@ -2152,7 +2165,7 @@ class ChaosXBot(discord.Client):
         # across restarts (the view has no per-message state beyond the scope it is showing).
         self.add_view(TierPanelView(self, timeout=None))
         self.add_view(TestingVoteOpenView(self, timeout=None))
-        self.add_view(TestingVoteOptionsView(self, timeout=None))
+        self.add_view(TestingPanelView(self, counts={}))
         self.add_view(IdeaBoardView(self))
         # Suggested-next buttons are keyed by the action alone (`chaosx:suggest:<key>`), so this single
         # persistent registration keeps every footer the bot has ever posted clickable (Hoops,
@@ -3155,59 +3168,109 @@ class ChaosXBot(discord.Client):
             + (", with chaos credited to the author." if awarded else ".")
         )
 
-    async def _refresh_testing_poll_options(self) -> list[str]:
-        """Point the poll's slots at the current `Needs Testing` queue; returns the slot labels."""
-        rows = await asyncio.to_thread(self.knowledge.testing_queue_rows, 5)
-        if not rows:
-            return []
-        # Panel rows read better with the bare name; the buttons carry the event id so the choice is clear.
-        await self.store.set_testing_poll_options(rows)
-        return [f"Event {key}: {label}"[:78] for key, label in rows]
+    async def _testing_families(self) -> dict[str, list[tuple[str, str]]]:
+        """The whole ballot, by family: every catalog object marked `Needs Testing` plus nominations.
 
-    async def _testing_vote_panel_text(self, user_id: int, *, just_voted: str = "") -> str:
-        """The vote itself: what is on the table, what the community has chosen, what your vote counts."""
+        Hoops (2026-09-24): the poll used to hard-code five event slots. Now nothing is capped or
+        pre-selected - the catalogs decide, and members can nominate anything the catalogs do not cover.
+        """
+        grouped = await asyncio.to_thread(self.knowledge.testing_candidates)
+        grouped = {kind: list(items) for kind, items in (grouped or {}).items()}
+        grouped.setdefault("event", [])
+        grouped.setdefault("scenario", [])
+        grouped.setdefault("cluster", [])
+        try:
+            grouped["nomination"] = await self.store.testing_nominations()
+        except Exception:
+            grouped["nomination"] = []
+        return grouped
+
+    async def _testing_ballot_text(self, user_id: int, *, kind: str, page_note: str = "") -> str:
+        """One family's candidates, as the member sees them before choosing."""
+        families = await self._testing_families()
+        candidates = families.get(kind, [])
+        mine = await self.store.member_testing_vote(user_id)
+        lines = [
+            f"- {family_emoji(kind)} {clamp_label(label, 92)}"
+            for _key, label in candidates
+        ]
+        return sanitize_post(
+            block(
+                heading(f"{family_label(kind)} marked for testing", family_emoji(kind)),
+                small(f"{len(candidates)} candidate(s){page_note} - pick one below."),
+                bullets(lines) if lines else small("Nothing here is marked for testing right now."),
+                small(f"Your vote: **{mine[1]}**." if mine else "You have not voted yet."),
+            ),
+            max_chars=1800,
+        )
+
+    async def _cast_testing_vote(self, interaction: discord.Interaction, *, key: str, label: str) -> None:
+        """Record one member's vote. The weight stays internal; the public text never shows it."""
+        row = await self.store.member_tier(interaction.user.id)
+        tier = str(row[1]) if row else TIERS[0][0]
+        weight = voting_weight(tier)
+        await self.store.set_testing_vote(interaction.user.id, key, label, weight)
+        await self.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="testing vote",
+            summary=f"{label} (tier {tier})",
+        )
+        await interaction.response.send_message(
+            await self._testing_vote_panel_text(interaction.user.id, just_voted=label),
+            view=await TestingPanelView.build(self),
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+    async def _testing_vote_panel_text(
+        self, user_id: int, *, just_voted: str = "", notice: str = ""
+    ) -> str:
+        """The ballot: how many candidates each family has, what is leading, and your own vote."""
+        families = await self._testing_families()
+        counts = {kind: len(items) for kind, items in families.items()}
         tally = await self.store.testing_vote_tally()
         mine = await self.store.member_testing_vote(user_id)
         row = await self.store.member_tier(user_id)
         tier = str(row[1]) if row else TIERS[0][0]
-        weight = voting_weight(tier)
-        leaders = {key: (label, voters, total) for key, label, voters, total in tally}
-        options = await self.store.testing_poll_options()
-        rows: list[str] = []
-        for slot, (key, label) in sorted(options.items()):
-            _label, voters, total = leaders.get(key, (label, 0, 0))
-            # Votes only: the weighted total would publish exactly how much each tier is worth.
-            rows.append(f"`{slot}` **{label}** — {voters} vote{'s' if voters != 1 else ''}")
-        if weight:
-            mine_line = (
-                f"Your vote carries extra weight as {tier}. One vote per member, changeable any time."
-            )
+        leaders = sorted(
+            ((label, voters) for _key, label, voters, _total in tally if int(voters) > 0),
+            key=lambda item: -item[1],
+        )[:3]
+        ballot_lines = [
+            f"{family_emoji(kind)} **{family_label(kind)}** - {counts.get(kind, 0)} candidate(s)"
+            for kind in FAMILIES
+            if counts.get(kind, 0)
+        ]
+        vote_lines: list[str] = []
+        if mine is not None:
+            vote_lines.append(f"✅ On **{mine[1]}**.")
         else:
-            mine_line = (
-                f"Your vote as {tier} is recorded but does not count towards the total yet — Rising Chaos "
-                "and above carry weight. Playtesting, event ideas, suggestions and bug reports move you up."
+            vote_lines.append("You have not voted yet.")
+        if voting_weight(tier):
+            vote_lines.append(f"Your vote carries extra weight as {tier}.")
+        else:
+            vote_lines.append(
+                f"Your vote as {tier} is recorded; weight starts further up the ladder. Contributing moves you up."
             )
         return sanitize_post(
             block(
                 heading("What should we test next?", "🗳️"),
-                f"✅ Your vote is on **{just_voted}**." if just_voted else None,
-                section("On the table", "🕹️"),
-                rows or small("No events are marked `Needs Testing` right now — nothing to vote on yet."),
+                small(notice) if notice else None,
+                section("On the ballot", "🕹️"),
+                bullets(ballot_lines) or small("Nothing is marked for testing right now."),
+                section("Leading", "🏁"),
+                bullets([f"{label} - {voters} vote{'s' if int(voters) != 1 else ''}" for label, voters in leaders])
+                or small("No votes yet."),
                 section("Your vote", "🎯"),
-                bullets(
-                    [
-                        kv("Current vote", f"**{mine[1]}** (weight {mine[2]})", "✅")
-                        if mine is not None
-                        else "You have not voted yet.",
-                        mine_line,
-                    ]
-                ),
+                bullets(vote_lines),
                 small(
-                    "The winner is what the community wants tested next — it reaches Hoops as a signal, "
-                    "never as a decision."
+                    "Open a family below to vote on anything in it, or nominate something that is not "
+                    "on the ballot. One vote per member, changeable any time."
                 ),
             ),
-            max_chars=1200,
+            max_chars=1600,
         )
 
     async def on_member_join(self, member: discord.Member) -> None:
@@ -7685,9 +7748,8 @@ async def run_suggestion(bot: "ChaosXBot", interaction: discord.Interaction, key
         text_out: str
         view: discord.ui.View | None = None
         if key == "testing_vote":
-            await bot._refresh_testing_poll_options()
             text_out = await bot._testing_vote_panel_text(interaction.user.id)
-            view = TestingVoteOptionsView(bot, timeout=None)
+            view = await TestingPanelView.build(bot)
         elif key == "idea_board":
             text_out = await bot._idea_board_text("open")
             view = IdeaBoardView(bot)
@@ -7829,9 +7891,8 @@ async def suggested_footer(
         mine = await bot.store.idea_submissions(user_id=user_id, limit=50)
         my_open = [row for row in mine if str(row.get("status")) in OPEN_STATUSES]
         reviewed = [row for row in mine if str(row.get("status")) not in OPEN_STATUSES]
-        # Exactly the vote panel's own slot count (it shows the top 5), so the button label cannot
-        # promise more options than pressing it delivers.
-        testing_options = len(bot.knowledge.testing_queue_rows(5))
+        # Every candidate on the ballot, not a sample: the button opens the full list.
+        testing_options = await asyncio.to_thread(bot.knowledge.testing_candidate_count)
         has_voted = (await bot.store.member_testing_vote(user_id)) is not None
         suggestions = build_suggestions(
             is_owner=is_owner,
@@ -7881,62 +7942,230 @@ class IdeaBoardView(discord.ui.View):
         return callback
 
 
-class TestingVoteOptionsView(discord.ui.View):
-    """Which event gets playtested next - the community vote, weighted by chaos tier.
+class TestingNominationModal(discord.ui.Modal, title="Nominate something to test"):
+    """Free text on purpose: "test something other than events" includes things with no catalog row."""
 
-    The slots are fixed (chaosx_vote_slot1..5) so the buttons keep working after a restart; what each
-    slot points at lives in the database and is refreshed from the catalog's `Needs Testing` queue.
+    def __init__(self, bot: "ChaosXBot") -> None:
+        super().__init__()
+        self.bot = bot
+        self.what = discord.ui.TextInput(
+            label="What should be tested?",
+            placeholder="a mechanic, a system, a balance pass, a hunch...",
+            max_length=MAX_NOMINATION_CHARS,
+            required=True,
+        )
+        self.add_item(self.what)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        label = " ".join(str(self.what.value or "").split())
+        if not label:
+            await interaction.response.send_message("Nothing was entered.", ephemeral=True)
+            return
+        if not is_safe_nomination(label):
+            await interaction.response.send_message(
+                "That nomination contains a mention, which cannot go on the ballot. Try again without it.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        existing = await self.bot.store.count_testing_nominations(user_id=interaction.user.id)
+        if existing >= MAX_NOMINATIONS_PER_MEMBER:
+            await interaction.response.send_message(
+                f"You already have {existing} nominations on the ballot. Ask Hoops to clear some first.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        key = candidate_key("nomination", nomination_slug(label))
+        await self.bot.store.add_testing_nomination(key=key, label=label, user_id=interaction.user.id)
+        await self.bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="testing nomination",
+            summary=label[:180],
+        )
+        await interaction.response.send_message(
+            await self.bot._testing_vote_panel_text(interaction.user.id, notice=f"Nominated: {label}"),
+            ephemeral=True,
+            view=await TestingPanelView.build(self.bot),
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+
+class TestingCandidateSelectView(discord.ui.View):
+    """Choose one candidate from one family; paged, because Discord allows 25 options per select.
+
+    Ephemeral and short-lived: the ballot itself is rebuilt from the catalogs every time it is opened,
+    so a stale menu can never keep a retired candidate alive.
     """
 
-    def __init__(self, bot: "ChaosXBot", *, labels: list[str] | None = None, timeout: float | None = None) -> None:
+    def __init__(
+        self,
+        bot: "ChaosXBot",
+        *,
+        kind: str,
+        candidates: list[tuple[str, str]],
+        page: int = 0,
+        timeout: float | None = 600,
+    ) -> None:
         super().__init__(timeout=timeout)
         self.bot = bot
-        labels = labels or [f"Candidate {index}" for index in range(1, 6)]
-        for slot in range(1, 6):
-            label = labels[slot - 1] if slot <= len(labels) else f"Candidate {slot}"
-            button = discord.ui.Button(
-                label=f"🕹️ {label}"[:80],
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"chaosx_vote_slot{slot}",
-                row=(slot - 1) // 3,
+        self.kind = kind
+        self.candidates = list(candidates)
+        self.pages = split_pages(self.candidates)
+        self.page = max(0, min(int(page), len(self.pages) - 1))
+
+        options = [
+            discord.SelectOption(
+                label=clamp_label(label, 100),
+                value=key,
+                description=family_label(kind)[:100],
             )
-            button.callback = self._make_callback(slot)
+            for key, label in self.pages[self.page]
+        ]
+        select: discord.ui.Select = discord.ui.Select(
+            placeholder=f"{family_emoji(kind)} Pick a {FAMILY_SINGULAR.get(kind, kind)} to vote for",
+            options=options,
+            min_values=1,
+            max_values=1,
+            custom_id=f"chaosx_test_pick_{kind}_{self.page}",
+        )
+        select.callback = self._on_pick
+        self.select = select
+        self.add_item(select)
+
+        if len(self.pages) > 1:
+            previous: discord.ui.Button = discord.ui.Button(
+                label="◀", style=discord.ButtonStyle.secondary, custom_id=f"chaosx_test_prev_{kind}"
+            )
+            following: discord.ui.Button = discord.ui.Button(
+                label="▶", style=discord.ButtonStyle.secondary, custom_id=f"chaosx_test_next_{kind}"
+            )
+            previous.callback = self._on_page(-1)
+            following.callback = self._on_page(1)
+            self.add_item(previous)
+            self.add_item(following)
+
+        back: discord.ui.Button = discord.ui.Button(
+            label="All families", style=discord.ButtonStyle.secondary, custom_id=f"chaosx_test_family_back"
+        )
+        back.callback = self._on_back
+        self.add_item(back)
+
+    @property
+    def page_note(self) -> str:
+        if len(self.pages) == 1:
+            return ""
+        return f" - page {self.page + 1}/{len(self.pages)}"
+
+    def _on_page(self, delta: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            page = self.page + delta
+            if page < 0 or page >= len(self.pages):
+                await interaction.response.defer()
+                return
+            rebuilt = TestingCandidateSelectView(
+                self.bot, kind=self.kind, candidates=self.candidates, page=page
+            )
+            await interaction.response.edit_message(
+                content=await self.bot._testing_ballot_text(interaction.user.id, kind=self.kind, page_note=rebuilt.page_note),
+                view=rebuilt,
+            )
+
+        return callback
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        key = self.select.values[0] if self.select.values else ""
+        label = next((text for candidate, text in self.candidates if candidate == key), key)
+        await self.bot._cast_testing_vote(interaction, key=key, label=label)
+
+    async def _on_back(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content=await self.bot._testing_vote_panel_text(interaction.user.id),
+            view=await TestingPanelView.build(self.bot),
+        )
+
+
+class TestingPanelView(discord.ui.View):
+    """The testing ballot: one button per family of candidates, plus nomination and vote management.
+
+    Persistent (fixed custom_ids, timeout=None) so a panel posted weeks ago keeps working; the counts
+    in the labels are cosmetic, and every press rebuilds the ballot from the live catalogs.
+    """
+
+    def __init__(self, bot: "ChaosXBot", *, counts: dict[str, int] | None = None, timeout: float | None = None) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        counts = counts or {}
+        for kind in FAMILIES:
+            present = int(counts.get(kind, 0))
+            if kind == "nomination" and not present:
+                continue
+            button: discord.ui.Button = discord.ui.Button(
+                label=f"{family_emoji(kind)} {family_label(kind)} ({present})"[:80],
+                style=discord.ButtonStyle.primary if kind == "event" else discord.ButtonStyle.secondary,
+                custom_id=f"chaosx_test_family_{kind}",
+            )
+            button.callback = self._make_family_callback(kind)
             self.add_item(button)
 
-    def _make_callback(self, slot: int):
+        nominate: discord.ui.Button = discord.ui.Button(
+            label="✍️ Nominate something else",
+            style=discord.ButtonStyle.success,
+            custom_id="chaosx_test_nominate",
+        )
+        nominate.callback = self._on_nominate
+        self.add_item(nominate)
+
+        clear: discord.ui.Button = discord.ui.Button(
+            label="🗑️ Clear my vote",
+            style=discord.ButtonStyle.secondary,
+            custom_id="chaosx_test_clear",
+        )
+        clear.callback = self._on_clear
+        self.add_item(clear)
+
+    @classmethod
+    async def build(cls, bot: "ChaosXBot") -> "TestingPanelView":
+        families = await bot._testing_families()
+        return cls(bot, counts={kind: len(items) for kind, items in families.items()})
+
+    def _make_family_callback(self, kind: str):
         async def callback(interaction: discord.Interaction) -> None:
-            options = await self.bot.store.testing_poll_options()
-            choice = options.get(slot)
-            if choice is None:
+            families = await self.bot._testing_families()
+            candidates = families.get(kind, [])
+            if not candidates:
                 await interaction.response.send_message(
-                    "That option is no longer on the list - reopen the vote with the button below the "
-                    "testing queue.",
+                    f"Nothing in {family_label(kind).lower()} is marked for testing right now.",
                     ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
                 )
                 return
-            option_key, option_label = choice
-            row = await self.bot.store.member_tier(interaction.user.id)
-            tier = str(row[1]) if row else TIERS[0][0]
-            weight = voting_weight(tier)
-            await self.bot.store.set_testing_vote(interaction.user.id, option_key, option_label, weight)
-            await self.bot.store.audit(
-                actor_id=interaction.user.id,
-                guild_id=interaction.guild_id,
-                channel_id=interaction.channel_id,
-                command="testing vote",
-                summary=f"{option_label} (weight {weight}, tier {tier})",
-            )
+            view = TestingCandidateSelectView(self.bot, kind=kind, candidates=candidates)
             await interaction.response.send_message(
-                await self.bot._testing_vote_panel_text(interaction.user.id, just_voted=option_label),
+                await self.bot._testing_ballot_text(interaction.user.id, kind=kind, page_note=view.page_note),
+                view=view,
                 ephemeral=True,
                 allowed_mentions=safe_allowed_mentions(),
             )
 
         return callback
 
+    async def _on_nominate(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(TestingNominationModal(self.bot))
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        await self.bot.store.clear_testing_vote(interaction.user.id)
+        await interaction.response.send_message(
+            await self.bot._testing_vote_panel_text(interaction.user.id, notice="Your vote was cleared."),
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
 
 class TestingVoteOpenView(discord.ui.View):
-    """The single persistent button that opens the poll (sits under the testing queue)."""
+    """The single persistent button that opens the ballot (sits under the testing queue)."""
 
     def __init__(self, bot: "ChaosXBot", *, timeout: float | None = None) -> None:
         super().__init__(timeout=timeout)
@@ -7948,10 +8177,9 @@ class TestingVoteOpenView(discord.ui.View):
         custom_id="chaosx_vote_open",
     )
     async def open_poll(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        labels = await self.bot._refresh_testing_poll_options()
         await interaction.response.send_message(
             await self.bot._testing_vote_panel_text(interaction.user.id),
-            view=TestingVoteOptionsView(self.bot, labels=labels),
+            view=await TestingPanelView.build(self.bot),
             ephemeral=True,
             allowed_mentions=safe_allowed_mentions(),
         )
@@ -8201,9 +8429,11 @@ def register_commands(bot: ChaosXBot) -> None:
         # (Hoops, 2026-09-23: options at the bottom, suggested by the bot).
         await send_suggested_followup(bot, interaction)
 
-    @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
+    @bot.tree.command(
+        name="testing",
+        description="What is marked for testing, and the ballot for what gets tested next.",
+    )
     async def chaosx_testing(interaction: discord.Interaction) -> None:
-        await bot._refresh_testing_poll_options()
         await send_scripted_response(
             bot,
             interaction,

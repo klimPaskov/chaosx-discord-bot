@@ -122,9 +122,10 @@ def test_rebuild_index_and_event_lookup(tmp_path: Path):
     assert 'Indexed commit' not in status
     assert 'source docs' not in status
     testing = knowledge.testing_queue()
-    assert '## Testing queue' in testing
-    assert 'Use this before playtesting' in testing
+    assert 'Testing queue' in testing
     assert 'Event ' in testing
+    # the queue lists every candidate, not only the first few (Hoops 2026-09-24)
+    assert 'the first' not in testing and 'vote on what gets tested next' in testing.lower()
 
 
 def test_public_ask_context_never_empty_on_healthy_index(tmp_path: Path):

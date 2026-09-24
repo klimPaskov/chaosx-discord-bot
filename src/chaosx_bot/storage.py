@@ -167,6 +167,14 @@ CREATE TABLE IF NOT EXISTS testing_poll_options (
     updated_at TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS testing_nominations (
+    key TEXT PRIMARY KEY,
+    label TEXT NOT NULL DEFAULT '',
+    user_id INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS testing_votes (
     user_id INTEGER PRIMARY KEY,
     option_key TEXT NOT NULL,
@@ -1081,6 +1089,40 @@ class Store:
             rows = await cur.fetchall()
         return {int(slot): (str(key), str(label)) for slot, key, label in rows}
 
+    async def add_testing_nomination(self, *, key: str, label: str, user_id: int) -> None:
+        """A member-nominated testing target: anything the catalogs do not cover."""
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO testing_nominations(key, label, user_id, created_at, active) "
+                "VALUES(?, ?, ?, ?, 1) ON CONFLICT(key) DO UPDATE SET label=excluded.label, active=1",
+                (str(key), str(label)[:160], int(user_id), now_iso()),
+            )
+            await db.commit()
+
+    async def testing_nominations(self, *, active_only: bool = True) -> list[tuple[str, str]]:
+        sql = "SELECT key, label FROM testing_nominations"
+        if active_only:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY created_at, key"
+        async with self._connect() as db:
+            cur = await db.execute(sql)
+            rows = await cur.fetchall()
+        return [(str(key), str(label)) for key, label in rows]
+
+    async def count_testing_nominations(self, *, user_id: int) -> int:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM testing_nominations WHERE user_id = ? AND active = 1",
+                (int(user_id),),
+            )
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def deactivate_testing_nomination(self, *, key: str) -> None:
+        async with self._connect() as db:
+            await db.execute("UPDATE testing_nominations SET active = 0 WHERE key = ?", (str(key),))
+            await db.commit()
+
     async def set_testing_vote(
         self, user_id: int, option_key: str, option_label: str, weight: int
     ) -> None:
@@ -1104,6 +1146,11 @@ class Store:
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+            await db.commit()
+
+    async def clear_testing_vote(self, user_id: int) -> None:
+        async with self._connect() as db:
+            await db.execute("DELETE FROM testing_votes WHERE user_id = ?", (int(user_id),))
             await db.commit()
 
     async def member_testing_vote(self, user_id: int) -> tuple[str, str, int] | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -176,21 +177,30 @@ class Knowledge:
             f"- Event status breakdown: {status_text}\n"
         )
 
-    def testing_queue(self, limit: int = 10) -> str:
-        """Return a simple tester-facing list of events that need playtesting."""
+    def testing_queue(self) -> str:
+        """Every event marked `Needs Testing`, one compact line each.
+
+        Hoops (2026-09-24): "you should be able to select any event that is currently marked as needing
+        testing" - the list used to stop at the first few. Rows stay compact on purpose so the whole
+        queue fits in one message as the catalog grows; the ballot below the message holds the voting.
+        """
         self.ensure_index()
         conn = connect(self.db_path)
         try:
             rows = conn.execute(
                 """
-                SELECT event_id, name, type, cluster_id, member_severity, details
+                SELECT event_id, name, type, cluster_id
                 FROM catalog_events
                 WHERE status LIKE '%Needs Testing%'
                 ORDER BY CAST(event_id AS INTEGER)
-                LIMIT ?
-                """,
-                (limit,),
+                """
             ).fetchall()
+            others = {
+                family: conn.execute(
+                    f"SELECT COUNT(*) FROM catalog_{family}s WHERE status LIKE '%Needs Testing%'"
+                ).fetchone()[0]
+                for family in ("scenario", "cluster")
+            }
         finally:
             conn.close()
         if not rows:
@@ -198,40 +208,72 @@ class Knowledge:
                 heading("Testing queue", "🕹️"),
                 small("No events are currently marked `Needs Testing` in the catalog."),
             )
-        entries = []
-        for event_id, name, type_, cluster_id, severity, details in rows:
-            summary = _trim_words(_clean_snippet(details), 220) if details else "No details available."
-            entries.append(
-                f"`Event {int(event_id):03d}` **{name}** — {type_ or 'unknown'}; "
-                f"cluster `{cluster_id or 'none'}`; severity `{severity or 'none'}`. {summary}"
-            )
+        lines: list[str] = []
+        used = 0
+        for event_id, name, type_, cluster_id in rows:
+            line = f"`Event {int(event_id):03d}` **{name}**"
+            if type_:
+                line += f" - {type_}"
+            if used + len(line) > 1700 and lines:
+                break
+            lines.append(line)
+            used += len(line) + 1
+        hidden = len(rows) - len(lines)
         return block(
-            heading("Testing queue", "🕹️"),
-            section(f"{len(entries)} event(s) need feedback", "🧪"),
-            bullets(entries),
+            heading(f"Testing queue - {len(rows)} event(s)", "🕹️"),
+            bullets(lines),
+            small(f"and {hidden} more - the ballot below lists every one.") if hidden else None,
             small(
-                "Pick one, play it, then use `/playtest report` with the event ID and what happened — and "
-                "vote on what gets tested next with the button below."
+                f"Also on the ballot: {others['scenario']} scenario(s), {others['cluster']} cluster(s), "
+                "plus anything a member nominates - testing is not only about events."
+            ),
+            small(
+                "Pick any event, play it, then use `/playtest report` with the event ID and what happened. "
+                "Vote on what gets tested next with the button below."
             ),
         )
 
-    def testing_queue_rows(self, limit: int = 5) -> list[tuple[str, str]]:
-        """(event_id, name) for the events marked `Needs Testing` - the poll's candidates."""
+    def testing_candidate_count(self) -> int:
+        """How many candidates are on the ballot across every family."""
+        try:
+            return sum(len(items) for items in self.testing_candidates().values())
+        except Exception:
+            return 0
+
+    def testing_candidates(self) -> dict[str, list[tuple[str, str]]]:
+        """Every object currently marked `Needs Testing`, grouped by family.
+
+        Hoops (2026-09-24): the poll used to show only the first five events. This returns the whole
+        ballot - all events, scenarios and clusters whose catalog status says Needs Testing - and the
+        caller pages it because Discord allows 25 options per select.
+        """
+        from .testing_poll import candidate_key
+
         self.ensure_index()
+        grouped: dict[str, list[tuple[str, str]]] = {"event": [], "scenario": [], "cluster": []}
+        queries = {
+            "event": ("catalog_events", "event_id", "name"),
+            "scenario": ("catalog_scenarios", "scenario_id", "name"),
+            "cluster": ("catalog_clusters", "cluster_id", "name"),
+        }
         conn = connect(self.db_path)
         try:
-            rows = conn.execute(
-                """
-                SELECT event_id, name FROM catalog_events
-                WHERE status LIKE '%Needs Testing%'
-                ORDER BY CAST(event_id AS INTEGER)
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            for kind, (table, id_column, name_column) in queries.items():
+                try:
+                    rows = conn.execute(
+                        f"SELECT {id_column}, {name_column} FROM {table} "
+                        f"WHERE status LIKE '%Needs Testing%' "
+                        f"ORDER BY CAST({id_column} AS INTEGER), {name_column}"
+                    ).fetchall()
+                except sqlite3.Error:
+                    continue
+                grouped[kind] = [
+                    (candidate_key(kind, str(ident)), str(label or f"{kind.title()} {ident}"))
+                    for ident, label in rows
+                ]
         finally:
             conn.close()
-        return [(str(event_id), str(name or f"Event {event_id}")) for event_id, name in rows]
+        return grouped
 
     def search(self, query: str, scope: str = "all", limit: int = 5, show_evidence: bool = False) -> str:
         self.ensure_index()
