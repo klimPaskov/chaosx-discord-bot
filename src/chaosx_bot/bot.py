@@ -460,10 +460,9 @@ def _tier_standings_lines(rows: list[tuple], titles: dict[int, str] | None = Non
         days = int(days)
         title = known.get(int(user_id))
         titled = f" — *{title}*" if title else ""
-        out.append(
-            f"{rank}. {tier_emoji(progress.tier)} **{name or user_id}**{titled} — {progress.label} "
-            f"({int(xp)} chaos, {int(messages)} messages/{days} day{'s' if days != 1 else ''})"
-        )
+        # Rank, name, title and tier only: exact values stay out of public text (Hoops 2026-09-24).
+        # Members still see their own exact chaos privately in `My tier`.
+        out.append(f"{rank}. {tier_emoji(progress.tier)} **{name or user_id}**{titled} — {progress.label}")
     return out or ["(no activity recorded yet)"]
 
 
@@ -1572,7 +1571,7 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/status` — project catalog totals and event breakdowns.
 - `/testing` — show events currently marked as needing testing.
 - `/tiers [scope:all|week]` — the server's chaos tiers and leaderboard: the chaos ladder, the most active members, and buttons for your own tier (private, only you see it) and to take yourself off the leaderboard.
-  - Chat earns a little and is capped, so nobody levels up by spamming: 1 per message, 0.15 after 6 messages in a day, and the day's ceiling starts at 6 and rises with your contributions (up to 10). Contributions earn far more: an accepted event idea, a suggestion write-up or a playtest observation is worth 20 chaos, a formatted bug report 12, and the first 3 in a month pay full value.
+  - Chat earns a little and is capped, so nobody levels up by spamming. Contributing earns far more, and work that gets accepted or reaches the mod earns most. Quality pays here, volume does not.
   - Each tier unlocks perks as you climb: your tier emoji on the leaderboard, a written member title, priority review for ideas you post, a public credit when you contribute (Chaos Tier and up), and more. `My tier` lists your own perks.
   - Reaching a tier also colours your name in the server with that tier's colour (the mod's own tier colours).
 
@@ -3051,7 +3050,7 @@ class ChaosXBot(discord.Client):
         if author_notified:
             parts.append(author_notified)
         if awarded:
-            parts.append(f"+{awarded:g} chaos to the author")
+            parts.append("chaos credited to the author")
         await interaction.followup.send("\n".join(parts), ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     async def _idea_board_text(self, scope: str, *, user_id: int | None = None) -> str:
@@ -3153,7 +3152,7 @@ class ChaosXBot(discord.Client):
         return (
             f"Promoted `#{submission_id}` to event **{event_id:03d} - {spec_title}** "
             f"(`{note.path.name}`), status set to Planned"
-            + (f", +{awarded:g} chaos to the author." if awarded else ".")
+            + (", with chaos credited to the author." if awarded else ".")
         )
 
     async def _refresh_testing_poll_options(self) -> list[str]:
@@ -3177,10 +3176,11 @@ class ChaosXBot(discord.Client):
         rows: list[str] = []
         for slot, (key, label) in sorted(options.items()):
             _label, voters, total = leaders.get(key, (label, 0, 0))
-            rows.append(f"`{slot}` **{label}** — {voters} voter(s), {total} weighted")
+            # Votes only: the weighted total would publish exactly how much each tier is worth.
+            rows.append(f"`{slot}` **{label}** — {voters} vote{'s' if voters != 1 else ''}")
         if weight:
             mine_line = (
-                f"Your vote as {tier} counts **{weight}**. One vote per member, changeable any time."
+                f"Your vote carries extra weight as {tier}. One vote per member, changeable any time."
             )
         else:
             mine_line = (
@@ -3282,7 +3282,7 @@ class ChaosXBot(discord.Client):
         chat = max(0.0, xp - bonus)
         messages, days = await self.store.member_activity_totals(user_id)
         contributions = ", ".join(
-            f"{kind.replace('_', ' ')} (+{amount:g})" for kind, amount, _when in bonus_rows
+            f"{kind.replace('_', ' ')}" for kind, _amount, _when in bonus_rows
         ) or "none yet"
         joined = getattr(member, "joined_at", None)
         joined_text = joined.date().isoformat() if joined else "unknown"
@@ -3296,7 +3296,7 @@ class ChaosXBot(discord.Client):
         facts = (
             f"Member: {member.display_name}\n"
             f"New tier: {new_tier} (previous: {old_tier})\n"
-            f"Total chaos: {int(xp)} ({int(chat)} from chat, {int(bonus)} from contributions)\n"
+            "\n"
             f"Messages seen: {messages} across {days} active days\n"
             f"Contributions: {contributions}\n"
             f"Joined the server: {joined_text}\n"
@@ -3310,15 +3310,17 @@ class ChaosXBot(discord.Client):
             "they earned it, and what unlocks for them now. If they have contributions, name them; if they "
             "have none yet, speak about their activity instead. If a title is given in the facts, use it "
             "once, exactly as written. Use the tier emoji once. No pings, no "
-            "mentions, no invented facts, no dates or promises, no internal jargon or file names.\n\n"
+            "mentions, no invented facts, no dates or promises, no internal jargon or file names. "
+            "Never state chaos totals, point values or earning rates: describe their progress "
+            "qualitatively (Hoops 2026-09-24: exact values stay out of public text).\n\n"
             f"Facts (use only these):\n{facts}"
         )
         if user_id in self._never_mention_ids():
             return ""
         fallback = (
-            f"{tier_emoji(new_tier)} <@{user_id}> has climbed from **{old_tier}** to **{new_tier}** with "
-            f"{int(xp)} chaos ({int(chat)} from chatting, {int(bonus)} from contributions).\n"
-            f"That is the ladder's next rung up from {old_tier}. Congrats, and thank you for being here."
+            f"{tier_emoji(new_tier)} <@{user_id}> has climbed from **{old_tier}** to **{new_tier}**.\n"
+            f"That is the ladder's next rung up — earned by turning up and by contributing. "
+            "Congrats, and thank you for being here."
         )
         try:
             result = await _public_model_completion(
@@ -3570,10 +3572,8 @@ class ChaosXBot(discord.Client):
             section("The ladder"),
             ladder,
             small(
-                f"Chat earns a little and is capped at {int(CHAT_DAILY_XP_CAP)} chaos a day, less once you "
-                f"pass {DIMINISHING_AFTER} messages, and the cap rises as you contribute. Contributions "
-                f"earn far more: an event idea, a suggestion or a playtest note is "
-                f"{int(BONUS_XP['event_idea'])} chaos."
+                "Chat earns a little and is capped; contributing earns far more. Ideas, suggestions, bug "
+                "reports, playtest notes and docs all count, and accepted work pays best."
             ),
             LADDER_QUOTE_LINE,
             section(f"{header} — top {len(rows)}" if rows else header),
@@ -3628,7 +3628,7 @@ class ChaosXBot(discord.Client):
                     kv("Leaderboard", hidden),
                     kv(
                         "Testing vote",
-                        f"counts {voting_weight(progress.tier)}"
+                        "carries extra weight at this tier"
                         if voting_weight(progress.tier)
                         else "recorded, not counted yet (Rising Chaos and above carry weight)",
                     ),
@@ -3639,16 +3639,9 @@ class ChaosXBot(discord.Client):
             section("How chaos works"),
             bullets(
                 [
-                    f"Chat earns 1 per message, {DIMINISHED_VALUE} after {DIMINISHING_AFTER} messages in a day, "
-                    f"and is capped at {cap:g} chaos today"
-                    + (
-                        f" — your ceiling, lifted by your {recent.get(int(user_id), 0)} recent contribution(s)."
-                        if recent.get(int(user_id), 0)
-                        else f" — the base ceiling; contributions raise it, up to {CHAT_DAILY_XP_CAP_MAX:g}."
-                    ),
-                    f"Contributions pay far more: an event idea, a suggestion or a playtest note is "
-                    f"{int(BONUS_XP['event_idea'])} chaos, a bug report {int(BONUS_XP['bug_report'])}, and the "
-                    f"first {BONUS_FULL_PER_MONTH} in a month pay the full amount.",
+                    "Chat earns a little and is capped, and the cap lifts as you contribute.",
+                    "Contributing pays far more: ideas, suggestions, bug reports, playtest notes and docs.",
+                    "Accepted and shipped work pays best; repeating the same kind fades over a month.",
                     "You are only ever mentioned by banter if you are a high-tier active member and haven't "
                     "opted out.",
                 ]

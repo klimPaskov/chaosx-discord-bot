@@ -140,7 +140,7 @@ PERKS: dict[str, tuple[str, ...]] = {
     ),
     "Rising Chaos": (
         "event ideas and suggestions you post are flagged priority for review",
-        "your vote on what gets tested next carries extra weight (double from Chaos Tier)",
+        "your vote on what gets tested next carries extra weight",
     ),
     "Chaos Tier": (
         "your contributions get a public shout-out in the channel where you made them",

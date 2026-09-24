@@ -94,7 +94,10 @@ async def test_panel_text_lists_the_tiers_and_hides_opted_out_members():
     # every row carries its tier emoji, and the ladder itself is emoji-labelled
     assert "🔥" in text and "🌿" in text and "🎆" in text  # no skulls anywhere (Hoops)
     assert "💀" not in text and "☠️" not in text
-    assert "contributions earn far more" in text.lower()
+    assert "contributing earns far more" in text.lower()
+    # Exact earning values stay out of public text (Hoops 2026-09-24).
+    lowered = text.lower()
+    assert "per message" not in lowered and "chaos a day" not in lowered and "0.15" not in lowered
     # structure without emoji clutter (Hoops 2026-09-23: "the main title doesn't need it")
     assert "### The ladder" in text and "### All time" in text
     assert "🪜" not in text and "🏆" not in text and "📊" not in text
@@ -131,8 +134,9 @@ async def test_self_text_reports_tier_rank_and_visibility():
     assert "not ranked yet" in plain and "no activity recorded this week" in plain
     assert "shown on the leaderboard" in plain
     # the self view explains the chat cap, the contribution reward and the perks of this tier
-    assert "Chat earns 1 per message" in plain and "from contributions" in plain
-    assert "ceiling" in plain  # the cap is described as dynamic, not a fixed number
+    assert "Chat earns a little and is capped" in plain and "Contributing pays far more" in plain
+    # The member's own view may show their own standing, but never the earn rates (Hoops 2026-09-24).
+    assert "per message" not in plain and "0.15" not in plain and "chaos a day" not in plain
     # Calm World perks: the colour plus the written congratulation on every climb
     assert "Calm World colour" in plain and "congratulation" in plain
 
@@ -163,12 +167,15 @@ async def test_storage_rank_and_opt_out_exclusion(tmp_path):
     assert row[1] == tier_for_xp(float(row[0]))
 
 @pytest.mark.asyncio
-async def test_standings_pluralise_a_single_day():
+async def test_standings_show_rank_name_and_tier_without_exact_values():
+    """The public leaderboard carries rank, name, title and tier - never raw numbers."""
     from chaosx_bot.bot import _tier_standings_lines
 
     lines = _tier_standings_lines([(1, "groovy", 11.0, 16, 1), (2, "Cristi756", 91.0, 613, 12)])
-    assert "16 messages/1 day)" in lines[0]
-    assert "613 messages/12 days)" in lines[1]
+    assert lines[0].startswith("1. ") and "groovy" in lines[0] and "Calm World" in lines[0]
+    assert lines[1].startswith("2. ") and "Cristi756" in lines[1]
+    joined = " ".join(lines).lower()
+    assert "messages" not in joined and "chaos" not in joined and "day" not in joined
 
 
 class _Followup:
