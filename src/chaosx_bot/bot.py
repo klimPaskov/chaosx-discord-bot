@@ -2123,6 +2123,32 @@ class ChaosXBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await self.store.init()
+
+        @self.tree.error
+        async def on_app_command_error(
+            interaction: discord.Interaction, error: app_commands.AppCommandError
+        ) -> None:
+            """Always answer a failed command.
+
+            Without this, an exception raised after `defer()` leaves the interaction with no reply at
+            all and the member sees "The application did not respond" with nothing in the channel
+            (Hoops, 2026-09-24). The error still goes to the journal in full.
+            """
+            command = getattr(interaction, "command", None)
+            name = getattr(command, "qualified_name", None) or "command"
+            print(
+                f"[commands] {name} failed for {interaction.user.id}: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            try:
+                await safe_followup(
+                    interaction,
+                    f"Something went wrong running `/{name}`. It is logged and Hoops can see it; "
+                    "the other commands still work.",
+                )
+            except Exception:
+                pass
         # Persistent chaos-tier panel buttons: custom_id + timeout=None keeps a posted panel clickable
         # across restarts (the view has no per-message state beyond the scope it is showing).
         self.add_view(TierPanelView(self, timeout=None))
@@ -6397,6 +6423,7 @@ async def send_scripted_response(
 ) -> None:
     if not await public_gate(interaction, bot.settings):
         return
+    view_kwargs = _view_kwargs(view)
     limit = bot.settings.public_scripted_limit_per_hour
     rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
     if not rate.allowed:
@@ -6421,14 +6448,17 @@ async def send_scripted_response(
                 output = await output
     except Exception as exc:
         output = f"ChaosX scripted command failed: `{type(exc).__name__}: {exc}`"
-    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)
     for index, part in enumerate(_chunk(output)):
         await interaction.followup.send(
             part,
             ephemeral=not public,
             allowed_mentions=safe_allowed_mentions(),
-            view=view if index == 0 else None,
+            **(view_kwargs if index == 0 else {}),
         )
+    # The audit row is written AFTER the reply was delivered. It used to run before the send, so a
+    # transient `database is locked` on the 520MB archive killed the whole command and every member saw
+    # "The application did not respond" (Hoops, 2026-09-24). Diagnostics never gate the answer.
+    await safe_audit(bot, interaction=interaction, command=command_name, summary=summary)
     if after_send:
         try:
             await after_send()
@@ -7696,7 +7726,7 @@ async def run_suggestion(bot: "ChaosXBot", interaction: discord.Interaction, key
         else:
             text_out = "That suggestion is no longer available."
         await interaction.followup.send(
-            text_out, view=view, ephemeral=ephemeral, allowed_mentions=safe_allowed_mentions()
+            text_out, **_view_kwargs(view), ephemeral=ephemeral, allowed_mentions=safe_allowed_mentions()
         )
     except Exception as exc:  # a footer button must never leave the member with a dead interaction
         logger.warning("suggested action %s failed: %s", key, exc)
@@ -7717,6 +7747,41 @@ async def run_suggestion(bot: "ChaosXBot", interaction: discord.Interaction, key
             pass
 
 
+async def safe_audit(
+    bot: "ChaosXBot",
+    *,
+    interaction: discord.Interaction,
+    command: str,
+    summary: str,
+) -> None:
+    """Write an audit row without ever being able to break the command it describes.
+
+    Diagnostics are the least important thing happening here: if the database is busy, the reply has
+    already gone out and the failure belongs in the journal, not in the member's face.
+    """
+    try:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command=command,
+            summary=summary,
+        )
+    except Exception as exc:
+        print(f"[audit] {command} audit write failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _view_kwargs(view: discord.ui.View | None) -> dict:
+    """`view=` only when there really is a view.
+
+    discord.py raises `TypeError: expected view parameter to be of type View or LayoutView, not
+    NoneType` when `view=None` is passed, and the exception lands after the interaction was deferred,
+    so the member sees nothing at all. Every send that may have no view goes through this (Hoops hit
+    exactly this on /help, 2026-09-24).
+    """
+    return {"view": view} if isinstance(view, discord.ui.View) else {}
+
+
 def _suggested_view(bot: "ChaosXBot", suggestions: list[Suggestion]) -> discord.ui.View | None:
     return SuggestedActionsView(bot, suggestions) if suggestions else None
 
@@ -7734,7 +7799,7 @@ async def send_suggested_followup(
         return
     try:
         await interaction.followup.send(
-            footer, view=view, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            footer, **_view_kwargs(view), ephemeral=True, allowed_mentions=safe_allowed_mentions()
         )
     except Exception as exc:
         logger.warning("suggested followup failed: %s", exc)
@@ -8005,7 +8070,7 @@ def register_commands(bot: ChaosXBot) -> None:
             body = f"{part}\n\n{footer}" if last and footer else part
             await interaction.followup.send(
                 body,
-                view=view if last else None,
+                **(_view_kwargs(view) if last else {}),
                 allowed_mentions=safe_allowed_mentions(),
             )
 
@@ -8365,7 +8430,7 @@ def register_commands(bot: ChaosXBot) -> None:
             body = f"{part}\n\n{footer}" if last and footer else part
             await interaction.followup.send(
                 body,
-                view=view if last else None,
+                **(_view_kwargs(view) if last else {}),
                 ephemeral=True,
                 allowed_mentions=safe_allowed_mentions(),
             )

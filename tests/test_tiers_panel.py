@@ -225,7 +225,10 @@ async def test_command_attaches_the_view_to_the_first_chunk_only():
     )
     assert len(followup.sent) >= 2  # long output is sent as several messages
     assert followup.sent[0]["view"] is view
-    assert all(call["view"] is None for call in followup.sent[1:])
+    # Later chunks must OMIT the view kwarg entirely: passing view=None raises in discord.py
+    # ("expected view parameter to be of type View or LayoutView, not NoneType"), which silently broke
+    # /help for every member on 2026-09-24.
+    assert all("view" not in call for call in followup.sent[1:])
     assert all(call["allowed_mentions"] is not None for call in followup.sent)
 
 

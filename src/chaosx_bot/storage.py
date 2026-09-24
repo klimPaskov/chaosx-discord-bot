@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -349,9 +352,28 @@ class Store:
     def __init__(self, db_path: Path):
         self.db_path = db_path
 
+    @contextlib.asynccontextmanager
+    async def _connect(self, *, timeout: float = 30.0):
+        """Open a connection with a long busy timeout.
+
+        The database is a busy ~520MB archive with maintenance writers, and sqlite's default 5s busy
+        timeout surfaced as `database is locked` inside live commands (Hoops, 2026-09-24). WAL is set
+        once in init() and persists; the timeout has to be set per connection.
+        """
+        db = await aiosqlite.connect(self.db_path, timeout=timeout)
+        try:
+            await db.execute("PRAGMA busy_timeout = 30000")
+            await db.execute("PRAGMA synchronous = NORMAL")
+            yield db
+        finally:
+            await db.close()
+
     async def init(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
+            # WAL lets maintenance writers and live commands share the file instead of queueing behind
+            # each other, and the mode persists in the database header.
+            await db.execute("PRAGMA journal_mode = WAL")
             await db.executescript(SCHEMA)
             for name, enabled in DEFAULT_AUTOMATIONS.items():
                 await db.execute(
@@ -361,15 +383,28 @@ class Store:
             await db.commit()
 
     async def audit(self, *, actor_id: int, guild_id: int | None, channel_id: int | None, command: str, summary: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO audit_log(created_at, actor_id, guild_id, channel_id, command, summary) VALUES (?, ?, ?, ?, ?, ?)",
-                (now_iso(), actor_id, guild_id, channel_id, command, summary[:2000]),
-            )
-            await db.commit()
+        """Record one command. Never raises: an audit row must not be able to break its command."""
+        # `summary` arrives as None from some scripted paths (e.g. /event, /scenario), and `None[:2000]`
+        # raised inside the write - which is how those two commands lost their audit rows silently.
+        summary_text = "" if summary is None else str(summary)[:2000]
+        row = (now_iso(), actor_id, guild_id, channel_id, str(command), summary_text)
+        for attempt in (1, 2):
+            try:
+                async with self._connect(timeout=45.0) as db:
+                    await db.execute(
+                        "INSERT INTO audit_log(created_at, actor_id, guild_id, channel_id, command, summary) VALUES (?, ?, ?, ?, ?, ?)",
+                        row,
+                    )
+                    await db.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                if attempt == 2:
+                    print(f"[audit] write failed twice, dropping row for {command}: {exc}", flush=True)
+                    return
+                await asyncio.sleep(1.0)
 
     async def record_hermes_run(self, *, actor_id: int, guild_id: int | None, channel_id: int | None, prompt_hash: str, status: str, output_excerpt: str = "") -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT INTO hermes_runs(created_at, actor_id, guild_id, channel_id, prompt_hash, status, output_excerpt) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (now_iso(), actor_id, guild_id, channel_id, prompt_hash, status, output_excerpt[:4000]),
@@ -388,7 +423,7 @@ class Store:
         output_excerpt: str,
         keep_last: int = 20,
     ) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO admin_ask_memory(created_at, actor_id, guild_id, channel_id, prompt_hash, status, request, output_excerpt)
@@ -419,7 +454,7 @@ class Store:
     async def list_admin_ask_memory(self, *, actor_id: int, guild_id: int | None, channel_id: int | None, limit: int = 5) -> list[tuple]:
         if limit <= 0:
             return []
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT created_at, prompt_hash, status, request, output_excerpt
@@ -436,7 +471,7 @@ class Store:
         return list(reversed(rows))
 
     async def clear_admin_ask_memory(self, *, actor_id: int, guild_id: int | None, channel_id: int | None) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 DELETE FROM admin_ask_memory
@@ -465,7 +500,7 @@ class Store:
         output_excerpt: str,
         keep_last: int = 0,
     ) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT OR REPLACE INTO message_ask_memory(
@@ -510,7 +545,7 @@ class Store:
     async def get_message_ask_turn(self, *, bot_message_id: int | None, guild_id: int | None, channel_id: int | None) -> tuple | None:
         if not bot_message_id:
             return None
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT created_at, mode, actor_id, prompt_hash, status, request, output_excerpt, bot_message_id, parent_bot_message_id
@@ -531,7 +566,7 @@ class Store:
         rows: list[tuple] = []
         seen: set[int] = set()
         current = bot_message_id
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             while current and len(rows) < limit and current not in seen:
                 seen.add(current)
                 cur = await db.execute(
@@ -556,7 +591,7 @@ class Store:
     async def list_recent_message_ask_memory(self, *, guild_id: int | None, channel_id: int | None, limit: int = 3) -> list[tuple]:
         if limit <= 0:
             return []
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT created_at, mode, actor_id, prompt_hash, status, request, output_excerpt, bot_message_id, parent_bot_message_id
@@ -572,14 +607,14 @@ class Store:
         return list(reversed(rows))
 
     async def automation_enabled(self, name: str) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT enabled FROM automation_config WHERE name = ?", (name,))
             row = await cur.fetchone()
         return bool(row and row[0])
 
     async def warning_count_for(self, actor_id: int) -> int:
         """Total recorded soft warnings for one user (the warned-users count)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT COUNT(*) FROM auto_scan_events WHERE actor_id = ? AND action = 'soft_warning'",
                 (actor_id,),
@@ -612,7 +647,7 @@ class Store:
             LIMIT ?
         """
         params.append(limit)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(sql, tuple(params))
             return [tuple(row) for row in await cur.fetchall()]
 
@@ -630,7 +665,7 @@ class Store:
         content_excerpt: str,
         response_excerpt: str,
     ) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO auto_scan_events(
@@ -674,12 +709,12 @@ class Store:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(sql, tuple(params))
             return [tuple(row) for row in await cur.fetchall()]
 
     async def record_github_delivery(self, *, delivery_id: str, event: str, action: str | None, status: str, summary: str) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             try:
                 await db.execute(
                     "INSERT INTO github_deliveries(delivery_id, event, action, received_at, status, summary) VALUES (?, ?, ?, ?, ?, ?)",
@@ -691,7 +726,7 @@ class Store:
                 return False
 
     async def upsert_card(self, *, card_key: str, destination: str, title: str, body: str, source_url: str = "") -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO message_cards(card_key, destination, title, body, source_url, updated_at)
@@ -703,7 +738,7 @@ class Store:
             await db.commit()
 
     async def create_issue_draft(self, *, draft_id: str, actor_id: int, guild_id: int | None, channel_id: int | None, summary: str, body: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO issue_drafts(draft_id, created_at, actor_id, guild_id, channel_id, summary, body, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')",
                 (draft_id, now_iso(), actor_id, guild_id, channel_id, summary[:500], body[:8000]),
@@ -711,7 +746,7 @@ class Store:
             await db.commit()
 
     async def list_issue_drafts(self, limit: int = 10) -> list[tuple]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT draft_id, created_at, summary, status FROM issue_drafts ORDER BY created_at DESC LIMIT ?", (limit,))
             return [tuple(row) for row in await cur.fetchall()]
 
@@ -725,7 +760,7 @@ class Store:
         build: str = "",
     ) -> None:
         """Store the parsed timing block of a playtest draft (reminder/result automation reads it)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE playtest_records SET start_time = ?, duration_minutes = ?, voice = ?, build = ? "
                 "WHERE playtest_id = ?",
@@ -735,7 +770,7 @@ class Store:
 
     async def list_scheduled_playtests(self, *, guild_id: int, limit: int = 25) -> list[dict]:
         """Playtests that carry a real parsed start time (placeholders excluded)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT playtest_id, created_at, guild_id, channel_id, target, start_time, "
@@ -747,7 +782,7 @@ class Store:
             return [dict(row) for row in await cur.fetchall()]
 
     async def mark_playtest_automation(self, *, playtest_id: str, kind: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO playtest_automation_marks(playtest_id, kind, created_at) VALUES (?, ?, ?)",
                 (playtest_id, kind, now_iso()),
@@ -755,14 +790,14 @@ class Store:
             await db.commit()
 
     async def playtest_automation_marks(self, *, kind: str) -> set[str]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT playtest_id FROM playtest_automation_marks WHERE kind = ?", (kind,)
             )
             return {str(row[0]) for row in await cur.fetchall()}
 
     async def create_playtest(self, *, playtest_id: str, actor_id: int, guild_id: int | None, channel_id: int | None, target: str, start_time: str, duration_minutes: int, voice: str, build: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR REPLACE INTO playtest_records(playtest_id, created_at, actor_id, guild_id, channel_id, target, start_time, duration_minutes, voice, build, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')",
                 (playtest_id, now_iso(), actor_id, guild_id, channel_id, target, start_time, duration_minutes, voice, build),
@@ -770,7 +805,7 @@ class Store:
             await db.commit()
 
     async def add_playtest_report(self, *, playtest_id: str, report: dict) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE playtest_records SET report_json = ?, status = 'reported' WHERE playtest_id = ?",
                 (json.dumps(report, ensure_ascii=False), playtest_id),
@@ -778,12 +813,12 @@ class Store:
             await db.commit()
 
     async def list_playtests(self, limit: int = 10) -> list[tuple]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT playtest_id, target, start_time, duration_minutes, voice, build, status FROM playtest_records ORDER BY created_at DESC LIMIT ?", (limit,))
             return [tuple(row) for row in await cur.fetchall()]
 
     async def list_playtest_reports(self, limit: int = 10) -> list[tuple]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT playtest_id, created_at, target, status, report_json
@@ -803,7 +838,7 @@ class Store:
         summary is the note name the member's submission became. File mtimes are NOT a source: the
         vault is synced in bulk, so mtime is sync time, not authoring time.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT created_at, command, summary, COALESCE(actor_id, 0)
@@ -818,7 +853,7 @@ class Store:
 
     async def list_playtest_reports_since(self, *, since_iso: str, limit: int = 6) -> list[tuple]:
         """Reports recorded in the window, newest first (community observations for the digest)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT created_at, target, report_json
@@ -835,7 +870,7 @@ class Store:
         self, *, guild_id: int, limit: int = 25
     ) -> list[tuple]:
         limit = max(1, min(limit, 100))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT p.playtest_id, p.created_at, p.target, p.status, p.report_json
@@ -866,7 +901,7 @@ class Store:
     ) -> None:
         if not playtest_ids:
             raise ValueError("playtest synthesis requires at least one report")
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
@@ -895,12 +930,12 @@ class Store:
             await db.commit()
 
     async def list_automations(self) -> list[tuple[str, int, str, str]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT name, enabled, destination FROM automation_config ORDER BY name")
             return [(*tuple(row), AUTOMATION_DESCRIPTIONS.get(str(row[0]), "No description yet.")) for row in await cur.fetchall()]
 
     async def set_automation(self, name: str, enabled: bool) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("UPDATE automation_config SET enabled = ?, updated_at = ? WHERE name = ?", (1 if enabled else 0, now_iso(), name))
             await db.commit()
             return cur.rowcount > 0
@@ -909,7 +944,7 @@ class Store:
         if not names:
             return
         placeholders = ",".join("?" for _ in names)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 f"UPDATE automation_config SET destination = ?, updated_at = ? WHERE name IN ({placeholders})",
                 (destination, now_iso(), *names),
@@ -918,7 +953,7 @@ class Store:
 
     # ---------------------------------------------------------------- member activity / chaos tiers
     async def activity_cursor(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT value FROM activity_state WHERE key = 'archive_cursor'")
             row = await cur.fetchone()
         try:
@@ -927,7 +962,7 @@ class Store:
             return 0
 
     async def set_activity_cursor(self, value: int) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT INTO activity_state(key, value) VALUES('archive_cursor', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -944,7 +979,7 @@ class Store:
         """
         skip = sorted({int(value) for value in (ignore_ids or set()) if value})
         clause = f" AND author_id NOT IN ({','.join('?' for _ in skip)})" if skip else ""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 f"""
                 SELECT id, author_id, created_at, channel_id, content
@@ -963,7 +998,7 @@ class Store:
         """(content, channel_id) for one member's day, in order — used to re-roll that day in full."""
         if int(user_id) in {int(value) for value in (ignore_ids or set()) if value}:
             return []
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT content, channel_id FROM message_archive WHERE author_id = ? "
                 "AND substr(created_at, 1, 10) = ? ORDER BY created_at ASC, id ASC",
@@ -976,7 +1011,7 @@ class Store:
         if not rows:
             return 0
         stamp = datetime.now(timezone.utc).isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.executemany(
                 """
                 INSERT INTO member_activity_daily(user_id, day, messages, xp, updated_at)
@@ -998,7 +1033,7 @@ class Store:
         re-running the capture can never pay twice. The day's bonus total is capped (`BONUS_DAILY_CAP`).
         """
         today = parse_day(when) or str(when)[:10]
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT 1 FROM member_bonus_xp WHERE ref = ?", (str(ref),))
             if await cur.fetchone() is not None:
                 return 0.0
@@ -1029,7 +1064,7 @@ class Store:
     async def set_testing_poll_options(self, options: list[tuple[str, str]]) -> None:
         """Fill the poll's fixed slots (1..5). Fixed slots keep the buttons alive across restarts."""
         now = datetime.now(timezone.utc).isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("DELETE FROM testing_poll_options")
             await db.executemany(
                 "INSERT INTO testing_poll_options(slot, option_key, option_label, updated_at) "
@@ -1039,7 +1074,7 @@ class Store:
             await db.commit()
 
     async def testing_poll_options(self) -> dict[int, tuple[str, str]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT slot, option_key, option_label FROM testing_poll_options ORDER BY slot"
             )
@@ -1050,7 +1085,7 @@ class Store:
         self, user_id: int, option_key: str, option_label: str, weight: int
     ) -> None:
         """One vote per member - a new choice replaces the old one; the weight is snapshotted."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO testing_votes(user_id, option_key, option_label, weight, voted_at)
@@ -1072,7 +1107,7 @@ class Store:
             await db.commit()
 
     async def member_testing_vote(self, user_id: int) -> tuple[str, str, int] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT option_key, option_label, weight FROM testing_votes WHERE user_id = ?",
                 (int(user_id),),
@@ -1082,7 +1117,7 @@ class Store:
 
     async def testing_vote_tally(self) -> list[tuple[str, str, int, int]]:
         """(option_key, option_label, voters, weighted_total) per option, strongest first."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 """
                 SELECT option_key, MAX(option_label), COUNT(*), SUM(weight)
@@ -1105,7 +1140,7 @@ class Store:
             + " AND ".join(clauses)
             + " GROUP BY user_id"
         )
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(sql, tuple(params))
             return {int(user_id): int(count) for user_id, count in await cur.fetchall()}
 
@@ -1116,7 +1151,7 @@ class Store:
     ) -> int:
         """File a new idea submission and return its id."""
         when = now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "INSERT INTO idea_submissions (user_id, title, raw_idea, draft, status, priority, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, 'filed', ?, ?, ?)",
@@ -1133,7 +1168,7 @@ class Store:
         return submission_id
 
     async def idea_submission(self, submission_id: int) -> dict[str, Any] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM idea_submissions WHERE id = ?", (int(submission_id),))
             row = await cur.fetchone()
@@ -1155,13 +1190,13 @@ class Store:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(int(limit))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(sql, tuple(params))
             return [dict(row) for row in await cur.fetchall()]
 
     async def idea_submissions_since(self, *, user_id: int, since_iso: str) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT COUNT(*) FROM idea_submissions WHERE user_id = ? AND created_at >= ?",
                 (int(user_id), str(since_iso)),
@@ -1169,12 +1204,12 @@ class Store:
             return int((await cur.fetchone())[0] or 0)
 
     async def idea_status_counts(self) -> dict[str, int]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT status, COUNT(*) FROM idea_submissions GROUP BY status")
             return {str(status): int(count) for status, count in await cur.fetchall()}
 
     async def oldest_open_idea_days(self) -> int | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT MIN(created_at) FROM idea_submissions WHERE status IN ('filed', 'reviewing', "
                 "'planned', 'building')"
@@ -1194,7 +1229,7 @@ class Store:
         self, *, submission_id: int, status: str, note: str = "", reviewer_id: int | None = None
     ) -> None:
         when = now_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE idea_submissions SET status = ?, reviewer_note = ?, updated_at = ? WHERE id = ?",
                 (str(status), str(note)[:400], when, int(submission_id)),
@@ -1209,7 +1244,7 @@ class Store:
     async def set_idea_post_location(
         self, *, submission_id: int, channel_id: int, message_id: int, vault_path: str = ""
     ) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE idea_submissions SET forum_channel_id = ?, forum_message_id = ?, "
                 "vault_path = COALESCE(NULLIF(?, ''), vault_path), updated_at = ? WHERE id = ?",
@@ -1218,7 +1253,7 @@ class Store:
             await db.commit()
 
     async def set_idea_promoted(self, *, submission_id: int, promoted_path: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE idea_submissions SET promoted_path = ?, updated_at = ? WHERE id = ?",
                 (str(promoted_path), now_iso(), int(submission_id)),
@@ -1228,7 +1263,7 @@ class Store:
     # --- member titles (deliberately over-the-top, generated from activity + personality) -------------
 
     async def set_member_title(self, *, user_id: int, title: str, blurb: str = "", source: str = "model") -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT INTO member_titles (user_id, title, blurb, source, updated_at) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(user_id) DO UPDATE SET title = excluded.title, blurb = excluded.blurb, "
@@ -1238,7 +1273,7 @@ class Store:
             await db.commit()
 
     async def member_title(self, user_id: int) -> tuple[str, str] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT title, blurb FROM member_titles WHERE user_id = ?", (int(user_id),)
             )
@@ -1246,13 +1281,13 @@ class Store:
             return (str(row[0]), str(row[1] or "")) if row else None
 
     async def member_titles(self) -> dict[int, str]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT user_id, title FROM member_titles")
             return {int(row[0]): str(row[1]) for row in await cur.fetchall()}
 
     async def member_activity_totals(self, user_id: int) -> tuple[int, int]:
         """(messages, active days) for one member, for the tier-up congratulation."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT COALESCE(SUM(messages), 0), COUNT(*) FROM member_activity_daily WHERE user_id = ?",
                 (int(user_id),),
@@ -1262,7 +1297,7 @@ class Store:
 
     async def bonus_xp_breakdown(self, user_id: int) -> list[tuple[str, float, str]]:
         """(kind, xp, awarded_at) for one member's contributions, newest first."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT kind, xp, awarded_at FROM member_bonus_xp WHERE user_id = ? "
                 "ORDER BY awarded_at DESC",
@@ -1271,14 +1306,14 @@ class Store:
             return [(str(kind), float(xp), str(when)) for kind, xp, when in await cur.fetchall()]
 
     async def bonus_xp_total(self, user_id: int) -> float:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT COALESCE(SUM(xp), 0) FROM member_bonus_xp WHERE user_id = ?", (int(user_id),)
             )
             return float((await cur.fetchone())[0] or 0)
 
     async def recompute_member_tiers(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT user_id, SUM(xp) FROM ("
                 "SELECT user_id, xp FROM member_activity_daily "
@@ -1304,19 +1339,19 @@ class Store:
 
     async def all_member_tiers(self) -> list[tuple[int, float, str]]:
         """Every member with recorded activity: (user_id, xp, tier)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT user_id, xp, tier FROM member_tiers ORDER BY xp DESC")
             return [(int(user_id), float(xp), str(tier)) for user_id, xp, tier in await cur.fetchall()]
 
     async def tier_role_state(self, user_id: int) -> str | None:
         """The tier the member's role was last synced to, or None if never synced."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT tier FROM member_role_state WHERE user_id = ?", (int(user_id),))
             row = await cur.fetchone()
         return str(row[0]) if row else None
 
     async def set_tier_role_state(self, user_id: int, tier: str, when: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT INTO member_role_state(user_id, tier, synced_at) VALUES(?, ?, ?) "
                 "ON CONFLICT(user_id) DO UPDATE SET tier = excluded.tier, synced_at = excluded.synced_at",
@@ -1325,7 +1360,7 @@ class Store:
             await db.commit()
 
     async def member_tier(self, user_id: int) -> tuple[float, str] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT xp, tier FROM member_tiers WHERE user_id = ?", (int(user_id),))
             row = await cur.fetchone()
         return (float(row[0]), str(row[1])) if row else None
@@ -1347,7 +1382,7 @@ class Store:
             "SELECT a.user_id, COALESCE(u.display_name, ''), SUM(a.xp), SUM(a.messages), COUNT(*) "
             "FROM member_activity_daily a LEFT JOIN users u ON u.user_id = a.user_id "
         )
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             if since_day:
                 sql = (
                     select
@@ -1375,7 +1410,7 @@ class Store:
 
     async def recent_member_messages(self, user_id: int, *, limit: int = 6) -> list[str]:
         """The member's own most recent public messages, for a title's style hint (public archive only)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT content FROM message_archive WHERE author_id = ? AND content IS NOT NULL "
                 "AND length(trim(content)) > 0 ORDER BY created_at DESC LIMIT ?",
@@ -1386,7 +1421,7 @@ class Store:
 
     async def last_seen_in_channel(self, channel_id: int) -> dict[int, str]:
         """user_id -> newest archived message timestamp in one channel (banter eligibility)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT author_id, MAX(created_at) FROM message_archive WHERE channel_id = ? "
                 "AND author_id IS NOT NULL GROUP BY author_id",
@@ -1395,17 +1430,17 @@ class Store:
             return {int(row[0]): str(row[1]) for row in await cur.fetchall()}
 
     async def known_bot_ids(self) -> set[int]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT user_id FROM users WHERE COALESCE(is_bot, 0) = 1")
             return {int(row[0]) for row in await cur.fetchall()}
 
     async def activity_xp_by_member(self) -> dict[int, float]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute("SELECT user_id, xp FROM member_tiers")
             return {int(row[0]): float(row[1] or 0) for row in await cur.fetchall()}
 
     async def member_prefs(self, user_id: int) -> dict[str, bool]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 "SELECT banter_optout, leaderboard_optout FROM member_prefs WHERE user_id = ?", (int(user_id),)
             )
@@ -1418,7 +1453,7 @@ class Store:
         if field not in {"banter_optout", "leaderboard_optout"}:
             raise ValueError(f"unknown member preference: {field}")
         stamp = datetime.now(timezone.utc).isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 f"INSERT INTO member_prefs(user_id, {field}, updated_at) VALUES(?, ?, ?) "
                 f"ON CONFLICT(user_id) DO UPDATE SET {field} = excluded.{field}, updated_at = excluded.updated_at",
@@ -1429,13 +1464,13 @@ class Store:
     async def opted_out_members(self, field: str = "banter_optout") -> set[int]:
         if field not in {"banter_optout", "leaderboard_optout"}:
             raise ValueError(f"unknown member preference: {field}")
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(f"SELECT user_id FROM member_prefs WHERE {field} = 1")
             return {int(row[0]) for row in await cur.fetchall()}
 
     async def upsert_member_tier(self, user_id: int, xp: float, tier: str) -> None:
         stamp = datetime.now(timezone.utc).isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT INTO member_tiers(user_id, xp, tier, updated_at) VALUES(?, ?, ?, ?) "
                 "ON CONFLICT(user_id) DO UPDATE SET xp = excluded.xp, tier = excluded.tier, "
@@ -1449,7 +1484,7 @@ class Store:
         if not names:
             return {}
         placeholders = ",".join("?" for _ in names)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cur = await db.execute(
                 f"SELECT name, period_key, posted_at, checked_at, channel_id, message_id, status, detail "
                 f"FROM routine_posts WHERE name IN ({placeholders})",
@@ -1476,7 +1511,7 @@ class Store:
         Empty values never clobber existing data, so a baseline write (checked_at +
         detail) can coexist with a later real post (period_key + posted_at).
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO routine_posts(name, period_key, posted_at, checked_at, channel_id, message_id, status, detail)
@@ -1496,7 +1531,7 @@ class Store:
 
     async def routine_stats(self, *, since_iso: str) -> dict[str, int]:
         """Windowed server facts for the weekly digest (counted rows, never estimates)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async def scalar(sql: str, params: tuple = ()) -> int:
                 cur = await db.execute(sql, params)
                 row = await cur.fetchone()
@@ -1538,7 +1573,7 @@ class Store:
         detail: str = "",
     ) -> None:
         """Upsert one announcement; empty fields never clobber stored values."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO announcements(
@@ -1568,7 +1603,7 @@ class Store:
             await db.commit()
 
     async def list_announcements(self, *, limit: int = 10) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT announcement_id, created_at, status, topic, destination_channel_id, message_id "
@@ -1579,7 +1614,7 @@ class Store:
 
     async def last_announcement(self, *, status: str = "posted") -> dict | None:
         """Most recent announcement in the given status (used for 'since the last announcement' facts)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT announcement_id, created_at, topic, body, status, detail FROM announcements "
@@ -1591,7 +1626,7 @@ class Store:
 
     async def latest_draft_announcement(self, *, topic: str = "") -> dict | None:
         """Newest stored draft (optionally for an exact topic) so review→post keeps the same text."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             if topic.strip():
                 cur = await db.execute(
@@ -1618,7 +1653,7 @@ class Store:
         params_json: str = "{}",
         status: str = "planned",
     ) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO server_action_plans(plan_id, created_at, actor_id, guild_id, request, action, params_json, status)
@@ -1633,7 +1668,7 @@ class Store:
             await db.commit()
 
     async def get_action_plan(self, plan_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT plan_id, created_at, actor_id, guild_id, request, action, params_json, status, result, executed_at "
@@ -1644,7 +1679,7 @@ class Store:
             return dict(row) if row else None
 
     async def finish_action_plan(self, plan_id: str, *, status: str, result: str = "") -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE server_action_plans SET status = ?, result = ?, executed_at = ? WHERE plan_id = ?",
                 (status, result[:2000], now_iso(), plan_id),
@@ -1652,7 +1687,7 @@ class Store:
             await db.commit()
 
     async def list_action_plans(self, *, limit: int = 10) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT plan_id, created_at, action, status, request, result FROM server_action_plans "
