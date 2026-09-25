@@ -147,18 +147,25 @@ PERKS: dict[str, tuple[str, ...]] = {
     ),
     "Total Chaos": (
         "your ideas go to the top of the captured list",
+        "ladder titles of your own, and more of them the higher you climb",
     ),
     "World Collapse": (
         "a permanent place at the top of the tier panel while you stay active",
     ),
 }
 
+# Titles are a reward for the top of the ladder only (Hoops, 2026-09-24): "these titles actually should be
+# removed. Instead, they should only be added when a user is higher than chaos tier and then the higher the
+# tier, the more titles."
+TITLE_MIN_TIER = "Total Chaos"
+TITLES_PER_TIER_STEP = 2
+
 PERK_KEYS: dict[str, set[str]] = {
     "Calm World": {"color", "tier_up_post"},
     "Gathering Storm": {"color", "tier_up_post", "panel_emoji"},
     "Rising Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "voting_weight"},
     "Chaos Tier": {"color", "tier_up_post", "panel_emoji", "idea_priority", "credit_shoutout", "voting_weight"},
-    "Total Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "credit_shoutout", "idea_top", "voting_weight"},
+    "Total Chaos": {"color", "tier_up_post", "panel_emoji", "idea_priority", "credit_shoutout", "idea_top", "voting_weight", "ladder_titles"},
     "World Collapse": {
         "color",
         "tier_up_post",
@@ -168,6 +175,7 @@ PERK_KEYS: dict[str, set[str]] = {
         "idea_top",
         "panel_pinned",
         "voting_weight",
+        "ladder_titles",
     },
 }
 
@@ -190,6 +198,27 @@ def voting_weight(tier: str) -> int:
 
 # Everything below a member's tier, in ladder order, so `My tier` reads as a running list of what they
 # have collected (Hoops: "perks should have more a bit" - each tier adds one, nothing is taken away).
+def title_slots_for(tier: str) -> int:
+    """How many ladder titles this tier has earned - zero below Total Chaos.
+
+    Every step above `TITLE_MIN_TIER` adds `TITLES_PER_TIER_STEP` more titles: Total Chaos 2,
+    World Collapse 4. Members below the threshold keep none.
+    """
+    names = [name for name, _threshold in TIERS]
+    try:
+        index = names.index(str(tier))
+        floor = names.index(TITLE_MIN_TIER)
+    except ValueError:
+        return 0
+    if index < floor:
+        return 0
+    return TITLES_PER_TIER_STEP * (index - floor + 1)
+
+
+def has_ladder_titles(tier: str) -> bool:
+    return title_slots_for(tier) > 0
+
+
 def cumulative_perks(tier: str) -> tuple[str, ...]:
     collected: list[str] = []
     for name, _threshold in TIERS:

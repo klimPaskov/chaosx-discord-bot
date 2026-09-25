@@ -278,12 +278,14 @@ CREATE TABLE IF NOT EXISTS idea_status_log (
 );
 CREATE INDEX IF NOT EXISTS idx_idea_log_submission ON idea_status_log(submission_id);
 
-CREATE TABLE IF NOT EXISTS member_titles (
-    user_id INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS member_title_slots (
+    user_id INTEGER NOT NULL,
+    slot INTEGER NOT NULL,
     title TEXT NOT NULL,
     blurb TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT 'model',
-    updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, slot)
 );
 
 CREATE TABLE IF NOT EXISTS member_role_state (
@@ -383,6 +385,19 @@ class Store:
             # each other, and the mode persists in the database header.
             await db.execute("PRAGMA journal_mode = WAL")
             await db.executescript(SCHEMA)
+            # Older databases stored one title per member (`member_titles`); titles are now a ladder
+            # reward that scales with tier, so the first title moves into slot 0.
+            legacy = await (
+                await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'member_titles'"
+                )
+            ).fetchone()
+            if legacy:
+                await db.execute(
+                    "INSERT OR IGNORE INTO member_title_slots(user_id, slot, title, blurb, source, created_at) "
+                    "SELECT user_id, 0, title, blurb, source, updated_at FROM member_titles"
+                )
+                await db.execute("DROP TABLE member_titles")
             for name, enabled in DEFAULT_AUTOMATIONS.items():
                 await db.execute(
                     "INSERT OR IGNORE INTO automation_config(name, enabled, updated_at) VALUES (?, ?, ?)",
@@ -1318,25 +1333,79 @@ class Store:
     async def set_member_title(self, *, user_id: int, title: str, blurb: str = "", source: str = "model") -> None:
         async with self._connect() as db:
             await db.execute(
-                "INSERT INTO member_titles (user_id, title, blurb, source, updated_at) VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(user_id) DO UPDATE SET title = excluded.title, blurb = excluded.blurb, "
-                "source = excluded.source, updated_at = excluded.updated_at",
+                "INSERT INTO member_title_slots(user_id, slot, title, blurb, source, created_at) "
+                "VALUES (?, 0, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, slot) DO UPDATE SET title = excluded.title, blurb = excluded.blurb, "
+                "source = excluded.source, created_at = excluded.created_at",
                 (int(user_id), str(title)[:120], str(blurb)[:400], str(source), now_iso()),
             )
             await db.commit()
 
     async def member_title(self, user_id: int) -> tuple[str, str] | None:
+        """The member's first ladder title (what the leaderboard shows), or None."""
         async with self._connect() as db:
             cur = await db.execute(
-                "SELECT title, blurb FROM member_titles WHERE user_id = ?", (int(user_id),)
+                "SELECT title, blurb FROM member_title_slots WHERE user_id = ? ORDER BY slot LIMIT 1",
+                (int(user_id),),
             )
             row = await cur.fetchone()
             return (str(row[0]), str(row[1] or "")) if row else None
 
     async def member_titles(self) -> dict[int, str]:
+        """`{user_id: first title}` - one line per member for standings."""
         async with self._connect() as db:
-            cur = await db.execute("SELECT user_id, title FROM member_titles")
+            cur = await db.execute(
+                "SELECT user_id, title FROM member_title_slots WHERE slot = 0"
+            )
             return {int(row[0]): str(row[1]) for row in await cur.fetchall()}
+
+    async def member_title_slots(self, user_id: int) -> list[str]:
+        """Every ladder title this member has earned, in the order they were earned."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT title FROM member_title_slots WHERE user_id = ? ORDER BY slot",
+                (int(user_id),),
+            )
+            return [str(row[0]) for row in await cur.fetchall()]
+
+    async def all_member_title_slots(self) -> dict[int, list[str]]:
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT user_id, title FROM member_title_slots ORDER BY user_id, slot"
+            )
+            grouped: dict[int, list[str]] = {}
+            for user_id, title in await cur.fetchall():
+                grouped.setdefault(int(user_id), []).append(str(title))
+            return grouped
+
+    async def set_member_title_slot(
+        self, *, user_id: int, slot: int, title: str, blurb: str = "", source: str = "model"
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO member_title_slots(user_id, slot, title, blurb, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, slot) DO UPDATE SET title = excluded.title, blurb = excluded.blurb, "
+                "source = excluded.source, created_at = excluded.created_at",
+                (
+                    int(user_id),
+                    int(slot),
+                    str(title)[:120],
+                    str(blurb)[:400],
+                    str(source),
+                    now_iso(),
+                ),
+            )
+            await db.commit()
+
+    async def clear_member_title_slots(self, user_id: int) -> int:
+        """Remove every title a member holds - used when they fall below the title threshold."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "DELETE FROM member_title_slots WHERE user_id = ?", (int(user_id),)
+            )
+            await db.commit()
+            return int(cur.rowcount or 0)
 
     async def member_activity_totals(self, user_id: int) -> tuple[int, int]:
         """(messages, active days) for one member, for the tier-up congratulation."""

@@ -47,11 +47,22 @@ class _FakeStore:
     async def contribution_counts(self, *, since_day, month=None):
         return dict(getattr(self, "contributions", {}) or {})
 
+    def _title_map(self):
+        """`{user_id: [titles]}` - accepts the legacy flat `titles` dict too."""
+        raw = getattr(self, "title_slots", None)
+        if raw is None:
+            raw = {uid: [name] for uid, name in (getattr(self, "titles", {}) or {}).items()}
+        return {int(uid): list(names) for uid, names in raw.items()}
+
     async def member_titles(self):
-        return dict(getattr(self, "titles", {}) or {})
+        return {uid: names[0] for uid, names in self._title_map().items() if names}
 
     async def member_title(self, user_id):
-        return (dict(getattr(self, "titles", {}) or {}).get(int(user_id)), "") or None
+        names = self._title_map().get(int(user_id), [])
+        return (names[0], "") if names else None
+
+    async def member_title_slots(self, user_id):
+        return list(self._title_map().get(int(user_id), []))
 
     async def bonus_xp_total(self, user_id):
         return float(self.bonus or 0.0)
@@ -139,6 +150,9 @@ async def test_self_text_reports_tier_rank_and_visibility():
     assert "per message" not in plain and "0.15" not in plain and "chaos a day" not in plain
     # Calm World perks: the colour plus the written congratulation on every climb
     assert "Calm World colour" in plain and "congratulation" in plain
+    # No ladder titles below the threshold - the view says where they start instead (Hoops 2026-09-24)
+    assert "Your title" in plain and "titles start above Chaos Tier" in plain
+    assert "*" not in plain.split("Your title")[1].split("\n")[1]
 
 
 @pytest.mark.asyncio
@@ -279,9 +293,25 @@ async def test_sync_callable_returning_a_coroutine_is_awaited():
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_self_text_lists_every_ladder_title_above_the_threshold():
+    store = _FakeStore([], tier=(1100.0, tier_for_xp(1100.0)), rank=1, week_rank=1)
+    store.title_slots = {7: ["Warden of the Closing Bell", "Baron of the Second Wave", "Duke of Late Threads"]}
+    text = await ChaosXBot._tier_self_text(_bot(store), 7)
+    assert "Your titles" in text
+    for title in store.title_slots[7]:
+        assert f"*{title}*" in text
+    assert "titles start above Chaos Tier" not in text
+    # more titles at higher tiers, and still no earn rates in the member's own view
+    assert "More titles come with every tier above Total Chaos" in text
+    assert "per message" not in text and "0.15" not in text
+
+
 async def test_self_text_lists_perks_and_splits_chat_from_contributions():
     store = _FakeStore([], tier=(690.0, tier_for_xp(690.0)), rank=1, week_rank=1, bonus=190.0)
     text = await ChaosXBot._tier_self_text(_bot(store), 7)
     assert "500 from chat" in text and "190 from contributions" in text
     assert "priority" in text.lower()  # Rising Chaos and up get the idea priority perk
     assert "🎁" in text
+    # Chaos Tier is still below the title threshold, so no title is claimed here
+    assert "titles start above Chaos Tier" in text

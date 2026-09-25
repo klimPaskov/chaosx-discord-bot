@@ -275,6 +275,7 @@ from .activity import (
     DIMINISHED_VALUE,
     DIMINISHING_AFTER,
     LADDER_QUOTE_LINE,
+    TITLE_MIN_TIER,
     chat_daily_cap,
     DEFAULT_ELIGIBLE_TIER,
     TIERS,
@@ -285,6 +286,7 @@ from .activity import (
     select_banter_candidates,
     tier_emoji,
     tier_for_xp,
+    title_slots_for,
     tier_progress,
     voting_weight,
 )
@@ -1585,7 +1587,7 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/testing` — show events currently marked as needing testing.
 - `/tiers [scope:all|week]` — the server's chaos tiers and leaderboard: the chaos ladder, the most active members, and buttons for your own tier (private, only you see it) and to take yourself off the leaderboard.
   - Chat earns a little and is capped, so nobody levels up by spamming. Contributing earns far more, and work that gets accepted or reaches the mod earns most. Quality pays here, volume does not.
-  - Each tier unlocks perks as you climb: your tier emoji on the leaderboard, a written member title, priority review for ideas you post, a public credit when you contribute (Chaos Tier and up), and more. `My tier` lists your own perks.
+  - Each tier unlocks perks as you climb: your tier emoji on the leaderboard, priority review for ideas you post, a public credit when you contribute (Chaos Tier and up), and more. Ladder titles start above Chaos Tier - one to begin with, then more at every tier above. `My tier` lists your own perks and titles.
   - Reaching a tier also colours your name in the server with that tier's colour (the mod's own tier colours).
 
 ### Report or draft feedback
@@ -2622,23 +2624,38 @@ class ChaosXBot(discord.Client):
             report["failed"].append(f"role colour: {exc}")
 
     async def _fill_missing_member_titles(self, *, limit: int = 3) -> int:
-        """Write titles for members who have none yet, a few per pass (owner excluded, never-mention too).
+        """Write the ladder titles members have earned, a few per pass.
 
-        Titles are deliberately over-the-top and generated from activity plus the member's own public
-        tone. They are decoration: no pings, no authority, and the bot only ever names them like a rank.
+        Hoops (2026-09-24): titles start above Chaos Tier and grow with it, so the pass first strips
+        titles from anyone who no longer qualifies, then fills the missing ones for members above the
+        threshold, top of the ladder first. Owner and never-mention members are never touched.
         """
         guild = self.get_guild(int(self.settings.allowed_guild_id))
         if guild is None:
             tier_logger.info("member title pass skipped: guild not cached")
             return 0
-        existing = await self.store.member_titles()
+        held = await self.store.all_member_title_slots()
+        cleared = 0
+        for holder in list(held):
+            if holder == int(self.settings.owner_id) or holder in self._never_mention_ids():
+                continue
+            row = await self.store.member_tier(holder)
+            tier = str(row[1]) if row else tier_for_xp(float(row[0]) if row else 0.0)
+            if title_slots_for(tier) == 0:
+                cleared += await self.store.clear_member_title_slots(holder)
+        if cleared:
+            tier_logger.info("member title pass: removed %d title(s) below %s", cleared, TITLE_MIN_TIER)
+        threshold = dict(TIERS)[TITLE_MIN_TIER]
         rows = await self.store.top_members(limit=25)
         written = 0
         for row in rows:
+            user_id = int(row[0])
+            if float(row[2] or 0) < threshold:
+                # rows arrive ordered by chaos, so nobody below this point can hold a title
+                break
             if written >= limit:
                 break
-            user_id = int(row[0])
-            if user_id in existing or user_id == int(self.settings.owner_id):
+            if user_id == int(self.settings.owner_id):
                 continue
             if user_id in self._never_mention_ids():
                 continue
@@ -2651,11 +2668,12 @@ class ChaosXBot(discord.Client):
                 name = str(member.display_name)
             else:
                 name = str(row[1]) if row[1] else str(user_id)
-            if await self._ensure_member_title(user_id=user_id, name=name):
+            if await self._ensure_member_titles(user_id=user_id, name=name):
                 written += 1
         tier_logger.info(
-            "member title pass: wrote %d (candidates=%d, cached members=%d)",
+            "member title pass: wrote %d, cleared %d (candidates=%d, cached members=%d)",
             written,
+            cleared,
             len(rows),
             len(getattr(guild, "members", []) or []),
         )
@@ -3411,6 +3429,71 @@ class ChaosXBot(discord.Client):
             return fallback
         return text
 
+    async def _ensure_member_titles(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        force: bool = False,
+        contributions: list[str] | None = None,
+    ) -> list[str]:
+        """Every ladder title this member holds, oldest first.
+
+        Hoops (2026-09-24): "these titles actually should be removed. Instead, they should only be added
+        when a user is higher than chaos tier and then the higher the tier, the more titles." So a member
+        at or below Chaos Tier holds none - stored titles are cleared - and every tier above adds more.
+
+        Titles are display decoration: they never ping, never grant authority, and a never-mention member
+        gets none at all.
+        """
+        user_id = int(user_id)
+        if user_id == int(self.settings.owner_id):
+            title = str(self.settings.owner_title or "").strip()
+            if not title:
+                return []
+            await self.store.set_member_title(
+                user_id=user_id, title=title, blurb="Creator of everything.", source="configured"
+            )
+            return [title]
+        if user_id in self._never_mention_ids():
+            return []
+        xp, tier_row, bonus_rows, messages, days = await self._title_facts_inputs(user_id)
+        tier = tier_row or tier_for_xp(xp)
+        wanted = title_slots_for(tier)
+        held = await self.store.member_title_slots(user_id)
+        if wanted == 0:
+            if held:
+                cleared = await self.store.clear_member_title_slots(user_id)
+                tier_logger.info(
+                    "cleared %d ladder title(s) for %s: titles start above %s", cleared, user_id, TITLE_MIN_TIER
+                )
+            return []
+        if not force and len(held) >= wanted:
+            return held[:wanted]
+        titles = held[:wanted]
+        for slot in range(len(titles), wanted):
+            title = await self._generate_member_title(
+                user_id=user_id,
+                name=name,
+                tier=tier,
+                xp=xp,
+                contributions=contributions,
+                messages=messages,
+                days=days,
+                bonus_rows=bonus_rows,
+                already=list(titles),
+            )
+            if not title:
+                break
+            await self.store.set_member_title_slot(
+                user_id=user_id,
+                slot=slot,
+                title=title,
+                blurb=f"Earned at {tier} with {int(xp)} chaos.",
+            )
+            titles.append(title)
+        return titles
+
     async def _ensure_member_title(
         self,
         *,
@@ -3419,27 +3502,26 @@ class ChaosXBot(discord.Client):
         force: bool = False,
         contributions: list[str] | None = None,
     ) -> str:
-        """The member's title, generated once from their activity and public tone (owner: configured).
+        """The member's first ladder title - what a leaderboard line shows - or "" when they hold none."""
+        titles = await self._ensure_member_titles(
+            user_id=user_id, name=name, force=force, contributions=contributions
+        )
+        return titles[0] if titles else ""
 
-        Titles are display decoration: they never ping, never grant authority, and a never-mention member
-        gets none at all.
-        """
-        user_id = int(user_id)
-        if user_id == int(self.settings.owner_id):
-            title = str(self.settings.owner_title or "").strip()
-            if title:
-                await self.store.set_member_title(
-                    user_id=user_id, title=title, blurb="Creator of everything.", source="configured"
-                )
-            return title
-        if user_id in self._never_mention_ids():
-            return ""
-        if not force:
-            existing = await self.store.member_title(user_id)
-            if existing and existing[0]:
-                return existing[0]
-        xp, tier_row, bonus_rows, messages, days = await self._title_facts_inputs(user_id)
-        tier = tier_row or tier_for_xp(xp)
+    async def _generate_member_title(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        tier: str,
+        xp: float,
+        contributions: list[str] | None,
+        messages: int,
+        days: int,
+        bonus_rows: list,
+        already: list[str],
+    ) -> str:
+        """Write one title from real activity facts; a deterministic fallback covers a model outage."""
         facts = title_facts_line(
             name=str(name),
             tier=tier,
@@ -3453,6 +3535,8 @@ class ChaosXBot(discord.Client):
             ),
         )
         prompt = TITLE_PROMPT.format(name=str(name), facts=facts, words=MAX_TITLE_WORDS)
+        if already:
+            prompt += "\n\nThey already hold these titles, so this one must be clearly different: " + "; ".join(already)
         title = ""
         try:
             result = await _public_model_completion(
@@ -3473,9 +3557,6 @@ class ChaosXBot(discord.Client):
             title = fallback_title(
                 tier=tier, messages=int(messages), contributions=len(bonus_rows), active_days=int(days)
             )
-        await self.store.set_member_title(
-            user_id=user_id, title=title, blurb=f"Earned at {tier} with {int(xp)} chaos."
-        )
         return title
 
     async def _title_facts_inputs(self, user_id: int) -> tuple[float, str, list, int, int]:
@@ -3675,14 +3756,30 @@ class ChaosXBot(discord.Client):
             since_day=(utcnow() - timedelta(days=CHAT_CAP_WINDOW_DAYS)).date().isoformat()
         )
         cap = chat_daily_cap(recent.get(int(user_id), 0))
-        own = await self.store.member_title(int(user_id))
-        if own is None and int(user_id) == int(self.settings.owner_id):
-            own = (str(self.settings.owner_title), "")
-        title_line = f"### *{own[0]}*" if own and own[0] else None
+        titles = await self.store.member_title_slots(int(user_id))
+        if not titles and int(user_id) == int(self.settings.owner_id) and self.settings.owner_title:
+            titles = [str(self.settings.owner_title)]
+        # Titles are a top-of-the-ladder reward: none below the threshold, more of them above it
+        # (Hoops 2026-09-24). Generation happens in the activity pass, not inside a command.
+        title_items: list[str] = []
+        if titles:
+            title_items = [
+                section("Your titles" if len(titles) > 1 else "Your title"),
+                bullets(f"*{title}*" for title in titles),
+                small(f"More titles come with every tier above {TITLE_MIN_TIER}."),
+            ]
+        else:
+            title_items = [
+                section("Your title"),
+                small(
+                    f"None yet - titles start above Chaos Tier. Reach {TITLE_MIN_TIER} to earn your first, "
+                    "and more at each tier above it."
+                ),
+            ]
         return block(
             heading("Your chaos tier"),
             f"{tier_emoji(progress.tier)} **{progress.label}**",
-            title_line,
+            *title_items,
             section("Where you stand"),
             bullets(
                 [
