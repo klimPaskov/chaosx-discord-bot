@@ -1520,8 +1520,24 @@ class Store:
             cur = await db.execute(sql, params)
             return [tuple(row) for row in await cur.fetchall()]
 
+    async def members_at_or_above(self, *, xp_threshold: float, limit: int = 25) -> list[tuple]:
+        """(user_id, display_name, xp, tier) for rolled-up members at or above `xp_threshold`.
+
+        Reads the rolled-up `member_tiers` row rather than summing daily activity, because the tier row is
+        the authority the tiers panel and the titles use - summing daily rows can disagree with it and
+        would silently skip a member who qualifies (found against a real database, 2026-09-25).
+        """
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT t.user_id, COALESCE(u.display_name, ''), t.xp, t.tier FROM member_tiers t "
+                "LEFT JOIN users u ON u.user_id = t.user_id WHERE t.xp >= ? "
+                "ORDER BY t.xp DESC, t.user_id LIMIT ?",
+                (float(xp_threshold), max(1, int(limit))),
+            )
+            return [tuple(row) for row in await cur.fetchall()]
+
     async def member_rank(
-        self, user_id: int, *, since_day: str | None = None, exclude_ids: Iterable[int] | None = None
+        self, user_id: int, *, since_day: str | None = None, exclude_ids: Iterable[int] | None = None,
     ) -> int | None:
         """1-based position of a member on the leaderboard, or None when they have no recorded activity."""
         rows = await self.top_members(limit=1000, since_day=since_day, exclude_ids=exclude_ids)

@@ -165,6 +165,151 @@ def test_titles_scale_past_the_threshold_and_stay_distinct(tmp_path):
     asyncio.run(scenario())
 
 
+class _Guild:
+    """No members-intent cache, exactly like the live bot: names come from the archive."""
+
+    members: list = []
+
+    def get_member(self, user_id: int):
+        return None
+
+
+class _PassBot(_StubBot):
+    def __init__(self, store, **kwargs):
+        super().__init__(store, **kwargs)
+        self.settings = type(
+            "S", (), {"owner_id": kwargs.get("owner_id", 111), "owner_title": "The Host",
+                      "allowed_guild_id": 1}
+        )()
+
+    def get_guild(self, _guild_id):
+        return _Guild()
+
+
+def _pass_bot(store, **kwargs):
+    from chaosx_bot.bot import ChaosXBot
+
+    bot = _PassBot(store, **kwargs)
+    bot._title_facts_inputs = ChaosXBot._title_facts_inputs.__get__(bot)
+    bot._ensure_member_titles = ChaosXBot._ensure_member_titles.__get__(bot)
+    bot._ensure_member_title = ChaosXBot._ensure_member_title.__get__(bot)
+    # the title text itself is stubbed: it samples the message archive and is covered by the
+    # real-database verification, while this test is about who gets titles at all
+    async def _fake_generate(**kwargs):
+        bot.generated.append(kwargs)
+        return f"Title {len(bot.generated)} for {kwargs['tier']}"
+
+    bot._generate_member_title = _fake_generate
+    bot._fill_missing_member_titles = ChaosXBot._fill_missing_member_titles.__get__(bot)
+    return bot
+
+
+def test_pass_strips_titles_below_the_threshold_and_fills_above_it(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "pass.db")
+        await store.init()
+        await store.set_member_title_slot(user_id=1001, slot=0, title="Keeper of Calm World")
+        await store.set_member_title_slot(user_id=1002, slot=0, title="Baron of Rising Chaos")
+        await store.upsert_activity_days(
+            [
+                (1001, "2026-09-22", 10, 300.0),   # Rising Chaos - below the threshold
+                (1002, "2026-09-22", 10, 950.0),   # Total Chaos - two titles
+                (1003, "2026-09-22", 10, 1200.0),  # World Collapse - four titles
+            ]
+        )
+        await store.recompute_member_tiers()
+        bot = _pass_bot(store)
+        written = await bot._fill_missing_member_titles(limit=6)
+        assert written == 2  # only the two members above the threshold are candidates
+        assert await store.member_title_slots(1001) == []  # below: stripped, not kept
+        assert len(await store.member_title_slots(1002)) == 2
+        assert len(await store.member_title_slots(1003)) == 4
+    asyncio.run(scenario())
+
+
+def test_pass_respects_the_per_pass_limit(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "limit.db")
+        await store.init()
+        await store.upsert_activity_days(
+            [(1002, "2026-09-22", 10, 950.0), (1003, "2026-09-22", 10, 1200.0)]
+        )
+        await store.recompute_member_tiers()
+        bot = _pass_bot(store)
+        assert await bot._fill_missing_member_titles(limit=1) == 1
+        assert len(await store.member_title_slots(1003)) == 4  # top of the ladder first
+        assert await store.member_title_slots(1002) == []
+        assert await bot._fill_missing_member_titles(limit=1) == 1
+        assert len(await store.member_title_slots(1002)) == 2
+    asyncio.run(scenario())
+
+
+def test_a_rolled_up_tier_row_above_the_threshold_is_never_skipped(tmp_path):
+    """A member qualifies from the tier row, even when their daily rows would not say so.
+
+    Found on a real database: gating on summed daily activity instead of the rolled-up row silently
+    skipped members who were above Chaos Tier.
+    """
+    async def scenario():
+        store = Store(tmp_path / "divergence.db")
+        await store.init()
+        await store.upsert_activity_days([(1002, "2026-09-22", 1, 5.0)])
+        await store.recompute_member_tiers()
+        db = await aiosqlite.connect(tmp_path / "divergence.db")
+        await db.execute("UPDATE member_tiers SET xp = 1100.0, tier = 'World Collapse' WHERE user_id = 1002")
+        await db.commit()
+        await db.close()
+        bot = _pass_bot(store)
+        assert await bot._fill_missing_member_titles(limit=6) == 1
+        assert len(await store.member_title_slots(1002)) == 4
+    asyncio.run(scenario())
+
+
+def test_owner_and_never_mention_members_are_left_alone(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "guard.db")
+        await store.init()
+        await store.set_member_title_slot(user_id=1001, slot=0, title="Keeper of Calm World")
+        await store.upsert_activity_days(
+            [(111, "2026-09-22", 10, 1500.0), (1001, "2026-09-22", 10, 950.0)]
+        )
+        await store.recompute_member_tiers()
+        bot = _pass_bot(store, owner_id=111)
+        bot._never_mention_ids = lambda: {1001}
+        assert await bot._fill_missing_member_titles(limit=6) == 0
+        assert await store.member_title_slots(1001) == ["Keeper of Calm World"]  # untouched
+        assert await store.member_title_slots(111) == []
+    asyncio.run(scenario())
+
+
+def test_offline_fallback_titles_are_distinct_per_slot():
+    from chaosx_bot.titles import MAX_TITLE_WORDS, fallback_title
+
+    facts = dict(tier="World Collapse", messages=500, contributions=0, active_days=40)
+    titles = [fallback_title(slot=slot, **facts) for slot in range(4)]
+    assert titles[0] == "Warden of the Endless Conversation"  # slot 0 keeps the classic form
+    assert len(set(titles)) == 4
+    assert all(len(title.split()) <= MAX_TITLE_WORDS for title in titles)
+    assert "Second Herald of the Ladder, World Collapse Class" == titles[1]
+
+
+def test_a_repeated_title_is_replaced_instead_of_duplicated(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "repeat.db")
+        await store.init()
+        stub = _StubBot(store, xp=1200.0, tier="World Collapse")
+
+        async def same_again(**_kwargs):
+            return "Keeper of the Total Chaos"
+
+        stub._generate_member_title = same_again
+        titles = await _call(stub)
+        assert len(titles) == 4 and len(set(titles)) == 4
+        assert titles[0] == "Keeper of the Total Chaos"
+        assert "Second Herald of the Ladder, World Collapse Class" in titles
+    asyncio.run(scenario())
+
+
 def test_owner_keeps_configured_title_and_is_not_on_the_ladder(tmp_path):
     async def scenario():
         store = Store(tmp_path / "owner.db")

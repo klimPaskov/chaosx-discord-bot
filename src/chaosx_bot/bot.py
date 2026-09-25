@@ -2645,17 +2645,22 @@ class ChaosXBot(discord.Client):
                 cleared += await self.store.clear_member_title_slots(holder)
         if cleared:
             tier_logger.info("member title pass: removed %d title(s) below %s", cleared, TITLE_MIN_TIER)
+        # Candidates come from the rolled-up tier row - the same authority `My tier` and the panel use -
+        # so a member who qualifies is never skipped because their daily rows disagree.
         threshold = dict(TIERS)[TITLE_MIN_TIER]
-        rows = await self.store.top_members(limit=25)
+        rows = await self.store.members_at_or_above(xp_threshold=threshold, limit=25)
         written = 0
         for row in rows:
             user_id = int(row[0])
-            if float(row[2] or 0) < threshold:
-                # rows arrive ordered by chaos, so nobody below this point can hold a title
-                break
             if written >= limit:
                 break
             if user_id == int(self.settings.owner_id):
+                continue
+            wanted = title_slots_for(str(row[3]))
+            if wanted == 0:
+                continue
+            if len(held.get(user_id, [])) >= wanted:
+                # already complete: must not consume this pass's budget
                 continue
             if user_id in self._never_mention_ids():
                 continue
@@ -3482,8 +3487,19 @@ class ChaosXBot(discord.Client):
                 days=days,
                 bonus_rows=bonus_rows,
                 already=list(titles),
+                slot=slot,
             )
-            if not title:
+            if not title or title in titles:
+                # offline, or a repeated answer: fall back to the distinct ladder form for this slot so
+                # the member still gets every title they earned, never the same one twice
+                title = fallback_title(
+                    tier=tier,
+                    messages=int(messages),
+                    contributions=len(bonus_rows),
+                    active_days=int(days),
+                    slot=slot,
+                )
+            if not title or title in titles:
                 break
             await self.store.set_member_title_slot(
                 user_id=user_id,
@@ -3520,6 +3536,7 @@ class ChaosXBot(discord.Client):
         days: int,
         bonus_rows: list,
         already: list[str],
+        slot: int = 0,
     ) -> str:
         """Write one title from real activity facts; a deterministic fallback covers a model outage."""
         facts = title_facts_line(
@@ -3553,9 +3570,14 @@ class ChaosXBot(discord.Client):
                 title = clean_title(getattr(result, "stdout", "") or "")
         except Exception as exc:
             print(f"ChaosX title model call failed: {type(exc).__name__}")
-        if not title:
+        if not title or title in already:
+            # offline, or the model repeated a title they already hold: use the distinct ladder form
             title = fallback_title(
-                tier=tier, messages=int(messages), contributions=len(bonus_rows), active_days=int(days)
+                tier=tier,
+                messages=int(messages),
+                contributions=len(bonus_rows),
+                active_days=int(days),
+                slot=slot,
             )
         return title
 
