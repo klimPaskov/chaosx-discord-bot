@@ -78,9 +78,9 @@ OFFICIAL_RESOURCES: tuple[Resource, ...] = (
     ),
     Resource(
         key="hoi4-mod-setup",
-        label="HOI4 Mod Setup (AI-ready mod scaffold and tool installer)",
+        label="HOI4 Mod Setup (AI-ready mod scaffold)",
         url="https://github.com/klimPaskov/HOI4-Mod-Setup",
-        when="installing and registering the modding tools (Live Tools, Agent Tools, ComfyUI workflows) for your coding client, or preparing a HOI4 mod for AI-assisted development",
+        when="preparing a HOI4 mod for AI-assisted development (desktop app and browser edition)",
     ),
     Resource(
         key="agentic-modding",

@@ -31,7 +31,7 @@ from .indexer import (
 MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
 PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES = {"agent_skill_or_contract"}
-MAX_CONTEXT_CHARS = 4000
+MAX_CONTEXT_CHARS = 6000
 # Last-resort fallback for public asks: guaranteed-hit digest terms so the
 # answering model always gets real docs/notes/code ground truth from the index
 # instead of answering from memory.
@@ -379,6 +379,37 @@ class Knowledge:
             lines.append(item)
         return "\n".join(lines)
 
+    def _excerpt_for_terms(self, path: str, terms: list[str], window: int = 900) -> str:
+        """A passage from `path` centred on the most specific query term the document contains.
+
+        FTS snippets window around the *first* match, which for a README is the badge header — the line
+        that answers "how do I install this" sits 15 lines below it and never reaches the model. Anchoring
+        on the longest term the document actually contains puts the answer in the window instead.
+        """
+        conn = connect(self.db_path)
+        try:
+            row = conn.execute("SELECT content FROM source_docs WHERE path = ?", (path,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return ""
+        content = str(row[0] or "")
+        if not content:
+            return ""
+        lowered = content.lower()
+        anchor = 0
+        for term in sorted(terms, key=len, reverse=True):
+            if len(term) < 4:
+                continue
+            index = lowered.find(term)
+            if index >= 0:
+                anchor = index
+                break
+        start = max(0, anchor - 220)
+        passage = content[start : start + window]
+        passage = re.sub(r"[ \t]+", " ", passage).strip()
+        return f" … {passage}" if start else passage
+
     def public_ask_context(self, query: str, limit: int = 6, include_sources: bool = False) -> str:
         """Return internal retrieval snippets for public /ask.
 
@@ -391,11 +422,12 @@ class Knowledge:
         """
         self.ensure_index()
         rows = self._public_ask_ranked_rows(query, limit)
+        terms = expand_terms(_query_terms(query))
         snippets: list[str] = []
         total = 0
         seen_snips: set[str] = set()
         for i, (path, source_class, snip, _rank) in enumerate(rows, 1):
-            clean = _clean_snippet(snip)
+            clean = self._excerpt_for_terms(path, terms) or _clean_snippet(snip)
             if not clean:
                 continue
             # Duplicate chunks (same doc indexed under several paths) add length, not information.
