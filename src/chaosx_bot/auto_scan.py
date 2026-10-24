@@ -177,8 +177,24 @@ def is_question_like(content: str) -> bool:
 
 
 def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    """Phrase match with plural tolerance.
+
+    Members write "mcps", "mods", "workflows", not the singular the term list uses, and an exact
+    space-delimited match missed them: "what are the mcps used for?" carried no domain signal at all, so
+    the bot stayed silent on a plain project question (Hoops, 2026-10-24). "s" covers almost every case;
+    "es" is only added for sibilant endings so "mod" never matches "modes".
+    """
     normalized_phrase = normalize_scan_text(phrase)
-    return bool(normalized_phrase) and f" {normalized_phrase} " in f" {text} "
+    if not normalized_phrase:
+        return False
+    haystack = f" {text} "
+    if f" {normalized_phrase} " in haystack:
+        return True
+    if f" {normalized_phrase}s " in haystack:
+        return True
+    if normalized_phrase.endswith(("s", "x", "z", "ch", "sh")):
+        return f" {normalized_phrase}es " in haystack
+    return False
 
 
 def has_domain_signal(content: str) -> bool:
