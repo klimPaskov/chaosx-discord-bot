@@ -54,3 +54,31 @@ def test_chunk_reopens_a_fence_it_had_to_close():
     for part in parts:
         assert part.count("```") % 2 == 0, part[-80:]
     assert parts[1].lstrip().startswith("```txt")
+
+def test_source_labels_are_not_shown_to_members():
+    # Hoops, 2026-10-24: "The bot doesn't need to show where it gathered context from."
+    repaired = repair_discord_markdown(
+        "Run the **HOI4 Mod Setup** app — it wires things up for you (HOI4 Mod Setup readme).\n"
+        "The **Chaos Meter** is documented in the events chapter (Event 042 spec)."
+    )
+    assert "readme" not in repaired.lower()
+    assert "Event 042 spec" not in repaired
+    assert "HOI4 Mod Setup" in repaired and "Chaos Meter" in repaired
+
+
+def test_source_lines_are_dropped():
+    repaired = repair_discord_markdown("## Steps\n1. Run the app\n\nSource: docs/install.md\n2. Done")
+    assert "Source:" not in repaired
+    assert "docs/install.md" not in repaired
+    assert "Run the app" in repaired
+
+
+def test_attribution_lead_is_dropped_and_capitalised():
+    repaired = repair_discord_markdown("According to the HOI4 Live Tools readme, install the release zip first.")
+    assert repaired.startswith("Install the release zip first")
+    assert "readme" not in repaired.lower()
+
+
+def test_a_real_parenthetical_survives():
+    repaired = repair_discord_markdown("The meter fills over time (roughly one stage per year).")
+    assert "(roughly one stage per year)" in repaired

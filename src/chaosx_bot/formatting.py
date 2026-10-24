@@ -130,9 +130,31 @@ _CITATION_RE = re.compile(r"(?<![\w\]`])\[([^\]\n]{2,60})\](?!\()")
 _UNDERSCORE_IDENT_RE = re.compile(
     r"(?<![\w`./\\-])([A-Za-z0-9][\w./\\-]*_[A-Za-z0-9_./\\-]+)(?![\w`])"
 )
+# Hoops, 2026-10-24: "The bot doesn't need to show where it gathered context from. It is not useful for a
+# user." The prompt is told not to do it; these strip what still slips through — a trailing "(HOI4 Live Tools
+# readme)", a "(Event 042 spec)", or a whole "Source: docs/…" line.
+_PROVENANCE_LINE_RE = re.compile(r"(?im)^\s*(?:sources?|sources? used|references?)\s*:.*(?:\n|$)")
+_PROVENANCE_PAREN_RE = re.compile(
+    r"\s*\((?:[^()\n]{1,60}?)\b(?:readme|guidance|guide|specs?|docs?|documentation|wiki|vault|repo)\b[^()\n]{0,40}\)",
+    re.I,
+)
+_PROVENANCE_LEAD_RE = re.compile(
+    r"(?i)\baccording to (?:the )?[^.,;\n]{1,60}?\b(?:readme|guide|specs?|docs?|documentation|wiki)\b,?\s*(\S)"
+)
+
+
+def _drop_attribution(match: "re.Match[str]") -> str:
+    """Remove "According to the X readme, ..." and capitalise what becomes the sentence start."""
+    following = match.group(1)
+    before = match.string[: match.start()].rstrip()
+    at_sentence_start = (not before) or before[-1] in ".!?" or before.endswith("\n")
+    return following.upper() if at_sentence_start and following.islower() else following
 
 
 def _repair_prose(segment: str) -> str:
+    segment = _PROVENANCE_LINE_RE.sub("", segment)
+    segment = _PROVENANCE_PAREN_RE.sub("", segment)
+    segment = _PROVENANCE_LEAD_RE.sub(_drop_attribution, segment)
     segment = _GLUED_HEADING_RE.sub(r"\1\n\n\2", segment)
     segment = _DEEPER_HEADING_RE.sub("### ", segment)
     # `[source label]` without a following URL looks like a broken link; parentheses read as a note.

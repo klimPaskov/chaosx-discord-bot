@@ -17,6 +17,14 @@ LOGGER = logging.getLogger("chaosx.knowledge")
 
 # Knowledge is a frozen dataclass, so this cache lives at module level: (db path, doc path) -> lowercased text.
 _DOC_CONTENT_CACHE: dict[tuple[str, str], str] = {}
+# Documents that describe a bundled route say it in their own words ("Installs it for you", "part of the …
+# toolkit", "the installer script sets it up"). The excerpt used to jump straight to the manual steps, so the
+# answer told people to download the zip even when a tool exists that wires the component up for them.
+_BUNDLED_ROUTE_RE = re.compile(
+    r"(?i)(installs? (?:it|this|them|everything) for you|part of the [^\n]{0,40}toolkit|"
+    r"installer (?:app|script|that)|sets? (?:it|this|them|everything) up for you)"
+)
+
 from .indexer import (
     CatalogReadError,
     INDEX_SCHEMA_VERSION,
@@ -416,7 +424,17 @@ class Knowledge:
         start = max(0, anchor - 220)
         passage = content[start : start + window]
         passage = re.sub(r"[ \t]+", " ", passage).strip()
-        return f" … {passage}" if start else passage
+        excerpt = f" … {passage}" if start else passage
+        # If the document itself says something else installs this for the reader, that line belongs next to
+        # the manual steps — otherwise the answer leads with "download the release zip" and contradicts the
+        # bundled route it recommends elsewhere.
+        bundled = _BUNDLED_ROUTE_RE.search(content)
+        if bundled:
+            b_start = max(0, bundled.start() - 120)
+            extra = " ".join(content[b_start : bundled.start() + 260].split())
+            if extra and extra not in excerpt:
+                excerpt = f"{extra} … {excerpt}"
+        return excerpt
 
     def public_ask_context(
         self,
