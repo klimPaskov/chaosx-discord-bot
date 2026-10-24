@@ -135,7 +135,8 @@ _UNDERSCORE_IDENT_RE = re.compile(
 def _repair_prose(segment: str) -> str:
     segment = _GLUED_HEADING_RE.sub(r"\1\n\n\2", segment)
     segment = _DEEPER_HEADING_RE.sub("### ", segment)
-    segment = _CITATION_RE.sub(lambda m: f"`{m.group(1).strip()}`", segment)
+    # `[source label]` without a following URL looks like a broken link; parentheses read as a note.
+    segment = _CITATION_RE.sub(lambda m: f"({m.group(1).strip()})", segment)
     segment = _UNDERSCORE_IDENT_RE.sub(lambda m: f"`{m.group(1)}`", segment)
     return segment
 

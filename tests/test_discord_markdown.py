@@ -16,7 +16,7 @@ def test_heading_glued_to_a_paragraph_gets_a_blank_line():
 def test_bracket_citation_is_not_left_looking_like_a_broken_link():
     repaired = repair_discord_markdown("Run the installer [HOI4 Live Tools readme].")
     assert "[HOI4 Live Tools readme]" not in repaired
-    assert "`HOI4 Live Tools readme`" in repaired
+    assert "(HOI4 Live Tools readme)" in repaired
 
 
 def test_underscore_identifier_is_backticked():
