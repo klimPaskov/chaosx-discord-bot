@@ -49,6 +49,15 @@ AUTO_SCAN_DOMAIN_TERMS = {
     "access",
     "reaction role",
     "community",
+    "comfyui",
+    "mcp",
+    "hoi4 agent tools",
+    "agentic modding",
+    "agentic",
+    "codex",
+    "hermes agent",
+    "lora",
+    "workflow json",
 }
 AUTO_SCAN_GROUNDED_CONTEXT_TERMS = {
     "chaos redux",

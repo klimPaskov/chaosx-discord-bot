@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -95,6 +96,7 @@ def _cost_lookup_block(*, settings: Settings, text: str) -> str:
 from .conversation_memory import (
     MEMORY_MAINTENANCE_INTERVAL_S,
     backfill_capture,
+    record_voice_exchange,
     capture_message,
     conversation_context_for,
     known_authors_for,
@@ -104,6 +106,7 @@ from .conversation_memory import (
     schedule_compaction,
     schedule_user_profile_compaction,
     search_user_profiles,
+    server_memory_for,
     sync_user_registry,
     user_history_for,
     user_profile_for,
@@ -111,6 +114,7 @@ from .conversation_memory import (
 )
 from .catalog_validation import format_workbook_validation, validate_workbook
 from .community_notes import (
+    promote_community_idea,
     format_event_idea_post_body,
     format_event_idea_post_title,
     is_vague_event_idea,
@@ -164,6 +168,8 @@ from .web_grounding import WebGrounder, format_web_results_for_display
 from .web_sources import EvidenceImage
 from .vault_index import refresh_vault_indexes
 from .ask_api import DirectAskError, direct_chat_completion, direct_chat_completion_stream
+from .voice_audio import SpeechToText, build_tts
+from .voice_chat import VoiceChatSession
 from .hermes_bridge import (
     HermesResult,
     HermesRunActivity,
@@ -185,6 +191,7 @@ from .hermes_bridge import (
     SYSTEM_BOUNDARY,
 )
 from .knowledge import Knowledge
+from .indexer import parse_extra_roots
 from .issue_duplicates import (
     SimilarGitHubIssue,
     candidate_review_context,
@@ -210,6 +217,7 @@ from .playtest_reminders import (
     strip_schedule_json,
 )
 from .rate_limit import FixedWindowRateLimiter, RateLimitResult
+from .resources import help_resources_section
 from .server_intel import (
     IntelFacts,
     archive_fallback,
@@ -239,19 +247,61 @@ from .announcements import (
     collect_announcement_facts,
     title_from_body,
 )
+from .ideas import (
+    IDEA_STATUSES,
+    MAX_SUBMISSIONS_PER_WEEK,
+    OPEN_STATUSES,
+    BUILDING,
+    PLANNED,
+    REVIEW_BUTTONS,
+    SHIPPED,
+    award_for_status,
+    board_line,
+    board_summary,
+    find_duplicate,
+    preview_text,
+    priority_marker,
+    rate_limit_message,
+    status_label,
+    status_line,
+)
+from .titles import (
+    MAX_TITLE_WORDS,
+    TITLE_PROMPT,
+    clean_title,
+    fallback_title,
+    title_facts_line,
+)
 from .activity import (
+    BONUS_FULL_PER_MONTH,
+    has_perk,
     BONUS_XP,
+    CHAT_CAP_WINDOW_DAYS,
+    CHAT_DAILY_XP_CAP,
+    CHAT_DAILY_XP_CAP_MAX,
+    DIMINISHED_VALUE,
+    DIMINISHING_AFTER,
+    LADDER_QUOTE_LINE,
+    TITLE_MIN_TIER,
+    chat_daily_cap,
     DEFAULT_ELIGIBLE_TIER,
     TIERS,
     banter_eligible,
     day_xp,
     parse_day,
+    cumulative_perks,
     select_banter_candidates,
+    tier_emoji,
     tier_for_xp,
+    title_slots_for,
     tier_progress,
+    voting_weight,
 )
-from .guild_stats import GuildCounts, GuildCountsCache
+from .formatting import block, bullets, heading, kv, numbered, scrub_names, section, small
+from .guild_stats import GuildCountsCache
 from .routine_posts import (
+    refresh_repo,
+    preferred_revision,
     DEV_DIGEST,
     DIGEST_WINDOW_DAYS,
     RELEASE_POSTS,
@@ -264,14 +314,19 @@ from .routine_posts import (
     descriptor_version,
     digest_fallback,
     git_change_areas,
+    git_themes,
     git_commit_summary,
     git_commits_between,
     git_files_touched,
     git_head_sha,
     github_issue_activity,
     github_latest_release,
+    iso_week_key,
+    last_complete_week,
     parse_iso,
     plan_due_posts,
+    strip_online_count,
+    with_window_note,
     playtest_observation,
     release_fallback,
     release_signal_changed,
@@ -281,22 +336,67 @@ from .routine_posts import (
     weekly_period_key,
     weekly_slot,
 )
+from .answer_cache import AnswerCache
+from .capabilities import probe_capabilities
+from .denial_guard import corrective_prompt, is_denial
+from .grounding import citations, is_ungrounded_refusal, unverified_citations
+from .live_facts import set_capability_summary
 from .runtime_status import (
+    answer_quality_lines,
+    command_timings_lines,
+    record_answer_event,
+    record_command_timing,
     collect_process_tree,
     format_hermes_progress,
     format_process_panel,
+    timing_lines,
 )
 from .server_rules import ServerRules
+from .testing_poll import (
+    FAMILIES,
+    FAMILY_SINGULAR,
+    MAX_NOMINATIONS_PER_MEMBER,
+    MAX_NOMINATION_CHARS,
+    candidate_key,
+    clamp_label,
+    family_emoji,
+    family_label,
+    is_safe_nomination,
+    nomination_slug,
+    split_pages,
+)
+from .suggestions import (
+    MAX_SUGGESTIONS,
+    SUGGESTION_KEYS,
+    Suggestion,
+    build_suggestions,
+    render_suggestions,
+)
 from .storage import Store
+from .tier_roles import ensure_tier_roles, sync_tier_role, tier_role_name
 from .webhook_server import GitHubWebhookServer
 
 logger = logging.getLogger("chaosx.attachments")
+tier_logger = logging.getLogger("chaosx.tiers")
+idea_logger = logging.getLogger("chaosx.ideas")
 if not logger.handlers:  # bot.py configures no logging of its own, so attach our own
     _attachments_handler = logging.StreamHandler()  # stderr → journald
     _attachments_handler.setFormatter(logging.Formatter("[attachments] %(message)s"))
     logger.addHandler(_attachments_handler)
     logger.setLevel(logging.INFO)
+    # TEMPORARY voice/MLS diagnostics: CHAOSX_VOICE_DEBUG=1 in the service environment (remove after testing)
+    import os as _os
+
+    if _os.environ.get("CHAOSX_VOICE_DEBUG"):
+        logging.getLogger("discord.gateway").setLevel(logging.DEBUG)
+        logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
     logger.propagate = False
+if not tier_logger.handlers:  # tier-role work is otherwise invisible in the journal
+    _tier_handler = logging.StreamHandler()
+    _tier_handler.setFormatter(logging.Formatter("[tiers] %(message)s"))
+    tier_logger.addHandler(_tier_handler)
+    tier_logger.setLevel(logging.INFO)
+    tier_logger.propagate = False
 
 # Words that suggest the user is referring to an attachment they posted earlier
 # ("get it from an earlier message"). Deliberately concrete: pronoun-only
@@ -367,21 +467,47 @@ def activity_window_start(days: int) -> str:
     return (utcnow() - timedelta(days=max(1, days))).date().isoformat()
 
 
-def _tier_standings_lines(rows: list[tuple]) -> list[str]:
+async def tier_report_lines(bot: "ChaosXBot") -> list[str]:
+    """The owner-facing tier report: all-time, last seven days, and the rollup state."""
+    week_start = activity_window_start(7)
+    cursor = await bot.store.activity_cursor()
+    return [
+        "## Chaos tiers (all time)",
+        *_tier_standings_lines(await bot.store.top_members(limit=15)),
+        f"\n## Last 7 days (since {week_start})",
+        *_tier_standings_lines(await bot.store.top_members(limit=10, since_day=week_start)),
+        f"\nRollup cursor: archive id {cursor}; tiers: " + ", ".join(f"{name} ({threshold})" for name, threshold in TIERS),
+    ]
+
+
+def _idea_age_days(created_at: str) -> int:
+    """Whole days since an idea was filed (0 when the timestamp is unusable)."""
+    try:
+        created = datetime.fromisoformat(str(created_at))
+    except ValueError:
+        return 0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0, (utcnow() - created).days)
+
+
+def _tier_standings_lines(rows: list[tuple], titles: dict[int, str] | None = None) -> list[str]:
     out: list[str] = []
+    known = titles or {}
     for rank, (user_id, name, xp, messages, days) in enumerate(rows, start=1):
         progress = tier_progress(float(xp or 0))
         days = int(days)
-        out.append(
-            f"{rank}. {name or user_id} — {progress.label} "
-            f"({int(xp)} chaos, {int(messages)} messages/{days} day{'s' if days != 1 else ''})"
-        )
+        title = known.get(int(user_id))
+        titled = f" — *{title}*" if title else ""
+        # Rank, name, title and tier only: exact values stay out of public text (Hoops 2026-09-24).
+        # Members still see their own exact chaos privately in `My tier`.
+        out.append(f"{rank}. {tier_emoji(progress.tier)} **{name or user_id}**{titled} — {progress.label}")
     return out or ["(no activity recorded yet)"]
 
 
 ROUTINE_POSTS_WORKER_INITIAL_DELAY_S = 90
 ACTIVITY_WORKER_INITIAL_DELAY_S = 120
-PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux questions. Try asking about events, scenarios, mechanics, testing, or mod info."
+PUBLIC_ASK_REDIRECT = "I can only answer Chaos Redux and modding questions. Try asking about events, scenarios, mechanics, testing, the modding setup, or the mod's official links."
 PUBLIC_ASK_DOMAIN_TERMS = {
     "chaos redux", "chaosx", "hoi4", "hearts of iron", "mod", "event", "scenario", "cluster", "mechanic",
     "testing", "playtest", "bug", "balance", "focus", "country", "lore", "zombie", "infection", "outbreak",
@@ -913,7 +1039,7 @@ async def generate_auto_scan_model_response(
             user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
-            server_facts=bot.server_facts_for_request(user_message),
+            server_facts=await bot.facts_block_for_request(user_message, requester_id=message.author.id),
             known_users=await bot.known_users_block(),
             server_members=bot.members_block(),
             referenced_users=await bot.referenced_user_contexts_block(user_message),
@@ -932,7 +1058,7 @@ async def generate_auto_scan_model_response(
             reference_context=decision.reference_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
-            server_facts=bot.server_facts_for_request(user_message),
+            server_facts=await bot.facts_block_for_request(user_message, requester_id=message.author.id),
             known_users=await bot.known_users_block(),
             server_members=bot.members_block(),
             web_context=web_context,
@@ -1336,6 +1462,9 @@ async def submit_validated_issue(
     )
     ok, result = await create_github_issue(bot.settings.github_repo, title=issue_title, body=body)
     await bot.store.audit(actor_id=actor_id, guild_id=guild_id, channel_id=channel_id, command="issue", summary=issue_title)
+    await bot._award_contribution(
+        user_id=actor_id, kind="bug_report", ref=f"issue:{issue_title}", guild_id=guild_id, channel_id=channel_id
+    )
     return ok, result, issue_title
 
 
@@ -1464,7 +1593,7 @@ def _event_label(event_id: str) -> str:
 
 
 def community_help_text() -> str:
-    return """## ChaosX community help
+    return f"""## ChaosX community help
 Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing notes, and cleaner idea/report drafts.
 
 ### Ask
@@ -1480,21 +1609,32 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/cluster cluster:<id or name>` — event cluster summary with member event names.
 - `/status` — project catalog totals and event breakdowns.
 - `/testing` — show events currently marked as needing testing.
+- `/tiers [scope:all|week]` — the server's chaos tiers and leaderboard: the chaos ladder, the most active members, and buttons for your own tier (private, only you see it) and to take yourself off the leaderboard.
+  - Chat earns a little and is capped, so nobody levels up by spamming. Contributing earns far more, and work that gets accepted or reaches the mod earns most. Quality pays here, volume does not.
+  - Each tier unlocks perks as you climb: your tier emoji on the leaderboard, priority review for ideas you post, a public credit when you contribute (Chaos Tier and up), and more. Ladder titles start above Chaos Tier - one to begin with, then more at every tier above. `My tier` lists your own perks and titles.
+  - Reaching a tier also colours your name in the server with that tier's colour (the mod's own tier colours).
 
 ### Report or draft feedback
 - `/issue` — uses AI to review a report form; if approved, ChaosX formats it and sends it to GitHub Issues. Bug/crash forms ask for relevant `error.log` lines.
 - `/suggestion suggestion:<idea>` — uses AI to turn a rough suggestion into a clearer review note.
-- `/event-idea idea:<idea>` — uses AI to format an event idea with a name, ID placeholder, type, baseline description, evolutions, and scenario hooks.
+- `/event-idea` — opens a short form (the idea plus optional type, cluster, world-end link and evolution stages). The bot drafts it and shows you a private **preview**: `Post to forum` files it, `Edit` reopens the form with your text, `Discard` throws it away. Nothing is saved or posted until you press a button.
+  - Filing earns a little chaos; if the idea is accepted into the plan or reaches the mod, the author earns more.
+  - Near-duplicates are flagged in the preview, and there is a limit of 5 submissions a week so the queue stays reviewable.
+- `/ideas` — the idea pipeline: how many ideas are waiting, what is planned, what is in the mod, and your own submissions. Buttons switch the view.
 
 ### Playtest notes
 - `/playtest report observation:<text>` — record testing observations, quick notes, balance feel, weird behavior, or unclear feedback that is not ready to become a GitHub issue. Add `event_id` if the note is about one event.
 - `/playtest summary` — show recent recorded playtest observations.
+
+### Links
+{help_resources_section()}
 
 Tip: use `/ask` when you need a flexible explanation; use exact lookup commands for events, scenarios, clusters, status, and testing."""
 
 
 def operator_help_text(settings: Settings) -> str:
     reminder_channel = settings.automation_reminder_channel_id or "unset"
+    banter_channel = f"<#{settings.idle_banter_channel_id}>" if settings.idle_banter_channel_id else "unset"
     return f"""## ChaosX admin help
 Use this only for private owner tools. If you are unsure, use `/admin ask` and write the request normally.
 
@@ -1503,10 +1643,12 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
 
 ### Event idea tools
 - `/admin event-idea` — use the stronger private model to mine the repo and Chaos Redux vault for connections, generate one structured event idea, assign the next available numeric event ID, and save `<id> - <event name>.md` under `Events/Event Specs/`. It refreshes vault indexes but does **not** post the idea to the public event-ideas forum.
+- `/admin ideas action:<list|counts|panel|status|promote>` — the community idea pipeline. `list` shows the queue, `counts` the health line, `panel` posts the public board in the ideas channel, `status submission_id:<n> status:<planned|building|shipped|declined> note:<text>` moves an idea (and pays the staged chaos), and `promote submission_id:<n>` turns an accepted community idea into the next numbered spec under `Events/Event Specs/`. The same status moves are available as owner-only buttons on each idea's own forum post.
 - `/admin event-improvement event_id:<id>` — autonomously improve an existing event note while keeping it as a rough idea collection. It mines the repo and vault to expand thin sections and draw relevant connections, but it does not turn the note into a full specification or add planning/coding guidance.
 
 ### Useful shortcuts
 - `/admin health` — quick check that ChaosX is online and looking at the right Chaos Redux server. Use when commands look missing or the bot just restarted.
+- `/admin model action:<status|set|reset> scope:<public|admin> model:<id> reasoning:<effort>` — show or switch which model answers on the community surface or your protected runs. Persists across restarts; `action:reset` returns to the .env model.
 - `/admin processes` — show the live ChaosX launcher/bot/child process tree plus active Hermes model runs, PIDs, model, reasoning effort, phase, and elapsed time without exposing prompts or secrets.
 - `/admin restart` — safely restart the ChaosX systemd service. Flag and leader artwork refreshes automatically on each focus request, so this is only for restarting the bot itself.
 - `/admin validate-workbook` — validate the authoritative XLSX for duplicate/invalid IDs, missing required fields, evolution gaps, and broken event/cluster references.
@@ -1518,6 +1660,15 @@ Use this only for private owner tools. If you are unsure, use `/admin ask` and w
   - Example: `/playtest schedule request:Test Fury tomorrow 8pm for 90 minutes in voice, latest Steam build`
   - Example: `/playtest schedule request:Plan a weekend multiplayer test for zombie outbreak and Soviet collapse, ask testers to report crashes and balance issues`
   - If you like the draft, confirm the exact action through `/admin ask`, e.g. `create the Discord Scheduled Event from this playtest draft and post the reminder in <channel>`.
+
+### Chaos tiers / activity
+- `/admin tiers action:show` — current chaos-tier standings (all time plus the last seven days) with the rollup cursor and the tier ladder.
+- `/admin tiers action:rebuild` — re-roll the whole activity archive from scratch. Safe and repeatable: each member-day is replaced, never added to.
+- `/admin tiers action:member member:<@user|name>` — one member's tier, XP, active days, banter exclusion and both opt-outs.
+- `/admin tiers action:banter` — the banter switches and exactly who idle banter could target right now (banter itself is off and in shadow mode).
+- `/admin tiers action:panel` — post the public chaos-tier panel with live buttons into `{banter_channel}`. The panel keeps working across restarts, and members can hide themselves from it individually.
+- `/admin tiers action:roles` — create or recolour the six chaos-tier roles (the mod's own tier colours) and move every member to their tier's role. Reports anything Discord refused, e.g. when the bot's role sits below the tier roles. Tier colours only show for members whose highest coloured role is their tier, so the ChaosX role has to sit above cosmetic roles like Custerdome.
+- Chaos for contributions is credited automatically when a playtest observation is recorded, an event idea or suggestion is captured, or an issue reaches GitHub. Each contribution is credited once (`ref`), capped at 30 chaos a day; the value drops to half after the first three in a calendar month so the same credit cannot be farmed. Chat is capped dynamically (6 a day, up to 10 for members who contribute) so typing volume cannot out-earn contribution.
 
 ### Automation / diagnostics
 - `/admin automation action:list` — shows each automation, what it does, whether it is enabled, and where it posts. Reminder-style automation output goes to channel `{reminder_channel}`; weekly content dumps go to the content-dump channel.
@@ -1563,11 +1714,23 @@ class ChaosXBot(discord.Client):
         # not a high-confidence local engagement opportunity; public text is
         # generated by the configured model, not hardcoded here.
         intents.message_content = settings.mention_ask_enabled or settings.auto_scan_enabled
+        # The members intent is what makes guild.members (and the user registry, digests, tiers and every
+        # "who is this" answer) non-empty. Intents.default() excludes it, which is why the bot used to report
+        # "0 members visible" and could not answer anything about users. The intent must also be enabled in the
+        # Discord developer portal (Bot -> Privileged Gateway Intents -> Server Members).
+        intents.members = settings.members_intent_enabled
         super().__init__(intents=intents, allowed_mentions=safe_allowed_mentions())
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
         self.store = Store(settings.db_path)
+        self.answer_cache = AnswerCache(
+            settings.db_path,
+            ttl=settings.answer_cache_ttl_seconds,
+            enabled=settings.answer_cache_enabled,
+        )
         self.rate_limiter = FixedWindowRateLimiter()
+        # Per-user voice pace/verbosity, remembered across restarts.
+        self.voice_prefs = VoicePreferences(Path(settings.voice_work_dir) / "voice-prefs.json")
         visual_repo = settings.focus_tree_repo or settings.chaos_redux_repo
         self.knowledge = Knowledge(
             settings.chaos_redux_repo,
@@ -1575,6 +1738,8 @@ class ChaosXBot(discord.Client):
             settings.obsidian_vault_path,
             settings.qoder_repowiki_path,
             catalog_repo=visual_repo,
+            autorebuild=settings.index_autorebuild,
+            extra_roots=parse_extra_roots(settings.extra_knowledge_roots),
         )
         self.mcp_session = SharedMcpSession(settings)
         self.focus_tree_catalog = FocusTreeCatalog(visual_repo)
@@ -1708,6 +1873,11 @@ class ChaosXBot(discord.Client):
             f"- ChaosX bot maker: {s.bot_maker_name}",
             f"- Main Chaos Redux developer: {s.main_dev_name}",
             "- If asked who made, created or built ChaosX, who owns or runs it, or who the owner/developer is: answer with these names plainly and never say you do not know.",
+            "- Voice: ChaosX is not a text-only bot. It can sit in the \U0001f534\u2503chaosx-live voice channel "
+            f"(channel id {getattr(s, 'voice_channel_id', 0) or 1553693069210165319}) and answer spoken questions "
+            "out loud there whenever members are talking in it. It does not join by itself if the channel is "
+            "empty. If asked whether it can use voice, hear people, or join a call, the answer is yes for that "
+            "channel \u2014 never claim it cannot sit in voice channels, cannot listen, or is limited to text.",
         ]
         return "\n".join(parts)
 
@@ -1731,6 +1901,17 @@ class ChaosXBot(discord.Client):
         "chaos redux developer",
         "chaos redux dev",
         "who develops",
+        "voice",
+        "vc",
+        "voice chat",
+        "voice channel",
+        "chaosx-live",
+        "voice call",
+        "in a call",
+        "join the call",
+        "join voice",
+        "can you hear",
+        "do you listen",
         "who maintains",
         "who is the developer",
         "who is the dev",
@@ -1771,6 +1952,28 @@ class ChaosXBot(discord.Client):
         if request_needs_server_facts(request, self._SERVER_FACTS_LOOKUP_TERMS):
             return self.server_facts_block()
         return ""
+
+    async def live_facts_for_request(self, request: str, *, requester_id: int = 0) -> str:
+        """LIVE state (activity, GitHub, playtests, moderation), always fetched.
+
+        Fetching and reciting are separate decisions. The block is cached for a short TTL, so fetching it on every
+        ask is cheap, and having it always present is what makes a false "I can't check that" impossible. Whether
+        any of it appears in the answer is RELEVANCE_RULE's job (Hoops 2026-10-18).
+        """
+        from . import live_facts
+
+        try:
+            return await live_facts.collect(self, requester_id=requester_id)
+        except Exception:
+            return ""
+
+    async def facts_block_for_request(
+        self, request: str, *, requester_id: int = 0, always_identity: bool = False
+    ) -> str:
+        """Identity facts plus live state for one ask. Never let either half break the answer."""
+        identity = self.server_facts_block() if always_identity else self.server_facts_for_request(request)
+        live = await self.live_facts_for_request(request, requester_id=requester_id)
+        return "\n\n".join(part for part in (identity, live) if part)
 
     def members_block(self) -> str:
         """Prompt-ready member directory; kicks a background refresh when stale."""
@@ -1929,6 +2132,52 @@ class ChaosXBot(discord.Client):
             return ""
         return "\n\n".join(blocks)
 
+    def channel_name_map(self) -> dict[int, str]:
+        """Channel id -> name, so shared server memory can be labelled with readable channel names."""
+        names: dict[int, str] = {}
+        for guild in self.guilds:
+            for channel in getattr(guild, "channels", []):
+                names[int(channel.id)] = getattr(channel, "name", None) or str(channel.id)
+        return names
+
+    def voice_idea_recorder(self, channel: Any):
+        """Return the callback the voice session uses to file a confirmed spoken idea."""
+
+        async def file_idea(user_id: int, idea: str) -> str:
+            guild = getattr(channel, "guild", None)
+            member = guild.get_member(user_id) if guild is not None else None
+            return await self.submit_voice_event_idea(
+                user_id=int(user_id),
+                user_name=getattr(member, "display_name", "") or str(user_id),
+                raw_idea=idea,
+                guild_id=getattr(guild, "id", self.settings.allowed_guild_id),
+                channel_id=int(getattr(channel, "id", 0)),
+            )
+
+        return file_idea
+
+    def voice_memory_recorder(self, channel: Any):
+        """Return the callback that files spoken exchanges into the message archive."""
+
+        async def record(user_id: int, question: str, answer: str) -> None:
+            guild = getattr(channel, "guild", None)
+            member = guild.get_member(user_id) if guild is not None else None
+            await record_voice_exchange(
+                self.settings.db_path,
+                guild_id=getattr(guild, "id", self.settings.allowed_guild_id),
+                channel_id=int(getattr(channel, "id", 0)),
+                memory_channel_id=self.settings.voice_transcript_channel_id,
+                user_id=int(user_id),
+                user_name=getattr(member, "display_name", "") or str(user_id),
+                question=question,
+                answer=answer,
+                allowed_guild_id=self.settings.allowed_guild_id,
+                bot_user_id=int(self.user.id) if self.user is not None else 0,
+                created_at=datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            )
+
+        return record
+
     async def user_context_for(self, user_id: int, *, exclude_message_id: int | None = None) -> str:
         """Prompt-ready info about the asking user: display name, top role,
         their stored profile (preferences/suggestions from earlier messages),
@@ -1974,8 +2223,8 @@ class ChaosXBot(discord.Client):
         # (or a non-owner uses the owner's display name) -> include the
         # actual username so the asking user stays distinct.
         username: str | None = None
+        same = 0
         if display:
-            same = 0
             for member in self.guild_members._members:  # noqa: SLF001 - same-module access
                 if str(member.get("id")) == str(user_id):
                     username = user_reference_name(member) or None
@@ -2012,11 +2261,154 @@ class ChaosXBot(discord.Client):
             parts.append(history)
         return "\n".join(parts)
 
+    async def on_voice_state_update(self, member, before, after) -> None:
+        """Join the voice channel only while a human is in it, and leave when they all go.
+
+        Sitting in the channel permanently marks it as voice-active on the server and starts
+        Discord's connection timer, neither of which we want.
+        """
+        channel_id = self.settings.voice_channel_id
+        if not self.settings.voice_enabled or not channel_id or member.bot:
+            return
+        channel = self.get_channel(channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+        humans = [m for m in channel.members if not m.bot]
+        session = getattr(self, "_voice_session", None)
+        # After the idle leave the session object still exists but is disconnected; treat that as
+        # "not in the channel" so the next person to join gets a fresh join.
+        if session is not None and (session.vc is None or not session.vc.is_connected()):
+            self._voice_session = None
+            session = None
+        if humans and session is None:
+            await self.start_voice_chat()
+        elif not humans and session is not None:
+            try:
+                await session.stop()
+            finally:
+                self._voice_session = None
+
+    async def start_voice_chat(self) -> None:
+        """Join the configured public voice channel and answer spoken questions."""
+        if getattr(self, "_voice_session", None) is not None or not self.settings.voice_enabled:
+            return
+        channel_id = self.settings.voice_channel_id
+        channel = self.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.VoiceChannel):
+            logger.warning("Voice chat enabled but channel %s is not a voice channel", channel_id)
+            return
+        stt = SpeechToText(self.settings.voice_stt_model)
+        tts = build_tts(self.settings)
+
+        def _transcribe(path, unfiltered: bool = False):
+            # A prompt is only safe on the retry: on a normal pass it biases a short utterance into
+            # hallucinated prompt words (a real "hi" came back as "Super events.").
+            return stt.transcribe(path, vad_filter=not unfiltered, prompt=unfiltered)
+
+        async def _speak(text: str, out_path, pace: float | None = None) -> None:
+            await asyncio.to_thread(tts.render, text, out_path, pace)
+
+        async def _answer(question: str, user_id: int, history: str = "") -> str:
+            return await run_voice_ask(
+                self,
+                question=question,
+                user_id=user_id,
+                guild_id=channel.guild.id,
+                channel_id=channel.id,
+                conversation_context=history,
+            )
+
+        async def _answer_stream(question: str, user_id: int, history: str = ""):
+            async for piece in run_voice_ask_stream(
+                self,
+                question=question,
+                user_id=user_id,
+                guild_id=channel.guild.id,
+                channel_id=channel.id,
+                conversation_context=history,
+            ):
+                yield piece
+
+        session = VoiceChatSession(
+            self,
+            channel,
+            _answer,
+            answer_stream_fn=_answer_stream,
+            memory_recorder=self.voice_memory_recorder(channel),
+            prefs=self.voice_prefs,
+            idea_fn=self.voice_idea_recorder(channel),
+            settings=self.settings,
+            transcribe_fn=_transcribe,
+            speak_fn=_speak,
+        )
+        try:
+            started = await session.start()
+        except Exception:
+            logger.exception("Could not start voice chat")
+            return
+        # Only remember the session if it really joined; otherwise a later join can start afresh.
+        self._voice_session = session if started else None
+
     async def setup_hook(self) -> None:
         await self.store.init()
+        # /admin model persists a switch, so re-apply it here: the choice must outlive a restart.
+        from . import model_switch
+
+        try:
+            applied = await model_switch.apply_stored(self.store, self.settings)
+            for scope, state in applied.items():
+                print(f"[model] applied stored {scope} override: {state['model']}", flush=True)
+        except Exception as exc:  # never block startup over a stale override
+            print(f"[model] could not apply stored overrides: {type(exc).__name__}: {exc}", flush=True)
+
+        @self.tree.error
+        async def on_app_command_error(
+            interaction: discord.Interaction, error: app_commands.AppCommandError
+        ) -> None:
+            """Always answer a failed command.
+
+            Without this, an exception raised after `defer()` leaves the interaction with no reply at
+            all and the member sees "The application did not respond" with nothing in the channel
+            (Hoops, 2026-09-24). The error still goes to the journal in full.
+            """
+            command = getattr(interaction, "command", None)
+            name = getattr(command, "qualified_name", None) or "command"
+            print(
+                f"[commands] {name} failed for {interaction.user.id}: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            try:
+                await safe_followup(
+                    interaction,
+                    f"Something went wrong running `/{name}`. It is logged and Hoops can see it; "
+                    "the other commands still work.",
+                )
+            except Exception:
+                pass
         # Persistent chaos-tier panel buttons: custom_id + timeout=None keeps a posted panel clickable
         # across restarts (the view has no per-message state beyond the scope it is showing).
         self.add_view(TierPanelView(self, timeout=None))
+        self.add_view(TestingVoteOpenView(self, timeout=None))
+        self.add_view(TestingPanelView(self, counts={}))
+        self.add_view(IdeaBoardView(self))
+        # Suggested-next buttons are keyed by the action alone (`chaosx:suggest:<key>`), so this single
+        # persistent registration keeps every footer the bot has ever posted clickable (Hoops,
+        # 2026-09-23). Per-member relevance is recomputed on press, not baked into the button.
+        self.add_view(
+            SuggestedActionsView(
+                self,
+                [
+                    Suggestion(key=key, label=key.replace("_", " "), emoji="\u2022")
+                    for key in SUGGESTION_KEYS
+                ],
+            )
+        )
+        # Every filed idea keeps its status buttons working across restarts.
+        try:
+            await self._register_idea_views()
+        except Exception as _exc:  # registration must never block startup
+            idea_logger.warning("idea view registration at startup failed: %s", type(_exc).__name__)
         asyncio.create_task(self._refresh_rules_background())
         asyncio.create_task(self._refresh_channels_background())
         await self.store.set_automation_destination(["auto_question_answering", "auto_bot_topic_banter"], "source channel")
@@ -2071,6 +2463,9 @@ class ChaosXBot(discord.Client):
             status=discord.Status.online,
         )
         await self.leave_unauthorized_guilds()
+        set_capability_summary(
+            probe_capabilities(members_intent=bool(self.intents.members))["summary"]
+        )
         self.schedule_playtest_result_synthesis(delay_seconds=5)
         # Seed the user registry with ALL guild members and keep per-user
         # memories maintained continuously from the durable archive.
@@ -2086,6 +2481,7 @@ class ChaosXBot(discord.Client):
                 self._warm_mcp_session(), name="chaosx-mcp-warmup"
             )
         if self._activity_task is None or self._activity_task.done():
+            asyncio.create_task(self.start_voice_chat(), name="chaosx-voice-start")
             self._activity_task = asyncio.create_task(
                 self._activity_worker(ACTIVITY_WORKER_INITIAL_DELAY_S), name="chaosx-activity-rollup"
             )
@@ -2392,13 +2788,1282 @@ class ChaosXBot(discord.Client):
                 break
         rolled: list[tuple[int, str, int, float]] = []
         affected = {(user_id, day) for user_id, day in affected if user_id not in ignore_ids}
+        # The chat ceiling is dynamic: a member's recent contributions lift it (see `chat_daily_cap`).
+        since_day = (utcnow() - timedelta(days=CHAT_CAP_WINDOW_DAYS)).date().isoformat()
+        recent = await self.store.contribution_counts(since_day=since_day)
         for user_id, day in sorted(affected):
             messages = await self.store.archive_day_rows(user_id, day, ignore_ids=ignore_ids)
-            count, xp = day_xp(messages)
+            count, xp = day_xp(messages, daily_cap=chat_daily_cap(recent.get(int(user_id), 0)))
             rolled.append((user_id, day, count, xp))
         days = await self.store.upsert_activity_days(rolled)
         members = await self.store.recompute_member_tiers()
-        return {"messages": processed, "days": days, "members": members}
+        summary: dict[str, int] = {"messages": processed, "days": days, "members": members}
+        try:
+            await self._sync_member_tier_roles()
+        except Exception as exc:  # role colours must never break the rollup itself
+            tier_logger.warning("tier role sync failed: %s", exc)
+        try:
+            titled = await self._fill_missing_member_titles(limit=3)
+            if titled:
+                summary["titles"] = titled
+        except Exception as exc:  # a title is decoration; it must never break the rollup
+            tier_logger.warning("member title pass failed: %s", exc)
+        return summary
+
+    async def _strip_bot_tier_roles(self, guild: discord.Guild, roles: dict[str, discord.Role]) -> int:
+        """Remove any chaos tier role worn by a bot account (the bot itself included)."""
+        removed = 0
+        ladder = {role.id for role in roles.values()}
+        bots = [member for member in list(getattr(guild, "members", []) or []) if member.bot]
+        me = guild.me
+        if me is not None and me not in bots:
+            bots.append(me)
+        for member in bots:
+            worn = [role for role in member.roles if role.id in ladder]
+            if not worn:
+                continue
+            try:
+                await member.remove_roles(*worn, reason="ChaosX: bots do not hold chaos tiers")
+                removed += len(worn)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                tier_logger.info("could not remove tier role from bot %s: %s", member.id, exc)
+        return removed
+
+    async def _apply_chaosx_role_color(self, guild: discord.Guild, report: dict[str, Any]) -> None:
+        """Keep the bot's own role in the mod's red (Hoops 2026-09-23)."""
+        wanted = int(getattr(self.settings, "chaosx_role_color", 0) or 0)
+        role = guild.me.top_role if guild.me is not None else None
+        if not wanted or role is None or role.is_default():
+            return
+        if int(role.colour.value or 0) == wanted:
+            return
+        try:
+            await role.edit(colour=discord.Colour(wanted), reason="ChaosX bot role colour")
+            report["created"].append(f"recoloured the {role.name} role to #{wanted:06X}")
+        except discord.Forbidden:
+            # Discord refuses point-blank: a bot can never edit the role it wears, because that role is
+            # its highest. Either the owner sets the colour once, or the bot gets a role above ChaosX.
+            report["failed"].append(
+                f"role colour: the bot cannot edit its own role ({role.name}) - set #{wanted:06X} once in "
+                "Server Settings > Roles, or give the bot a role above it so it can do it itself"
+            )
+        except discord.HTTPException as exc:
+            report["failed"].append(f"role colour: {exc}")
+
+    async def _fill_missing_member_titles(self, *, limit: int = 3) -> int:
+        """Write the ladder titles members have earned, a few per pass.
+
+        Hoops (2026-09-24): titles start above Chaos Tier and grow with it, so the pass first strips
+        titles from anyone who no longer qualifies, then fills the missing ones for members above the
+        threshold, top of the ladder first. Owner and never-mention members are never touched.
+        """
+        guild = self.get_guild(int(self.settings.allowed_guild_id))
+        if guild is None:
+            tier_logger.info("member title pass skipped: guild not cached")
+            return 0
+        held = await self.store.all_member_title_slots()
+        cleared = 0
+        for holder in list(held):
+            if holder == int(self.settings.owner_id) or holder in self._never_mention_ids():
+                continue
+            row = await self.store.member_tier(holder)
+            tier = str(row[1]) if row else tier_for_xp(float(row[0]) if row else 0.0)
+            if title_slots_for(tier) == 0:
+                cleared += await self.store.clear_member_title_slots(holder)
+        if cleared:
+            tier_logger.info("member title pass: removed %d title(s) below %s", cleared, TITLE_MIN_TIER)
+        # Candidates come from the rolled-up tier row - the same authority `My tier` and the panel use -
+        # so a member who qualifies is never skipped because their daily rows disagree.
+        threshold = dict(TIERS)[TITLE_MIN_TIER]
+        rows = await self.store.members_at_or_above(xp_threshold=threshold, limit=25)
+        written = 0
+        for row in rows:
+            user_id = int(row[0])
+            if written >= limit:
+                break
+            if user_id == int(self.settings.owner_id):
+                continue
+            wanted = title_slots_for(str(row[3]))
+            if wanted == 0:
+                continue
+            if len(held.get(user_id, [])) >= wanted:
+                # already complete: must not consume this pass's budget
+                continue
+            if user_id in self._never_mention_ids():
+                continue
+            member = guild.get_member(user_id)
+            if member is not None and member.bot:
+                continue
+            # The name comes from the archive, so titles work even without the members intent (which
+            # leaves the guild member cache nearly empty).
+            if member is not None and getattr(member, "display_name", None):
+                name = str(member.display_name)
+            else:
+                name = str(row[1]) if row[1] else str(user_id)
+            if await self._ensure_member_titles(user_id=user_id, name=name):
+                written += 1
+        tier_logger.info(
+            "member title pass: wrote %d, cleared %d (candidates=%d, cached members=%d)",
+            written,
+            cleared,
+            len(rows),
+            len(getattr(guild, "members", []) or []),
+        )
+        return written
+
+    async def _award_contribution(
+        self,
+        *,
+        user_id: int,
+        kind: str,
+        ref: str,
+        guild_id: int | None = None,
+        channel_id: int | None = None,
+    ) -> float:
+        """Pay chaos for a real contribution (Hoops: contributions should grant more than chat).
+
+        `ref` is the contribution's identity, so this is safe to call from any capture path more than once:
+        the store refuses a second credit for the same reference. Returns the XP actually granted.
+        """
+        amount = BONUS_XP.get(kind)
+        if not amount or not user_id or int(user_id) <= 0:
+            return 0.0
+        granted = await self.store.award_bonus_xp(
+            ref=str(ref), user_id=int(user_id), kind=kind, xp=float(amount), when=utcnow().isoformat()
+        )
+        if granted <= 0:
+            return 0.0
+        await self.store.recompute_member_tiers()
+        await self.store.audit(
+            actor_id=int(user_id),
+            guild_id=guild_id,
+            channel_id=channel_id,
+            command=f"chaos bonus {kind}",
+            summary=f"+{granted:g} for {ref}",
+        )
+        row = await self.store.member_tier(int(user_id))
+        xp = float(row[0]) if row else 0.0
+        tier = str(row[1]) if row else tier_for_xp(xp)
+        tier_logger.info("bonus xp: %s +%s (%s) -> %s", user_id, granted, kind, tier)
+        # Chaos Tier+ perk: the contribution is credited in public, in the channel it came from.
+        if channel_id and has_perk(tier, "credit_shoutout") and int(user_id) not in self._never_mention_ids():
+            await self._credit_contribution(
+                user_id=int(user_id), kind=kind, granted=granted, channel_id=int(channel_id)
+            )
+        return granted
+
+    async def _credit_contribution(self, *, user_id: int, kind: str, granted: float, channel_id: int) -> None:
+        """A short public thank-you for a contribution, only for members who unlocked the perk."""
+        channel = self.get_channel(int(channel_id))
+        if channel is None:
+            return
+        title = ""
+        row = await self.store.member_title(int(user_id))
+        if row and row[0]:
+            title = f" — *{row[0]}*"
+        label = str(kind).replace("_", " ")
+        # No ping: the credit names the member, it never notifies them.
+        name = _display_name_for(self, int(user_id))
+        text = (
+            f"🎖️ **{name}**{title} — **+{granted:g} chaos** for the {label}. "
+            "Thank you for keeping the chaos going."
+        )
+        try:
+            await channel.send(text, allowed_mentions=safe_allowed_mentions())
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            tier_logger.info("contribution credit skipped: %s", exc)
+
+    # --- event idea pipeline (Hoops 2026-09-23: "implement the plans") --------------------------------
+
+    async def _idea_error(self, interaction: discord.Interaction, prefix: str, error: Exception) -> None:
+        """Report an idea-pipeline failure in the channel without leaking internals."""
+        idea_logger.warning("%s: %s", prefix, type(error).__name__)
+        message = f"{prefix} (`{type(error).__name__}`). Nothing was saved."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            else:
+                await interaction.response.send_message(
+                    message, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+                )
+        except (discord.HTTPException, discord.InteractionResponded):
+            pass
+
+    @staticmethod
+    def _idea_fields(payload: dict[str, str]) -> dict[str, str]:
+        """Map the modal fields onto the note writer's keyword arguments."""
+        evolutions = [line.strip() for line in str(payload.get("evolutions", "")).splitlines() if line.strip()]
+        fields = {
+            "event_type": payload.get("event_type", ""),
+            "cluster": payload.get("cluster", ""),
+            "world_end": payload.get("world_end", ""),
+        }
+        for index, name in enumerate(("evo_i", "evo_ii", "evo_iii", "evo_iv", "evo_v")):
+            fields[name] = evolutions[index] if index < len(evolutions) else ""
+        return fields
+
+    async def _handle_event_idea_submission(
+        self, interaction: discord.Interaction, *, payload: dict[str, str]
+    ) -> None:
+        """Draft the idea, then show a preview. Nothing is written or posted at this point."""
+        idea = str(payload.get("idea", "")).strip()
+        if not idea:
+            await interaction.response.send_message(
+                "Give me the idea itself and I will draft it.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user_id = int(interaction.user.id)
+        # Rate limit: a member cannot flood the queue.
+        since = (utcnow() - timedelta(days=7)).isoformat()
+        recent = await self.store.idea_submissions_since(user_id=user_id, since_iso=since)
+        if recent >= MAX_SUBMISSIONS_PER_WEEK:
+            await interaction.followup.send(
+                rate_limit_message(recent=recent), ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            await self.store.audit(
+                actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+                command="event-idea", summary=f"rate limited ({recent} in 7 days)",
+            )
+            return
+        # Duplicate check against what has already been filed.
+        existing = [
+            (int(row["id"]), str(row["title"]), str(row["status"]))
+            for row in await self.store.idea_submissions(limit=60)
+        ]
+        duplicate = find_duplicate(idea, existing)
+        vague_hint = ""
+        if is_vague_event_idea(idea):
+            vague_hint = (
+                "This reads more like a topic than an event. Add what happens, what triggers it and what "
+                "it changes - or post it anyway and it will be reviewed as a loose concept."
+            )
+        draft = ""
+        try:
+            draft = await self._draft_event_idea(idea=idea, payload=payload)
+        except Exception as exc:
+            await self._idea_error(interaction, "The draft could not be written", exc)
+            return
+        if draft.upper().startswith("VAGUE"):
+            hint = draft.split(":", 1)[1].strip() if ":" in draft else "It needs a concrete concept."
+            vague_hint = vague_hint or f"{hint} You can add it, or post it anyway."
+            draft = ""
+        if not draft:
+            draft = (
+                "**Draft pending** - the model declined to format this one.\n\n"
+                f"{idea}"
+            )
+        tier_row = await self.store.member_tier(user_id)
+        priority = bool(tier_row and has_perk(str(tier_row[1]), "idea_priority"))
+        text = preview_text(
+            draft=draft, raw_idea=idea, duplicate=duplicate, vague_hint=vague_hint, priority=priority
+        )
+        view = EventIdeaPreviewView(self, payload={**payload, "draft": draft}, priority=priority)
+        await interaction.followup.send(
+            text[:1900], view=view, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+        )
+        await self.store.audit(
+            actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            command="event-idea preview",
+            summary=f"previewed (priority={priority}, duplicate={duplicate.submission_id if duplicate else '-'})",
+        )
+
+    async def _draft_event_idea(self, *, idea: str, payload: dict[str, str]) -> str:
+        """The single light-reasoning formatting call, shared by the modal flow."""
+        fields = self._idea_fields(payload)
+        request = (
+            f"/event-idea idea={idea!r} fields={fields!r}. First decide whether this idea is specific "
+            "enough to become a real event: it needs a concrete concept (what happens, when or how it "
+            "triggers, what it affects, and a gameplay effect). If it is too vague — just a topic, country, "
+            "or theme with no real event concept — reply with exactly `VAGUE: <one short sentence saying what "
+            "is missing and what to add>`. Otherwise format a Chaos Redux event idea draft with name, TBD ID, "
+            "type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, "
+            "easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use "
+            "placeholders for missing parts. Do not assign a real ID or claim acceptance."
+        )
+        result = await _public_model_completion(
+            bot=self,
+            system=SYSTEM_BOUNDARY,
+            prompt=request,
+            model=self.settings.ask_model,
+            reasoning_effort=self.settings.ask_reasoning_effort,
+            timeout_seconds=min(self.settings.hermes_timeout_seconds, 150),
+            activity_label="event idea draft",
+            actor_id=None,
+        )
+        if not getattr(result, "ok", False):
+            raise RuntimeError("model call failed")
+        text = sanitize_post((getattr(result, "stdout", "") or "").strip(), max_chars=2200)
+        # The model sometimes opens with its own verdict line ("**Specific enough** - ..."); that belongs in
+        # the preview, not in the draft that gets filed.
+        lines = text.splitlines()
+        while lines and re.match(r"^\s*(\*\*)?(specific enough|vague|verdict)\b", lines[0], re.IGNORECASE):
+            lines.pop(0)
+        return "\n".join(lines).strip()
+
+    async def _file_event_idea(
+        self, interaction: discord.Interaction, *, payload: dict[str, str], priority: bool
+    ) -> None:
+        """Confirm step: write the note, post the thread, award chaos - all only after a button press."""
+        idea = str(payload.get("idea", "")).strip()
+        draft = str(payload.get("draft", "")).strip()
+        user_id = int(interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        title = format_event_idea_post_title(raw_idea=idea, draft=draft)
+        try:
+            submission_id = await self.store.create_idea_submission(
+                user_id=user_id, title=title, raw_idea=idea, draft=draft, priority=priority
+            )
+        except Exception as exc:
+            await self._idea_error(interaction, "The idea could not be filed", exc)
+            return
+        fields = self._idea_fields(payload)
+        note_path = ""
+        try:
+            if self.settings.community_notes_enabled:
+                note = write_event_idea_note(
+                    vault_path=self.settings.obsidian_vault_path,
+                    event_specs_folder=self.settings.community_event_specs_folder,
+                    raw_idea=idea,
+                    draft=draft,
+                    actor_id=user_id,
+                    guild_id=interaction.guild_id,
+                    channel_id=interaction.channel_id,
+                    **fields,
+                )
+                if note is not None:
+                    note_path = str(note.path)
+                    if note.created:
+                        refresh_vault_indexes(
+                            vault_path=self.settings.obsidian_vault_path,
+                            event_specs_folder=self.settings.community_event_specs_folder,
+                            suggestions_folder=self.settings.community_suggestions_folder,
+                            reason="ChaosX filed a community event idea.",
+                            changed_path=note.path,
+                        )
+        except Exception as exc:
+            await self.store.audit(
+                actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+                command="vault event-idea error", summary=type(exc).__name__,
+            )
+        posted: tuple[int, int] | None = None
+        try:
+            posted = await self._post_idea_to_forum(
+                submission_id=submission_id,
+                actor_id=user_id,
+                title=title,
+                raw_idea=idea,
+                draft=draft,
+                priority=priority,
+                note_path=note_path,
+                **fields,
+            )
+        except Exception as exc:
+            await self.store.audit(
+                actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+                command="event-idea channel post error", summary=type(exc).__name__,
+            )
+        if posted:
+            await self.store.set_idea_post_location(
+                submission_id=submission_id, channel_id=posted[0], message_id=posted[1], vault_path=note_path
+            )
+        granted = await self._award_contribution(
+            user_id=user_id,
+            kind="idea_filed",
+            ref=f"idea:{submission_id}:filed",
+            guild_id=interaction.guild_id,
+            channel_id=self.settings.community_event_ideas_channel_id,
+        )
+        link = f"<#{posted[0]}>" if posted else "the ideas forum"
+        await interaction.followup.send(
+            "📮 Filed as submission "
+            f"`#{submission_id}` - it is in {link}"
+            + (f" and saved to the vault." if note_path else ".")
+            + (f" **+{granted:g} chaos** for a real contribution." if granted else "")
+            + "\nThe status buttons on the post are for the owner; you will see the status change there.",
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        await self.store.audit(
+            actor_id=user_id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            command="event-idea filed",
+            summary=f"#{submission_id} forum={posted[1] if posted else '-'} vault={note_path or '-'}",
+        )
+
+    async def submit_voice_event_idea(
+        self,
+        *,
+        user_id: int,
+        user_name: str,
+        raw_idea: str,
+        guild_id: int | None,
+        channel_id: int | None,
+    ) -> str:
+        """File a spoken event idea the same way /event-idea files a typed one.
+
+        Returns a short line to be spoken back. Never raises and never mentions vault paths, submissions or
+        internal systems out loud — a member asked to contribute, not to read an audit trail.
+        """
+        idea = " ".join((raw_idea or "").split())[:600]
+        if len(idea) < 12:
+            return "I did not catch enough of that idea - say it again with a little more detail."
+        try:
+            if is_vague_event_idea(idea):
+                return "That one is a bit vague - give me a concrete event idea and I will file it."
+        except Exception:
+            pass
+        rate = self.rate_limiter.check(bucket="voice_idea", user_id=user_id, limit=3, window_seconds=3600)
+        if not rate.allowed:
+            return "You have filed a few ideas already - try another one a bit later."
+
+        payload: dict[str, str] = {"idea": idea}
+        draft = ""
+        try:
+            draft = await self._draft_event_idea(idea=idea, payload=payload)
+        except Exception:
+            draft = ""
+        # A transient draft failure must not cost the member their idea: the note writer wants a draft, so
+        # fall back to the idea itself rather than filing a forum post with no note behind it.
+        draft = (draft or "").strip() or idea
+        title = format_event_idea_post_title(raw_idea=idea, draft=draft)
+        try:
+            submission_id = await self.store.create_idea_submission(
+                user_id=user_id, title=title, raw_idea=idea, draft=draft, priority=False
+            )
+        except Exception as exc:
+            await self.store.audit(
+                actor_id=user_id, guild_id=guild_id, channel_id=channel_id,
+                command="voice event-idea error", summary=type(exc).__name__,
+            )
+            return "I could not file that idea just now - please try again in a moment."
+
+        fields = self._idea_fields(payload)
+        note_path = ""
+        try:
+            if self.settings.community_notes_enabled:
+                note = write_event_idea_note(
+                    vault_path=self.settings.obsidian_vault_path,
+                    event_specs_folder=self.settings.community_event_specs_folder,
+                    raw_idea=idea,
+                    draft=draft,
+                    actor_id=user_id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    **fields,
+                )
+                if note is not None:
+                    note_path = str(note.path)
+                    if note.created:
+                        refresh_vault_indexes(
+                            vault_path=self.settings.obsidian_vault_path,
+                            event_specs_folder=self.settings.community_event_specs_folder,
+                            suggestions_folder=self.settings.community_suggestions_folder,
+                            reason="ChaosX filed a spoken community event idea.",
+                            changed_path=note.path,
+                        )
+        except Exception as exc:
+            await self.store.audit(
+                actor_id=user_id, guild_id=guild_id, channel_id=channel_id,
+                command="voice vault event-idea error", summary=type(exc).__name__,
+            )
+
+        posted: tuple[int, int] | None = None
+        try:
+            posted = await self._post_idea_to_forum(
+                submission_id=submission_id,
+                actor_id=user_id,
+                title=title,
+                raw_idea=idea,
+                draft=draft,
+                priority=False,
+                note_path=note_path,
+                **fields,
+            )
+        except Exception as exc:
+            await self.store.audit(
+                actor_id=user_id, guild_id=guild_id, channel_id=channel_id,
+                command="voice event-idea channel post error", summary=type(exc).__name__,
+            )
+        if posted:
+            try:
+                await self.store.set_idea_post_location(
+                    submission_id=submission_id,
+                    channel_id=posted[0],
+                    message_id=posted[1],
+                    vault_path=note_path,
+                )
+            except Exception:
+                pass
+
+        granted = 0.0
+        try:
+            granted = await self._award_contribution(
+                user_id=user_id,
+                kind="idea_filed",
+                ref=f"idea:{submission_id}:voice",
+                guild_id=guild_id,
+                channel_id=self.settings.community_event_ideas_channel_id,
+            )
+        except Exception:
+            granted = 0.0
+
+        await self.store.audit(
+            actor_id=user_id, guild_id=guild_id, channel_id=channel_id,
+            command="voice event-idea filed",
+            summary=f"#{submission_id} forum={posted[1] if posted else '-'} vault={note_path or '-'}",
+        )
+        where = "the event ideas forum" if posted else "the idea list"
+        line = f"Filed - that is idea number {submission_id} in {where}."
+        if granted:
+            line += f" You earned {granted:g} chaos for it."
+        return line
+
+    async def _post_idea_to_forum(
+        self,
+        *,
+        submission_id: int,
+        actor_id: int,
+        title: str,
+        raw_idea: str,
+        draft: str,
+        priority: bool,
+        note_path: str,
+        **fields: str,
+    ) -> tuple[int, int]:
+        """Post the idea as its own forum thread with the status buttons and a status line."""
+        channel_id = self.settings.community_event_ideas_channel_id
+        if not channel_id:
+            raise RuntimeError("no community ideas channel configured")
+        channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+        body = format_event_idea_post_body(raw_idea=raw_idea, draft=draft, actor_id=actor_id)
+        header = (
+            f"{status_line(status='filed')}\n"
+            f"🗳️ **Votes:** 0\n"
+            f"-# Submission `#{submission_id}`"
+            + (f" · priority review ⭐" if priority else "")
+            + (f" · vault note saved" if note_path else "")
+        )
+        chunks = _chunk(header + "\n\n" + body, limit=1850)
+        post_title = f"{priority_marker(priority)}{title}"[:95]
+        if isinstance(channel, discord.ForumChannel):
+            created = await channel.create_thread(
+                name=post_title,
+                content=chunks[0],
+                applied_tags=event_idea_forum_tags(
+                    channel,
+                    event_type=fields.get("event_type", ""),
+                    cluster=fields.get("cluster", ""),
+                    world_end=fields.get("world_end", ""),
+                ),
+                view=IdeaStatusView(submission_id),
+                allowed_mentions=safe_allowed_mentions(),
+                reason=f"ChaosX filed community idea #{submission_id}",
+            )
+            thread = created.thread
+            for part in chunks[1:]:
+                await thread.send(part, allowed_mentions=safe_allowed_mentions())
+            return int(thread.id), int(created.message.id)
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            message = await channel.send(
+                chunks[0], view=IdeaStatusView(submission_id), allowed_mentions=safe_allowed_mentions()
+            )
+            for part in chunks[1:]:
+                await channel.send(part, allowed_mentions=safe_allowed_mentions())
+            return int(message.channel.id), int(message.id)
+        raise TypeError(f"Unsupported event idea channel type: {type(channel).__name__}")
+
+    async def _apply_idea_status(
+        self, interaction: discord.Interaction, *, submission_id: int, status: str, note: str
+    ) -> None:
+        """Move an idea through the pipeline: record it, pay the staged chaos, tell the author (no ping)."""
+        if int(interaction.user.id) != int(self.settings.owner_id):
+            await interaction.response.send_message(
+                "Only Hoops McCann can move an idea through the pipeline.", ephemeral=True
+            )
+            return
+        row = await self.store.idea_submission(submission_id)
+        if row is None:
+            await interaction.response.send_message(
+                f"There is no idea submission `#{submission_id}`.", ephemeral=True
+            )
+            return
+        if str(row.get("status")) == str(status):
+            await interaction.response.send_message(
+                f"`#{submission_id}` is already {status_label(status).lower()}.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.store.set_idea_status(
+            submission_id=submission_id, status=status, note=note, reviewer_id=int(interaction.user.id)
+        )
+        line = status_line(status=status, note=note)
+        announced = ""
+        channel_id, message_id = row.get("forum_channel_id"), row.get("forum_message_id")
+        if channel_id and message_id:
+            try:
+                channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+                await channel.send(line, allowed_mentions=safe_allowed_mentions())
+                announced = "announced on the idea's post"
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                announced = f"could not announce ({type(exc).__name__})"
+        author_id = int(row.get("user_id") or 0)
+        author_notified = ""
+        if author_id:
+            try:
+                author = self.get_user(author_id) or await self.fetch_user(author_id)
+                await author.send(
+                    f"Your event idea `#{submission_id}` is now **{status_label(status)}**"
+                    + (f" — {note}" if note else "")
+                    + "."
+                )
+                author_notified = "author told privately"
+            except (discord.Forbidden, discord.HTTPException, AttributeError):
+                author_notified = "author could not be messaged"
+        awarded = 0.0
+        if award_for_status(status):
+            awarded = await self._award_contribution(
+                user_id=author_id,
+                kind=f"idea_{status}",
+                ref=f"idea:{submission_id}:{status}",
+                guild_id=interaction.guild_id,
+                channel_id=self.settings.community_event_ideas_channel_id,
+            )
+        await self.store.audit(
+            actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+            command="idea status", summary=f"#{submission_id} -> {status} (award {awarded:g})",
+        )
+        parts = [f"`#{submission_id}` → **{status_label(status)}**"]
+        if note:
+            parts.append(f"note: {note}")
+        if announced:
+            parts.append(announced)
+        if author_notified:
+            parts.append(author_notified)
+        if awarded:
+            parts.append("chaos credited to the author")
+        await interaction.followup.send("\n".join(parts), ephemeral=True, allowed_mentions=safe_allowed_mentions())
+
+    async def _idea_board_text(self, scope: str, *, user_id: int | None = None) -> str:
+        """One slice of the idea pipeline, as a message."""
+        scope = (scope or "open").lower().strip()
+        if scope == "open":
+            rows = await self.store.idea_submissions(statuses=OPEN_STATUSES, limit=12)
+            heading_text = "Needs review"
+        elif scope == "planned":
+            rows = await self.store.idea_submissions(statuses=(PLANNED, BUILDING), limit=12)
+            heading_text = "Planned and being built"
+        elif scope == "shipped":
+            rows = await self.store.idea_submissions(statuses=(SHIPPED,), limit=12)
+            heading_text = "In the mod"
+        elif scope == "mine":
+            rows = await self.store.idea_submissions(user_id=user_id, limit=12)
+            heading_text = "Your ideas"
+        else:
+            rows = await self.store.idea_submissions(limit=12)
+            heading_text = "Newest ideas"
+        counts = await self.store.idea_status_counts()
+        oldest = await self.store.oldest_open_idea_days()
+        lines = [
+            board_line(
+                submission_id=int(row["id"]),
+                title=str(row["title"] or "untitled"),
+                status=str(row["status"]),
+                author=_display_name_for(self, int(row["user_id"])),
+                age_days=_idea_age_days(str(row["created_at"] or "")),
+                priority=bool(row.get("priority")),
+            )
+            for row in rows
+        ]
+        vote_totals = await self.store.idea_vote_counts([int(row["id"]) for row in rows])
+        lines = [
+            board_line(
+                submission_id=int(row["id"]),
+                title=str(row["title"] or "untitled"),
+                status=str(row["status"]),
+                author=_display_name_for(self, int(row["user_id"])),
+                age_days=_idea_age_days(str(row["created_at"] or "")),
+                priority=bool(row.get("priority")),
+                votes=int(vote_totals.get(int(row["id"]), 0)),
+            )
+            for row in rows
+        ]
+        return block(
+            heading("Event ideas"),
+            small(board_summary(counts, oldest_open_days=oldest)),
+            section(heading_text),
+            bullets(lines) if lines else small("Nothing here yet."),
+            small(
+                "Buttons switch the view. Ideas are filed with `/event-idea`; the owner moves them through "
+                "the pipeline with the buttons on each idea's own post. ⭐ marks priority review, 🗳️ counts "
+                "members' votes."
+            ),
+        )
+
+    async def _register_idea_views(self) -> int:
+        """Re-register the persistent idea components after a restart."""
+        registered = 0
+        try:
+            self.add_view(IdeaBoardView(self))
+            registered += 1
+        except Exception as exc:
+            idea_logger.warning("idea board view registration failed: %s", type(exc).__name__)
+        try:
+            for row in await self.store.idea_submissions(limit=200):
+                self.add_view(IdeaStatusView(int(row["id"])))
+                registered += 1
+        except Exception as exc:
+            idea_logger.warning("idea status view registration failed: %s", type(exc).__name__)
+        idea_logger.info("registered %d persistent idea view(s)", registered)
+        return registered
+
+    async def _promote_idea(self, submission_id: int) -> str:
+        """Turn an accepted community idea into a numbered event spec (the missing bridge)."""
+        row = await self.store.idea_submission(submission_id)
+        if row is None:
+            return f"There is no idea submission `#{submission_id}`."
+        async with self._event_note_lock:
+            event_id = next_available_event_id(
+                self.settings.obsidian_vault_path, self.settings.community_event_specs_folder
+            )
+            note = promote_community_idea(
+                vault_path=self.settings.obsidian_vault_path,
+                event_specs_folder=self.settings.community_event_specs_folder,
+                event_id=event_id,
+                title=str(row.get("title") or "Community Event Idea"),
+                draft=str(row.get("draft") or ""),
+                raw_idea=str(row.get("raw_idea") or ""),
+                submission_id=int(submission_id),
+            )
+        await self.store.set_idea_promoted(submission_id=int(submission_id), promoted_path=str(note.path))
+        await self.store.set_idea_status(
+            submission_id=int(submission_id), status=PLANNED, note=f"promoted to event {event_id:03d}"
+        )
+        refresh_vault_indexes(
+            vault_path=self.settings.obsidian_vault_path,
+            event_specs_folder=self.settings.community_event_specs_folder,
+            suggestions_folder=self.settings.community_suggestions_folder,
+            reason=f"ChaosX promoted idea #{submission_id} to event {event_id:03d}.",
+            changed_path=note.path,
+        )
+        awarded = await self._award_contribution(
+            user_id=int(row.get("user_id") or 0),
+            kind="idea_planned",
+            ref=f"idea:{submission_id}:planned",
+            guild_id=None,
+            channel_id=self.settings.community_event_ideas_channel_id,
+        )
+        spec_title = note.path.stem.split(" - ", 1)[-1] if " - " in note.path.stem else note.path.stem
+        return (
+            f"Promoted `#{submission_id}` to event **{event_id:03d} - {spec_title}** "
+            f"(`{note.path.name}`), status set to Planned"
+            + (", with chaos credited to the author." if awarded else ".")
+        )
+
+    async def _testing_families(self) -> dict[str, list[tuple[str, str]]]:
+        """The whole ballot, by family: every catalog object marked `Needs Testing` plus nominations.
+
+        Hoops (2026-09-24): the poll used to hard-code five event slots. Now nothing is capped or
+        pre-selected - the catalogs decide, and members can nominate anything the catalogs do not cover.
+        """
+        grouped = await asyncio.to_thread(self.knowledge.testing_candidates)
+        grouped = {kind: list(items) for kind, items in (grouped or {}).items()}
+        grouped.setdefault("event", [])
+        grouped.setdefault("scenario", [])
+        grouped.setdefault("cluster", [])
+        try:
+            grouped["nomination"] = await self.store.testing_nominations()
+        except Exception:
+            grouped["nomination"] = []
+        return grouped
+
+    async def _testing_ballot_text(self, user_id: int, *, kind: str, page_note: str = "") -> str:
+        """One family's candidates, as the member sees them before choosing."""
+        families = await self._testing_families()
+        candidates = families.get(kind, [])
+        mine = await self.store.member_testing_vote(user_id)
+        lines = [
+            f"- {family_emoji(kind)} {clamp_label(label, 92)} - {detail}"
+            for _key, label, detail in candidates
+        ]
+        return sanitize_post(
+            block(
+                heading(f"{family_label(kind)} marked for testing", family_emoji(kind)),
+                small(f"{len(candidates)} candidate(s){page_note} - pick one below."),
+                bullets(lines) if lines else small("Nothing here is marked for testing right now."),
+                small(f"Your vote: **{mine[1]}**." if mine else "You have not voted yet."),
+            ),
+            max_chars=1800,
+        )
+
+    async def _cast_testing_vote(self, interaction: discord.Interaction, *, key: str, label: str) -> None:
+        """Record one member's vote. The weight stays internal; the public text never shows it."""
+        row = await self.store.member_tier(interaction.user.id)
+        tier = str(row[1]) if row else TIERS[0][0]
+        weight = voting_weight(tier)
+        await self.store.set_testing_vote(interaction.user.id, key, label, weight)
+        await self.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="testing vote",
+            summary=f"{label} (tier {tier})",
+        )
+        await interaction.response.send_message(
+            await self._testing_vote_panel_text(interaction.user.id, just_voted=label),
+            view=await TestingPanelView.build(self),
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+    async def _testing_vote_panel_text(
+        self, user_id: int, *, just_voted: str = "", notice: str = ""
+    ) -> str:
+        """The ballot: how many candidates each family has, what is leading, and your own vote."""
+        families = await self._testing_families()
+        counts = {kind: len(items) for kind, items in families.items()}
+        tally = await self.store.testing_vote_tally()
+        mine = await self.store.member_testing_vote(user_id)
+        row = await self.store.member_tier(user_id)
+        tier = str(row[1]) if row else TIERS[0][0]
+        leaders = sorted(
+            ((label, voters) for _key, label, voters, _total in tally if int(voters) > 0),
+            key=lambda item: -item[1],
+        )[:3]
+        ballot_lines = [
+            f"{family_emoji(kind)} **{family_label(kind)}** - {counts.get(kind, 0)} candidate(s)"
+            for kind in FAMILIES
+            if counts.get(kind, 0)
+        ]
+        vote_lines: list[str] = []
+        if mine is not None:
+            vote_lines.append(f"✅ On **{mine[1]}**.")
+        else:
+            vote_lines.append("You have not voted yet.")
+        if voting_weight(tier):
+            vote_lines.append(f"Your vote carries extra weight as {tier}.")
+        else:
+            vote_lines.append(
+                f"Your vote as {tier} is recorded; weight starts further up the ladder. Contributing moves you up."
+            )
+        return sanitize_post(
+            block(
+                heading("What should we test next?", "🗳️"),
+                small(notice) if notice else None,
+                section("On the ballot", "🕹️"),
+                bullets(ballot_lines) or small("Nothing is marked for testing right now."),
+                section("Leading", "🏁"),
+                bullets([f"{label} - {voters} vote{'s' if int(voters) != 1 else ''}" for label, voters in leaders])
+                or small("No votes yet."),
+                section("Your vote", "🎯"),
+                bullets(vote_lines),
+                small(
+                    "Open a family below to vote on anything in it, or nominate something that is not "
+                    "on the ballot. One vote per member, changeable any time."
+                ),
+            ),
+            max_chars=1600,
+        )
+
+    async def on_member_join(self, member: discord.Member) -> None:
+        """Every new member starts on the ladder: Calm World until they earn chaos (Hoops 2026-09-23).
+
+        `on_member_join` is a normal gateway event, so this works without the privileged members intent
+        (the intent only gates the full member list, which is why a backfill of older silent members needs
+        either that intent or a manual pass).
+        """
+        if member.guild is None or int(member.guild.id) != int(self.settings.allowed_guild_id):
+            return
+        if not self.settings.tier_roles_enabled:
+            return
+        try:
+            roles, _notes = await ensure_tier_roles(member.guild, bot_member=member.guild.me)
+            calm = roles.get(TIERS[0][0])
+            if calm is None or not await self._member_has_no_tier(member):
+                return
+            await member.add_roles(calm, reason="ChaosX chaos tier: new member starts at Calm World")
+            await self.store.set_tier_role_state(int(member.id), TIERS[0][0], utcnow().isoformat())
+            tier_logger.info("new member %s -> %s", member.display_name, TIERS[0][0])
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            tier_logger.warning("new member tier role failed for %s: %s", member.id, exc)
+
+    async def _backfill_calm_world(self, guild: discord.Guild, roles: dict[str, Any], when: str) -> int:
+        """Put every member who has never earned chaos on the ladder at Calm World.
+
+        Enumerating a guild needs the privileged Server Members Intent; without it Discord answers 403 and
+        this is skipped (new arrivals are still covered by `on_member_join`, which is a normal gateway
+        event). With the intent enabled the whole server is backfilled, capped per pass.
+        """
+        calm = roles.get(TIERS[0][0])
+        if calm is None:
+            return 0
+        try:
+            members = [member async for member in guild.fetch_members(limit=None)]
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            tier_logger.info("calm-world backfill skipped (member list unavailable): %s", exc)
+            return 0
+        placed = 0
+        for member in members:
+            if member.bot or placed >= 50:
+                continue
+            if await self.store.member_tier(int(member.id)) is not None:
+                continue
+            try:
+                await member.add_roles(calm, reason="ChaosX chaos tier: no chaos yet, Calm World")
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            await self.store.set_tier_role_state(int(member.id), TIERS[0][0], when)
+            placed += 1
+        if placed:
+            tier_logger.info("calm-world backfill placed %d member(s)", placed)
+        return placed
+
+    async def _member_has_no_tier(self, member: discord.Member) -> bool:
+        row = await self.store.member_tier(int(member.id))
+        return row is None
+
+    async def _tier_up_message(self, *, member: discord.Member, old_tier: str, new_tier: str) -> str:
+        """A written congratulation for a member who just reached a new tier.
+
+        The model is asked for it because Hoops wants something personal (why they earned it, what it
+        means); every fact in the prompt is real and the facts-only fallback still reads like a
+        congratulation, so a model outage never silences the moment.
+        """
+        user_id = int(member.id)
+        row = await self.store.member_tier(user_id)
+        xp = float(row[0]) if row else 0.0
+        bonus_rows = await self.store.bonus_xp_breakdown(user_id)
+        bonus = sum(amount for _kind, amount, _when in bonus_rows)
+        chat = max(0.0, xp - bonus)
+        messages, days = await self.store.member_activity_totals(user_id)
+        contributions = ", ".join(
+            f"{kind.replace('_', ' ')}" for kind, _amount, _when in bonus_rows
+        ) or "none yet"
+        joined = getattr(member, "joined_at", None)
+        joined_text = joined.date().isoformat() if joined else "unknown"
+        perk_line = "; ".join(cumulative_perks(new_tier)[-2:]) or "none yet"
+        member_title = await self._ensure_member_title(
+            user_id=int(member.id),
+            name=member.display_name,
+            contributions=[str(kind).replace("_", " ") for kind, _amount, _when in bonus_rows],
+        )
+        title_fact = f"\nTheir title on the ladder: {member_title}" if member_title else ""
+        facts = (
+            f"Member: {member.display_name}\n"
+            f"New tier: {new_tier} (previous: {old_tier})\n"
+            "\n"
+            f"Messages seen: {messages} across {days} active days\n"
+            f"Contributions: {contributions}\n"
+            f"Joined the server: {joined_text}\n"
+            f"Perks unlocked by this tier: {perk_line}{title_fact}"
+        )
+        prompt = (
+            "Write a short public congratulation for a Chaos Redux community member who just reached a new "
+            "chaos tier. Two or three sentences, warm and specific, celebratory but not cheesy.\n"
+            "Say what tier they reached and what that tier means on the server's chaos ladder (the ladder "
+            "runs Calm World, Gathering Storm, Rising Chaos, Chaos Tier, Total Chaos, World Collapse), why "
+            "they earned it, and what unlocks for them now. If they have contributions, name them; if they "
+            "have none yet, speak about their activity instead. If a title is given in the facts, use it "
+            "once, exactly as written. Use the tier emoji once. No pings, no "
+            "mentions, no invented facts, no dates or promises, no internal jargon or file names. "
+            "Never state chaos totals, point values or earning rates: describe their progress "
+            "qualitatively (Hoops 2026-09-24: exact values stay out of public text).\n\n"
+            f"Facts (use only these):\n{facts}"
+        )
+        if user_id in self._never_mention_ids():
+            return ""
+        fallback = (
+            f"{tier_emoji(new_tier)} <@{user_id}> has climbed from **{old_tier}** to **{new_tier}**.\n"
+            f"That is the ladder's next rung up — earned by turning up and by contributing. "
+            "Congrats, and thank you for being here."
+        )
+        try:
+            result = await _public_model_completion(
+                bot=self,
+                system=SYSTEM_BOUNDARY,
+                prompt=prompt,
+                model=self.settings.ask_model,
+                reasoning_effort=self.settings.ask_reasoning_effort,
+                timeout_seconds=min(self.settings.hermes_timeout_seconds, 120),
+                activity_label="tier up congratulation",
+                actor_id=user_id,
+            )
+        except Exception as exc:
+            print(f"ChaosX tier-up model call failed: {type(exc).__name__}")
+            return fallback
+        # HermesResult carries stdout/ok, not `.text` - reading the wrong field silently returned the
+        # facts-only fallback for every climb (2026-09-23).
+        text = sanitize_post((getattr(result, "stdout", "") or "").strip(), max_chars=700)
+        text = self._scrub_never_mention(text)
+        if not getattr(result, "ok", False) or len(text) < 40:
+            print(
+                "ChaosX tier-up congratulation used the facts-only fallback: "
+                f"ok={getattr(result, 'ok', False)} chars={len(text)}"
+            )
+            return fallback
+        return text
+
+    async def _ensure_member_titles(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        force: bool = False,
+        contributions: list[str] | None = None,
+    ) -> list[str]:
+        """Every ladder title this member holds, oldest first.
+
+        Hoops (2026-09-24): "these titles actually should be removed. Instead, they should only be added
+        when a user is higher than chaos tier and then the higher the tier, the more titles." So a member
+        at or below Chaos Tier holds none - stored titles are cleared - and every tier above adds more.
+
+        Titles are display decoration: they never ping, never grant authority, and a never-mention member
+        gets none at all.
+        """
+        user_id = int(user_id)
+        if user_id == int(self.settings.owner_id):
+            title = str(self.settings.owner_title or "").strip()
+            if not title:
+                return []
+            await self.store.set_member_title(
+                user_id=user_id, title=title, blurb="Creator of everything.", source="configured"
+            )
+            return [title]
+        if user_id in self._never_mention_ids():
+            return []
+        xp, tier_row, bonus_rows, messages, days = await self._title_facts_inputs(user_id)
+        tier = tier_row or tier_for_xp(xp)
+        wanted = title_slots_for(tier)
+        held = await self.store.member_title_slots(user_id)
+        if wanted == 0:
+            if held:
+                cleared = await self.store.clear_member_title_slots(user_id)
+                tier_logger.info(
+                    "cleared %d ladder title(s) for %s: titles start above %s", cleared, user_id, TITLE_MIN_TIER
+                )
+            return []
+        if not force and len(held) >= wanted:
+            return held[:wanted]
+        titles = held[:wanted]
+        for slot in range(len(titles), wanted):
+            title = await self._generate_member_title(
+                user_id=user_id,
+                name=name,
+                tier=tier,
+                xp=xp,
+                contributions=contributions,
+                messages=messages,
+                days=days,
+                bonus_rows=bonus_rows,
+                already=list(titles),
+                slot=slot,
+            )
+            if not title or title in titles:
+                # offline, or a repeated answer: fall back to the distinct ladder form for this slot so
+                # the member still gets every title they earned, never the same one twice
+                title = fallback_title(
+                    tier=tier,
+                    messages=int(messages),
+                    contributions=len(bonus_rows),
+                    active_days=int(days),
+                    slot=slot,
+                )
+            if not title or title in titles:
+                break
+            await self.store.set_member_title_slot(
+                user_id=user_id,
+                slot=slot,
+                title=title,
+                blurb=f"Earned at {tier} with {int(xp)} chaos.",
+            )
+            titles.append(title)
+        return titles
+
+    async def _ensure_member_title(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        force: bool = False,
+        contributions: list[str] | None = None,
+    ) -> str:
+        """The member's first ladder title - what a leaderboard line shows - or "" when they hold none."""
+        titles = await self._ensure_member_titles(
+            user_id=user_id, name=name, force=force, contributions=contributions
+        )
+        return titles[0] if titles else ""
+
+    async def _generate_member_title(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        tier: str,
+        xp: float,
+        contributions: list[str] | None,
+        messages: int,
+        days: int,
+        bonus_rows: list,
+        already: list[str],
+        slot: int = 0,
+    ) -> str:
+        """Write one title from real activity facts; a deterministic fallback covers a model outage."""
+        facts = title_facts_line(
+            name=str(name),
+            tier=tier,
+            chaos=xp,
+            messages=messages,
+            active_days=days,
+            contributions=contributions
+            or [str(kind).replace("_", " ") for kind, _amount, _when in bonus_rows],
+            style=" | ".join(
+                line[:80] for line in await self.store.recent_member_messages(user_id, limit=5)
+            ),
+        )
+        prompt = TITLE_PROMPT.format(name=str(name), facts=facts, words=MAX_TITLE_WORDS)
+        if already:
+            prompt += "\n\nThey already hold these titles, so this one must be clearly different: " + "; ".join(already)
+        title = ""
+        try:
+            result = await _public_model_completion(
+                bot=self,
+                system=SYSTEM_BOUNDARY,
+                prompt=prompt,
+                model=self.settings.ask_model,
+                reasoning_effort=self.settings.ask_reasoning_effort,
+                timeout_seconds=min(self.settings.hermes_timeout_seconds, 90),
+                activity_label="member title",
+                actor_id=user_id,
+            )
+            if getattr(result, "ok", False):
+                title = clean_title(getattr(result, "stdout", "") or "")
+        except Exception as exc:
+            print(f"ChaosX title model call failed: {type(exc).__name__}")
+        if not title or title in already:
+            # offline, or the model repeated a title they already hold: use the distinct ladder form
+            title = fallback_title(
+                tier=tier,
+                messages=int(messages),
+                contributions=len(bonus_rows),
+                active_days=int(days),
+                slot=slot,
+            )
+        return title
+
+    async def _title_facts_inputs(self, user_id: int) -> tuple[float, str, list, int, int]:
+        """(chaos, tier, bonus rows, messages, active days) - the facts a title is written from."""
+        row = await self.store.member_tier(int(user_id))
+        xp = float(row[0]) if row else 0.0
+        tier = str(row[1]) if row else tier_for_xp(xp)
+        bonus_rows = await self.store.bonus_xp_breakdown(int(user_id))
+        messages, days = await self.store.member_activity_totals(int(user_id))
+        return xp, tier, bonus_rows, int(messages), int(days)
+
+    async def _post_tier_up(self, *, member: discord.Member, old_tier: str, new_tier: str) -> str | None:
+        """Post the congratulation; returns the text sent, or None when it was skipped."""
+        if not self.settings.tier_up_posts_enabled:
+            return None
+        channel_id = int(self.settings.tier_up_channel_id or self.settings.idle_banter_channel_id or 0)
+        channel = self.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            return None
+        text = await self._tier_up_message(member=member, old_tier=old_tier, new_tier=new_tier)
+        if not text:
+            return None  # a never-mention member gets no public congratulation
+        sent = await channel.send(text, allowed_mentions=safe_allowed_mentions())
+        await self.store.audit(
+            actor_id=int(member.id),
+            guild_id=getattr(member.guild, "id", None),
+            channel_id=channel_id,
+            command="tier up congrats",
+            summary=f"{old_tier} -> {new_tier} (message {sent.id})",
+        )
+        tier_logger.info("tier up: %s %s -> %s", member.display_name, old_tier, new_tier)
+        return text
+
+    async def _sync_member_tier_roles(self, *, force: bool = False) -> dict[str, Any]:
+        """Give members their chaos-tier colour role.
+
+        Only members whose tier actually changed are touched (the last synced tier is remembered), so the
+        ten-minute rollup does not hammer the Discord API. Returns a small report for `/admin tiers
+        action:roles`; every failure is reported rather than swallowed.
+        """
+        report: dict[str, Any] = {"assigned": 0, "gone": 0, "congrats": 0, "created": [], "failed": [], "skipped": ""}
+        if not self.settings.tier_roles_enabled:
+            report["skipped"] = "tier roles are disabled (tier_roles_enabled=False)"
+            return report
+        guild = self.get_guild(int(self.settings.allowed_guild_id))
+        if guild is None:
+            report["skipped"] = "guild not available"
+            return report
+        roles, notes = await ensure_tier_roles(guild, bot_member=guild.me)
+        report["created"] = notes
+        if not roles:
+            report["skipped"] = "no tier roles could be managed"
+            return report
+        when = utcnow().isoformat()
+        # The bot itself never wears a chaos tier (Hoops 2026-09-23): it is the ladder's keeper, not a
+        # climber, and a tier colour on the bot would also fight its own role colour.
+        report["bot_roles_removed"] = await self._strip_bot_tier_roles(guild, roles)
+        await self._apply_chaosx_role_color(guild, report)
+        ladder = [name for name, _threshold in TIERS]
+        upgrades: list[tuple[discord.Member, str, str]] = []
+        for user_id, _xp, tier in await self.store.all_member_tiers():
+            previous = await self.store.tier_role_state(user_id)
+            if not force and previous == tier:
+                continue
+            if int(user_id) == int(getattr(self.user, "id", 0) or 0):
+                continue  # never colour the bot itself
+            try:
+                member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+            except discord.NotFound:
+                # Left the server: their archived messages keep their chaos, but there is no one to
+                # colour. Remembered so the ten-minute pass stops re-asking (and re-reporting) forever.
+                await self.store.set_tier_role_state(user_id, "left", when)
+                report["gone"] += 1
+                continue
+            except discord.HTTPException as exc:
+                report["failed"].append(f"{user_id}: lookup failed ({exc.status})")
+                continue
+            status = await sync_tier_role(member, tier, roles)
+            if status.startswith(("forbidden", "failed", "skipped")):
+                report["failed"].append(f"{member.display_name}: {status}")
+                continue
+            await self.store.set_tier_role_state(user_id, tier, when)
+            if status != "unchanged":
+                report["assigned"] += 1
+            # A real climb (not a re-roll, not a first assignment) earns a written congratulation.
+            if previous in ladder and tier in ladder and ladder.index(tier) > ladder.index(previous):
+                upgrades.append((member, previous, tier))
+        if force and guild is not None:
+            try:
+                report["calm_default"] = await self._backfill_calm_world(guild, roles, when)
+            except Exception as exc:  # a backfill failure must never break the role sync
+                report["failed"].append(f"calm backfill failed ({type(exc).__name__})")
+        for member, old_tier, new_tier in upgrades[:3]:  # never flood the channel from one pass
+            try:
+                await self._post_tier_up(member=member, old_tier=old_tier, new_tier=new_tier)
+                report["congrats"] += 1
+            except Exception as exc:  # a failed congratulation must not stop the role sync
+                report["failed"].append(f"{member.display_name}: congrats failed ({type(exc).__name__})")
+        if report["created"] or report["assigned"] or report["failed"] or report["skipped"] or report["gone"]:
+            tier_logger.info("tier roles: %s", report)
+            print(f"ChaosX tier roles: {report}")
+        return report
+
+    def _never_mention_ids(self) -> set[int]:
+        """Members the bot never names in its own writing (Hoops: "holly must never be mentioned")."""
+        return {int(value) for value in (self.settings.never_mention_user_ids or []) if int(value)}
+
+    def _never_mention_names(self) -> list[str]:
+        """Display names scrubbed from generated posts, as a last line of defence."""
+        names = [str(name) for name in (self.settings.never_mention_names or []) if str(name).strip()]
+        return names
+
+    def _scrub_never_mention(self, text: str) -> str:
+        names = self._never_mention_names()
+        return scrub_names(text, names) if names else text
 
     async def _activity_ignore_ids(self) -> set[int]:
         """Bot accounts never earn chaos: ChaosX must not rank on its own leaderboard."""
@@ -2412,55 +4077,128 @@ class ChaosXBot(discord.Client):
         return ignore
 
     async def _tier_rows(self, scope: str) -> list[tuple]:
-        """Leaderboard rows for one scope, hiding members who opted out of the leaderboard."""
-        opts = await self.store.opted_out_members("leaderboard_optout")
+        """Leaderboard rows for one scope, hiding members who opted out and the owner.
+
+        Hoops (2026-09-23): "i shouldn't be included in the list" - the owner is a host, not a competitor,
+        so he is filtered out of the standings and out of everyone else's rank arithmetic.
+        """
+        opts = set(await self.store.opted_out_members("leaderboard_optout")) | {int(self.settings.owner_id)}
         if scope == "week":
             return await self.store.top_members(limit=10, since_day=activity_window_start(7), exclude_ids=opts)
         return await self.store.top_members(limit=10, exclude_ids=opts)
 
     async def _tier_panel_text(self, scope: str = "all") -> str:
         """The public chaos-tier panel: the ladder, the leaders and the caller-independent state."""
-        tiers = await self.store.activity_xp_by_member()
-        ladder = " → ".join(f"{name} ({threshold})" for name, threshold in TIERS)
-        lines = [
-            "## Chaos tiers",
-            f"Every message you send earns chaos: {ladder}.",
-            "",
-        ]
+        # The top of the ladder is open-ended: chaos keeps counting past 1000, there is simply no tier
+        # above it (Hoops 2026-09-23).
+        top_name, top_threshold = TIERS[-1]
+        ladder = " → ".join(
+            f"{tier_emoji(name)} {name} ({threshold}{'+' if name == top_name else ''})"
+            for name, threshold in TIERS
+        )
         rows = await self._tier_rows(scope)
         header = "This week" if scope == "week" else "All time"
-        lines.append(f"**{header} — top {len(rows) or 0}**" if rows else f"**{header}** — no activity recorded yet.")
-        lines.extend(_tier_standings_lines(rows))
         other = "all" if scope == "week" else "week"
-        lines.extend(
-            [
-                "",
-                f"Use the buttons below to switch, or `/tiers scope:{other}`. `My tier` shows your own "
-                "progress privately; `Hide me / show me` takes you off the leaderboard if you prefer.",
-            ]
+        standings = _tier_standings_lines(rows, await self.store.member_titles())
+        host_title = str(self.settings.owner_title or "").strip()
+        host_name = getattr(getattr(self, "user", None), "display_name", "") or ""
+        host_line = small(f"Hosted by {host_name} — {host_title}") if host_title and host_name else None
+        text = block(
+            heading("Chaos tiers"),
+            section("The ladder"),
+            ladder,
+            small(
+                "Chat earns a little and is capped; contributing earns far more. Ideas, suggestions, bug "
+                "reports, playtest notes and docs all count, and accepted work pays best."
+            ),
+            LADDER_QUOTE_LINE,
+            section(f"{header} — top {len(rows)}" if rows else header),
+            standings or small("No activity recorded for this period yet."),
+            small(
+                f"Switch with the buttons below or `/tiers scope:{other}`. `My tier` shows your own progress "
+                "privately; `Hide me / show me` takes you off this leaderboard."
+            ),
+            host_line,
         )
-        text = "\n".join(lines)
         return text if len(text) <= 1900 else text[:1890] + "…"
 
     async def _tier_self_text(self, user_id: int) -> str:
         row = await self.store.member_tier(user_id)
         xp = float(row[0]) if row else 0.0
         progress = tier_progress(xp)
-        rank = await self.store.member_rank(user_id)
-        week_rank = await self.store.member_rank(user_id, since_day=activity_window_start(7))
+        # Ranks are computed on the same basis as the panel, so a member's "#3" cannot disagree with
+        # the list they see (owner and opted-out members are not in the standings).
+        rank_excluded = set(await self.store.opted_out_members("leaderboard_optout"))
+        if int(user_id) != int(self.settings.owner_id):
+            # everyone else's rank matches the public list; the owner sees his own true rank here
+            rank_excluded.add(int(self.settings.owner_id))
+        rank = await self.store.member_rank(user_id, exclude_ids=rank_excluded)
+        week_rank = await self.store.member_rank(
+            user_id, since_day=activity_window_start(7), exclude_ids=rank_excluded
+        )
         opts = await self.store.opted_out_members("leaderboard_optout")
         hidden = "hidden from the leaderboard" if user_id in opts else "shown on the leaderboard"
         position = f"#{rank} all time" if rank else "not ranked yet (no recorded activity)"
         weekly = f"#{week_rank} this week" if week_rank else "no activity recorded this week"
-        return (
-            f"## Your chaos tier\n"
-            f"**{progress.label}** — {int(xp)} chaos earned.\n"
-            f"- Ranking: {position}; {weekly}.\n"
-            f"- You are currently {hidden}.\n"
-            f"- Chaos comes from messages (a tenth of each day past ten messages counts less; short "
-            f"messages count half; #bot-spam and #off-topic earn nothing; help channels earn a quarter more).\n"
-            f"- You are only ever mentioned by banter if you are a high-tier active member and haven't "
-            f"opted out."
+        bonus = await self.store.bonus_xp_total(user_id)
+        chat_xp = max(0.0, xp - bonus)
+        perks = cumulative_perks(progress.tier)
+        perk_lines = bullets(f"🎁 {perk}" for perk in perks) or [f"- 🎁 No perks yet - gather chaos to unlock them."]
+        recent = await self.store.contribution_counts(
+            since_day=(utcnow() - timedelta(days=CHAT_CAP_WINDOW_DAYS)).date().isoformat()
+        )
+        cap = chat_daily_cap(recent.get(int(user_id), 0))
+        titles = await self.store.member_title_slots(int(user_id))
+        if not titles and int(user_id) == int(self.settings.owner_id) and self.settings.owner_title:
+            titles = [str(self.settings.owner_title)]
+        # Titles are a top-of-the-ladder reward: none below the threshold, more of them above it
+        # (Hoops 2026-09-24). Generation happens in the activity pass, not inside a command.
+        title_items: list[str] = []
+        if titles:
+            title_items = [
+                section("Your titles" if len(titles) > 1 else "Your title"),
+                bullets(f"*{title}*" for title in titles),
+                small(f"More titles come with every tier above {TITLE_MIN_TIER}."),
+            ]
+        else:
+            title_items = [
+                section("Your title"),
+                small(
+                    f"None yet - titles start above Chaos Tier. Reach {TITLE_MIN_TIER} to earn your first, "
+                    "and more at each tier above it."
+                ),
+            ]
+        return block(
+            heading("Your chaos tier"),
+            f"{tier_emoji(progress.tier)} **{progress.label}**",
+            *title_items,
+            section("Where you stand"),
+            bullets(
+                [
+                    kv("Chaos earned", f"{int(xp)} ({int(chat_xp)} from chat, {int(bonus)} from contributions)"),
+                    kv("Ranking", f"{position}; {weekly}"),
+                    kv("Leaderboard", hidden),
+                    kv(
+                        "Testing vote",
+                        "carries extra weight at this tier"
+                        if voting_weight(progress.tier)
+                        else "recorded, not counted yet (Rising Chaos and above carry weight)",
+                    ),
+                ]
+            ),
+            section(f"Perks at {progress.tier}"),
+            perk_lines,
+            section("How chaos works"),
+            bullets(
+                [
+                    "Chat earns a little and is capped, and the cap lifts as you contribute.",
+                    "Contributing pays far more: ideas, suggestions, bug reports, playtest notes and docs.",
+                    "Accepted and shipped work pays best; repeating the same kind fades over a month.",
+                    "You are only ever mentioned by banter if you are a high-tier active member and haven't "
+                    "opted out.",
+                ]
+            ),
+            LADDER_QUOTE_LINE,
         )
 
     def _banter_excluded_ids(self) -> set[int]:
@@ -2570,7 +4308,10 @@ class ChaosXBot(discord.Client):
 
     async def _build_server_intel(self) -> tuple[str, str, IntelFacts]:
         """Build the private intel digest text from the bot's own tables."""
-        facts = await asyncio.to_thread(collect_intel, self.settings.db_path)
+        # The owner is passed in so he can be excluded: he reads this digest, he is never one of its subjects.
+        facts = await asyncio.to_thread(
+            collect_intel, self.settings.db_path, owner_id=getattr(self.settings, "owner_id", 0) or None
+        )
         channel_names, member_names = self._guild_name_maps()
         # The users table outlives the member cache (and works for members who left),
         # so it wins on names the diagnostic cache cannot resolve.
@@ -2627,18 +4368,41 @@ class ChaosXBot(discord.Client):
         """
         repo = self.settings.focus_tree_repo or self.settings.chaos_redux_repo
         window = DIGEST_WINDOW_DAYS
-        since_iso = (utcnow() - timedelta(days=window)).isoformat()
-        commits, event_files, version, head, issues, change_areas = await asyncio.gather(
-            git_commit_summary(repo, since_days=window),
-            git_files_touched(repo, since_days=window, prefix="events"),
+        # The last complete ISO week (Mon 00:00 -> next Mon 00:00 UTC), so the post's dates, its ISO-week
+        # key and the Monday schedule all describe the same week (Hoops, 2026-09-23).
+        window_start, window_end = last_complete_week()
+        since_iso = window_start.isoformat()
+        # Read the fetched branch, not the checkout's HEAD. The host checkout is only updated when someone
+        # fetches it; on 2026-10-19 its HEAD was twelve days old and the digest announced "no changes landed"
+        # while 496 commits had been pushed (Hoops: "the weekly reports are just plain wrong").
+        await refresh_repo(repo)
+        rev = await preferred_revision(repo)
+        commits, event_files, version, head, issues, change_areas, themes = await asyncio.gather(
+            git_commit_summary(repo, since=window_start, until=window_end, rev=rev),
+            git_files_touched(repo, prefix="events", since=window_start, until=window_end, rev=rev),
             descriptor_version(repo),
-            git_head_sha(repo),
-            github_issue_activity(self.settings.github_repo, since_days=window),
+            git_head_sha(repo, rev=rev),
+            github_issue_activity(self.settings.github_repo, since=window_start, until=window_end),
             # Weight the digest by where changes landed: commit subjects alone skew towards whichever
             # single topic was documented most, which made the digest claim one event was the whole week.
-            git_change_areas(repo, since_days=window),
+            git_change_areas(repo, since=window_start, until=window_end, rev=rev),
+            # What the week was about, by subject: areas alone cannot tell systems work from a bulk art export.
+            git_themes(repo, since=window_start, until=window_end, rev=rev),
         )
         stats = await self.store.routine_stats(since_iso=since_iso)
+        # The thank-you names: top chaos earners in the covered week, minus leaderboard opt-outs (and bots).
+        opted_out = await self.store.opted_out_members("leaderboard_optout")
+        never_mention = self._never_mention_ids()
+        top_rows = await self.store.top_members(
+            limit=3,
+            since_day=window_start.date().isoformat(),
+            exclude_ids=opted_out | never_mention,
+        )
+        top_members = [
+            {"name": str(name), "xp": int(xp or 0)}
+            for _user_id, name, xp, _messages, _days in top_rows
+            if str(name).strip()
+        ]
         counts = await self._discord_counts()
         playtest_rows = await self.store.list_playtest_reports_since(since_iso=since_iso, limit=6)
         playtests = [
@@ -2651,16 +4415,23 @@ class ChaosXBot(discord.Client):
         community_captures = [
             {"created_at": str(row[0]), "command": str(row[1]), "summary": str(row[2])}
             for row in captures
+            if len(row) < 4 or int(row[3] or 0) not in never_mention
         ]
         guild = self.guilds[0] if self.guilds else None
         return {
             "window_days": window,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "window_key": iso_week_key(window_start),
+            "window_label": f"{window_start.strftime('%a %d %B %Y')} to {(window_end - timedelta(days=1)).strftime('%a %d %B %Y')}",
+            "top_members": top_members,
             "commits": commits,
             "event_files": event_files,
             "version": version,
             "head": head,
             "issues": issues,
             "change_areas": change_areas,
+            "themes": themes,
             "playtests": playtests,
             "community_captures": community_captures,
             "repo_url": f"https://github.com/{self.settings.github_repo}",
@@ -2796,6 +4567,12 @@ class ChaosXBot(discord.Client):
             activity_label="weekly dev digest",
             fallback=digest_fallback(signals),
         )
+        # Say which dates the post covers (the last complete ISO week) and drop the online count: it is
+        # stale minutes after posting (Hoops, 2026-09-23).
+        text = strip_online_count(text)
+        text = self._scrub_never_mention(text)
+        window_start, window_end = last_complete_week()
+        text = with_window_note(text, window_start=window_start, window_end=window_end)
         result = await self._deliver_routine_post(spec, text=text, preview=preview)
         result.facts = signals
         result.detail = f"{source}; {result.detail}".strip("; ")
@@ -4474,6 +6251,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         interaction=None,
         raw=True,
         dm_user=message.author,
+        enabled=bot.settings.owner_thinking_feed,
     )
     await feed.start()
 
@@ -4607,12 +6385,17 @@ class _ThinkingFeed:
         interaction: discord.Interaction | None,
         raw: bool = False,
         dm_user: discord.User | discord.Member | None = None,
+        enabled: bool = True,
     ) -> None:
         self.bot = bot
         self.label = label
         self.interaction = interaction
         self.raw = raw
         self.dm_user = dm_user
+        # A disabled feed still exists as an object so every call site keeps working, but it starts
+        # nothing, streams nothing and never opens a DM (Hoops, 2026-09-24: "disable the thinking
+        # function right now").
+        self.enabled = bool(enabled)
         self.message: discord.Message | None = None
         self.messages: list[discord.Message] = []
         self.reasoning = ""
@@ -4622,6 +6405,8 @@ class _ThinkingFeed:
         self._last_edit = 0.0
 
     async def start(self) -> bool:
+        if not self.enabled:
+            return False
         try:
             if self.dm_user is not None:
                 channel = await self.dm_user.create_dm()
@@ -4710,6 +6495,7 @@ async def _public_model_completion(
     system: str,
     prompt: str,
     model: str,
+    provider: str | None = None,
     reasoning_effort: str,
     timeout_seconds: int,
     activity_label: str,
@@ -4732,6 +6518,8 @@ async def _public_model_completion(
     fallback Hermes run uses the caller-specified toolsets/ignore_rules so
     owner paths can keep their tool access if the direct path fails.
     """
+    settings_obj = getattr(bot, "settings", None)
+    provider = (provider or getattr(settings_obj, "ask_provider", "") or "deepseek").strip().lower() or "deepseek"
     digest = prompt_hash(prompt)
     user_part = prompt[len(system):].strip() if prompt.startswith(system) else prompt.strip()
     if attachment_text:
@@ -4742,6 +6530,7 @@ async def _public_model_completion(
             system=system,
             user=user_part,
             model=model,
+            provider=provider,
             reasoning_effort=reasoning_effort,
             images=images or [],
             on_usage=lambda usage: _get_cost_tracker(bot.settings).record(
@@ -4977,6 +6766,484 @@ async def run_mention_banter(bot: ChaosXBot, message: discord.Message, request: 
     schedule_compaction(bot.settings, channel_id=channel_id)
 
 
+class VoicePreferences:
+    """Per-user voice settings (pace, verbosity), kept beside the voice scratch dir.
+
+    Small and boring on purpose: a JSON map of user id -> settings, written on every change so a member's
+    "keep it short" survives a restart. Unknown or malformed files degrade to defaults rather than raising.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._data: dict[int, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            self._data = {}
+            return
+        for key, value in (raw or {}).items():
+            try:
+                self._data[int(key)] = dict(value)
+            except Exception:
+                continue
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps({str(k): v for k, v in self._data.items()}, indent=1), encoding="utf-8")
+        except Exception:
+            pass  # preferences are a nicety; never break an answer over them
+
+    def get(self, user_id: int) -> dict[str, Any]:
+        return dict(self._data.get(int(user_id), {}))
+
+    def update(self, user_id: int, **changes: Any) -> dict[str, Any]:
+        current = self.get(user_id)
+        for key, value in changes.items():
+            if value is None:
+                current.pop(key, None)
+            else:
+                current[key] = value
+        if current:
+            self._data[int(user_id)] = current
+        else:
+            self._data.pop(int(user_id), None)
+        self._save()
+        return current
+
+    def pace(self, user_id: int, default: float) -> float:
+        try:
+            value = float(self.get(user_id).get("pace") or default)
+        except Exception:
+            value = float(default)
+        return max(0.6, min(2.0, value))
+
+    def verbosity(self, user_id: int) -> str:
+        value = str(self.get(user_id).get("verbosity") or "normal")
+        return value if value in {"short", "normal", "detailed"} else "normal"
+
+
+async def server_memory_block(bot: ChaosXBot, *, skip_channel_ids: set[int] | None = None) -> str:
+    """Recent public activity from every channel, for both voice and text answers."""
+    return await server_memory_for(
+        bot.settings.db_path,
+        limit=12,
+        scope="public",
+        channel_names=bot.channel_name_map(),
+        skip_channel_ids=skip_channel_ids or set(),
+    )
+
+
+async def voice_memory_context(
+    bot: ChaosXBot,
+    *,
+    user_id: int,
+    channel_id: int,
+    session_context: str = "",
+) -> str:
+    """Give a spoken question the memory a text ask gets from its thread.
+
+    Includes the shared memory channel (where voice exchanges are archived so text chat sees them), the
+    voice channel's own chat, the speaker's recent history from wherever they have talked, and the current
+    session's transcript.
+    """
+    parts: list[str] = []
+    memory_channel = bot.settings.voice_transcript_channel_id or channel_id
+    try:
+        server_block = await server_memory_block(
+            bot, skip_channel_ids={int(memory_channel or 0), int(channel_id or 0)}
+        )
+    except Exception:
+        server_block = ""
+    if server_block.strip():
+        parts.append(server_block.strip())
+    for channel in dict.fromkeys([int(memory_channel or 0), int(channel_id or 0)]):
+        if not channel:
+            continue
+        try:
+            block = await conversation_context_for(bot.settings.db_path, channel, scope="public")
+        except Exception:
+            block = ""
+        if block.strip():
+            parts.append(block.strip())
+    try:
+        history = await user_history_for(bot.settings.db_path, int(user_id), scope="public")
+    except Exception:
+        history = ""
+    if history.strip():
+        parts.append(history.strip())
+    if session_context.strip():
+        parts.append("Earlier in this voice session:\n" + session_context.strip())
+    # Kept small on purpose: voice latency matters more than deep history, and the session
+    # transcript plus the newest lines is what follow-ups actually need.
+    return "\n\n".join(parts)[:1800]
+
+
+def _voice_speaker_line(bot: "ChaosXBot", guild_id: int | None, user_id: int) -> str:
+    """A system-prompt line naming whoever is talking, so a busy call gets attributed answers."""
+    name = ""
+    try:
+        guild = bot.get_guild(int(guild_id)) if guild_id else None
+        member = guild.get_member(int(user_id)) if guild is not None else None
+        name = (getattr(member, "display_name", "") or "").replace("@", "").strip()[:60]
+    except Exception:
+        name = ""
+    who = f"The member speaking with you right now is {name}." if name else "A member is speaking with you."
+    return (
+        f"\n{who} Answer the person who just asked, and use their name once as you answer. When several "
+        "members are in the call, never blend two people's questions into one answer: answer the one whose "
+        "question arrived first, and let the next question stand on its own."
+    )
+
+
+# An empty completion usually repeats if the retry asks the identical question, so the retry adds a directive.
+_RETRY_NUDGE = "\n\n(Answer the question now, plainly and briefly: two or three sentences, no preamble.)"
+
+
+async def run_voice_ask(
+    bot: "ChaosXBot",
+    *,
+    question: str,
+    user_id: int,
+    guild_id: int | None,
+    channel_id: int | None,
+    conversation_context: str = "",
+) -> str:
+    """Answer a spoken question through the same sandboxed path as text asks.
+
+    Voice deliberately reuses the public ask boundary, the knowledge grounding, the rejection
+    filter and the rate limiter: speaking to the bot grants no capability that typing does not.
+    """
+    request = " ".join(question.split())
+    if not request:
+        return ""
+    source_paths_allowed = public_ask_wants_sources(request)
+    reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+    rejection = public_ask_rejection_reason(request, reference_context=reference_context)
+    if rejection:
+        return rejection
+    max_chars = bot.settings.public_prompt_max_chars
+    if len(request) > max_chars:
+        return "That question is too long for me to answer out loud. Please keep it short."
+    limit = bot.settings.public_ask_limit_per_hour
+    if limit == 0:
+        return "Voice questions are currently disabled."
+    if limit > 0:
+        rate = bot.rate_limiter.check(bucket="voice_ask", user_id=user_id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            minutes = max(1, rate.retry_after_seconds // 60)
+            return f"I have answered a lot of your questions already. Please try again in about {minutes} minute(s)."
+
+    guild = bot.get_guild(guild_id) if guild_id else None
+    channel = bot.get_channel(channel_id) if channel_id else None
+    # Memory parity with text chat, in both directions: what was said out loud is archived like any
+    # message, and a spoken question is answered with the same context a text ask would get.
+    # Per-user preferences: verbosity changes the cap and the style hint, not the knowledge.
+    _prefs = bot.voice_prefs.get(user_id) if hasattr(bot, "voice_prefs") else {}
+    _verbosity = str(_prefs.get("verbosity") or "normal")
+    _cap = int(bot.settings.voice_max_answer_chars)
+    if _verbosity == "short":
+        _cap = min(_cap, 220)
+        request = "Answer in one or two short sentences. " + request
+    elif _verbosity == "detailed":
+        _cap = max(_cap, 700)
+        request = "Give the full picture, but stay spoken-length. " + request
+    # Catch-up requests ("what did I miss?") summarise recent server activity instead of answering a
+    # knowledge question, so they get a wider window and their own system prompt.
+    _catchup_hours = catchup_window_hours(request)
+    system_prompt = VOICE_ASK_SYSTEM
+    system_prompt += _voice_speaker_line(bot, guild_id, user_id)
+    if _catchup_hours is not None:
+        try:
+            _recent = await server_memory_for(
+                bot.settings.db_path,
+                limit=40,
+                max_chars=3000,
+                excerpt_chars=220,
+                channel_names=bot.channel_name_map(),
+                since_hours=_catchup_hours,
+            )
+        except Exception:
+            _recent = ""
+        if _recent.strip():
+            conversation_context = _recent.strip() + "\n\n" + conversation_context
+        system_prompt = VOICE_CATCHUP_SYSTEM
+    conversation_context = await voice_memory_context(
+        bot,
+        user_id=user_id,
+        channel_id=int(channel_id or 0),
+        session_context=conversation_context,
+    )
+    prompt = build_public_prompt(
+        user_request=request,
+        guild_name=guild.name if guild else None,
+        channel_name=getattr(channel, "name", None),
+        reference_context=reference_context,
+        source_paths_allowed=source_paths_allowed,
+        # Same context a text ask gets from its thread.
+        conversation_context=conversation_context,
+        user_context=await bot.user_context_for(user_id),
+        server_rules=bot.rules_block(),
+        server_channels=bot.channels_block(),
+        server_facts=await bot.facts_block_for_request(request, requester_id=user_id),
+        server_members=bot.members_block(),
+        cost_context=_cost_lookup_block(settings=bot.settings, text=request),
+    )
+    result = await _public_model_completion(
+        bot=bot,
+        system=system_prompt,
+        prompt=prompt,
+        model=bot.settings.ask_model,
+        reasoning_effort=bot.settings.ask_reasoning_effort,
+        timeout_seconds=bot.settings.hermes_timeout_seconds,
+        activity_label="voice ask",
+        actor_id=user_id,
+    )
+    if not result.ok:
+        return "I could not reach my knowledge base just now. Please ask again in a moment."
+    answer = sanitize_public_ask_output(result.stdout or "")
+    if not answer.strip():
+        # one nudge-retry: a blank twice in a row used to answer "I do not have an answer for that yet."
+        second = await _public_model_completion(
+            bot=bot,
+            system=system_prompt,
+            prompt=prompt + _RETRY_NUDGE,
+            model=bot.settings.ask_model,
+            reasoning_effort=bot.settings.ask_reasoning_effort,
+            timeout_seconds=bot.settings.hermes_timeout_seconds,
+            activity_label="voice ask retry",
+            actor_id=user_id,
+        )
+        answer = sanitize_public_ask_output(second.stdout or "") if second.ok else ""
+    if not answer.strip():
+        return "I do not have an answer for that yet."
+    await bot.store.audit(
+        actor_id=user_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        command="voice ask",
+        summary=f"voice question answered ({len(answer)} chars)",
+    )
+    return answer
+
+
+# A spoken answer is heard, not read: this keeps replies conversational and free of markdown.
+VOICE_ASK_SYSTEM = (
+    PUBLIC_ASK_BOUNDARY
+    + "\n\nYour reply is going to be read ALOUD by a voice in a Discord voice channel.\n"
+    "- Write plain conversational speech: no markdown, no headings, no bullet points, no asterisks, "
+    "no backticks, no code, no tables, no URLs and no source paths.\n"
+    "- Keep it short: one or two sentences, about 40 words, unless the question genuinely needs more.\n"
+    "- Speak numbers, dates and names naturally, the way a person would say them.\n"
+    "- Give the whole picture: if the topic has several parts (events, stages, phases), name every part in one breath, then the detail. Never speak only the first item of a chain.\n"
+    "- If someone just greets you or makes small talk, answer in one short, friendly sentence and "
+    "invite a Chaos Redux question. Never invent facts to fill the silence.\n"
+    "- If you do not know, say so briefly in one sentence.\n"
+    " When you state a specific fact, say where it came from in a few words - the event id or the file it lives in - so a listener can check it. Never invent a source."
+)
+VOICE_ASK_MAX_TOKENS = 450  # reasoning is charged against this too; 240 left no room for the reply
+
+
+CATCHUP_RE = re.compile(
+    r"\b(what did i miss|what have i missed|anything i missed|catch me up|fill me in|"
+    r"anything new|what happened (today|in the last hour|in the past hour|while i was|since i)|"
+    r"what did i miss today)\b",
+    re.IGNORECASE,
+)
+
+VOICE_CATCHUP_SYSTEM = (
+    VOICE_ASK_SYSTEM
+    + "\nThis is a catch-up request: the member wants to know what has been going on in the server "
+    "recently. Summarise the recent activity from the memory you were given — group it by topic and name "
+    "the channels involved, newest first, and keep it to a short spoken summary (a few sentences, no "
+    "bulleted lists read out loud, no greetings). Mention only what is actually in that memory, and if it "
+    "is empty say that it has been quiet rather than inventing anything. Do not treat chat as mod content: "
+    "what people discussed is community talk, not a Chaos Redux feature."
+)
+
+
+# "what did I miss about the zombie chain" is a content question: a catch-up request has no topic clause.
+_CATCHUP_TOPIC_RE = re.compile(r"\b(about|regarding|concerning|on|with|for|to)\b", re.IGNORECASE)
+
+
+def catchup_window_hours(question: str) -> float | None:
+    """Hours of history to summarise, or None when this is not a catch-up request."""
+    text = (question or "").lower()
+    if not CATCHUP_RE.search(text):
+        return None
+    if _CATCHUP_TOPIC_RE.search(text) or len(text.split()) > 9:
+        return None  # a topic clause means they are asking about content, not for a catch-up
+    if "last hour" in text or "past hour" in text:
+        return 1.0
+    if "today" in text or "this morning" in text or "this afternoon" in text:
+        return 12.0
+    if "yesterday" in text:
+        return 36.0
+    if "this week" in text or "last week" in text:
+        return 168.0
+    return 12.0
+
+
+async def run_voice_ask_stream(
+    bot: "ChaosXBot",
+    *,
+    question: str,
+    user_id: int,
+    guild_id: int | None,
+    channel_id: int | None,
+    conversation_context: str = "",
+):
+    """Yield a spoken answer in sentence-sized pieces as the model writes it.
+
+    Same sandboxed path as text asks (boundary prompt, grounding, rejection filter, rate limiter,
+    no tools); streaming means the voice can start speaking before the full answer exists.
+    """
+    request = " ".join(question.split())
+    if not request:
+        return
+    source_paths_allowed = public_ask_wants_sources(request)
+    reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+    rejection = public_ask_rejection_reason(request, reference_context=reference_context)
+    if rejection:
+        yield rejection
+        return
+    if len(request) > bot.settings.public_prompt_max_chars:
+        yield "That question is too long for me to answer out loud. Please keep it short."
+        return
+    limit = bot.settings.public_ask_limit_per_hour
+    if limit == 0:
+        yield "Voice questions are currently disabled."
+        return
+    if limit > 0:
+        rate = bot.rate_limiter.check(bucket="voice_ask", user_id=user_id, limit=limit, window_seconds=3600)
+        if not rate.allowed:
+            minutes = max(1, rate.retry_after_seconds // 60)
+            yield f"I have answered a lot of your questions already. Please try again in about {minutes} minute(s)."
+            return
+
+    guild = bot.get_guild(guild_id) if guild_id else None
+    channel = bot.get_channel(channel_id) if channel_id else None
+    # Memory parity with text chat, in both directions: what was said out loud is archived like any
+    # message, and a spoken question is answered with the same context a text ask would get.
+    # Catch-up requests ("what did I miss?") summarise recent server activity instead of answering a
+    # knowledge question, so they get a wider window and their own system prompt.
+    _catchup_hours = catchup_window_hours(request)
+    system_prompt = VOICE_ASK_SYSTEM
+    system_prompt += _voice_speaker_line(bot, guild_id, user_id)
+    if _catchup_hours is not None:
+        try:
+            _recent = await server_memory_for(
+                bot.settings.db_path,
+                limit=40,
+                max_chars=3000,
+                excerpt_chars=220,
+                channel_names=bot.channel_name_map(),
+                since_hours=_catchup_hours,
+            )
+        except Exception:
+            _recent = ""
+        if _recent.strip():
+            conversation_context = _recent.strip() + "\n\n" + conversation_context
+        system_prompt = VOICE_CATCHUP_SYSTEM
+    conversation_context = await voice_memory_context(
+        bot,
+        user_id=user_id,
+        channel_id=int(channel_id or 0),
+        session_context=conversation_context,
+    )
+    prompt = build_public_prompt(
+        user_request=request,
+        guild_name=guild.name if guild else None,
+        channel_name=getattr(channel, "name", None),
+        reference_context=reference_context,
+        source_paths_allowed=source_paths_allowed,
+        # Same context a text ask gets from its thread.
+        conversation_context=conversation_context,
+        user_context=await bot.user_context_for(user_id),
+        server_rules=bot.rules_block(),
+        server_channels=bot.channels_block(),
+        server_facts=await bot.facts_block_for_request(request, requester_id=user_id),
+        server_members=bot.members_block(),
+        cost_context=_cost_lookup_block(settings=bot.settings, text=request),
+    )
+    buffer = ""
+    answered = False
+    try:
+        async for _reasoning, delta in direct_chat_completion_stream(
+            system=system_prompt,
+            user=prompt,
+            model=bot.settings.ask_model,
+            provider=bot.settings.ask_provider,
+            reasoning_effort=bot.settings.ask_reasoning_effort,
+            max_tokens=VOICE_ASK_MAX_TOKENS,
+            timeout_s=bot.settings.hermes_timeout_seconds,
+        ):
+            if not delta:
+                continue
+            buffer += delta
+            while True:
+                match = re.search(r"[.!?]\s", buffer)
+                if not match:
+                    break
+                sentence, buffer = buffer[: match.end()], buffer[match.end():]
+                if len(sentence.strip()) >= 12:
+                    answered = True
+                    yield sentence.strip()
+        tail = buffer.strip()
+        # A reply that stops mid-sentence (the token budget can run out while the model is still
+        # reasoning) must not be spoken as if it were complete: leave it unanswered so the retry below
+        # runs with room for the full answer.
+        if tail and (len(tail) >= 120 or tail.endswith((".", "!", "?", "…", ":"))):
+            answered = True
+            yield tail
+        elif tail:
+            print(f"[voice] reply looked cut off after {len(tail)} chars; retrying", flush=True)
+    except Exception as exc:
+        print(f"[voice] answer stream failed: {type(exc).__name__}: {exc}", flush=True)
+
+    if not answered:
+        # The model can spend its whole budget reasoning and return no content at all, which left the
+        # bot silent in the channel. Give the answer its own room, then fall back to speaking a short
+        # line: a voice that answers slightly less well beats a voice that says nothing.
+        print("[voice] empty answer; retrying with room for the reply", flush=True)
+        retry = ""
+        try:
+            async for _reasoning, delta in direct_chat_completion_stream(
+                system=system_prompt,
+                user=prompt + _RETRY_NUDGE,
+                model=bot.settings.ask_model,
+                provider=bot.settings.ask_provider,
+                reasoning_effort=bot.settings.ask_reasoning_effort,
+                max_tokens=max(400, VOICE_ASK_MAX_TOKENS * 2),
+                timeout_s=bot.settings.hermes_timeout_seconds,
+            ):
+                if delta:
+                    retry += delta
+        except Exception as exc:
+            print(f"[voice] answer retry failed: {type(exc).__name__}: {exc}", flush=True)
+        retry = retry.strip()
+        if retry:
+            answered = True
+            yield retry
+    if not answered:
+        print("[voice] still nothing to say; speaking the fallback line", flush=True)
+        yield "I could not put that into words. Try asking me a shorter way."
+        if not answered:
+            yield "I could not reach my knowledge base just now. Please ask again in a moment."
+        return
+    if answered:
+        await bot.store.audit(
+            actor_id=user_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            command="voice ask",
+            summary="voice question answered",
+        )
+
+
 async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, request: str, *, parent_bot_message_id: int | None = None) -> None:
     guild_id = message.guild.id if message.guild else None
     channel_id = getattr(message.channel, "id", None)
@@ -5022,6 +7289,14 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         exclude_message_id=message.id,
         scope="public",
     )
+    # Server-wide awareness, like voice: what was recently said in the other channels.
+    server_context = await server_memory_block(
+        bot, skip_channel_ids={int(getattr(message.channel, "id", 0) or 0)}
+    )
+    if server_context.strip():
+        conversation_context = "\n\n".join(
+            part for part in [server_context.strip(), conversation_context.strip()] if part
+        )
     # Read-only channel context: recent messages from the ask channel plus any
     # channels the user explicitly linked (<#id>). GET-only; never modifies.
     channel_context = ""
@@ -5046,6 +7321,15 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         reply_context=reply_context,
         has_conversation=bool(conversation_context.strip() or channel_context.strip()),
     )
+    # The facts read and the web search are independent, so they run together. The facts read is started here and
+    # awaited when the prompt is assembled.
+    facts_task = asyncio.create_task(
+        bot.facts_block_for_request(
+            owner_request if owner_only else request,
+            requester_id=interaction.user.id,
+            always_identity=owner_only,
+        )
+    )
     # Web grounding: always available so the model can reach the web when it
     # needs it (never for catalog lookups — a miss must be a plain "not
     # found", not a search dump).
@@ -5058,7 +7342,9 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         web_context, evidence = await bot.web.search_evidence(
             request,
             max_pages=bot.settings.web_evidence_max_pages,
-            evidence_enabled=bot.settings.web_evidence_enabled,
+            # The attached PNG is a table scraped off a result page: only attach it when the member actually
+            # asked for outside information. A fallback search still informs the answer, just without a picture.
+            evidence_enabled=bot.settings.web_evidence_enabled and wants_web_evidence_image(request),
         )
     prompt = build_public_prompt(
         user_request=request,
@@ -5071,7 +7357,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
         user_context=await bot.user_context_for(message.author.id, exclude_message_id=message.id),
         server_rules=bot.rules_block(),
         server_channels=bot.channels_block(),
-        server_facts=bot.server_facts_for_request(request),
+        server_facts=await bot.facts_block_for_request(request, requester_id=message.author.id),
         known_users=await bot.known_users_block(),
         server_members=bot.members_block(),
         referenced_users=await bot.referenced_user_contexts_block(request),
@@ -5202,6 +7488,7 @@ async def send_scripted_response(
 ) -> None:
     if not await public_gate(interaction, bot.settings):
         return
+    view_kwargs = _view_kwargs(view)
     limit = bot.settings.public_scripted_limit_per_hour
     rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
     if not rate.allowed:
@@ -5219,16 +7506,24 @@ async def send_scripted_response(
             output = await render()
         else:
             output = await asyncio.to_thread(render)
+            if inspect.isawaitable(output):
+                # A sync callable can still return a coroutine (e.g. `lambda: bot._tier_panel_text(x)`).
+                # Without this, len() on the coroutine raised "object of type 'coroutine' has no len()"
+                # and /tiers failed for every user (2026-09-23).
+                output = await output
     except Exception as exc:
         output = f"ChaosX scripted command failed: `{type(exc).__name__}: {exc}`"
-    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command=command_name, summary=summary)
     for index, part in enumerate(_chunk(output)):
         await interaction.followup.send(
             part,
             ephemeral=not public,
             allowed_mentions=safe_allowed_mentions(),
-            view=view if index == 0 else None,
+            **(view_kwargs if index == 0 else {}),
         )
+    # The audit row is written AFTER the reply was delivered. It used to run before the send, so a
+    # transient `database is locked` on the 520MB archive killed the whole command and every member saw
+    # "The application did not respond" (Hoops, 2026-09-24). Diagnostics never gate the answer.
+    await safe_audit(bot, interaction=interaction, command=command_name, summary=summary)
     if after_send:
         try:
             await after_send()
@@ -5417,6 +7712,60 @@ async def send_event_chain_lookup(bot: ChaosXBot, interaction: discord.Interacti
     await interaction.followup.send(
         f"### Event chain — {record.label}\nIncludes `{len(record.event_keys)}` event definition(s) from this event package.",
         file=discord.File(io.BytesIO(graph.png), filename=record.filename),
+        ephemeral=False,
+        allowed_mentions=safe_allowed_mentions(),
+    )
+
+
+async def send_tech_lookup(
+    bot: ChaosXBot, interaction: discord.Interaction, view: str, target: str = ""
+) -> None:
+    """Post an MCP-rendered technology view."""
+    if not await public_gate(interaction, bot.settings):
+        return
+    limit = bot.settings.public_scripted_limit_per_hour
+    rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
+    if not rate.allowed:
+        minutes = max(1, rate.retry_after_seconds // 60)
+        await interaction.response.send_message(
+            f"Rate limit hit for ChaosX scripted commands. Try again in about {minutes} minute(s).",
+            ephemeral=True,
+        )
+        return
+    target = " ".join((target or "").split())[:80]
+    await interaction.response.defer(ephemeral=False, thinking=True)
+    await bot.store.audit(
+        actor_id=interaction.user.id,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        command="chaosx tech-tree",
+        summary=f"{view} {target}".strip(),
+    )
+    folder_id = target if view == "folder" else ""
+    technology_id = target if view == "technology" else ""
+    try:
+        png = await bot.event_visual_mcp.render_tech_view(
+            view=view, folder_id=folder_id, technology_id=technology_id
+        )
+    except EventVisualError as exc:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="tech tree render error",
+            summary=type(exc.__cause__ or exc).__name__,
+        )
+        await interaction.followup.send(
+            "Technology renders are unavailable right now.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    label = view.replace("_", " ")
+    detail = f" for `{target}`" if target else ""
+    await interaction.followup.send(
+        f"### Technology view — {label}{detail}\nRendered from the Chaos Redux technology files by the mod tools.",
+        file=discord.File(io.BytesIO(png), filename=f"chaosx-tech-{view}.png"),
         ephemeral=False,
         allowed_mentions=safe_allowed_mentions(),
     )
@@ -5774,6 +8123,69 @@ def reasoning_effort_for_path(
     return settings.ask_reasoning_effort
 
 
+async def _no_context() -> str:
+    """A blank context block, for `asyncio.gather` branches that must return a string."""
+    return ""
+
+
+async def _public_channel_context(
+    bot: "ChaosXBot", interaction: discord.Interaction, request: str
+) -> str:
+    """Read-only channel context for public /ask (GET-only; never modifies)."""
+    try:
+        main_context = await bot.channel_reader.recent_context(interaction.channel_id)
+        linked_context = await bot.channel_reader.referenced_channels_context(request)
+        return "\n".join(part for part in (main_context, linked_context) if part)
+    except Exception:
+        return ""
+
+
+# Questions that genuinely need the outside world; everything else tries the local knowledge first.
+_WEB_INTENT_RE = re.compile(
+    r"\b(latest|newest|news|recent(?:ly)?|today|tomorrow|this (?:week|month|year)|release[sd]?|patch|"
+    r"update[sd]?|steam|workshop|download|version \d|changelog|roadmap|announcement|premiere|"
+    r"search|google|web|internet|source[s]?|cite|202[5-9])\b",
+    re.IGNORECASE,
+)
+WEB_EVIDENCE_MIN_LOCAL_CHARS = 700
+
+# Conversational asks are not requests for outside facts. They were falling through to the thin-KB fallback
+# below, which searched the web for them and attached a scraped table to answers that came from the mod's own
+# files — the member gets an unrelated picture they never asked for (Hoops 2026-10-12).
+_CASUAL_RE = re.compile(
+    r"\b(?:have you (?:ever )?tried|do you (?:think|like|prefer|reckon|believe)|what do you think|"
+    r"your (?:opinion|take|thoughts?)|thoughts|opinion|lol|lmao|haha|hehe|xd|nice|cool|thanks|thank you|cheers)\b",
+    re.IGNORECASE,
+)
+
+
+def wants_web_evidence_image(request: str) -> bool:
+    """Whether an attachable evidence image is warranted for this ask.
+
+    The image is a data table scraped off a result page, so it only makes sense when the member actually asked
+    for outside information. A fallback search (the local knowledge base came up thin) can still inform the
+    answer, but attaching a web table to it is unasked-for noise.
+    """
+    return bool(_WEB_INTENT_RE.search(request or ""))
+
+
+def needs_web_evidence(request: str, *, reference_context: str = "") -> bool:
+    """Whether this ask should reach out to the web at all.
+
+    Web evidence costs a network round trip on every ask, so it is now a fallback: explicit
+    outside-world intent always searches, and otherwise the local knowledge base has to come up
+    thin before the bot looks outside. A catalog lookup never searches.
+    """
+    if looks_like_catalog_lookup(request):
+        return False
+    if _WEB_INTENT_RE.search(request or ""):
+        return True
+    if _CASUAL_RE.search(request or ""):
+        # Opinion/banter: nothing to look up, so do not spend a search on it.
+        return False
+    return len(reference_context or "") < WEB_EVIDENCE_MIN_LOCAL_CHARS
+
+
 async def run_hermes_command(
     bot: ChaosXBot,
     interaction: discord.Interaction,
@@ -5789,6 +8201,12 @@ async def run_hermes_command(
     send_output: bool = True,
     postprocess: Any = None,
 ) -> tuple[HermesResult, str] | None:
+    _started_at = time.perf_counter()
+    _model_path = (
+        "operator"
+        if use_operator_model
+        else ("hermes-subprocess" if bot.settings.hermes_subprocess_enabled else "ask-api")
+    )
     rate = None
     source_paths_allowed = False
     reference_context = ""
@@ -5865,10 +8283,17 @@ async def run_hermes_command(
     guild_name, channel_name = _guild_channel(interaction)
     owner_context = ""
     if owner_only:
-        if command_name == "admin ask":
-            owner_context = await fetch_admin_ask_memory_context(bot, interaction)
-        owner_context += await fetch_admin_member_context(bot, interaction, request)
-        owner_context += await fetch_admin_message_context(bot, interaction, request)
+        # These lookups are independent and together they were the largest serial cost on the slowest
+        # path (owner commands), so they now run concurrently (Hoops 2026-09-23: "why do commands take
+        # such a long time?").
+        memory_context, member_context, message_context = await asyncio.gather(
+            fetch_admin_ask_memory_context(bot, interaction)
+            if command_name == "admin ask"
+            else _no_context(),
+            fetch_admin_member_context(bot, interaction, request),
+            fetch_admin_message_context(bot, interaction, request),
+        )
+        owner_context = f"{memory_context}{member_context}{message_context}"
     # Background records ride in the memory block, not the request slot (see
     # _owner_memory_block): the prompt must end on the current owner request.
     owner_request = request
@@ -5880,28 +8305,38 @@ async def run_hermes_command(
             scope="admin",
         )
     # Read-only channel context for public /ask (GET-only; never modifies).
+    user_context = ""
+    known_users = ""
+    referenced_users = ""
     channel_context = ""
     if not owner_only:
-        try:
-            main_context = await bot.channel_reader.recent_context(interaction.channel_id)
-            linked_context = await bot.channel_reader.referenced_channels_context(request)
-            channel_context = "\n".join(part for part in (main_context, linked_context) if part)
-        except Exception:
-            channel_context = ""
+        # Same on the public path: channel context, the asker's own context, the known-user block and
+        # referenced members are four independent reads, so they happen together.
+        channel_context, user_context, known_users, referenced_users = await asyncio.gather(
+            _public_channel_context(bot, interaction, request),
+            bot.user_context_for(interaction.user.id),
+            bot.known_users_block(),
+            bot.referenced_user_contexts_block(request),
+        )
     # Web grounding: always available so the model can reach the web when it
     # needs it (public asks only; never for catalog lookups — a miss must be
     # a plain "not found", not a dump).
     web_context = ""
     evidence: EvidenceImage | None = None
+    # The web search is the only stage that leaves the box, so it became a fallback instead of a
+    # default: it runs when the question asks for outside information or when the local knowledge base
+    # had little to offer. Most asks skip it entirely now.
     if (
         not owner_only
         and bot.settings.web_search_enabled
-        and not looks_like_catalog_lookup(request)
+        and needs_web_evidence(request, reference_context=reference_context)
     ):
         web_context, evidence = await bot.web.search_evidence(
             request,
             max_pages=bot.settings.web_evidence_max_pages,
-            evidence_enabled=bot.settings.web_evidence_enabled,
+            # The attached PNG is a table scraped off a result page: only attach it when the member actually
+            # asked for outside information. A fallback search still informs the answer, just without a picture.
+            evidence_enabled=bot.settings.web_evidence_enabled and wants_web_evidence_image(request),
         )
     prompt = (
         build_owner_prompt(
@@ -5912,7 +8347,7 @@ async def run_hermes_command(
             memory_context=owner_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
-            server_facts=bot.server_facts_block(),
+            server_facts=await facts_task,
             model_name=bot.settings.operator_model if looks_like_model_identity_question(owner_request) else "",
             cost_context=_cost_lookup_block(settings=bot.settings, text=owner_request),
         )
@@ -5924,23 +8359,25 @@ async def run_hermes_command(
             reference_context=reference_context if rate_bucket == "ask" else "",
             source_paths_allowed=source_paths_allowed,
             memory_context=memory_context if rate_bucket == "ask" else "",
-            user_context=await bot.user_context_for(interaction.user.id),
+            user_context=user_context,
             server_rules=bot.rules_block(),
             server_channels=bot.channels_block(),
-            server_facts=bot.server_facts_for_request(request),
-            known_users=await bot.known_users_block(),
+            server_facts=await facts_task,
+            known_users=known_users,
             server_members=bot.members_block(),
-            referenced_users=await bot.referenced_user_contexts_block(request),
+            referenced_users=referenced_users,
             channel_context=channel_context,
             model_name=bot.settings.ask_model if looks_like_model_identity_question(request) else "",
             cost_context=_cost_lookup_block(settings=bot.settings, text=request),
         )
     )
-    model = provider = reasoning_effort = toolsets = None
+    # Every command now has a model. It used to be set only when the caller opted into the direct API, which left
+    # the rest on the Hermes CLI subprocess path -- absent on the interim host, so those commands failed outright.
     if use_operator_model:
         model, provider = bot.settings.operator_model, bot.settings.operator_provider
-    elif use_ask_model:
+    else:
         model, provider = bot.settings.ask_model, bot.settings.ask_provider
+    toolsets = None
     reasoning_effort = reasoning_effort_for_path(
         bot.settings,
         owner_only=owner_only,
@@ -5962,7 +8399,7 @@ async def run_hermes_command(
         activity_box[0] = activity
 
     try:
-        if (not owner_only and use_ask_model) or owner_stream:
+        if (not bot.settings.hermes_subprocess_enabled and not owner_only) or owner_stream:
             assert model is not None and reasoning_effort is not None  # set by the model branch
             is_owner = interaction.user.id == bot.settings.owner_id
             feed: _ThinkingFeed | None = None
@@ -5975,6 +8412,8 @@ async def run_hermes_command(
                     interaction=interaction,
                     raw=is_owner,
                     dm_user=interaction.user if is_owner else None,
+                    # Owner-only switch: everyone else's dismissable feed keeps its own setting.
+                    enabled=bot.settings.owner_thinking_feed if is_owner else True,
                 )
             if feed is not None:
                 await feed.start()
@@ -6019,6 +8458,66 @@ async def run_hermes_command(
             output = postprocess(output)
         except Exception as exc:  # a broken postprocess must never swallow the answer
             print(f"[chaosx] postprocess failed for {command_name}: {type(exc).__name__}: {exc}")
+    # Two false-negative classes, one retry budget: claiming a capability is missing, and refusing while
+    # retrieval clearly supplied the material. A second retry would double a worst case that is already slow.
+    ungrounded_refusal = is_ungrounded_refusal(output, reference_context)
+    if (
+        not owner_only
+        and not result.timed_out
+        and (is_denial(output) or ungrounded_refusal)
+        and bot.settings.denial_guard_enabled
+        and model
+        and reasoning_effort
+    ):
+        capability = (
+            "live server, GitHub and playtest data, the knowledge base, web search and page reading, "
+            "and video pages"
+        )
+        try:
+            retry_result = await _public_model_completion(
+                bot=bot,
+                system=PUBLIC_ASK_BOUNDARY,
+                prompt=prompt
+                + "\n\n"
+                + corrective_prompt(capability)
+                + (
+                    "\nThe context above does contain material on this subject. Answer from it and name the "
+                    "files it provides."
+                    if ungrounded_refusal
+                    else ""
+                ),
+                model=model,
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=hermes_timeout,
+                activity_label=f"{command_name} (denial retry)",
+                actor_id=interaction.user.id,
+                feed=None,
+                fallback_toolsets="safe",
+                fallback_ignore_rules=True,
+                fallback_provider=None,
+            )
+            retry_text = (retry_result.stdout or "").strip()
+            if retry_text:
+                output = retry_text
+                result = retry_result
+                print(f"[chaosx] denial_guard: retried {command_name}")
+        except Exception as exc:  # a failed retry must never cost the member their answer
+            print(f"[chaosx] denial_guard retry failed: {type(exc).__name__}: {exc}")
+
+    _citations = len(citations(output))
+    _unverified = 0
+    # A named file that is not in the index is the most confident way to be wrong. Mark it, never delete the
+    # sentence: the surrounding answer may still be right, and hiding the invention is worse than showing it.
+    if not owner_only and output and not result.timed_out:
+        try:
+            missing = unverified_citations(output, bot.knowledge.known_paths())
+            _unverified = len(missing)
+            if missing:
+                for path in missing:
+                    output = output.replace(f"`{path}`", f"`{path}` (not found in the index)")
+                print(f"[grounding] unverified citations: {missing}", flush=True)
+        except Exception as exc:  # citation checking must never cost the member their answer
+            print(f"[grounding] check failed: {type(exc).__name__}: {exc}", flush=True)
     if result.timed_out:
         output = (
             f"Hermes run timed out after {hermes_timeout}s. "
@@ -6117,6 +8616,23 @@ async def run_hermes_command(
             output_excerpt=sanitize_admin_context_text(memory_output, limit=2500),
             keep_last=bot.settings.reply_memory_keep_last,
         )
+    _elapsed = time.perf_counter() - _started_at
+    record_command_timing(
+        command_name,
+        _elapsed,
+        path=_model_path,
+        db_path=bot.settings.db_path,
+    )
+    # One row per answer so "is it getting more accurate?" has data behind it.
+    record_answer_event(
+        db_path=bot.settings.db_path,
+        path=_model_path,
+        seconds=_elapsed,
+        denial=is_denial(output),
+        refusal_retry=ungrounded_refusal,
+        citations=_citations,
+        unverified=_unverified,
+    )
     return result, output
 
 
@@ -6197,6 +8713,707 @@ async def post_approved_event_idea(
             await channel.send(part, allowed_mentions=safe_allowed_mentions())
         return message.jump_url
     raise TypeError(f"Unsupported event idea channel type: {type(channel).__name__}")
+
+
+class EventIdeaModal(discord.ui.Modal, title="Submit an event idea"):
+    """The intake form (Hoops 2026-09-23): a modal, not eleven slash options.
+
+    Long text is possible here, every field is optional except the idea itself, and the submission is not
+    written anywhere until the submitter confirms the preview.
+    """
+
+    idea = discord.ui.TextInput(
+        label="The idea",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1500,
+        placeholder="What happens, when or how it triggers, what it affects, and the gameplay effect.",
+    )
+    event_type = discord.ui.TextInput(label="Type (optional)", required=False, max_length=80)
+    cluster = discord.ui.TextInput(label="Cluster / tags (optional)", required=False, max_length=120)
+    world_end = discord.ui.TextInput(label="World-end scenario link (optional)", required=False, max_length=200)
+    evolutions = discord.ui.TextInput(
+        label="Evolution stages (optional, one per line)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=900,
+    )
+
+    def __init__(self, bot: "ChaosXBot", *, prefill: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self.bot = bot
+        if prefill:
+            self.idea.default = str(prefill.get("idea", ""))[:1500]
+            self.event_type.default = str(prefill.get("event_type", ""))[:80]
+            self.cluster.default = str(prefill.get("cluster", ""))[:120]
+            self.world_end.default = str(prefill.get("world_end", ""))[:200]
+            self.evolutions.default = str(prefill.get("evolutions", ""))[:900]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        payload = {
+            "idea": str(self.idea.value or "").strip(),
+            "event_type": str(self.event_type.value or "").strip(),
+            "cluster": str(self.cluster.value or "").strip(),
+            "world_end": str(self.world_end.value or "").strip(),
+            "evolutions": str(self.evolutions.value or "").strip(),
+        }
+        await self.bot._handle_event_idea_submission(interaction, payload=payload)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await self.bot._idea_error(interaction, "The idea form failed", error)
+
+
+class EventIdeaPreviewView(discord.ui.View):
+    """Ephemeral preview with Post / Edit / Discard - nothing is saved or posted before a button press."""
+
+    def __init__(self, bot: "ChaosXBot", *, payload: dict[str, str], priority: bool) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.payload = dict(payload)
+        self.priority = bool(priority)
+
+    @discord.ui.button(label="Post to forum", style=discord.ButtonStyle.primary, emoji="📮")
+    async def post(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self.bot._file_event_idea(interaction, payload=self.payload, priority=self.priority)
+        self.stop()
+
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.secondary, emoji="✏️")
+    async def edit(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(EventIdeaModal(self.bot, prefill=self.payload))
+        self.stop()
+
+    @discord.ui.button(label="Discard", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def discard(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content="🗑️ Discarded - nothing was saved and nothing was posted.",
+            view=None,
+        )
+        self.stop()
+
+
+class IdeaStatusNoteModal(discord.ui.Modal):
+    """The optional one-line reason that travels with a status change."""
+
+    def __init__(self, bot: "ChaosXBot", *, submission_id: int, status: str) -> None:
+        super().__init__(title=f"Idea #{submission_id} - {status_label(status)}"[:45])
+        self.bot = bot
+        self.submission_id = int(submission_id)
+        self.status = str(status)
+        self.note = discord.ui.TextInput(
+            label="Reason / note (optional)",
+            required=False,
+            max_length=200,
+            placeholder="e.g. fits the 1948 cluster, needs art first",
+        )
+        self.add_item(self.note)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.bot._apply_idea_status(
+            interaction,
+            submission_id=self.submission_id,
+            status=self.status,
+            note=str(self.note.value or "").strip(),
+        )
+
+
+class IdeaStatusView(discord.ui.View):
+    """Owner-only status buttons, attached to an idea's own forum post (persistent)."""
+
+    def __init__(self, submission_id: int) -> None:
+        super().__init__(timeout=None)
+        self.submission_id = int(submission_id)
+        for status, label, style in REVIEW_BUTTONS:
+            button = discord.ui.Button(
+                label=label,
+                style=getattr(discord.ButtonStyle, style),
+                custom_id=f"chaosx:idea:{self.submission_id}:{status}",
+            )
+            button.callback = self._callback_for(status)
+            self.add_item(button)
+
+        # Public vote: anyone may press it, only the count is ever public.
+        vote = discord.ui.Button(
+            label="Vote",
+            emoji="🗳️",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"chaosx:ideavote:{self.submission_id}",
+        )
+        vote.callback = self._vote_callback
+        self.add_item(vote)
+
+    async def _vote_callback(self, interaction: discord.Interaction) -> None:
+        bot = interaction.client
+        try:
+            outcome = await bot.store.toggle_idea_vote(
+                submission_id=self.submission_id, user_id=interaction.user.id
+            )
+        except Exception:
+            await interaction.response.send_message("Voting is unavailable right now.", ephemeral=True)
+            return
+        if outcome is None:
+            # the idea is gone (deleted or never filed): say that, do not claim a vote was removed
+            await interaction.response.send_message(
+                f"Idea #{self.submission_id} is no longer on the board, so there is nothing to vote on.",
+                ephemeral=True,
+            )
+            return
+        voted, count = outcome
+        content = interaction.message.content if interaction.message else ""
+        updated = _with_idea_vote_line(content, count)
+        if updated and updated != content:
+            await interaction.response.edit_message(content=updated)
+        else:
+            await interaction.response.defer()
+        await interaction.followup.send(
+            f"{'Vote counted' if voted else 'Vote removed'} - idea #{self.submission_id} now has {count} vote(s).",
+            ephemeral=True,
+        )
+
+    def _callback_for(self, status: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            settings = getattr(interaction.client, "settings", None)
+            if settings is None or int(interaction.user.id) != int(settings.owner_id):
+                await interaction.response.send_message(
+                    "Only Hoops McCann can move an idea through the pipeline.", ephemeral=True
+                )
+                return
+            await interaction.response.send_modal(
+                IdeaStatusNoteModal(interaction.client, submission_id=self.submission_id, status=status)
+            )
+
+        return callback
+
+
+class SuggestedActionsView(discord.ui.View):
+    """Dynamic "suggested next" buttons under a command footer (Hoops, 2026-09-23).
+
+    Callbacks depend only on the action key (``chaosx:suggest:<key>``), never on the message that
+    carried them, so one instance registered at startup keeps working after a restart and every press
+    recomputes its content for whoever pressed it.
+    """
+
+    def __init__(self, bot: "ChaosXBot", suggestions: list[Suggestion]) -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+        for suggestion in suggestions[:MAX_SUGGESTIONS]:
+            button: discord.ui.Button = discord.ui.Button(
+                label=suggestion.label[:80],
+                emoji=suggestion.emoji,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"chaosx:suggest:{suggestion.key}",
+            )
+            button.callback = _suggested_callback(bot, suggestion.key)
+            self.add_item(button)
+
+
+def _suggested_callback(bot: "ChaosXBot", key: str):
+    async def callback(interaction: discord.Interaction) -> None:
+        await run_suggestion(bot, interaction, key)
+
+    return callback
+
+
+def _is_owner_id(bot: "ChaosXBot", user_id: int) -> bool:
+    return int(user_id) == int(bot.settings.owner_id)
+
+
+async def run_suggestion(bot: "ChaosXBot", interaction: discord.Interaction, key: str) -> None:
+    """Run the action behind a suggested-next button.
+
+    Owner-only actions re-check ownership here rather than trusting the footer that rendered them.
+    """
+    ephemeral = True
+    try:
+        if key in {"idea_pipeline", "command_latency", "server_health"} and not _is_owner_id(
+            bot, interaction.user.id
+        ):
+            await interaction.response.send_message(
+                "That one is owner-only.", ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+
+        if key == "submit_idea":
+            await interaction.response.send_modal(EventIdeaModal(bot))
+            return
+        if key == "report_bug":
+            await interaction.response.send_modal(IssueReportModal(bot, "bug"))
+            return
+
+        await interaction.response.defer(ephemeral=ephemeral, thinking=False)
+        text_out: str
+        view: discord.ui.View | None = None
+        if key == "testing_vote":
+            text_out = await bot._testing_vote_panel_text(interaction.user.id)
+            view = await TestingPanelView.build(bot)
+        elif key == "idea_board":
+            text_out = await bot._idea_board_text("open")
+            view = IdeaBoardView(bot)
+        elif key == "my_ideas":
+            text_out = await bot._idea_board_text("mine", user_id=interaction.user.id)
+            view = IdeaBoardView(bot)
+        elif key == "my_tier":
+            text_out = await bot._tier_self_text(interaction.user.id)
+            view = TierPanelView(bot, timeout=None)
+        elif key == "ask_question":
+            text_out = block(
+                small("Use `/ask` and phrase it as a question about the mod or the server."),
+                bullets(
+                    [
+                        "`/ask question:how does the death pipeline work?`",
+                        "`/ask question:what changed in the convoy system?`",
+                        "-# Answers come from the mod files, this server and the vault.",
+                    ]
+                ),
+            )
+        elif key == "idea_pipeline":
+            text_out = await bot._idea_board_text("open") + "\n" + block(
+                small("Use `/admin ideas` for the status buttons, or press one on an idea post.")
+            )
+        elif key == "command_latency":
+            text_out = block(section("Command latency"), bullets(command_timings_lines()))
+        elif key == "server_health":
+            guilds = ", ".join(g.name for g in bot.guilds) or "none"
+            text_out = block(
+                section("Health"),
+                bullets(
+                    [
+                        f"Visible guilds: {guilds}",
+                        f"Profile: `{bot.settings.hermes_profile}`",
+                        *command_timings_lines(limit=3),
+                    ]
+                ),
+            )
+        else:
+            text_out = "That suggestion is no longer available."
+        await interaction.followup.send(
+            text_out, **_view_kwargs(view), ephemeral=ephemeral, allowed_mentions=safe_allowed_mentions()
+        )
+    except Exception as exc:  # a footer button must never leave the member with a dead interaction
+        logger.warning("suggested action %s failed: %s", key, exc)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Sorry, that did not work. Try the slash command instead.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+            else:
+                await interaction.response.send_message(
+                    "Sorry, that did not work. Try the slash command instead.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+        except Exception:
+            pass
+
+
+async def safe_followup(interaction: discord.Interaction, text: str, **kwargs) -> None:
+    """Reply to an interaction that may already be deferred or answered, without ever raising."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                text, ephemeral=True, allowed_mentions=safe_allowed_mentions(), **kwargs
+            )
+        else:
+            await interaction.response.send_message(
+                text, ephemeral=True, allowed_mentions=safe_allowed_mentions(), **kwargs
+            )
+    except Exception:
+        pass
+
+
+async def safe_audit(
+    bot: "ChaosXBot",
+    *,
+    interaction: discord.Interaction,
+    command: str,
+    summary: str,
+) -> None:
+    """Write an audit row without ever being able to break the command it describes.
+
+    Diagnostics are the least important thing happening here: if the database is busy, the reply has
+    already gone out and the failure belongs in the journal, not in the member's face.
+    """
+    try:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command=command,
+            summary=summary,
+        )
+    except Exception as exc:
+        print(f"[audit] {command} audit write failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _view_kwargs(view: discord.ui.View | None) -> dict:
+    """`view=` only when there really is a view.
+
+    discord.py raises `TypeError: expected view parameter to be of type View or LayoutView, not
+    NoneType` when `view=None` is passed, and the exception lands after the interaction was deferred,
+    so the member sees nothing at all. Every send that may have no view goes through this (Hoops hit
+    exactly this on /help, 2026-09-24).
+    """
+    return {"view": view} if isinstance(view, discord.ui.View) else {}
+
+
+def _suggested_view(bot: "ChaosXBot", suggestions: list[Suggestion]) -> discord.ui.View | None:
+    return SuggestedActionsView(bot, suggestions) if suggestions else None
+
+
+async def send_suggested_followup(
+    bot: "ChaosXBot", interaction: discord.Interaction, *, owner: bool | None = None
+) -> None:
+    """Post the personal suggestions as their own ephemeral follow-up.
+
+    A Discord message carries exactly one view, so a command that already owns its buttons (or is
+    public) gets the suggestions as a private extra message instead of fighting for the same row.
+    """
+    footer, view = await suggested_footer(bot, interaction, owner=owner)
+    if not footer:
+        return
+    try:
+        await interaction.followup.send(
+            footer, **_view_kwargs(view), ephemeral=True, allowed_mentions=safe_allowed_mentions()
+        )
+    except Exception as exc:
+        logger.warning("suggested followup failed: %s", exc)
+
+
+async def suggested_footer(
+    bot: "ChaosXBot", interaction: discord.Interaction, *, owner: bool | None = None
+) -> tuple[str, discord.ui.View | None]:
+    """Live next-step suggestions for the bottom of a command reply.
+
+    Everything here is derived from current state (queue depth, the member's own ideas and tier), so
+    the footer never advertises something that is not actually there. Failures degrade to "no footer"
+    rather than breaking the command that called it.
+    """
+    try:
+        user_id = int(interaction.user.id)
+        is_owner = _is_owner_id(bot, user_id) if owner is None else bool(owner)
+        tier_name = ""
+        tier_row = await bot.store.member_tier(user_id)
+        if tier_row:
+            tier_name = str(tier_row[1])
+        counts = await bot.store.idea_status_counts()
+        open_ideas = sum(int(counts.get(status, 0)) for status in OPEN_STATUSES)
+        mine = await bot.store.idea_submissions(user_id=user_id, limit=50)
+        my_open = [row for row in mine if str(row.get("status")) in OPEN_STATUSES]
+        reviewed = [row for row in mine if str(row.get("status")) not in OPEN_STATUSES]
+        # Every candidate on the ballot, not a sample: the button opens the full list.
+        testing_options = await asyncio.to_thread(bot.knowledge.testing_candidate_count)
+        has_voted = (await bot.store.member_testing_vote(user_id)) is not None
+        suggestions = build_suggestions(
+            is_owner=is_owner,
+            tier_name=tier_name,
+            testing_options=testing_options,
+            has_voted=has_voted,
+            open_ideas=open_ideas,
+            my_ideas=len(my_open),
+            reviewed_ideas=len(reviewed),
+        )
+        return render_suggestions(suggestions), _suggested_view(bot, suggestions)
+    except Exception as exc:
+        logger.warning("suggested footer failed: %s", exc)
+        return "", None
+
+
+VOTE_LINE_RE = re.compile(r"^🗳️ \*\*Votes:\*\*.*$", re.MULTILINE)
+
+
+def _with_idea_vote_line(content: str, count: int) -> str:
+    """Return the post body with its vote line set to ``count`` (appending one when missing)."""
+    line = f"🗳️ **Votes:** {int(count)}"
+    body = content or ""
+    if VOTE_LINE_RE.search(body):
+        updated = VOTE_LINE_RE.sub(line, body, count=1)
+    elif body.strip():
+        updated = body.rstrip() + "\n\n" + line
+    else:
+        updated = line
+    if len(updated) <= 2000:
+        return updated
+    # Discord rejects over-long edits with a 400, which would freeze the count forever. Never trim the
+    # member's idea text for a vote count; the private confirmation still shows the total.
+    return body if body.strip() else line
+
+
+class IdeaBoardView(discord.ui.View):
+    """The idea board: buttons switch which slice of the pipeline is shown (persistent)."""
+
+    SCOPES: tuple[tuple[str, str, str], ...] = (
+        ("open", "Needs review", "📥"),
+        ("newest", "Newest", "🆕"),
+        ("planned", "Planned", "🗺️"),
+        ("shipped", "In the mod", "✅"),
+        ("mine", "My ideas", "👤"),
+    )
+
+    def __init__(self, bot: "ChaosXBot") -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+        for scope, label, emoji in self.SCOPES:
+            button = discord.ui.Button(
+                label=label, emoji=emoji, style=discord.ButtonStyle.secondary,
+                custom_id=f"chaosx:ideas:{scope}",
+            )
+            button.callback = self._callback_for(scope)
+            self.add_item(button)
+
+    def _callback_for(self, scope: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            user_id = int(interaction.user.id) if scope == "mine" else None
+            text = await self.bot._idea_board_text(scope, user_id=user_id)
+            await interaction.response.send_message(
+                text, ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+
+        return callback
+
+
+class TestingNominationModal(discord.ui.Modal, title="Nominate something to test"):
+    """Free text on purpose: "test something other than events" includes things with no catalog row."""
+
+    def __init__(self, bot: "ChaosXBot") -> None:
+        super().__init__()
+        self.bot = bot
+        self.what = discord.ui.TextInput(
+            label="What should be tested?",
+            placeholder="a mechanic, a system, a balance pass, a hunch...",
+            max_length=MAX_NOMINATION_CHARS,
+            required=True,
+        )
+        self.add_item(self.what)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        label = " ".join(str(self.what.value or "").split())
+        if not label:
+            await interaction.response.send_message("Nothing was entered.", ephemeral=True)
+            return
+        if not is_safe_nomination(label):
+            await interaction.response.send_message(
+                "That nomination contains a mention, which cannot go on the ballot. Try again without it.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        existing = await self.bot.store.count_testing_nominations(user_id=interaction.user.id)
+        if existing >= MAX_NOMINATIONS_PER_MEMBER:
+            await interaction.response.send_message(
+                f"You already have {existing} nominations on the ballot. Ask Hoops to clear some first.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+        key = candidate_key("nomination", nomination_slug(label))
+        await self.bot.store.add_testing_nomination(key=key, label=label, user_id=interaction.user.id)
+        await self.bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="testing nomination",
+            summary=label[:180],
+        )
+        await interaction.response.send_message(
+            await self.bot._testing_vote_panel_text(interaction.user.id, notice=f"Nominated: {label}"),
+            ephemeral=True,
+            view=await TestingPanelView.build(self.bot),
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+
+class TestingCandidateSelectView(discord.ui.View):
+    """Choose one candidate from one family; paged, because Discord allows 25 options per select.
+
+    Ephemeral and short-lived: the ballot itself is rebuilt from the catalogs every time it is opened,
+    so a stale menu can never keep a retired candidate alive.
+    """
+
+    def __init__(
+        self,
+        bot: "ChaosXBot",
+        *,
+        kind: str,
+        candidates: list[tuple[str, str]] | list[tuple[str, str, str]],
+        page: int = 0,
+        timeout: float | None = 600,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        self.kind = kind
+        self.candidates = list(candidates)
+        self.pages = split_pages(self.candidates)
+        self.page = max(0, min(int(page), len(self.pages) - 1))
+
+        options = [
+            discord.SelectOption(
+                label=clamp_label(item[1], 100),
+                value=item[0],
+                description=clamp_label(item[2] if len(item) > 2 else "", 100),
+            )
+            for item in self.pages[self.page]
+        ]
+        select: discord.ui.Select = discord.ui.Select(
+            placeholder=f"{family_emoji(kind)} Pick a {FAMILY_SINGULAR.get(kind, kind)} to vote for",
+            options=options,
+            min_values=1,
+            max_values=1,
+            custom_id=f"chaosx_test_pick_{kind}_{self.page}",
+        )
+        select.callback = self._on_pick
+        self.select = select
+        self.add_item(select)
+
+        if len(self.pages) > 1:
+            previous: discord.ui.Button = discord.ui.Button(
+                label="◀", style=discord.ButtonStyle.secondary, custom_id=f"chaosx_test_prev_{kind}"
+            )
+            following: discord.ui.Button = discord.ui.Button(
+                label="▶", style=discord.ButtonStyle.secondary, custom_id=f"chaosx_test_next_{kind}"
+            )
+            previous.callback = self._on_page(-1)
+            following.callback = self._on_page(1)
+            self.add_item(previous)
+            self.add_item(following)
+
+        back: discord.ui.Button = discord.ui.Button(
+            label="All families", style=discord.ButtonStyle.secondary, custom_id=f"chaosx_test_family_back"
+        )
+        back.callback = self._on_back
+        self.add_item(back)
+
+    @property
+    def page_note(self) -> str:
+        if len(self.pages) == 1:
+            return ""
+        return f" - page {self.page + 1}/{len(self.pages)}"
+
+    def _on_page(self, delta: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            page = self.page + delta
+            if page < 0 or page >= len(self.pages):
+                await interaction.response.defer()
+                return
+            rebuilt = TestingCandidateSelectView(
+                self.bot, kind=self.kind, candidates=self.candidates, page=page
+            )
+            await interaction.response.edit_message(
+                content=await self.bot._testing_ballot_text(interaction.user.id, kind=self.kind, page_note=rebuilt.page_note),
+                view=rebuilt,
+            )
+
+        return callback
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        key = self.select.values[0] if self.select.values else ""
+        # the stored vote label keeps the ID, so a tally line identifies the exact candidate
+        label = next((text for candidate, text, _detail in self.candidates if candidate == key), key)
+        await self.bot._cast_testing_vote(interaction, key=key, label=label)
+
+    async def _on_back(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content=await self.bot._testing_vote_panel_text(interaction.user.id),
+            view=await TestingPanelView.build(self.bot),
+        )
+
+
+class TestingPanelView(discord.ui.View):
+    """The testing ballot: one button per family of candidates, plus nomination and vote management.
+
+    Persistent (fixed custom_ids, timeout=None) so a panel posted weeks ago keeps working; the counts
+    in the labels are cosmetic, and every press rebuilds the ballot from the live catalogs.
+    """
+
+    def __init__(self, bot: "ChaosXBot", *, counts: dict[str, int] | None = None, timeout: float | None = None) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        counts = counts or {}
+        for kind in FAMILIES:
+            present = int(counts.get(kind, 0))
+            if kind == "nomination" and not present:
+                continue
+            button: discord.ui.Button = discord.ui.Button(
+                label=f"{family_emoji(kind)} {family_label(kind)} ({present})"[:80],
+                style=discord.ButtonStyle.primary if kind == "event" else discord.ButtonStyle.secondary,
+                custom_id=f"chaosx_test_family_{kind}",
+            )
+            button.callback = self._make_family_callback(kind)
+            self.add_item(button)
+
+        nominate: discord.ui.Button = discord.ui.Button(
+            label="✍️ Nominate something else",
+            style=discord.ButtonStyle.success,
+            custom_id="chaosx_test_nominate",
+        )
+        nominate.callback = self._on_nominate
+        self.add_item(nominate)
+
+        clear: discord.ui.Button = discord.ui.Button(
+            label="🗑️ Clear my vote",
+            style=discord.ButtonStyle.secondary,
+            custom_id="chaosx_test_clear",
+        )
+        clear.callback = self._on_clear
+        self.add_item(clear)
+
+    @classmethod
+    async def build(cls, bot: "ChaosXBot") -> "TestingPanelView":
+        families = await bot._testing_families()
+        return cls(bot, counts={kind: len(items) for kind, items in families.items()})
+
+    def _make_family_callback(self, kind: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            families = await self.bot._testing_families()
+            candidates = families.get(kind, [])
+            if not candidates:
+                await interaction.response.send_message(
+                    f"Nothing in {family_label(kind).lower()} is marked for testing right now.",
+                    ephemeral=True,
+                    allowed_mentions=safe_allowed_mentions(),
+                )
+                return
+            view = TestingCandidateSelectView(self.bot, kind=kind, candidates=candidates)
+            await interaction.response.send_message(
+                await self.bot._testing_ballot_text(interaction.user.id, kind=kind, page_note=view.page_note),
+                view=view,
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+
+        return callback
+
+    async def _on_nominate(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(TestingNominationModal(self.bot))
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        await self.bot.store.clear_testing_vote(interaction.user.id)
+        await interaction.response.send_message(
+            await self.bot._testing_vote_panel_text(interaction.user.id, notice="Your vote was cleared."),
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
+
+class TestingVoteOpenView(discord.ui.View):
+    """The single persistent button that opens the ballot (sits under the testing queue)."""
+
+    def __init__(self, bot: "ChaosXBot", *, timeout: float | None = None) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="🗳️ Vote what gets tested next",
+        style=discord.ButtonStyle.primary,
+        custom_id="chaosx_vote_open",
+    )
+    async def open_poll(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            await self.bot._testing_vote_panel_text(interaction.user.id),
+            view=await TestingPanelView.build(self.bot),
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
 
 
 class TierPanelView(discord.ui.View):
@@ -6308,15 +9525,34 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await public_gate(interaction, settings):
             return
         await interaction.response.defer(ephemeral=False, thinking=False)
-        for part in _chunk(community_help_text()):
-            await interaction.followup.send(part, allowed_mentions=safe_allowed_mentions())
+        footer, view = await suggested_footer(bot, interaction)
+        parts = _chunk(community_help_text())
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            body = f"{part}\n\n{footer}" if last and footer else part
+            await interaction.followup.send(
+                body,
+                **(_view_kwargs(view) if last else {}),
+                allowed_mentions=safe_allowed_mentions(),
+            )
 
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
     admin = app_commands.Group(name="admin", description="ChaosX admin commands", default_permissions=discord.Permissions(administrator=True))
 
     @bot.tree.command(name="ask", description="Answer a Chaos Redux question.")
     async def chaosx_ask(interaction: discord.Interaction, question: str, visibility: str = "public") -> None:
-        await run_hermes_command(
+        # Identical public questions are the common case; only non-live ones may be replayed (the cache refuses
+        # anything about the present, so figures are never stale).
+        commit = bot.knowledge.commit_sha()
+        cached = (
+            bot.answer_cache.get(question, live_commit=commit) if visibility != "private" else None
+        )
+        if cached:
+            await interaction.response.send_message(
+                cached, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+        answer = await run_hermes_command(
             bot,
             interaction,
             f"/ask question={question!r} visibility={visibility!r}. Answer concisely for the community; do not include internal source/debug metadata unless asked.",
@@ -6325,6 +9561,9 @@ def register_commands(bot: ChaosXBot) -> None:
             rate_bucket="ask",
             use_ask_model=True,
         )
+        if answer is not None and visibility != "private":
+            _result, output = answer
+            bot.answer_cache.put(question, output, commit=bot.knowledge.commit_sha())
 
     @bot.tree.command(name="event", description="Look up an event by ID or name and show its chain, focus trees, and scripted GUIs.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:
@@ -6387,6 +9626,28 @@ def register_commands(bot: ChaosXBot) -> None:
     async def chaosx_event_chain(interaction: discord.Interaction, query: str) -> None:
         await send_event_chain_lookup(bot, interaction, query)
 
+    @bot.tree.command(name="tech-tree", description="View an MCP-rendered Chaos Redux technology tree.")
+    @app_commands.choices(
+        view=[
+            app_commands.Choice(name="Overview", value="summary"),
+            app_commands.Choice(name="By folder", value="folder"),
+            app_commands.Choice(name="Dependencies", value="dependencies"),
+            app_commands.Choice(name="Single technology", value="technology"),
+            app_commands.Choice(name="Doctrine", value="doctrine"),
+            app_commands.Choice(name="Exclusive branches", value="exclusive"),
+            app_commands.Choice(name="Bonuses", value="bonuses"),
+            app_commands.Choice(name="Grants", value="grants"),
+            app_commands.Choice(name="Unlocks", value="unlocks"),
+            app_commands.Choice(name="Unresolved references", value="unresolved"),
+        ]
+    )
+    async def chaosx_tech_tree(
+        interaction: discord.Interaction,
+        view: app_commands.Choice[str],
+        target: str = "",
+    ) -> None:
+        await send_tech_lookup(bot, interaction, view.value, target)
+
     @bot.tree.command(name="scripted-gui", description="View an offline MCP preview of a Chaos Redux scripted GUI.")
     async def chaosx_scripted_gui(interaction: discord.Interaction, query: str) -> None:
         await send_scripted_gui_lookup(bot, interaction, query)
@@ -6419,23 +9680,49 @@ def register_commands(bot: ChaosXBot) -> None:
     )
     async def chaosx_tiers(interaction: discord.Interaction, scope: app_commands.Choice[str] | None = None) -> None:
         chosen = scope.value if scope else "all"
+
+        async def render_panel() -> str:
+            return await bot._tier_panel_text(chosen)
+
         await send_scripted_response(
             bot,
             interaction,
             command_name="chaosx tiers",
             summary=chosen,
-            render=lambda: bot._tier_panel_text(chosen),
+            render=render_panel,
             view=TierPanelView(bot, scope=chosen),
         )
+        # The panel owns its own button row, so the dynamic suggestions ride in a private follow-up
+        # (Hoops, 2026-09-23: options at the bottom, suggested by the bot).
+        await send_suggested_followup(bot, interaction)
 
-    @bot.tree.command(name="testing", description="Show events currently marked as needing testing.")
+    @bot.tree.command(
+        name="testing",
+        description="What is marked for testing, and the ballot for what gets tested next.",
+    )
     async def chaosx_testing(interaction: discord.Interaction) -> None:
-        await send_scripted_response(bot, interaction, command_name="chaosx testing", summary="queue", render=bot.knowledge.testing_queue)
+        await send_scripted_response(
+            bot,
+            interaction,
+            command_name="chaosx testing",
+            summary="queue",
+            render=bot.knowledge.testing_queue,
+            view=TestingVoteOpenView(bot, timeout=None),
+        )
+        await send_suggested_followup(bot, interaction)
 
 
     @bot.tree.command(name="suggestion", description="Draft a clearer review note of your rough suggestion.")
     async def chaosx_suggestion(interaction: discord.Interaction, suggestion: str) -> None:
-        result = await run_hermes_command(bot, interaction, f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.", command_name="suggestion")
+        # `use_ask_model=True` routes this to the direct API: it is pure text formatting, so paying the
+        # ~4.3s Hermes CLI subprocess startup for it was pure waste (measured 2026-09-23).
+        result = await run_hermes_command(
+            bot,
+            interaction,
+            f"/suggestion suggestion={suggestion!r}. Structure this as a concise community suggestion review note. Mention likely overlap if obvious; do not promote it to accepted design.",
+            command_name="suggestion",
+            use_ask_model=True,
+        )
         if result and result[0].ok and settings.community_notes_enabled:
             try:
                 note = write_suggestion_note(
@@ -6457,107 +9744,48 @@ def register_commands(bot: ChaosXBot) -> None:
                             changed_path=note.path,
                         )
                     await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion", summary=str(note.path))
+                    await bot._award_contribution(
+                        user_id=interaction.user.id,
+                        kind="suggestion",
+                        ref=f"suggestion:{note.path}",
+                        guild_id=interaction.guild_id,
+                        channel_id=interaction.channel_id,
+                    )
             except Exception as exc:
                 await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault suggestion error", summary=type(exc).__name__)
 
-    @bot.tree.command(name="event-idea", description="Format a Chaos Redux event idea into a structured review draft.")
-    async def chaosx_event_idea(
-        interaction: discord.Interaction,
-        idea: str,
-        event_type: str = "",
-        cluster: str = "",
-        evo_i: str = "",
-        evo_ii: str = "",
-        evo_iii: str = "",
-        evo_iv: str = "",
-        evo_v: str = "",
-        world_end: str = "",
-        triggerable_scenario: str = "",
-        easter_egg: str = "",
-    ) -> None:
-        extra = {
-            "event_type": event_type,
-            "cluster": cluster,
-            "evo_i": evo_i,
-            "evo_ii": evo_ii,
-            "evo_iii": evo_iii,
-            "evo_iv": evo_iv,
-            "evo_v": evo_v,
-            "world_end": world_end,
-            "triggerable_scenario": triggerable_scenario,
-            "easter_egg": easter_egg,
-        }
-        request = f"/event-idea idea={idea!r} fields={extra!r}. First decide whether this idea is specific enough to become a real event: it needs a concrete concept (what happens, when or how it triggers, what it affects, and a gameplay effect). If it is too vague — just a topic, country, or theme with no real event concept — reply with exactly `VAGUE: <one short sentence saying what is missing and what to add>`. Otherwise format a Chaos Redux event idea draft with name, TBD ID, type, baseline, trigger, effects, Evo I-V, world-end, triggerable scenario hooks, cluster/tags, easter egg if supplied, testing notes, and overlap/gap note. Preserve supplied fields; use placeholders for missing parts. Do not assign a real ID or claim acceptance."
-        if is_vague_event_idea(idea):
-            await interaction.response.send_message(
-                "⚠️ That submission is too vague for an event idea, so I didn't format or post it. "
-                "Give me a concrete concept: what happens, when or how it triggers, what it affects, and the gameplay effect. "
-                'Example: "A military coup in Namibia after the civil war ends — if the country is in the western bloc, '
-                'it triggers a stability collapse, removes the old leader, and spawns a new warlord state."',
-                ephemeral=True,
-                allowed_mentions=safe_allowed_mentions(),
-            )
-            await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea", summary="rejected as too vague (pre-check)")
+    @bot.tree.command(name="ideas", description="The event idea pipeline: what is filed, planned, shipped.")
+    async def chaosx_ideas(interaction: discord.Interaction) -> None:
+        """The public idea board: queue health plus buttons to switch views."""
+        if not await public_gate(interaction, settings):
             return
-        result = await run_hermes_command(
-            bot,
-            interaction,
-            request,
-            command_name="event-idea",
-            max_chars_override=2200,
+        await interaction.response.defer(thinking=True)
+        text_out = await bot._idea_board_text("open")
+        await interaction.followup.send(
+            text_out, view=IdeaBoardView(bot), allowed_mentions=safe_allowed_mentions()
         )
-        if result and result[0].ok:
-            if result[1].strip().upper().startswith("VAGUE"):
-                # Model judged the idea too vague: reject without saving or posting.
-                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea", summary="rejected as too vague (model)")
-                return
-            if settings.community_notes_enabled:
-                try:
-                    note = write_event_idea_note(
-                        vault_path=settings.obsidian_vault_path,
-                        event_specs_folder=settings.community_event_specs_folder,
-                        raw_idea=idea,
-                        draft=result[1],
-                        actor_id=interaction.user.id,
-                        guild_id=interaction.guild_id,
-                        channel_id=interaction.channel_id,
-                        event_type=event_type,
-                        cluster=cluster,
-                        evo_i=evo_i,
-                        evo_ii=evo_ii,
-                        evo_iii=evo_iii,
-                        evo_iv=evo_iv,
-                        evo_v=evo_v,
-                        world_end=world_end,
-                        triggerable_scenario=triggerable_scenario,
-                        easter_egg=easter_egg,
-                    )
-                    if note:
-                        if note.created:
-                            refresh_vault_indexes(
-                                vault_path=settings.obsidian_vault_path,
-                                event_specs_folder=settings.community_event_specs_folder,
-                                suggestions_folder=settings.community_suggestions_folder,
-                                reason="ChaosX approved community event idea captured.",
-                                changed_path=note.path,
-                            )
-                            try:
-                                post_url = await post_approved_event_idea(
-                                    bot,
-                                    actor_id=interaction.user.id,
-                                    raw_idea=idea,
-                                    draft=result[1],
-                                    event_type=event_type,
-                                    cluster=cluster,
-                                    world_end=world_end,
-                                )
-                                if post_url:
-                                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post", summary=post_url)
-                            except Exception as exc:
-                                await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="event-idea channel post error", summary=type(exc).__name__)
-                        await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea", summary=str(note.path))
-                except Exception as exc:
-                    await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="vault event-idea error", summary=type(exc).__name__)
+        await send_suggested_followup(bot, interaction)
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="ideas",
+            summary="board opened",
+        )
+
+    @bot.tree.command(
+        name="event-idea",
+        description="Submit a Chaos Redux event idea: a short form, then a preview before anything posts.",
+    )
+    async def chaosx_event_idea(interaction: discord.Interaction) -> None:
+        """Open the idea form.
+
+        Hoops 2026-09-23 ("implement the plans"): the eleven-option slash command became a modal, and the
+        draft is previewed with Post / Edit / Discard before anything is written or posted.
+        """
+        if not await public_gate(interaction, settings):
+            return
+        await interaction.response.send_modal(EventIdeaModal(bot))
 
     @bot.tree.command(name="issue", description="AI-review a report form, then create a GitHub issue if approved.")
     @app_commands.choices(issue_type=[
@@ -6646,9 +9874,21 @@ def register_commands(bot: ChaosXBot) -> None:
         report = {"event_id": event_id.strip() or None, "observation": observation, "reporter_id": interaction.user.id, "created_at": datetime.now(timezone.utc).isoformat()}
         await bot.store.create_playtest(playtest_id=playtest_id, actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, target=target, start_time="", duration_minutes=0, voice="", build="")
         await bot.store.add_playtest_report(playtest_id=playtest_id, report=report)
+        granted = await bot._award_contribution(
+            user_id=interaction.user.id,
+            kind="playtest_report",
+            ref=f"playtest:{playtest_id}",
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+        )
+        reward = f"\n🎉 **+{granted:g} chaos** for playtesting." if granted else ""
         bot.schedule_playtest_result_synthesis()
-        heading = f"Recorded playtest observation for {label}." if event_id.strip() else "Recorded general playtest observation."
-        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id or "general", render=lambda: f"{heading}\nUse `/issue` instead if this should become a tracked GitHub bug/crash/request.\n```text\n{observation[:1500]}\n```")
+        heading = (
+            f"✅ Recorded playtest observation for {label}."
+            if event_id.strip()
+            else "✅ Recorded general playtest observation."
+        )
+        await send_scripted_response(bot, interaction, command_name="playtest report", summary=event_id or "general", render=lambda: f"{heading}{reward}\nUse `/issue` instead if this should become a tracked GitHub bug/crash/request.\n```text\n{observation[:1500]}\n```")
 
     @playtest.command(name="summary", description="Show recent recorded playtest observations.")
     async def playtest_summary(interaction: discord.Interaction, limit: int = 10) -> None:
@@ -6683,8 +9923,17 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await owner_gate(interaction, settings):
             return
         await interaction.response.defer(ephemeral=True, thinking=False)
-        for part in _chunk(operator_help_text(settings)):
-            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        footer, view = await suggested_footer(bot, interaction, owner=True)
+        parts = _chunk(operator_help_text(settings))
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            body = f"{part}\n\n{footer}" if last and footer else part
+            await interaction.followup.send(
+                body,
+                **(_view_kwargs(view) if last else {}),
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
 
     @admin.command(name="ask", description="Protected project/server request through Hermes.")
     async def admin_ask(interaction: discord.Interaction, request: str) -> None:
@@ -6704,6 +9953,109 @@ def register_commands(bot: ChaosXBot) -> None:
             )
             return
         await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_operator_model=True)
+
+    @admin.command(
+        name="ideas",
+        description="Idea pipeline control: list, post the board, move an idea, promote it to a spec.",
+    )
+    async def admin_ideas(
+        interaction: discord.Interaction,
+        action: str = "list",
+        submission_id: int = 0,
+        status: str = "",
+        note: str = "",
+    ) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        action = (action or "list").lower().strip()
+        if action not in {"list", "panel", "status", "promote", "counts"}:
+            await interaction.response.send_message(
+                "Use `action:list` (the pipeline), `action:counts` (queue health), `action:panel` (post the "
+                "public board in the ideas channel), `action:status submission_id:<n> status:<status>` "
+                "(move an idea), or `action:promote submission_id:<n>` (turn an accepted idea into a numbered "
+                "spec).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lines: list[str] = []
+        if action == "counts":
+            counts = await bot.store.idea_status_counts()
+            oldest = await bot.store.oldest_open_idea_days()
+            lines.append(board_summary(counts, oldest_open_days=oldest))
+            lines.extend(
+                f"- {status_label(name)}: {counts.get(name, 0)}" for name in IDEA_STATUSES
+            )
+        if action == "list":
+            rows = await bot.store.idea_submissions(limit=15)
+            lines.append(
+                "\n".join(
+                    board_line(
+                        submission_id=int(row["id"]),
+                        title=str(row["title"] or "untitled"),
+                        status=str(row["status"]),
+                        author=_display_name_for(bot, int(row["user_id"])),
+                        age_days=_idea_age_days(str(row["created_at"] or "")),
+                        priority=bool(row.get("priority")),
+                    )
+                    for row in rows
+                )
+                or "No ideas filed yet."
+            )
+        if action == "status":
+            if not submission_id or status not in IDEA_STATUSES:
+                lines.append(
+                    "Give `submission_id:<n>` and one of: " + ", ".join(IDEA_STATUSES) + "."
+                )
+            else:
+                await bot.store.set_idea_status(
+                    submission_id=int(submission_id),
+                    status=status,
+                    note=note,
+                    reviewer_id=interaction.user.id,
+                )
+                awarded = 0.0
+                row = await bot.store.idea_submission(int(submission_id))
+                if award_for_status(status) and row:
+                    awarded = await bot._award_contribution(
+                        user_id=int(row.get("user_id") or 0),
+                        kind=f"idea_{status}",
+                        ref=f"idea:{int(submission_id)}:{status}",
+                        guild_id=interaction.guild_id,
+                        channel_id=settings.community_event_ideas_channel_id,
+                    )
+                lines.append(
+                    f"`#{submission_id}` set to {status_label(status)}"
+                    + (f" (+{awarded:g} chaos)" if awarded else "")
+                )
+        if action == "promote":
+            if not submission_id:
+                lines.append("Give `submission_id:<n>`.")
+            else:
+                try:
+                    lines.append(await bot._promote_idea(int(submission_id)))
+                except Exception as exc:
+                    lines.append(f"Promotion failed (`{type(exc).__name__}`): {exc}")
+        if action == "panel":
+            channel_id = settings.community_event_ideas_channel_id
+            channel = bot.get_channel(int(channel_id)) if channel_id else None
+            if channel is None:
+                lines.append("The ideas channel is not visible to the bot.")
+            else:
+                board = await bot._idea_board_text("open")
+                sent = await channel.send(
+                    board, view=IdeaBoardView(bot), allowed_mentions=safe_allowed_mentions()
+                )
+                lines.append(f"Posted the idea board (message {sent.id}).")
+        for part in _chunk("\n".join(lines)):
+            await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin ideas",
+            summary=f"action={action} submission={submission_id or '-'} status={status or '-'}",
+        )
 
     @admin.command(
         name="event-idea",
@@ -6883,6 +10235,112 @@ def register_commands(bot: ChaosXBot) -> None:
                 allowed_mentions=safe_allowed_mentions(),
             )
 
+
+    @admin.command(
+        name="model",
+        description="Show, switch, or reset the answer model (public or admin surface).",
+    )
+    async def admin_model(
+        interaction: discord.Interaction,
+        action: str = "status",
+        scope: str = "public",
+        model: str = "",
+        reasoning: str = "",
+    ) -> None:
+        """Repoint the community or the protected surface at another model, without a redeploy.
+
+        The community surface has to stay cheap, so this is the switch for it; the protected
+        surface keeps the smart model unless it is changed here explicitly. The choice is
+        persisted, so it survives a restart.
+        """
+        if not await owner_gate(interaction, settings):
+            return
+        from . import model_switch
+
+        action = (action or "status").strip().lower()
+        scope = (scope or "public").strip().lower()
+        if scope not in model_switch.SCOPES:
+            await interaction.response.send_message(
+                "Use `scope:public` (community answers) or `scope:admin` (your protected runs).",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+
+        if action == "status":
+            current = model_switch.snapshot(bot.settings, scope)
+            option = model_switch.get_option(current["model"])
+            header = f"Answer model — {scope} surface"
+            lines = [
+                f"Model: `{current['model']}`" + (f" — {option.label} ({option.rate})" if option else ""),
+                f"Provider: `{current['provider']}`",
+                f"Reasoning effort: `{current['reasoning'] or 'default'}`",
+            ]
+            alternatives = [
+                f"`{o.model}` — {o.label}, {o.rate}" + (f" ({o.note})" if o.note else "")
+                for o in model_switch.usable_options()
+                if o.model != current["model"]
+            ]
+            text = block(section(header), bullets(lines))
+            if alternatives:
+                text += block(section("Switchable"), bullets(alternatives))
+            text += (
+                "\n`/admin model action:set scope:public model:<id>` switches; "
+                "`action:reset` goes back to the .env value."
+            )
+            await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+            return
+
+        if action == "reset":
+            state = await model_switch.reset_model(bot.store, bot.settings, scope)
+            await bot.store.audit(
+                actor_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+                channel_id=interaction.channel_id,
+                command="admin model",
+                summary=f"reset {scope} to .env ({state['model']})",
+            )
+            await interaction.response.send_message(
+                f"{scope.capitalize()} surface reset to the .env model: `{state['model']}` "
+                f"({state['reasoning'] or 'default effort'}).",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+
+        if action != "set" or not model.strip():
+            await interaction.response.send_message(
+                "Use `action:status`, `action:set model:<id> [scope:public|admin] [reasoning:low]`, "
+                "or `action:reset`.",
+                ephemeral=True,
+                allowed_mentions=safe_allowed_mentions(),
+            )
+            return
+
+        try:
+            state = await model_switch.set_model(
+                bot.store, bot.settings, scope, model.strip(), reasoning or None
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"Not switching: {exc}", ephemeral=True, allowed_mentions=safe_allowed_mentions()
+            )
+            return
+
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="admin model",
+            summary=f"{scope} -> {state['model']}",
+        )
+        await interaction.response.send_message(
+            f"{scope.capitalize()} surface now answers with `{state['model']}` "
+            f"({state['provider']}), reasoning `{state['reasoning'] or 'default'}`. Persisted across restarts.",
+            ephemeral=True,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+
     @admin.command(name="health", description="Check ChaosX runtime health.")
     async def admin_health(interaction: discord.Interaction) -> None:
         if not await owner_gate(interaction, settings):
@@ -6897,6 +10355,7 @@ def register_commands(bot: ChaosXBot) -> None:
             f"Repo: `{settings.chaos_redux_repo}`\n"
             f"Visible guilds: {guilds}"
         )
+        text += block(section("Command latency"), bullets(command_timings_lines()))
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin health", summary="health check")
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
@@ -6914,6 +10373,16 @@ def register_commands(bot: ChaosXBot) -> None:
         )
         activities = active_hermes_runs()
         text = format_process_panel(snapshot, activities)
+        # Latency lives here rather than in its own subcommand: /admin is at Discord's 25-subcommand ceiling and
+        # Hoops wants few, consolidated admin commands.
+        timings = await asyncio.to_thread(
+            timing_lines, db_path=bot.settings.db_path, limit=6
+        )
+        quality = await asyncio.to_thread(
+            answer_quality_lines, db_path=bot.settings.db_path, days=7
+        )
+        lines = list(timings) + [bot.answer_cache.stats_line()] + list(quality)
+        text = text + "\n\n" + "\n".join(lines)
         await bot.store.audit(
             actor_id=interaction.user.id,
             guild_id=interaction.guild_id,
@@ -6995,12 +10464,13 @@ def register_commands(bot: ChaosXBot) -> None:
         if not await owner_gate(interaction, settings):
             return
         action = (action or "show").lower().strip()
-        if action not in {"show", "rebuild", "member", "banter", "panel"}:
+        if action not in {"show", "rebuild", "member", "banter", "panel", "roles", "titles"}:
             await interaction.response.send_message(
                 "Use `action:show` (standings), `action:rebuild` (re-roll the whole archive), "
                 "`action:member member:<@user|name>` (one member's tier), `action:banter` (who idle "
-                "banter could target right now), or `action:panel` (post the public panel in the "
-                "banter channel).",
+                "banter could target right now), `action:panel` (post the public panel in the "
+                "banter channel), `action:titles` (write member titles for the current top 10), or "
+                "`action:roles` (create/recolour the chaos-tier roles and sync every member to their tier).",
                 ephemeral=True,
             )
             return
@@ -7013,6 +10483,16 @@ def register_commands(bot: ChaosXBot) -> None:
                 f"Re-rolled {summary['messages']} archived messages into {summary['days']} member-days; "
                 f"{summary['members']} member tier row(s)."
             )
+        if action == "roles":
+            report = await bot._sync_member_tier_roles(force=True)
+            if report["skipped"]:
+                lines.append(f"Tier roles: {report['skipped']}")
+            else:
+                lines.append(f"Tier roles: {report['assigned']} member(s) moved to their tier's colour.")
+            if report["created"]:
+                lines.append("Role changes: " + "; ".join(report["created"]))
+            if report["failed"]:
+                lines.append("Problems: " + "; ".join(report["failed"][:10]))
         if action == "panel":
             channel = bot.get_channel(int(settings.idle_banter_channel_id))
             if channel is None:
@@ -7024,6 +10504,23 @@ def register_commands(bot: ChaosXBot) -> None:
                     allowed_mentions=safe_allowed_mentions(),
                 )
                 lines.append(f"Posted the chaos-tier panel in <#{settings.idle_banter_channel_id}> (message {sent.id}).")
+        if action == "titles":
+            rows = await bot.store.top_members(limit=10)
+            written: list[str] = []
+            for row in rows:
+                user_id = int(row[0])
+                member = interaction.guild.get_member(user_id) if interaction.guild else None
+                if member is not None and member.bot:
+                    continue
+                name = member.display_name if member is not None else str(row[1] or user_id)
+                title = await bot._ensure_member_title(user_id=user_id, name=name, force=True)
+                if title:
+                    written.append(f"{name}: *{title}*")
+            lines.append(
+                "Titles written:\n" + "\n".join(f"- {line}" for line in written)
+                if written
+                else "No members to title yet."
+            )
         if action == "banter":
             targets = await bot._idle_banter_candidates()
             lines.append(
@@ -7051,13 +10548,7 @@ def register_commands(bot: ChaosXBot) -> None:
                     f"leaderboard opt-out: {prefs['leaderboard_optout']}"
                 )
         if action in {"show", "rebuild"}:
-            lines.append("## Chaos tiers (all time)")
-            lines.extend(bot._tier_standings_lines(await bot.store.top_members(limit=15)))
-            week_start = activity_window_start(7)
-            lines.append(f"\n## Last 7 days (since {week_start})")
-            lines.extend(bot._tier_standings_lines(await bot.store.top_members(limit=10, since_day=week_start)))
-            cursor = await bot.store.activity_cursor()
-            lines.append(f"\nRollup cursor: archive id {cursor}; tiers: " + ", ".join(f"{n} ({t})" for n, t in TIERS))
+            lines.extend(await tier_report_lines(bot))
         for part in _chunk("\n".join(lines)):
             await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
         await bot.store.audit(

@@ -28,11 +28,20 @@ VAULT_ALLOWED_ROOTS = {
     "Events",
     "Planning",
     "SlopX",
+    "Tooling",
 }
 VAULT_SKIP_DIRS = {".git", ".obsidian", ".trash", "Archive", "Scratch", "raw", "__pycache__"}
 VAULT_SKIP_FILES = {"important tokens.md", "index.md", "log.md", "SCHEMA.md", "Temp.md"}
 QODER_TEXT_EXTENSIONS = {".md", ".txt"}
 QODER_SKIP_DIRS = {".git", "__pycache__", ".obsidian"}
+# Extra knowledge roots: agentic-modding toolchains (MCP servers, ComfyUI workflow
+# packs, mod-setup kits). Indexed verbatim under `tooling/<name>/...` as public docs.
+TOOLING_TEXT_EXTENSIONS = {".md", ".txt", ".json", ".yml", ".yaml"}
+TOOLING_SKIP_DIRS = {
+    ".git", ".venv", "node_modules", "__pycache__", ".pytest_cache",
+    "dist", "build", "coverage", "tmp",
+}
+EXTRA_ROOT_NAME_RE = re.compile(r"[^a-z0-9_-]+")
 MAX_FILE_BYTES = 750_000
 SECRET_ASSIGNMENT_RE = re.compile(r"(?i)\b(token|secret|password|api[_-]?key|authorization)\s*[:=]\s*[^\s`'\"]+")
 DISCORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}")
@@ -60,6 +69,7 @@ CREATE TABLE IF NOT EXISTS source_docs (
     content TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_source_docs_class ON source_docs(source_class);
 CREATE VIRTUAL TABLE IF NOT EXISTS source_docs_fts USING fts5(
     path,
     source_class,
@@ -133,13 +143,27 @@ class IndexStats:
 
 
 def repo_commit(repo: Path) -> str:
+    """HEAD sha for a repo, or "unknown" when it is not one.
+
+    Deliberately quiet: a missing repo, a submodule, or a worktree pointer left over from another machine is
+    tolerated, and git's error must not leak into test or CLI output. A stray "fatal: not a git repository" in the
+    middle of a passing test run is exactly how a host move silently broke every git-derived fact (see the mod
+    worktree note in the interim-host reference).
+    """
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True, stderr=subprocess.DEVNULL
+        ).strip()
     except Exception:
         return "unknown"
 
 
-def index_commit(repo: Path, vault_path: Path | None = None, qoder_path: Path | None = None) -> str:
+def index_commit(
+    repo: Path,
+    vault_path: Path | None = None,
+    qoder_path: Path | None = None,
+    extra_roots: list[tuple[str, Path]] | None = None,
+) -> str:
     parts = [f"repo:{repo_commit(repo)}"]
     if vault_path and vault_path.exists():
         parts.append(f"vault:{repo_commit(vault_path)}")
@@ -152,6 +176,8 @@ def index_commit(repo: Path, vault_path: Path | None = None, qoder_path: Path | 
                 parts.append("qoder:mtime:" + f"{_qoder_latest_mtime(qoder_path):.3f}")
         else:
             parts.append("qoder:mtime:" + f"{_qoder_latest_mtime(qoder_path):.3f}")
+    for name, root in extra_roots or []:
+        parts.append(f"tooling:{name}:{_latest_tooling_mtime([(name, root)]):.3f}")
     return "|".join(parts)
 
 
@@ -318,6 +344,65 @@ def iter_qoder_indexable_files(qoder: Path):
                 continue
 
 
+def parse_extra_roots(spec: str | None) -> list[tuple[str, Path]]:
+    """Parse ``name=/abs/path:name2=/abs/path2`` into ``[(name, Path), ...]``.
+
+    Malformed or missing entries are skipped on purpose: a typo in the host ``.env``
+    must not stop the bot from starting. ``index_meta.tooling_doc_count`` makes a
+    silently missing root visible afterwards.
+    """
+    roots: list[tuple[str, Path]] = []
+    for item in (spec or "").split(":"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        raw_name, _, raw_path = item.partition("=")
+        name = EXTRA_ROOT_NAME_RE.sub("-", raw_name.strip().lower()).strip("-")
+        path = Path(raw_path.strip()).expanduser()
+        if not name or not raw_path.strip() or not path.exists():
+            continue
+        roots.append((name, path))
+    return roots
+
+
+def is_tooling_indexable(root: Path, path: Path) -> bool:
+    rel = path.relative_to(root)
+    if set(rel.parts) & TOOLING_SKIP_DIRS:
+        return False
+    if path.suffix.lower() not in TOOLING_TEXT_EXTENSIONS:
+        return False
+    try:
+        return path.stat().st_size <= MAX_FILE_BYTES
+    except OSError:
+        return False
+
+
+def iter_tooling_indexable_files(root: Path):
+    if not root.exists():
+        return
+    for root_dir, dirs, files in os.walk(root):
+        root_path = Path(root_dir)
+        dirs[:] = [d for d in dirs if d not in TOOLING_SKIP_DIRS]
+        for name in files:
+            path = root_path / name
+            try:
+                if is_tooling_indexable(root, path):
+                    yield path
+            except OSError:
+                continue
+
+
+def _latest_tooling_mtime(roots: list[tuple[str, Path]]) -> float:
+    latest = 0.0
+    for _name, root in roots:
+        for path in iter_tooling_indexable_files(root):
+            try:
+                latest = max(latest, path.stat().st_mtime)
+            except OSError:
+                continue
+    return latest
+
+
 def read_text(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -326,10 +411,19 @@ def read_text(path: Path) -> str | None:
     return sanitize_index_text(text)
 
 
+FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.S)
+
+
+def strip_frontmatter(text: str) -> str:
+    """Drop a leading YAML frontmatter block: it is metadata, not note content."""
+    return FRONTMATTER_RE.sub("", text, count=1)
+
+
 def sanitize_index_text(text: str) -> str:
+    text = strip_frontmatter(text)
+
     text = DISCORD_TOKEN_RE.sub("[REDACTED_DISCORD_TOKEN]", text)
     return SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
-
 
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
@@ -371,16 +465,18 @@ def rebuild_index(
     vault_path: Path | None = None,
     catalog_repo: Path | None = None,
     qoder_path: Path | None = None,
+    extra_roots: list[tuple[str, Path]] | None = None,
 ) -> IndexStats:
     repo = repo.resolve()
     vault = vault_path.resolve() if vault_path and vault_path.exists() else None
     qoder = qoder_path.resolve() if qoder_path and qoder_path.exists() else None
+    tooling = [(name, root.resolve()) for name, root in (extra_roots or []) if root.exists()]
     catalog_root = (
         catalog_repo.resolve()
         if catalog_repo and catalog_repo.exists()
         else repo
     )
-    commit = index_commit(repo, vault, qoder)
+    commit = index_commit(repo, vault, qoder, tooling)
     catalog_hash = catalog_fingerprint(catalog_root)
     indexed_at = time()
     conn = connect(db_path)
@@ -436,6 +532,23 @@ def rebuild_index(
                 )
                 docs += 1
                 qoder_docs += 1
+        tooling_docs = 0
+        for name, root in tooling:
+            for path in iter_tooling_indexable_files(root):
+                text = read_text(path)
+                if not text:
+                    continue
+                rel = path.relative_to(root).as_posix()
+                public_path = f"tooling/{name}/{rel}"
+                conn.execute(
+                    """
+                    INSERT INTO source_docs(path, source_class, file_type, commit_sha, mtime, content_hash, indexed_at, content)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (public_path, "tooling_doc", path.suffix.lower().lstrip("."), commit, path.stat().st_mtime, hash_text(text), indexed_at, text),
+                )
+                docs += 1
+                tooling_docs += 1
         events = _load_events(conn, catalog_root, indexed_at)
         scenarios = _load_scenarios(conn, catalog_root, indexed_at)
         clusters = _load_clusters(conn, catalog_root, indexed_at)
@@ -447,6 +560,7 @@ def rebuild_index(
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('repo_doc_count', ?)", (str(repo_docs),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('vault_doc_count', ?)", (str(vault_docs),))
         conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('qoder_doc_count', ?)", (str(qoder_docs),))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('tooling_doc_count', ?)", (str(tooling_docs),))
     conn.close()
     return IndexStats(docs=docs, events=events, scenarios=scenarios, clusters=clusters, commit_sha=commit)
 

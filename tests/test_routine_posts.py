@@ -62,10 +62,10 @@ def _signals() -> dict:
         "server": {"answers": 12, "qa_saved": 3, "warnings": 1, "playtests": 2, "members": 40},
         "playtests": [{"target": "event006", "observation": "convoy payments looked correct but the AI stalled"}],
         "change_areas": [
-            {"area": "focus tree icons", "files": 3662, "band": "took most of the week's work"},
-            {"area": "flags", "files": 3543, "band": "took most of the week's work"},
-            {"area": "game scripting", "files": 900, "band": "took a large share of the week"},
-            {"area": "event content", "files": 40, "band": "saw a few changes"},
+            {"area": "focus tree icons", "commits": 12, "band": "saw a few changes"},
+            {"area": "flags", "commits": 9, "band": "saw a few changes"},
+            {"area": "game scripting", "commits": 96, "band": "took a large share of the week"},
+            {"area": "event content", "commits": 40, "band": "saw solid work"},
         ],
         "community_captures": [
             {
@@ -425,21 +425,22 @@ def test_area_label_maps_paths_to_player_areas_and_hides_internal_work():
 
 
 def test_size_band_orders_emphasis_without_numbers():
-    assert size_band(8802) == "took most of the week's work"
-    assert size_band(500) == "took a large share of the week"
-    assert size_band(60) == "saw solid work"
-    assert size_band(20) == "saw a few changes"
+    # Thresholds are commits, not files: one bulk art export must not outrank a week of systems commits.
+    assert size_band(200) == "took most of the week's work"
+    assert size_band(80) == "took a large share of the week"
+    assert size_band(30) == "saw solid work"
+    assert size_band(10) == "saw a few changes"
     assert size_band(2) == "was touched lightly"
 
 
 def test_change_area_facts_line_lists_areas_with_weights():
     line = change_area_facts_line(
         [
-            {"area": "focus tree icons", "files": 3662, "band": "took most of the week's work"},
-            {"area": "flags", "files": 3543, "band": "took most of the week's work"},
+            {"area": "focus tree icons", "commits": 12, "band": "saw a few changes"},
+            {"area": "flags", "commits": 9, "band": "saw a few changes"},
         ]
     )
-    assert line == "focus tree icons (took most of the week's work); flags (took most of the week's work)"
+    assert line == "focus tree icons (saw a few changes); flags (saw a few changes)"
     assert change_area_facts_line([]) == "change areas unavailable"
 
 
@@ -447,7 +448,7 @@ def test_digest_prompt_weights_work_by_areas_and_demands_brevity():
     prompt = build_digest_prompt(signals=_signals())
     # the fix for "all work on event 006 is not entirely correct"
     assert "Where that work landed, biggest share first" in prompt
-    assert "focus tree icons (took most of the week's work)" in prompt
+    assert "focus tree icons (saw a few changes)" in prompt
     assert "NEVER describe the whole week as one event" in prompt
     assert "at most 3 bullets" in prompt
     assert f"under {DIGEST_MAX_CHARS} characters" in prompt

@@ -1,0 +1,46 @@
+[
+  {
+    "q": "explain the zombie outbreak event chain",
+    "expect_path": "Event 002 - Zombie Outbreak"
+  },
+  {
+    "q": "where is the super event text defined",
+    "expect_path": "super_event_text"
+  },
+  {
+    "q": "explain the chaos meter system",
+    "expect_path": "Chaos Meter System"
+  },
+  {
+    "q": "explain the holy realm event chain",
+    "expect_path": "003_holy_realm_spec"
+  },
+  {
+    "q": "where are the AI strategy profiles defined",
+    "expect_path": "ai_strategy"
+  },
+  {
+    "q": "what does the biological warfare system do",
+    "expect_path": "Biological Warfare System"
+  },
+  {
+    "q": "what is the world-end scenario",
+    "expect_path": "world_end_scenarios"
+  },
+  {
+    "q": "explain the migration and camps system",
+    "expect_path": "camp_repression"
+  },
+  {
+    "q": "what is the chaos meter",
+    "expect_path": "Chaos Meter System"
+  },
+  {
+    "q": "how do super events work",
+    "expect_path": "vault/Events/Super Events.md"
+  },
+  {
+    "q": "what is the holy realm",
+    "expect_path": "vault/Events/Event Specs/003 - The Holy Realm.md"
+  }
+]

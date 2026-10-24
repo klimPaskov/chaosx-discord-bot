@@ -90,72 +90,84 @@ def _scalar(db: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
     return int(list(rows[0].values())[0] or 0)
 
 
-def collect_intel(db_path: Path, *, window_days: int = WINDOW_DAYS) -> IntelFacts:
-    """Read the bot's own tables for one window. Synchronous: call via asyncio.to_thread."""
+def collect_intel(
+    db_path: Path, *, window_days: int = WINDOW_DAYS, owner_id: int | None = None
+) -> IntelFacts:
+    """Read the bot's own tables for one window. Synchronous: call via asyncio.to_thread.
+
+    ``owner_id`` is excluded from every member-level fact and from every count. The owner is the reader of this
+    digest, not one of its subjects: his own asks are not "what people wanted", and his own messages are not
+    community activity. He said so plainly — "the bot should never report on me" — and a digest that quotes his
+    questions back at him is exactly that mistake.
+    """
     since = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
     facts = IntelFacts(window_days=window_days, since=since)
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
+    skip_actor = " AND actor_id != ?" if owner_id else ""
+    skip_author = " AND author_id != ?" if owner_id else ""
+    skip_user = " AND user_id != ?" if owner_id else ""
+    who: tuple = (int(owner_id),) if owner_id else ()
     try:
         facts.asks = _rows(
             db,
             "SELECT created_at, mode, actor_id, channel_id, request FROM message_ask_memory "
-            "WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
-            (since, MAX_ASK_SAMPLES),
+            "WHERE created_at >= ?" + skip_actor + " ORDER BY created_at DESC LIMIT ?",
+            (since, *who, MAX_ASK_SAMPLES),
         )
         facts.refused = _rows(
             db,
             "SELECT created_at, actor_id, channel_id, request FROM message_ask_memory "
-            "WHERE created_at >= ? AND output_excerpt LIKE ? ORDER BY created_at DESC LIMIT ?",
-            (since, f"%{PUBLIC_ASK_REDIRECT_MARKER}%", MAX_REFUSED_SAMPLES),
+            "WHERE created_at >= ? AND output_excerpt LIKE ?" + skip_actor + " ORDER BY created_at DESC LIMIT ?",
+            (since, f"%{PUBLIC_ASK_REDIRECT_MARKER}%", *who, MAX_REFUSED_SAMPLES),
         )
         facts.shadow = _rows(
             db,
             "SELECT created_at, reason, confidence, actor_id, channel_id, content_excerpt FROM auto_scan_events "
-            "WHERE action = 'shadow' AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
-            (since, MAX_REFUSED_SAMPLES),
+            "WHERE action = 'shadow' AND created_at >= ?" + skip_actor + " ORDER BY created_at DESC LIMIT ?",
+            (since, *who, MAX_REFUSED_SAMPLES),
         )
         facts.warnings = _rows(
             db,
             "SELECT created_at, actor_id, channel_id, content_excerpt, response_excerpt FROM auto_scan_events "
-            "WHERE action = 'soft_warning' AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
-            (since, MAX_REFUSED_SAMPLES),
+            "WHERE action = 'soft_warning' AND created_at >= ?" + skip_actor + " ORDER BY created_at DESC LIMIT ?",
+            (since, *who, MAX_REFUSED_SAMPLES),
         )
         facts.answers = _scalar(
             db,
-            "SELECT COUNT(*) FROM auto_scan_events WHERE action = 'answer' AND created_at >= ?",
-            (since,),
+            "SELECT COUNT(*) FROM auto_scan_events WHERE action = 'answer' AND created_at >= ?" + skip_actor,
+            (since, *who),
         )
         facts.banter = _scalar(
             db,
-            "SELECT COUNT(*) FROM auto_scan_events WHERE action = 'banter' AND created_at >= ?",
-            (since,),
+            "SELECT COUNT(*) FROM auto_scan_events WHERE action = 'banter' AND created_at >= ?" + skip_actor,
+            (since, *who),
         )
         facts.archived_messages = _scalar(
-            db, "SELECT COUNT(*) FROM message_archive WHERE created_at >= ?", (since,)
+            db, "SELECT COUNT(*) FROM message_archive WHERE created_at >= ?" + skip_author, (since, *who)
         )
         top = _rows(
             db,
-            "SELECT channel_id, COUNT(*) AS n FROM message_archive WHERE created_at >= ? "
-            "GROUP BY channel_id ORDER BY n DESC LIMIT 6",
-            (since,),
+            "SELECT channel_id, COUNT(*) AS n FROM message_archive WHERE created_at >= ?" + skip_author +
+            " GROUP BY channel_id ORDER BY n DESC LIMIT 6",
+            (since, *who),
         )
         facts.top_channels = [(int(r["channel_id"]), int(r["n"])) for r in top]
         facts.channels_active = _scalar(
             db,
-            "SELECT COUNT(DISTINCT channel_id) FROM message_archive WHERE created_at >= ?",
-            (since,),
+            "SELECT COUNT(DISTINCT channel_id) FROM message_archive WHERE created_at >= ?" + skip_author,
+            (since, *who),
         )
         facts.new_members = _scalar(
-            db, "SELECT COUNT(*) FROM users WHERE first_seen_at >= ?", (since,)
+            db, "SELECT COUNT(*) FROM users WHERE first_seen_at >= ?" + skip_user, (since, *who)
         )
         facts.active_members = _scalar(
-            db, "SELECT COUNT(*) FROM users WHERE last_seen_at >= ?", (since,)
+            db, "SELECT COUNT(*) FROM users WHERE last_seen_at >= ?" + skip_user, (since, *who)
         )
         # Members the bot can see (partial: no privileged members intent). NOT the server size —
         # `_build_server_intel` overwrites member_count with Discord's own count and keeps this figure
         # here under an honest label.
-        facts.known_members = _scalar(db, "SELECT COUNT(*) FROM users")
+        facts.known_members = _scalar(db, "SELECT COUNT(*) FROM users WHERE 1=1" + skip_user, who)
         facts.admin_actions = _rows(
             db,
             "SELECT created_at, actor_id, command, summary FROM audit_log WHERE created_at >= ? "
@@ -256,6 +268,11 @@ def build_intel_prompt(
 
 He is the owner. This is a private briefing, not a public post: be direct, specific, and short.
 Use ONLY the facts below; invent nothing, no pings or mentions.
+
+HARD RULE — never report on Hoops himself. He is the reader, not a subject. His own messages and asks are
+already excluded from every figure below, so do not reintroduce him in any form: no "you asked", no quoting a
+question back at him, no naming him as an active member, no mention of his own activity, admin commands or
+rulings. If a section looks thin, that is the correct result — report it as thin, never backfill with him.
 
 Window: last {facts.window_days} days (since {facts.since[:16]}).
 

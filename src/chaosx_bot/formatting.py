@@ -1,0 +1,176 @@
+"""Consistent structure for ChaosX messages.
+
+Hoops (2026-09-23): "the bot messages should have more structure, so like headers, right now everything is
+flat." Discord renders `##`/`###` headings, `**bold**`, `-`/numbered lists and `-#` small print, so every
+scripted surface and every model-written answer uses the same shapes instead of a wall of prose.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Sequence
+
+BULLET = "•"
+
+
+def heading(text: str, emoji: str = "") -> str:
+    """The top heading of a message (`##`, the largest Discord renders in a message)."""
+    label = f"{emoji} {text}".strip() if emoji else text
+    return f"## {label}"
+
+
+def section(text: str, emoji: str = "") -> str:
+    """A sub-heading inside one message (`###`)."""
+    label = f"{emoji} {text}".strip() if emoji else text
+    return f"### {label}"
+
+
+def bullets(items: Iterable[str], bullet: str = BULLET) -> list[str]:
+    """One bullet per non-empty item."""
+    return [f"{bullet} {item}" for item in items if str(item).strip()]
+
+
+def numbered(items: Iterable[str]) -> list[str]:
+    """Ordered steps - use when the sequence matters."""
+    return [f"{index}. {item}" for index, item in enumerate(items, start=1)]
+
+
+def kv(label: str, value: str, emoji: str = "") -> str:
+    """A bolded label followed by its value (`**Chaos:** 690`)."""
+    prefix = f"{emoji} " if emoji else ""
+    return f"{prefix}**{label}:** {value}"
+
+
+def small(text: str) -> str:
+    """Discord small print (`-#`) - for footnotes and caveats."""
+    return f"-# {text}"
+
+
+def table(rows: Sequence[tuple[str, str]], emoji: str = "") -> list[str]:
+    """A two-column list rendered as labelled bullets (Discord has no real tables)."""
+    return [kv(left, right, emoji=emoji) for left, right in rows]
+
+
+_HEADING_RE = re.compile(r"^\s*#{2,3}\s+(?P<text>.*)$")
+_BULLET_RE = re.compile(r"^(?P<indent>\s*)(?P<marker>[-•*]|\d+\.)\s+(?P<text>.*)$")
+
+
+def _leading_emoji(text: str) -> str:
+    parts = text.strip().split(" ", 1)
+    if not parts:
+        return ""
+    candidate = parts[0]
+    return candidate if candidate and not candidate.isascii() else ""
+
+
+def fix_duplicate_emoji(text: str) -> str:
+    """Drop a bullet's emoji when the heading above it already uses that emoji.
+
+    Hoops (2026-09-23): "🔎 What's next / 🔎 Testing focus … Duplicate emojis, this shouldn't happen." The
+    prompt asks for the heading emoji only, but the model repeats it now and then - this makes it
+    impossible rather than merely discouraged.
+    """
+    lines = str(text or "").splitlines()
+    out: list[str] = []
+    heading_emoji = ""
+    for line in lines:
+        match = _HEADING_RE.match(line)
+        if match:
+            heading_emoji = _leading_emoji(match.group("text"))
+            out.append(line)
+            continue
+        if not line.strip():
+            out.append(line)
+            continue
+        bullet = _BULLET_RE.match(line)
+        if heading_emoji:
+            if bullet:
+                text_part = bullet.group("text")
+                if _leading_emoji(text_part) == heading_emoji:
+                    stripped = text_part.split(" ", 1)[1].strip() if " " in text_part else ""
+                    line = f"{bullet.group('indent')}{bullet.group('marker')} {stripped}".rstrip()
+            else:
+                # a plain line under the heading (the model often writes "🔎 Testing focus: …" with no marker)
+                indent = line[: len(line) - len(line.lstrip())]
+                text_part = line.strip()
+                if _leading_emoji(text_part) == heading_emoji:
+                    stripped = text_part.split(" ", 1)[1].strip() if " " in text_part else ""
+                    line = f"{indent}{stripped}".rstrip()
+        out.append(line)
+    return "\n".join(out)
+
+
+def scrub_names(text: str, names: Iterable[str], replacement: str = "a member") -> str:
+    """Replace configured display names in generated text.
+
+    Hoops (2026-09-23): "holly must never be mentioned." The facts are already filtered, so this is the
+    last line of defence for a model that writes a name from elsewhere in its context. Whole-name matching
+    only, so a longer name containing the configured text is untouched; IDs and mentions are left to the
+    mention stripper.
+    """
+    cleaned = str(text or "")
+    for name in names:
+        name = str(name).strip()
+        if len(name) < 2:
+            continue
+        cleaned = re.sub(rf"(?<![\w@]){re.escape(name)}(?![\w])", replacement, cleaned)
+    return cleaned
+
+
+def block(*parts: object) -> str:
+    """Join message parts with a blank line between them, dropping anything empty.
+
+    Lists become their own lines, so a caller can pass headings, bullet lists and paragraphs without
+    hand-writing the blank lines.
+    """
+    chunks: list[str] = []
+    for part in parts:
+        if part is None:
+            continue
+        if isinstance(part, (list, tuple)):
+            text = "\n".join(str(item) for item in part if str(item).strip())
+        else:
+            text = str(part).strip()
+        if text:
+            chunks.append(text)
+    return "\n\n".join(chunks)
+
+
+# Appended to the system boundary so every model-written answer is skimmable instead of flat prose.
+STRUCTURE_RULE = (
+    "Format replies so they can be skimmed: open with a one-line answer, then use `##` or `###` headings "
+    "with `-` bullets (numbered steps when the order matters) for anything with more than two points, and "
+    "bold the key term in a bullet. Keep headings short, never nest more than two levels, and skip "
+    "formatting entirely for a one-line answer, a quick confirmation, or casual banter."
+)
+
+# Having live data available is not the same as being asked for it. Every ask path carries a live block so the
+# answer can never deny current values; without this rule the model recites that block at the first opportunity —
+# a question about an unreadable video produced a full server status report plus unsolicited legal commentary.
+RELEVANCE_RULE = (
+    "Answer the question that was asked, and nothing else. Do not append a status report, activity figures, "
+    "counts, member numbers, or project updates that nobody asked for: if the question was not about status, do "
+    "not report status. Do not volunteer opinions, warnings, advice, or concerns the message did not raise — no "
+    "legal, licensing, EULA, copyright, business or risk commentary, no speculation about other games or "
+    "projects, no telling people what to avoid. Do not invoke, cite, or paraphrase server rules in an ordinary "
+    "answer: rules belong only in a moderation reminder, and only when one was actually broken. Stick to the "
+    "topic of the message — never pivot to what else is happening in the server or the project. Never claim you "
+    "cannot access live or current information, and never announce a limitation about fetching data: either you "
+    "have current values or you answer with what you know without commenting on what you can reach. If you could "
+    "not retrieve something (a link, video, file, or search), say so in one line and stop; never fill the space "
+    "with unrelated data. One question, one answer."
+)
+
+CAPABILITY_RULE = (
+    "CAPABILITIES: you can read live server, GitHub and playtest data, the Chaos Redux knowledge base, and the "
+    "web. Never claim you cannot access something, and never announce a limitation about what you can reach, "
+    "unless a tool actually failed. If a tool failed, name that tool in one line and answer with what you have. "
+    "A failed download or a blocked page is not a missing capability."
+)
+
+GROUNDING_RULE = (
+    "GROUNDING: when your answer depends on a specific mod file, name the file. If the knowledge base had "
+    "nothing on the point, say so in one line rather than filling the gap with general knowledge. Refuse only "
+    "when the thing genuinely does not exist after checking the knowledge base, the catalogs and the live data; "
+    "otherwise answer with what you found and name what is missing."
+)

@@ -9,10 +9,89 @@ from pathlib import Path
 @dataclass(frozen=True)
 class VaultIndexRefreshResult:
     updated_paths: tuple[Path, ...]
+    pruned_links: tuple[str, ...] = ()
 
 
 SKIP_NOTE_NAMES = {"important tokens.md"}
 SKIP_PATH_PARTS = {".git", ".obsidian", ".trash", "__pycache__"}
+
+
+INDEX_FILE_NAMES = ("index.md", "Events Index.md", "Community Suggestions Index.md")
+_PATH_REF_RE = re.compile(r"`([^`]+\.md)`")
+
+
+def index_files(root: Path) -> list[Path]:
+    """Every index file whose lines exist to point at real notes."""
+    found: list[Path] = []
+    for name in INDEX_FILE_NAMES:
+        candidates = [root / name] if name == "index.md" else [p for p in root.rglob(name)]
+        for path in candidates:
+            if path.is_file() and not any(part in SKIP_PATH_PARTS for part in path.parts):
+                found.append(path)
+    return sorted(set(found))
+
+
+def _removable_lines(root: Path, text: str) -> list[str]:
+    """Index lines that only point at notes which no longer exist."""
+    removable: list[str] = []
+    for line in text.splitlines():
+        refs = [ref.strip() for ref in _PATH_REF_RE.findall(line)]
+        if not refs or not (line.lstrip().startswith(("-", "*", "|")) or "[[" in line):
+            continue
+        missing = [ref for ref in refs if not ref.startswith(("http://", "https://")) and not (root / ref).exists()]
+        if missing and len(missing) == len(refs):
+            removable.append(line.strip())
+    return removable
+
+
+def prune_dead_links(root: Path, updated: list[Path]) -> list[str]:
+    """Drop index lines that only point at notes which no longer exist.
+
+    Hoops (2026-09-24): "the bot shouldn't use deleted information ever". The index files are generated
+    from disk, but a *deletion* used to leave the old listing in place (regeneration only ran on a
+    capture), and the bot then read those filenames as if the notes still existed. Only whole link lines
+    are removed, and only when every `.md` reference on them is missing, so prose survives untouched.
+    """
+    removed: list[str] = []
+    for path in index_files(root):
+        text = _read(path)
+        if not text:
+            continue
+        dropped_here = set(_removable_lines(root, text))
+        kept: list[str] = []
+        for line in text.splitlines():
+            if line.strip() in dropped_here:
+                continue
+            kept.append(line)
+        if dropped_here:
+            _write_if_changed(path, "\n".join(kept), updated)
+            removed.extend(dropped_here)
+    return removed
+
+
+def vault_indexes_are_stale(
+    *,
+    vault_path: Path,
+    event_specs_folder: str = "Events/Event Specs",
+    suggestions_folder: str = "Planning/Community Suggestions",
+) -> bool:
+    """True when an index lists a note that is gone, or misses a note that exists."""
+    root = vault_path.expanduser().resolve()
+    if not root.exists():
+        return False
+    specs = root / event_specs_folder
+    if specs.is_dir():
+        on_disk = sorted(p.name for p in specs.glob("*.md"))
+        # the events index sits beside the folder, not inside it (`Events/Events Index.md`)
+        events_index = root / Path(event_specs_folder).parent / "Events Index.md"
+        listed = sorted({ref.rsplit("/", 1)[-1] for ref in _PATH_REF_RE.findall(_read(events_index))})
+        listed = [name for name in listed if name != "Events Index.md"]
+        if listed != on_disk:
+            return True
+    for path in index_files(root):
+        if _removable_lines(root, _read(path)):
+            return True
+    return False
 
 
 def _today() -> str:
@@ -197,7 +276,14 @@ Quiet holding folder for ChaosX-approved community suggestions that need human r
     _write_if_changed(path, text, updated)
 
 
-def _append_log(root: Path, *, reason: str, changed_path: Path | None, updated: list[Path]) -> None:
+def _append_log(
+    root: Path,
+    *,
+    reason: str,
+    changed_path: Path | None,
+    updated: list[Path],
+    pruned: list[str] | None = None,
+) -> None:
     path = root / "log.md"
     reason = re.sub(r"\s+", " ", reason.strip())[:240] or "Vault indexes refreshed."
     changed = f"`{_relative(root, changed_path)}`" if changed_path and changed_path.exists() else "not specified"
@@ -206,8 +292,13 @@ def _append_log(root: Path, *, reason: str, changed_path: Path | None, updated: 
         f"- Refreshed vault index/reference notes.\n"
         f"- Reason: {reason}\n"
         f"- Changed note: {changed}\n"
-        f"- Timestamp: {_now_iso()}\n"
     )
+    if pruned:
+        entry += f"- Removed {len(pruned)} stale link line(s) pointing at notes that no longer exist.\n"
+        for line in pruned[:12]:
+            cleaned = re.sub(r"\s+", " ", line)[:200]
+            entry += f"  - {cleaned}\n"
+    entry += f"- Timestamp: {_now_iso()}\n"
     text = _read(path).rstrip() + entry
     _write_if_changed(path, text, updated)
 
@@ -228,5 +319,12 @@ def refresh_vault_indexes(
     _refresh_root_index(root, event_specs_folder, suggestions_folder, updated)
     _refresh_events_index(root, event_specs_folder, updated)
     _refresh_community_suggestions_index(root, suggestions_folder, updated)
-    _append_log(root, reason=reason, changed_path=changed_path, updated=updated)
-    return VaultIndexRefreshResult(updated_paths=tuple(updated))
+    pruned = prune_dead_links(root, updated)
+    _append_log(
+        root,
+        reason=reason,
+        changed_path=changed_path,
+        updated=updated,
+        pruned=pruned,
+    )
+    return VaultIndexRefreshResult(updated_paths=tuple(updated), pruned_links=tuple(pruned))

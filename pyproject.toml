@@ -12,6 +12,8 @@ dependencies = [
     "mcp>=1.21.0,<2",
     "cairosvg>=2.7,<3",
     "pillow>=10,<13",
+    # Video links: without this the bot told members it "cannot pull that video" while the code supported it.
+    "yt-dlp>=2026.1.0",
 ]
 
 [project.optional-dependencies]

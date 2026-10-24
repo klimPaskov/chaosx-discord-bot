@@ -258,6 +258,7 @@ class EventVisualMcpClient:
         self.session_pool = session_pool
         self._event_cache: dict[tuple[Any, ...], bytes] = {}
         self._gui_cache: dict[tuple[Any, ...], bytes] = {}
+        self._tech_cache: dict[tuple[Any, ...], bytes] = {}
         self._event_disk_cache = VisualArtifactCache(
             "event-chains", max_item_bytes=settings.focus_tree_max_attachment_bytes
         )
@@ -291,6 +292,47 @@ class EventVisualMcpClient:
     def _store_gui(self, key: tuple[Any, ...], png: bytes) -> None:
         self._gui_cache[key] = png
         self._gui_disk_cache.put(key, png)
+
+    async def render_tech_view(
+        self,
+        *,
+        view: str = "summary",
+        folder_id: str = "",
+        technology_id: str = "",
+        category_id: str = "",
+    ) -> bytes:
+        """Render a technology view through the MCP and return PNG bytes.
+
+        Views come straight from the MCP's enum; ids are optional and only sent when the caller has one.
+        """
+        key = (view, folder_id, technology_id, category_id, self._launcher_fingerprint)
+        cached = self._tech_cache.get(key)
+        if cached:
+            return cached
+        try:
+            return await self._render_tech_view(key, view, folder_id, technology_id, category_id)
+        except EventVisualError:
+            raise
+        except Exception as exc:  # an anyio ExceptionGroup from the MCP must not escape as a crash
+            raise EventVisualError("Technology render failed") from exc
+
+    async def _render_tech_view(
+        self, key: tuple[Any, ...], view: str, folder_id: str, technology_id: str, category_id: str
+    ) -> bytes:
+        async with self._session() as (session, workspace_id):
+            args: dict[str, Any] = {"workspaceId": workspace_id, "view": view}
+            if folder_id:
+                args["folderId"] = folder_id
+            if technology_id:
+                args["technologyId"] = technology_id
+            if category_id:
+                args["categoryId"] = category_id
+            payload = _structured_content(await session.call_tool("hoi4.tech_render", args))
+            png = await _tech_png_from_payload(
+                session, payload, max_bytes=self.settings.focus_tree_max_attachment_bytes
+            )
+            self._tech_cache[key] = png
+            return png
 
     async def render_event_chain(self, record: EventChainRecord) -> EventChainGraph:
         key = self._event_key(record)
@@ -786,6 +828,25 @@ def _artifact(payload: dict[str, Any], mime_type: str) -> dict[str, Any]:
         if isinstance(artifact, dict) and artifact.get("mimeType") == mime_type and artifact.get("uri"):
             return artifact
     raise EventVisualError(f"MCP render did not return {mime_type}")
+
+
+async def _tech_png_from_payload(
+    session: ClientSession, payload: dict[str, Any], *, max_bytes: int
+) -> bytes:
+    """Prefer the MCP's own PNG; fall back to rasterising its SVG."""
+    try:
+        artifact = _artifact(payload, "image/png")
+    except EventVisualError:
+        artifact = None
+    if artifact is not None:
+        return await read_resource_bytes(session, str(artifact["uri"]), max_bytes=max_bytes, expected_mime="image/png")
+    svg = _artifact(payload, "image/svg+xml")
+    svg_bytes = await read_resource_bytes(
+        session, str(svg["uri"]), max_bytes=max_bytes, expected_mime="image/svg+xml"
+    )
+    output = io.BytesIO()
+    cairosvg.svg2png(bytestring=svg_bytes, write_to=output)
+    return output.getvalue()
 
 
 def _event_definition_ids(text: str) -> tuple[str, ...]:

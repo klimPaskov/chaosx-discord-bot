@@ -477,10 +477,15 @@ def test_community_help_uses_search_and_root_feedback_commands():
     assert "e.g." not in help_text
     assert "/testing`" in help_text
     assert "kind" not in help_text
-    assert "limit" not in help_text
+    # A submission limit is deliberately user-facing (it explains the /ideas queue); what must
+    # never leak is the per-user ask limit or moderation internals.
+    assert "asks per hour" not in help_text.lower()
+    assert "rate limit" not in help_text.lower()
+    assert "there is a limit of 5 submissions a week" in help_text
     assert "/suggestion suggestion:<idea>" in help_text
-    assert "/event-idea idea:<idea>" in help_text
-    assert "baseline description" in help_text
+    assert "`/event-idea` — opens a short form" in help_text
+    assert "private **preview**" in help_text
+    assert "world-end link and evolution stages" in help_text
     assert "Playtest notes" in help_text
     assert "/playtest queue" not in help_text
     assert "Add `event_id` if the note is about one event" in help_text

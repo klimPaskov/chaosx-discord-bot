@@ -2,11 +2,224 @@ from __future__ import annotations
 
 import os
 import re
+import statistics
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+
+from .db import connect
 from typing import Any, Sequence
 
 _SAFE_TEXT_RE = re.compile(r"[^A-Za-z0-9 _./:+()\-]+")
+
+
+# Command latency: what the bot spent, per command, so "why is this slow" is answerable from the bot
+# itself instead of from guesswork (Hoops 2026-09-23). Kept in memory, newest first, ring-buffered.
+_COMMAND_TIMINGS: deque[tuple[str, float, str]] = deque(maxlen=60)
+
+_TIMING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS command_timing (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    seconds REAL NOT NULL,
+    path TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+_ANSWER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS answer_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    path TEXT NOT NULL DEFAULT '',
+    seconds REAL NOT NULL DEFAULT 0,
+    denial INTEGER NOT NULL DEFAULT 0,
+    refusal_retry INTEGER NOT NULL DEFAULT 0,
+    cache_hit INTEGER NOT NULL DEFAULT 0,
+    citations INTEGER NOT NULL DEFAULT 0,
+    unverified INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+
+def record_answer_event(
+    *,
+    db_path: Path | None = None,
+    path: str = "",
+    seconds: float = 0.0,
+    denial: bool = False,
+    refusal_retry: bool = False,
+    cache_hit: bool = False,
+    citations: int = 0,
+    unverified: int = 0,
+) -> None:
+    """One row per answer. Never raises: measurement must not cost a member their answer."""
+    if db_path is None:
+        return
+    from .db import retry_write
+
+    retry_write(db_path, _ANSWER_SCHEMA)
+    retry_write(
+        db_path,
+        "INSERT INTO answer_event (path, seconds, denial, refusal_retry, cache_hit, citations, unverified) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            str(path),
+            float(seconds),
+            int(bool(denial)),
+            int(bool(refusal_retry)),
+            int(bool(cache_hit)),
+            int(citations),
+            int(unverified),
+        ),
+    )
+
+
+def answer_quality_lines(*, db_path: Path | None = None, days: int = 7) -> list[str]:
+    """One line summarising answer health over the last ``days``."""
+    if db_path is None:
+        return []
+    try:
+        conn = connect(db_path)
+        try:
+            conn.execute(_ANSWER_SCHEMA)
+            row = conn.execute(
+                "SELECT COUNT(*), SUM(denial), SUM(refusal_retry), SUM(cache_hit), SUM(unverified) "
+                "FROM answer_event WHERE at >= datetime('now', ?)",
+                (f"-{int(days)} days",),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    total, denial, refusal, cache, unverified = row or (0, 0, 0, 0, 0)
+    if not total:
+        return []
+    share = 100.0 * (cache or 0) / total
+    return [
+        f"answers {days}d: {total} (denial {denial or 0}, refusal-retry {refusal or 0}, "
+        f"cache {share:.0f}%, unverified citations {unverified or 0})"
+    ]
+
+
+def record_command_timing(
+    name: str, seconds: float, *, path: str = "", db_path: Path | None = None
+) -> None:
+    """Remember how long one command took and which model path it used.
+
+    Kept in memory for the live panel and, when ``db_path`` is given, appended to the bot database so the numbers
+    survive a restart and "is it faster now?" can be answered with data instead of impressions.
+    """
+    try:
+        _COMMAND_TIMINGS.appendleft((str(name), float(seconds), str(path)))
+    except Exception:  # instrumentation must never break a command
+        pass
+    if db_path is None:
+        return
+    try:
+        conn = connect(db_path)
+        try:
+            conn.execute(_TIMING_SCHEMA)
+            conn.execute(
+                "INSERT INTO command_timing (name, seconds, path) VALUES (?, ?, ?)",
+                (str(name), float(seconds), str(path)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # a missing directory or locked DB must not break the command
+        pass
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    index = int(round((percentile / 100.0) * (len(values) - 1)))
+    return values[max(0, min(len(values) - 1, index))]
+
+
+def timing_stats(
+    *, db_path: Path | None = None, name: str | None = None, limit: int = 500
+) -> dict[str, float | int]:
+    """p50/p95/max for one command (or all) over the last ``limit`` recorded runs."""
+    if db_path is None:
+        return {"count": 0}
+    try:
+        conn = connect(db_path)
+        try:
+            conn.execute(_TIMING_SCHEMA)
+            rows = conn.execute(
+                "SELECT seconds FROM (SELECT seconds FROM command_timing "
+                "WHERE (? IS NULL OR name = ?) ORDER BY id DESC LIMIT ?)",
+                (name, name, int(limit)),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return {"count": 0}
+    values = sorted(float(row[0]) for row in rows)
+    if not values:
+        return {"count": 0}
+    return {
+        "count": len(values),
+        "p50": float(statistics.median(values)),
+        "p95": _percentile(values, 95),
+        "max": values[-1],
+    }
+
+
+def timing_lines(*, db_path: Path | None = None, limit: int = 5) -> list[str]:
+    """Readable per-command latency summary for the owner panel."""
+    if db_path is None:
+        return ["No command timings recorded yet."]
+    try:
+        conn = connect(db_path)
+        try:
+            conn.execute(_TIMING_SCHEMA)
+            names = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM command_timing GROUP BY name ORDER BY COUNT(*) DESC LIMIT ?",
+                    (int(limit),),
+                )
+            ]
+        finally:
+            conn.close()
+    except Exception:
+        return ["No command timings recorded yet."]
+    if not names:
+        return ["No command timings recorded yet."]
+    lines = ["## Command latency"]
+    for name in names:
+        stats = timing_stats(db_path=db_path, name=name)
+        lines.append(
+            f"- `{name}`: p50 {stats['p50']:.1f}s, p95 {stats['p95']:.1f}s, "
+            f"max {stats['max']:.1f}s ({stats['count']} run{'s' if stats['count'] != 1 else ''})"
+        )
+    return lines
+
+
+def command_timings_lines(*, slow_seconds: float = 5.0, limit: int = 5) -> list[str]:
+    """A short latency summary: the slowest recent commands and the count over the threshold."""
+    if not _COMMAND_TIMINGS:
+        return ["No command timings recorded yet."]
+    per_command: dict[str, list[float]] = {}
+    for name, seconds, _path in _COMMAND_TIMINGS:
+        per_command.setdefault(name, []).append(seconds)
+    ranked = sorted(per_command.items(), key=lambda item: -max(item[1]))
+    lines = []
+    for name, values in ranked[:limit]:
+        last = values[0]
+        worst = max(values)
+        lines.append(
+            f"- `{name}`: last {last:.1f}s, slowest {worst:.1f}s "
+            f"({len(values)} run{'s' if len(values) != 1 else ''})"
+        )
+    slow = sum(1 for _name, seconds, _path in _COMMAND_TIMINGS if seconds >= slow_seconds)
+    lines.append(
+        f"-# {len(_COMMAND_TIMINGS)} recent command(s) timed; {slow} took {slow_seconds:.0f}s or more."
+    )
+    return lines
 
 
 @dataclass(frozen=True)

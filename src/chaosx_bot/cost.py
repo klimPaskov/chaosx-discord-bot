@@ -19,8 +19,11 @@ from typing import Any
 from .models import display_model_name
 
 DEFAULT_PRICING: dict[str, dict[str, float]] = {
-    # Per-million-token USD prices. Configurable via CHAOSX_MODEL_PRICING.
-    "deepseek-flash": {"input": 0.30, "output": 1.20},
+    # Per-million-token USD prices, DeepSeek list rates checked 2026-09-27. These are the
+    # off-peak rates; peak (Mon-Fri 01:00-04:00 and 06:00-10:00 UTC) bills double, so bulk
+    # work scheduled outside those windows costs half. Configurable via CHAOSX_MODEL_PRICING.
+    "deepseek-flash": {"input": 0.15, "output": 0.60},
+    "deepseek-v4-pro": {"input": 0.66, "output": 1.98},
     # Legacy id kept so usage recorded before 2026-09 still prices.
     "deepseek-v4-flash-vision-exp": {"input": 0.50, "output": 1.50},
 }

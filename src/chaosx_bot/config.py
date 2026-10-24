@@ -25,10 +25,67 @@ class Settings(BaseSettings):
     allowed_guild_id: Optional[int] = Field(default=1395459671598436533)
     command_guild_id: Optional[int] = Field(default=1395459671598436533)
     public_ask_limit_per_hour: int = Field(default=-1, ge=-1, le=100, description="Public ask rate limit per user per hour; -1 = unlimited (no check), 0 = disabled")
+    # --- public voice channel ---
+    voice_enabled: bool = Field(default=False, description="Join the public voice channel and answer spoken questions")
+    hermes_subprocess_enabled: bool = Field(
+        default=False,
+        description=(
+            "Route model calls through the Hermes CLI subprocess instead of the direct API. Off by default: "
+            "the CLI is absent on the interim host, so that path failed every command that used it "
+            "(Hoops 2026-10-18)"
+        ),
+    )
+    answer_cache_enabled: bool = Field(
+        default=True,
+        description="Serve repeated non-live /ask questions from the answer cache",
+    )
+    answer_cache_ttl_seconds: int = Field(
+        default=3600,
+        description="How long a cached answer stays valid, in seconds",
+    )
+    members_intent_enabled: bool = Field(
+        default=True,
+        description=(
+            "Request the privileged Server Members intent. Without it the member directory, digests and any "
+            "who-is-this answer are empty. Must also be enabled in the Discord developer portal"
+        ),
+    )
+    denial_guard_enabled: bool = Field(
+        default=True,
+        description=(
+            "When an answer claims the bot cannot access something it can, retry once with a correction. "
+            "False disables the retry (never the capability prompt)"
+        ),
+    )
+    index_autorebuild: bool = Field(
+        default=True,
+        description=(
+            "Rebuild the knowledge index locally when it is stale. Set False on a host that serves an index "
+            "built where the authoritative corpus lives (CHAOSX_INDEX_AUTOREBUILD=0), so a rebuild there does "
+            "not replace it with a different revision and drop documents (Hoops 2026-10-12)"
+        ),
+    )
+    voice_channel_id: Optional[int] = Field(default=None, description="Voice channel the bot listens in")
+    voice_transcript_channel_id: Optional[int] = Field(default=None, description="Text channel that shares memory with voice: spoken questions and answers are archived here, so text asks in this channel and voice asks see each other. Blank keeps voice memory in the voice channel itself")
+    voice_stt_model: str = Field(default="base", description="faster-whisper model size used for voice input")
+    voice_tts_voice: str = Field(default="/srv/chaosx/piper-voices/en_GB-vctk-medium.onnx", description="Piper .onnx voice used to speak answers")
+    voice_tts_speaker: str = Field(default="p254", description="Speaker id inside a multi-speaker Piper voice")
+    voice_tts_length_scale: float = Field(default=1.30, ge=0.5, le=2.0, description="Piper pace: 1.0 native, 1.30 trailer pace")
+    voice_max_answer_chars: int = Field(default=420, ge=80, le=3000, description="Spoken answers are trimmed to this length")
+    voice_cooldown_seconds: int = Field(default=20, ge=0, le=600, description="Per-user cooldown between spoken questions")
+    voice_max_queue: int = Field(default=3, ge=1, le=20, description="Bounded utterance queue; speech beyond this is dropped")
+    voice_idle_leave_seconds: int = Field(default=600, ge=60, le=86400, description="Leave the voice channel after this much quiet")
+    voice_work_dir: str = Field(default="/srv/chaosx/voice-work", description="Scratch directory for utterance and answer audio")
+    voice_dave_mode: str = Field(
+        default="off",
+        description="off = advertise no voice E2EE so the channel falls back to unencrypted audio (the bot cannot "
+        "decrypt DAVE frames in this stack); auto = advertise E2EE and hope the library works",
+    )
     web_search_enabled: bool = Field(default=True, description="Allow server-side web-search grounding for public asks when local notes have no answer")
     web_evidence_enabled: bool = Field(default=True, description="Fetch the top web-search result pages and use their real page text/tables; attaches a source-table image when one is found")
     web_evidence_max_pages: int = Field(default=2, ge=0, le=3, description="How many search-result pages to fetch as source evidence; 0 disables page fetching")
     thinking_feed_enabled: bool = Field(default=False, description="Show a per-user dismissable thinking feed to the user the bot is answering (owner always gets the raw ephemeral feed); False hides thinking from everyone else")
+    owner_thinking_feed: bool = Field(default=True, description="Stream the owner's live reasoning (raw) while ChaosX answers an owner surface: a live-edited DM for /admin ask, owner /ask and owner mentions. False disables the thinking feed for the owner entirely (Hoops 2026-09-24)")
     server_owner_name: str = Field(default="Hoops McCann", description="Display name of the Discord server owner")
     bot_maker_name: str = Field(default="Hoops McCann", description="Who made/maintains the ChaosX bot")
     main_dev_name: str = Field(default="Hoops McCann", description="Main developer of Chaos Redux")
@@ -144,6 +201,7 @@ class Settings(BaseSettings):
     github_repo: str = Field(default="klimPaskov/Chaos-Redux", description="GitHub repo for public /issue creation")
     obsidian_vault_path: Path = Field(default=Path("/mnt/c/Users/klimp/Documents/Chaos Redux Vault"), description="Chaos Redux Obsidian/LLM wiki vault path")
     qoder_repowiki_path: Path | None = Field(default=None, description="Qoder repo-knowledge store root (e.g. .../knowledges/chaos_redux/master__en-US) indexed as an extra knowledge root")
+    extra_knowledge_roots: str = Field(default="", description="Colon-separated name=/abs/path extra knowledge roots indexed as public tooling docs")
     community_notes_enabled: bool = Field(default=True, description="Write approved public suggestions/event ideas to the Chaos Redux vault")
     community_event_specs_folder: str = Field(default="Events/Event Specs", description="Vault-relative folder for approved community event idea specs")
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")
@@ -164,6 +222,45 @@ class Settings(BaseSettings):
     activity_rollup_tick_seconds: int = Field(
         default=600, ge=120, le=3600,
         description="How often the chaos-tier activity rollup folds new archive messages in",
+    )
+    tier_up_posts_enabled: bool = Field(
+        default=True,
+        description="Post a written congratulation when a member reaches a new chaos tier",
+    )
+    tier_up_channel_id: int = Field(
+        default=0,
+        description="Channel for tier-up congratulations (0 = the banter channel)",
+    )
+    tier_roles_enabled: bool = Field(
+        default=True,
+        description="Give each member a coloured chaos-tier role (the mod's tier colours)",
+    )
+    never_mention_user_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Members the bot must never name in its own writing (digest, release posts, tier-up posts). "
+            "Their activity still counts in the numbers; only the name is withheld."
+        ),
+    )
+    never_mention_names: list[str] = Field(
+        default_factory=list,
+        description="Display names scrubbed from generated posts, as a last line of defence.",
+    )
+    chaosx_role_color: int = Field(
+        default=0xD6453C,
+        description=(
+            "Colour applied to the bot's own role (ChaosX) on each roles pass, so the bot always shows "
+            "the mod's red. 0 disables it (Hoops 2026-09-23: 'it should use the red color by default')."
+        ),
+    )
+    owner_title: str = Field(
+        default=(
+            "The One and Only, First of His Name, Creator of Everything, Sovereign of the Chaos Ladder"
+        ),
+        description=(
+            "The owner's member title. Deliberately over-the-top royalty, because he is the creator of "
+            "everything (Hoops 2026-09-23); it is never model-generated, so it cannot drift."
+        ),
     )
     idle_banter_excluded_ids: list[int] = Field(
         default_factory=lambda: [110546365032968192],  # Holly — never a banter target (Hoops, 2026-09-23)

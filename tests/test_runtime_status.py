@@ -7,6 +7,9 @@ from chaosx_bot.runtime_status import (
     collect_process_tree,
     format_hermes_progress,
     format_process_panel,
+    record_command_timing,
+    timing_lines,
+    timing_stats,
 )
 
 
@@ -120,3 +123,68 @@ def test_admin_processes_command_and_owner_progress_wiring_exist():
     assert "active_hermes_runs" in process_source
     assert "progress_callback" in command_source
     assert "_owner_progress_loop" in command_source
+
+
+def test_latency_panel_and_persisted_timings_are_wired():
+    bot_path = Path(__file__).resolve().parents[1] / "src" / "chaosx_bot" / "bot.py"
+    source = bot_path.read_text(encoding="utf-8")
+    assert "timing_lines" in source
+    assert "format_process_panel(snapshot, activities)" in source
+    assert "db_path=bot.settings.db_path" in source
+
+
+def test_timings_persist_across_calls(tmp_path: Path):
+    db = tmp_path / "t.db"
+    record_command_timing("ask", 1.5, path="ask-api", db_path=db)
+    record_command_timing("ask", 2.5, path="ask-api", db_path=db)
+    stats = timing_stats(db_path=db, name="ask")
+    assert stats["count"] == 2
+    assert stats["p50"] == 2.0
+    assert stats["max"] == 2.5
+
+
+def test_stats_are_filtered_by_name_and_ordered(tmp_path: Path):
+    db = tmp_path / "t.db"
+    for seconds in (0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0):
+        record_command_timing("event", seconds, path="ask-api", db_path=db)
+    record_command_timing("ask", 9.0, path="ask-api", db_path=db)
+    event = timing_stats(db_path=db, name="event")
+    assert event["count"] == 10
+    assert event["max"] == 2.0
+    assert 1.5 < event["p95"] <= 2.0
+    assert timing_stats(db_path=db, name="ask")["max"] == 9.0
+
+
+def test_missing_db_is_not_an_error(tmp_path: Path):
+    assert timing_stats(db_path=tmp_path / "nope.db")["count"] == 0
+
+
+def test_timing_lines_render_percentiles(tmp_path: Path):
+    db = tmp_path / "t.db"
+    record_command_timing("ask", 3.0, path="ask-api", db_path=db)
+    text = "\n".join(timing_lines(db_path=db, limit=5))
+    assert "ask" in text
+    assert "p50" in text
+
+
+def test_record_never_raises_on_a_bad_path(tmp_path: Path):
+    # instrumentation must never break a command
+    record_command_timing("ask", 1.0, path="ask-api", db_path=tmp_path / "missing-dir" / "x.db")
+
+
+def test_answer_events_are_recorded_and_summarised(tmp_path):
+    from chaosx_bot.runtime_status import answer_quality_lines, record_answer_event
+
+    db = tmp_path / "events.db"
+    record_answer_event(db_path=db, path="ask-api", seconds=4.2, denial=True, cache_hit=False, unverified=1)
+    record_answer_event(db_path=db, path="ask-api", seconds=3.1, cache_hit=True)
+    lines = answer_quality_lines(db_path=db, days=7)
+    assert lines and "answers 7d: 2" in lines[0]
+    assert "denial 1" in lines[0] and "cache 50%" in lines[0]
+
+
+def test_answer_event_without_db_is_a_no_op():
+    from chaosx_bot.runtime_status import answer_quality_lines, record_answer_event
+
+    record_answer_event(db_path=None)
+    assert answer_quality_lines(db_path=None) == []

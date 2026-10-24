@@ -20,15 +20,29 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 
 import httpx
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+
+def _endpoint_for(provider: str) -> tuple[str, str]:
+    """Resolve a provider to (OpenAI-compatible base URL, key env var).
+
+    Imported lazily to keep model_switch (which reads this module for key lookup) free of
+    an import cycle at module load.
+    """
+    from .model_switch import endpoint_for
+
+    return endpoint_for(provider)
 DEFAULT_TIMEOUT_S = 45.0
 DEFAULT_MAX_TOKENS = 4096
 
-_KEY_LINE = re.compile(r"^DEEPSEEK_API_KEY=(.*)$", re.IGNORECASE)
+def _key_pattern(env_name: str) -> re.Pattern[str]:
+    """Match one ``KEY=value`` line, ignoring case and surrounding whitespace."""
+    return re.compile(rf"^{re.escape(env_name)}\s*=\s*(.*)$", re.IGNORECASE)
+
 _KEY_CANDIDATES = (
     Path(".env"),
     Path("/srv/chaosx/chaosx-discord-bot/.env"),
@@ -45,18 +59,20 @@ async def _emit_usage(on_usage, usage: dict[str, Any] | None) -> None:
         await result
 
 
-def resolve_api_key() -> str:
-    """Return the DeepSeek API key from env or the bot/profile .env files."""
-    value = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+def resolve_api_key(env_name: str = "DEEPSEEK_API_KEY", environ: Mapping[str, str] | None = None) -> str:
+    """Return a provider API key from the environment or the bot/profile .env files."""
+    env = os.environ if environ is None else environ
+    value = str(env.get(env_name, "")).strip()
     if value:
         return value
+    pattern = _key_pattern(env_name)
     for candidate in _KEY_CANDIDATES:
         try:
             text = candidate.read_text(encoding="utf-8")
         except OSError:
             continue
         for line in text.splitlines():
-            match = _KEY_LINE.match(line.strip())
+            match = pattern.match(line.strip())
             if match and match.group(1).strip():
                 return match.group(1).strip()
     return ""
@@ -88,7 +104,8 @@ async def direct_chat_completion(
     system: str,
     user: str,
     model: str = "deepseek-flash",
-    base_url: str = DEEPSEEK_BASE_URL,
+    provider: str = "deepseek",
+    base_url: str | None = None,
     reasoning_effort: str = "low",
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = 0.7,
@@ -97,9 +114,11 @@ async def direct_chat_completion(
     on_usage: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
 ) -> str:
     """Run a single chat completion and return the trimmed assistant text."""
-    key = resolve_api_key()
+    resolved_base, key_env = _endpoint_for(provider)
+    base_url = (base_url or resolved_base).rstrip("/")
+    key = resolve_api_key(key_env)
     if not key:
-        raise DirectAskError("DEEPSEEK_API_KEY not found for the direct ask fast path")
+        raise DirectAskError(f"{key_env} not found for the direct ask fast path")
 
     payload = {
         "model": model,
@@ -144,7 +163,8 @@ async def direct_chat_completion_stream(
     system: str,
     user: str,
     model: str = "deepseek-flash",
-    base_url: str = DEEPSEEK_BASE_URL,
+    provider: str = "deepseek",
+    base_url: str | None = None,
     reasoning_effort: str = "low",
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = 0.7,
@@ -158,9 +178,11 @@ async def direct_chat_completion_stream(
     chain-of-thought, empty when reasoning is off) and the new answer text.
     This powers the owner's private live-thinking feed.
     """
-    key = resolve_api_key()
+    resolved_base, key_env = _endpoint_for(provider)
+    base_url = (base_url or resolved_base).rstrip("/")
+    key = resolve_api_key(key_env)
     if not key:
-        raise DirectAskError("DEEPSEEK_API_KEY not found for the direct ask fast path")
+        raise DirectAskError(f"{key_env} not found for the direct ask fast path")
 
     payload = {
         "model": model,

@@ -27,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .formatting import fix_duplicate_emoji
+
 # --------------------------------------------------------------------------------------
 # Post types
 # --------------------------------------------------------------------------------------
@@ -237,6 +239,8 @@ def sanitize_post(text: str, *, max_chars: int = MAX_POST_CHARS) -> str:
     """Strip pings from generated text and cap length (hooked to a line boundary)."""
     cleaned = _MENTION_RE.sub("", text or "").strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    # A heading emoji must not be repeated by the bullet right under it.
+    cleaned = fix_duplicate_emoji(cleaned)
     if len(cleaned) <= max_chars:
         return cleaned
     cut = cleaned[: max(0, max_chars - 1)]
@@ -268,10 +272,59 @@ async def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 90) ->
     return proc.returncode or 0, out.decode("utf-8", errors="replace"), err.decode("utf-8", errors="replace")
 
 
-async def git_commit_summary(repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS) -> dict[str, Any]:
+def _git_window_args(
+    *, since_days: int, since: datetime | None = None, until: datetime | None = None
+) -> list[str]:
+    """`--since/--until` as explicit ISO boundaries when given, else a rolling "N days ago"."""
+    if since is None and until is None:
+        return [f"--since={since_days} days ago"]
+    args: list[str] = []
+    if since is not None:
+        args.append(f"--since={since.astimezone(timezone.utc).isoformat()}")
+    if until is not None:
+        args.append(f"--until={until.astimezone(timezone.utc).isoformat()}")
+    return args
+
+
+async def refresh_repo(repo: Path, *, timeout: int = 120) -> bool:
+    """Fetch the tracked branch before reading history.
+
+    The host checkout is shallow and only updates when someone fetches it. Without this the digest read a
+    checkout whose HEAD was twelve days old and reported "no changes landed this week" while hundreds of
+    commits had been pushed (Hoops, 2026-10-19).
+    """
+    code, _out, _err = await _run(["git", "fetch", "--quiet", "origin", "master"], cwd=repo, timeout=timeout)
+    return code == 0
+
+
+async def preferred_revision(repo: Path) -> str:
+    """The freshest revision available: the fetched remote branch, else HEAD."""
+    code, out, _err = await _run(["git", "rev-parse", "--verify", "origin/master"], cwd=repo)
+    return "origin/master" if code == 0 and out.strip() else "HEAD"
+
+
+async def revision_commit_date(repo: Path, rev: str = "HEAD") -> datetime | None:
+    code, out, _err = await _run(["git", "log", "-1", "--format=%cI", rev], cwd=repo)
+    if code != 0 or not out.strip():
+        return None
+    try:
+        return datetime.fromisoformat(out.strip())
+    except ValueError:
+        return None
+
+
+async def git_commit_summary(
+    repo: Path,
+    *,
+    since_days: int = DIGEST_WINDOW_DAYS,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    rev: str = "HEAD",
+) -> dict[str, Any]:
     """Commit activity in the live mod checkout (real history, not a cache)."""
     code, out, err = await _run(
-        ["git", "log", f"--since={since_days} days ago", "--pretty=%h|%ad|%an|%s", "--date=short"],
+        ["git", "log", rev, *_git_window_args(since_days=since_days, since=since, until=until),
+         "--pretty=%h|%ad|%an|%s", "--date=short"],
         cwd=repo,
     )
     if code != 0:
@@ -280,14 +333,75 @@ async def git_commit_summary(repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS
     subjects = [row.split("|", 3)[3].strip() for row in rows if row.count("|") >= 3]
     authors = sorted({row.split("|", 3)[2].strip() for row in rows if row.count("|") >= 3})
     notable = [s for s in subjects if s and not _BOOKKEEPING_RE.match(s)]
+    # One bulk pass ("Restore historical eventN localisation wording" x39) used to fill every notable slot,
+    # hiding the rest of the week's work. Keep the first of each subject shape, so the sample spans topics.
+    seen_shapes: set[str] = set()
+    diverse: list[str] = []
+    for subject in notable:
+        shape = re.sub(r"\d+", "N", subject.lower())
+        if shape in seen_shapes:
+            continue
+        seen_shapes.add(shape)
+        diverse.append(subject)
+        if len(diverse) >= MAX_NOTABLE_COMMITS:
+            break
     return {
         "available": True,
         "count": len(rows),
         "subjects": subjects,
-        "notable": (notable or subjects)[:MAX_NOTABLE_COMMITS],
+        "notable": diverse or notable[:MAX_NOTABLE_COMMITS] or subjects[:MAX_NOTABLE_COMMITS],
         "authors": authors,
         "latest": subjects[0] if subjects else "",
     }
+
+
+_THEME_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("event content", re.compile(r"\bevents?\b|super[- ]event", re.I)),
+    ("restoring older content", re.compile(r"restor", re.I)),
+    ("scripting", re.compile(r"script|trigger|effect", re.I)),
+    ("decisions", re.compile(r"decision", re.I)),
+    ("AI behaviour", re.compile(r"\bai\b|ai_", re.I)),
+    ("localisation and wording", re.compile(r"localis|loc\b|wording|tooltip|text", re.I)),
+    ("interface and logs", re.compile(r"\bui\b|interface|event log", re.I)),
+    ("art and portraits", re.compile(r"\bart\b|icon|portrait|picture|render", re.I)),
+    ("bug fixes", re.compile(r"\bfix|bug", re.I)),
+)
+
+
+async def git_themes(
+    repo: Path,
+    *,
+    since_days: int = DIGEST_WINDOW_DAYS,
+    limit: int = 6,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    rev: str = "HEAD",
+) -> list[dict[str, Any]]:
+    """How many commits touch each theme.
+
+    Areas say where files went; themes say what the work was about. Event work and art both produce large
+    diffs, so the digest needs the subjects read as a whole, not a handful of samples.
+    """
+    code, out, _ = await _run(
+        ["git", "log", rev, *_git_window_args(since_days=since_days, since=since, until=until), "--pretty=%s"],
+        cwd=repo,
+    )
+    if code != 0:
+        return []
+    subjects = [line for line in out.splitlines() if line.strip()]
+    counted: list[dict[str, Any]] = []
+    for label, pattern in _THEME_RULES:
+        n = sum(1 for s in subjects if pattern.search(s))
+        if n:
+            counted.append({"theme": label, "commits": n})
+    counted.sort(key=lambda item: item["commits"], reverse=True)
+    return counted[:limit]
+
+
+def themes_facts_line(themes: list[dict[str, Any]]) -> str:
+    if not themes:
+        return "not available"
+    return ", ".join(f"{t['theme']} ({t['commits']})" for t in themes)
 
 
 def area_label(path: str) -> str | None:
@@ -301,21 +415,27 @@ def area_label(path: str) -> str | None:
     return "other content"
 
 
-def size_band(files: int) -> str:
+def size_band(weight: int) -> str:
     """Plain-language weight of an area, so the model can order emphasis without quoting statistics."""
-    if files >= 1000:
+    if weight >= 120:
         return "took most of the week's work"
-    if files >= 250:
+    if weight >= 60:
         return "took a large share of the week"
-    if files >= 50:
+    if weight >= 25:
         return "saw solid work"
-    if files >= 10:
+    if weight >= 8:
         return "saw a few changes"
     return "was touched lightly"
 
 
 async def git_change_areas(
-    repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS, limit: int = 8
+    repo: Path,
+    *,
+    since_days: int = DIGEST_WINDOW_DAYS,
+    limit: int = 8,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    rev: str = "HEAD",
 ) -> list[dict[str, Any]]:
     """Where the week's changes actually landed, biggest first.
 
@@ -323,17 +443,27 @@ async def git_change_areas(
     internal audit commits naming one event), so the digest weights its story by changed files instead.
     """
     code, out, _ = await _run(
-        ["git", "log", f"--since={since_days} days ago", "--name-only", "--pretty=format:"], cwd=repo
+        ["git", "log", rev, *_git_window_args(since_days=since_days, since=since, until=until), "--name-only",
+         "--pretty=format:@@%h"],
+        cwd=repo,
     )
     if code != 0:
         return []
+    # Count COMMITS per area, not files. One bulk icon export touches thousands of .dds files and used to
+    # dominate the digest, so a week of systems work was reported as "focus tree icons took the biggest slice"
+    # (Hoops, 2026-10-19). A commit counts once per area however many files it carries.
     counts: dict[str, int] = {}
+    seen_areas: set[str] = set()
     for line in out.splitlines():
+        if line.startswith("@@"):
+            seen_areas = set()
+            continue
         label = area_label(line)
-        if label:
+        if label and label not in seen_areas:
+            seen_areas.add(label)
             counts[label] = counts.get(label, 0) + 1
     ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[: max(1, limit)]
-    return [{"area": label, "files": files, "band": size_band(files)} for label, files in ranked]
+    return [{"area": label, "commits": commits, "band": size_band(commits)} for label, commits in ranked]
 
 
 def change_area_facts_line(areas: list[dict[str, Any]]) -> str:
@@ -342,8 +472,17 @@ def change_area_facts_line(areas: list[dict[str, Any]]) -> str:
     return "; ".join(f"{row.get('area')} ({row.get('band')})" for row in areas)
 
 
-async def git_files_touched(repo: Path, *, since_days: int = DIGEST_WINDOW_DAYS, prefix: str = "") -> int:
-    args = ["git", "log", f"--since={since_days} days ago", "--name-only", "--pretty=format:"]
+async def git_files_touched(
+    repo: Path,
+    *,
+    since_days: int = DIGEST_WINDOW_DAYS,
+    prefix: str = "",
+    since: datetime | None = None,
+    until: datetime | None = None,
+    rev: str = "HEAD",
+) -> int:
+    args = ["git", "log", rev, *_git_window_args(since_days=since_days, since=since, until=until), "--name-only",
+            "--pretty=format:"]
     if prefix:
         args += ["--", prefix]
     code, out, _ = await _run(args, cwd=repo)
@@ -361,8 +500,8 @@ async def git_commits_between(repo: Path, *, old_sha: str, new_sha: str = "HEAD"
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-async def git_head_sha(repo: Path) -> str:
-    code, out, _ = await _run(["git", "rev-parse", "--short", "HEAD"], cwd=repo)
+async def git_head_sha(repo: Path, *, rev: str = "HEAD") -> str:
+    code, out, _ = await _run(["git", "rev-parse", "--short", rev], cwd=repo)
     return out.strip() if code == 0 else ""
 
 
@@ -379,13 +518,22 @@ async def descriptor_version(repo: Path) -> str:
     return match.group(1).strip() if match else ""
 
 
-async def github_issue_activity(repo_slug: str, *, since_days: int = DIGEST_WINDOW_DAYS) -> dict[str, Any]:
+async def github_issue_activity(
+    repo_slug: str,
+    *,
+    since_days: int = DIGEST_WINDOW_DAYS,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> dict[str, Any]:
     """Issues touched in the window, via the authenticated gh CLI (same path as /issue)."""
-    since = (utcnow() - timedelta(days=since_days)).strftime("%Y-%m-%d")
+    since = (since or (utcnow() - timedelta(days=since_days))).strftime("%Y-%m-%d")
+    search = f"updated:>={since}"
+    if until is not None:
+        search += f" updated:<{until.astimezone(timezone.utc).strftime('%Y-%m-%d')}"
     code, out, err = await _run(
         [
             "gh", "issue", "list", "--repo", repo_slug, "--state", "all",
-            "--search", f"updated:>={since}", "--limit", str(MAX_ISSUE_TITLES * 3),
+            "--search", search, "--limit", str(MAX_ISSUE_TITLES * 3),
             "--json", "number,title,state,updatedAt",
         ]
     )
@@ -508,7 +656,7 @@ def community_facts_line(captures: list[dict[str, Any]]) -> str:
     return "; ".join(parts) if parts else "no member event ideas or suggestions were submitted this week"
 
 
-def server_facts_line(server: dict[str, Any]) -> str:
+def server_facts_line(server: dict[str, Any], *, include_online: bool = True) -> str:
     """Server-side facts, skipping zeros so a quiet week does not read as a wall of 0s.
 
     The member count comes from Discord (`GuildCounts`), never from the bot's `users` table: that table
@@ -529,7 +677,10 @@ def server_facts_line(server: dict[str, Any]) -> str:
     if members and str(server.get("members_source") or "discord") == "discord":
         online = server.get("online")
         label = f"{members} members in the server"
-        if isinstance(online, int) and online >= 0:
+        # Public posts never name the online count: Hoops, 2026-09-23 - "the how many online information
+        # will get outdated very quick so it shouldnt be included." The member count moves slowly; the
+        # online count is stale within minutes.
+        if include_online and isinstance(online, int) and online >= 0:
             label += f" ({online} online right now)"
         parts.append(label)
     return ", ".join(parts) if parts else "no tracked server activity in this window"
@@ -553,6 +704,95 @@ def issues_facts_line(issues: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+_ONLINE_RE = re.compile(
+    r"(?P<pre>[,.\s]|\band\b|\bwith\b|\bwhile\b)*(?P<count>\d[\d,]*)\s*(?:members?|people|users)?\s*"
+    r"online(?:\s+right\s+now)?(?P<post>[).,])?",
+    re.IGNORECASE,
+)
+
+
+def strip_online_count(text: str) -> str:
+    """Remove any "N online right now" figure from a public post.
+
+    Belt-and-braces for Hoops' rule that the online count is too volatile for a weekly digest: the facts
+    line no longer carries it and the prompt forbids it, and this catches the model adding it anyway.
+    """
+    lines_out: list[str] = []
+    for line in str(text or "").splitlines():
+        cleaned = _ONLINE_RE.sub("", line)
+        # tidy what the removal leaves behind: stray brackets, doubled separators, dangling dashes
+        if cleaned.count("(") != cleaned.count(")"):
+            excess = cleaned.count("(") - cleaned.count(")")
+            if excess > 0:
+                cleaned = cleaned.replace("(", "", excess)
+            else:
+                cleaned = cleaned.replace(")", "", -excess)
+        cleaned = re.sub(r"\(\s*\)", "", cleaned)
+        cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
+        cleaned = re.sub(r"([,;:])\s*(?=[,;:.!?])", "", cleaned)
+        cleaned = re.sub(r"\s+-\s*-\s+", " - ", cleaned)
+        cleaned = re.sub(r"\s+-\s+(?=[.,;:]|$)", "", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        lines_out.append(cleaned)
+    return "\n".join(lines_out)
+
+
+def iso_week_start(moment: datetime) -> datetime:
+    """Monday 00:00 UTC of the week `moment` falls in."""
+    moment = moment.astimezone(timezone.utc)
+    start = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start - timedelta(days=start.weekday())
+
+
+def iso_week_key(moment: datetime) -> str:
+    """The ISO week key of `moment` (`2026-W38`), the same shape the routine-post guard stores."""
+    iso = moment.astimezone(timezone.utc).isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def last_complete_week(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """(start, end) of the last complete ISO week: Monday 00:00 to the next Monday 00:00, UTC.
+
+    Hoops (2026-09-23) chose this over a rolling window so the post's dates, its ISO-week key and the
+    Monday-noon schedule all describe the same week.
+    """
+    start = iso_week_start(now or utcnow()) - timedelta(days=7)
+    return start, start + timedelta(days=7)
+
+
+def digest_window_note(*, window_start: datetime, window_end: datetime) -> str:
+    """The small-print line naming the dates a digest covers ("-# Covering Mon 14 – Sun 20 September 2026").
+
+    Hoops (2026-09-23): "what week? What dates does it span to?" The reader should never have to guess, so
+    the post always states its own range.
+    """
+    start = window_start.astimezone(timezone.utc)
+    end = (window_end - timedelta(days=1)).astimezone(timezone.utc)  # inclusive: Sunday, not next Monday
+    if start.year == end.year and start.month == end.month:
+        span = f"{start.strftime('%a')} {start.day} – {end.strftime('%a')} {end.day} {end.strftime('%B %Y')}"
+    elif start.year == end.year:
+        span = f"{start.strftime('%a')} {start.day} {start.strftime('%B')} – {end.strftime('%a')} {end.day} {end.strftime('%B %Y')}"
+    else:
+        span = f"{start.strftime('%a')} {start.day} {start.strftime('%B %Y')} – {end.strftime('%a')} {end.day} {end.strftime('%B %Y')}"
+    return f"-# Covering {span}"
+
+
+def with_window_note(text: str, *, window_start: datetime, window_end: datetime) -> str:
+    """Insert the window note directly under the digest title line."""
+    lines = str(text or "").splitlines()
+    note = digest_window_note(window_start=window_start, window_end=window_end)
+    if note in lines:
+        return text
+    for index, line in enumerate(lines):
+        if line.strip():
+            lines.insert(index + 1, "")
+            lines.insert(index + 2, note)
+            break
+    else:
+        return note
+    return "\n".join(lines)
+
+
 def build_digest_prompt(*, signals: dict[str, Any], max_chars: int = DIGEST_MAX_CHARS) -> str:
     commits = signals.get("commits") or {}
     issues = signals.get("issues") or {}
@@ -563,22 +803,33 @@ def build_digest_prompt(*, signals: dict[str, Any], max_chars: int = DIGEST_MAX_
 
 Facts (use only these, invent nothing, no pings/mentions):
 - Mod version: {signals.get('version') or 'unknown'}
-- Work completed in the last {signals.get('window_days', DIGEST_WINDOW_DAYS)} days: {commits.get('count', 0)} changes
-- Where that work landed, biggest share first: {change_area_facts_line(areas)}
+- Week covered: {signals.get('window_label') or signals.get('window_start') or 'the last complete week'}
+- Work completed in that week: {commits.get('count', 0)} changes
+- Where that work landed, biggest share first (counted in commits, not files): {change_area_facts_line(areas)}
+- What the commit subjects were about, most common first: {themes_facts_line(signals.get('themes') or [])}
 - Work worth naming, in the committer's own shorthand (translate it, never quote it): 
 {_bullet(commits.get('notable') or [])}
 - GitHub issues: {issues_facts_line(issues)}
 - Playtest observations recorded this week: {playtest_facts_line(playtests)}
 - Community ideas/suggestions submitted this week: {community_facts_line(signals.get('community_captures') or [])}
-- Server activity: {server_facts_line(server)}
+- Server activity: {server_facts_line(server, include_online=False)}
 
 Audience: players, testers and friends of the mod — not programmers. Someone who has never opened the
 repo must understand every line.
 
 Hard rules:
+- The digest never names members. No thank-you list, no "most active" shout-outs, no player names - only the
+  server's member count from the facts. (Hoops, 2026-09-23: the thank-you line was removed outright.)
 - Weight the post by where the work landed, not by which subject lines are noisiest. If a large share of
   the week went into art, sound, text or scripting, say that. NEVER describe the whole week as one event
   or one task unless the facts really are that narrow. Spread the bullets over the areas that saw work.
+- Art, icons, portraits and wording are SUPPORTING detail, never the lead. One bulk art or localisation
+  export can outnumber every systems change; if the themes include event content, scripting, decisions,
+  AI or restoration, the first bullet must be about that gameplay work, with art mentioned at most as a
+  closing clause. Do not judge importance by file counts.
+- If one theme dominates the week (for example "restoring older content"), the first bullet must name that
+  work and say what actually came back in player terms (event text that had gone missing, super-event
+  recordings), not just the word "restored".
 - Describe what a player would notice ("the zombie outbreak now…", "convoys pay out correctly now").
 - NEVER use file names, paths, repo hashes, branch names, commit counts as the headline, code blocks, or
   internal shorthand/acronyms (FSM, SCN-xxx, IW-xxx, FORM-xx, MCP, receipts, audits, crosswalks). If a term
@@ -587,17 +838,29 @@ Hard rules:
   cannot verify from the post itself.
 - No pings, no invented features, versions, dates or release promises.
 
-Sections (exactly these, nothing else):
-1. Title line: "**Weekly Chaos Redux digest — <version>**"
-2. "This week in the mod" — at most 3 bullets, one line each (roughly 20 words), covering the areas that
-   saw the most work. Group related work into one bullet instead of listing every change.
-3. "From the community" — one short line: playtests, reported issues, ideas written up, server activity.
-   Always include the server's member count exactly as the facts give it (Discord's own figure); include
-   the online count when the facts give one. If the week was otherwise quiet, say so in a few words
-   instead of printing zeros.
-4. "What's next" — one short line naming the testing focus from the facts. Never promise future features,
-   say something is "coming", or give dates/release timelines.
+Sections (exactly these, nothing else, in this order, each heading on its own line):
+1. Title line: "🌟 **Weekly Chaos Redux digest — <version>** 🌟"
+2. Heading "### 🛠️ This week in the mod" followed by at most 3 bullets, one line each (roughly 20 words),
+   covering the areas that saw the most work. Group related work into one bullet instead of listing every
+   change. Every bullet MUST start with "- " and then one fitting emoji (art 🎨, models 🧊, scripting ⚙️,
+   sound 🔊, text ✍️, flags 🚩, balance ⚖️) — a Discord bullet list, never bare emoji lines.
+3. Heading "### 💬 From the community" followed by one short line: playtests, reported issues, ideas
+   written up, server activity.
+   Always include the server's member count exactly as the facts give it (Discord's own figure). NEVER
+   mention how many members are online right now - that number is stale within minutes of posting, so the
+   public digest never carries it. If the week was otherwise quiet, say so in a few words instead of
+   printing zeros.
+4. Heading "### 🔎 What's next" followed by one short line naming the testing focus from the facts.
+   Never mention plans, notes, audits, checklists, validation or internal documents: say what players can
+   look at next, or what is being finished from this week's work. Do NOT
+   start that line with 🔎 (or any emoji) — the heading already carries it, and a repeated emoji looks like
+   a mistake. Never
+   promise future features, say something is "coming", or give dates/release timelines.
 
+Emoji are for orientation only: one per heading as above, at most one per bullet, never a wall of them.
+NEVER repeat a heading's emoji at the start of a line directly under it (no "### 🔎 What's next" followed by
+"🔎 …"); the heading emoji belongs to the heading alone.
+Blank line between sections; no section may sit inside another; never end a bullet mid-word.
 Keep the whole post under {max_chars} characters and keep it tight — Hoops called the previous digest
 bloated. Short and concrete beats complete. Plain Discord markdown."""
 
@@ -621,19 +884,19 @@ def digest_fallback(signals: dict[str, Any]) -> str:
     else:
         work_line = f"- {commits.get('count', 0)} changes landed in the last {window} days."
     lines = [
-        f"**Weekly Chaos Redux digest** — {signals.get('version') or 'in development'}",
+        f"🌟 **Weekly Chaos Redux digest** — {signals.get('version') or 'in development'} 🌟",
         "",
-        "**This week in the mod**",
+        "**🛠️ This week in the mod**",
         work_line,
-        "- Details are in the repo history if you want the technical view.",
+        "- 📜 Details are in the repo history if you want the technical view.",
         "",
-        "**From the community**",
+        "**💬 From the community**",
         (
             f"- {playtest_facts_line(playtests)}; {community_facts_line(signals.get('community_captures') or [])}; "
-            f"{issues_facts_line(issues)}; {server_facts_line(server)}"
+            f"{issues_facts_line(issues)}; {server_facts_line(server, include_online=False)}"
         ),
         "",
-        "**What's next**",
+        "**🔎 What's next**",
         "- Testing focus stays open until the current area is confirmed; the digest updates weekly.",
     ]
     if repo:

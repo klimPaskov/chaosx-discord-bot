@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -655,6 +655,124 @@ async def mark_messages_admin(db_path: Path, message_ids: list[int]) -> None:
         return
 
 
+async def server_memory_for(
+    db_path: Path,
+    *,
+    limit: int = 12,
+    scope: str = "public",
+    channel_names: dict[int, str] | None = None,
+    skip_channel_ids: set[int] | None = None,
+    max_chars: int = 1200,
+    excerpt_chars: int = 160,
+    since_hours: float | None = None,
+) -> str:
+    """Recent public activity across the whole server, oldest first.
+
+    A question asked in voice or in one channel may refer to something said anywhere in the server, so both
+    paths get this block. ``skip_channel_ids`` avoids repeating channels that are already supplied in full,
+    and admin-scope rows are never included outside admin scope.
+    """
+    visibility_filter = "" if scope == "admin" else "AND visibility = 'public'"
+    skip = set(skip_channel_ids or set())
+    try:
+        await _ensure_schema(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            time_filter = ""
+            params: list[object] = []
+            if since_hours:
+                cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=float(since_hours))
+                time_filter = "AND created_at >= ?"
+                params.append(cutoff.isoformat(timespec="seconds"))
+            params.append(max(limit * 4, 40))
+            rows = await (
+                await db.execute(
+                    f"SELECT id, channel_id, author_name, content FROM message_archive "
+                    f"WHERE 1 {visibility_filter} {time_filter} ORDER BY id DESC LIMIT ?",
+                    params,
+                )
+            ).fetchall()
+    except Exception:
+        return ""
+
+    names = channel_names or {}
+    selected: list[aiosqlite.Row] = []
+    for row in rows:  # newest first
+        if int(row["channel_id"]) in skip:
+            continue
+        selected.append(row)
+        if len(selected) >= limit:
+            break
+
+    lines: list[str] = []
+    total = 0
+    for row in reversed(selected):  # show chronologically
+        label = names.get(int(row["channel_id"])) or f"channel {row['channel_id']}"
+        line = (
+            f"- #{label} \u00b7 {row['author_name']}: "
+            + redact_internal_infrastructure(_excerpt(row["content"], excerpt_chars))
+        )
+        total += len(line) + 1
+        if total > max_chars:
+            break
+        lines.append(line)
+    if not lines:
+        return ""
+    return "Recent server activity (other channels):\n" + "\n".join(lines)
+
+
+async def record_voice_exchange(
+    db_path: Path,
+    *,
+    guild_id: int | None,
+    channel_id: int,
+    user_id: int,
+    user_name: str,
+    question: str,
+    answer: str,
+    allowed_guild_id: int | None,
+    bot_user_id: int = 0,
+    created_at: str,
+    memory_channel_id: int | None = None,
+) -> None:
+    """Archive a spoken question and the bot's spoken answer as ordinary memory rows.
+
+    Voice goes into the same durable archive text chat uses, so a conversation survives everyone leaving
+    the channel, the per-user profile maintenance learns from it, and a text ask in the memory channel
+    sees what was said out loud. Synthetic negative ids keep these rows clear of real Discord ids.
+    """
+    target = int(memory_channel_id or channel_id)
+    stamp = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    if question.strip():
+        await capture_message(
+            db_path,
+            guild_id=guild_id,
+            channel_id=target,
+            author_id=user_id,
+            author_name=user_name or str(user_id),
+            content=f"[voice] {question.strip()}"[:2000],
+            created_at=created_at,
+            is_bot_self=False,
+            allowed_guild_id=allowed_guild_id,
+            message_id=-stamp,
+            visibility="public",
+        )
+    if answer.strip():
+        await capture_message(
+            db_path,
+            guild_id=guild_id,
+            channel_id=target,
+            author_id=bot_user_id or user_id,
+            author_name="ChaosX",
+            content=f"[voice] {answer.strip()}"[:2000],
+            created_at=created_at,
+            is_bot_self=True,
+            allowed_guild_id=allowed_guild_id,
+            message_id=-(stamp + 1),
+            visibility="public",
+        )
+
+
 async def conversation_context_for(
     db_path: Path,
     channel_id: int,
@@ -695,11 +813,13 @@ async def conversation_context_for(
             "Channel memory (compacted summary):\n"
             + redact_internal_infrastructure(str(summary_row["summary"]).strip())
         )
-    kept = [row for row in reversed(rows) if row["id"] != exclude_message_id]
+    # rows arrive newest-first: take the newest window, then show it in chronological order. Reversing
+    # before slicing used to keep the oldest messages and trim the newest ones away.
+    kept = list([row for row in rows if row["id"] != exclude_message_id][:window])[::-1]
     if kept:
         lines = [
             f"- {row['author_name']}: {redact_internal_infrastructure(_excerpt(row['content']))}"
-            for row in kept[:window]
+            for row in kept
         ]
         parts.append("Recent conversation:\n" + "\n".join(lines))
     return "\n\n".join(parts)
@@ -734,7 +854,9 @@ async def user_history_for(
             ).fetchall()
     except Exception:
         return ""
-    kept = [row for row in list(rows)[::-1] if row["id"] != exclude_message_id]
+    # Same rule as the channel block: the newest messages are the ones worth remembering, so select
+    # them first and only then trim for length (oldest goes first).
+    kept = list([row for row in rows if row["id"] != exclude_message_id][:limit])[::-1]
     if not kept:
         return ""
     lines: list[str] = []
