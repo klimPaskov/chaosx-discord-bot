@@ -379,7 +379,9 @@ class Knowledge:
             lines.append(item)
         return "\n".join(lines)
 
-    def _excerpt_for_terms(self, path: str, terms: list[str], window: int = 900) -> str:
+    def _excerpt_for_terms(
+        self, path: str, terms: list[str], window: int = 900, anchors: list[str] | None = None
+    ) -> str:
         """A passage from `path` centred on the most specific query term the document contains.
 
         FTS snippets window around the *first* match, which for a README is the badge header — the line
@@ -398,7 +400,10 @@ class Knowledge:
             return ""
         lowered = content.lower()
         anchor = 0
-        for term in sorted(terms, key=len, reverse=True):
+        # A caller-supplied anchor (the project term the question carried) beats the longest query word:
+        # "how do I debug a crash?" centred on "debug" and never showed the crash passage at all.
+        ordered = list(anchors or []) + sorted(terms, key=len, reverse=True)
+        for term in ordered:
             if len(term) < 4:
                 continue
             index = lowered.find(term)
@@ -410,7 +415,13 @@ class Knowledge:
         passage = re.sub(r"[ \t]+", " ", passage).strip()
         return f" … {passage}" if start else passage
 
-    def public_ask_context(self, query: str, limit: int = 6, include_sources: bool = False) -> str:
+    def public_ask_context(
+        self,
+        query: str,
+        limit: int = 6,
+        include_sources: bool = False,
+        anchors: list[str] | None = None,
+    ) -> str:
         """Return internal retrieval snippets for public /ask.
 
         Broad ask may use specs and planning docs for accuracy, but user-facing
@@ -427,7 +438,7 @@ class Knowledge:
         total = 0
         seen_snips: set[str] = set()
         for i, (path, source_class, snip, _rank) in enumerate(rows, 1):
-            clean = self._excerpt_for_terms(path, terms) or _clean_snippet(snip)
+            clean = self._excerpt_for_terms(path, terms, anchors=anchors) or _clean_snippet(snip)
             if not clean:
                 continue
             # Duplicate chunks (same doc indexed under several paths) add length, not information.

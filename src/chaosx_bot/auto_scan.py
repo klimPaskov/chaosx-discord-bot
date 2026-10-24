@@ -442,6 +442,7 @@ AUTO_SCAN_WEAK_TERMS = {
     "country",
     "download",
     "equipment",
+    "ideas",
     "map",
     "model",
     "music",
@@ -663,7 +664,10 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     # required. The old branch accepted ANY grounded signal, and "mod"/"modding" live in that set, so
     # "minecraft mods are fun" and "is modding hard?" both reached an answer; a bare generic word must not
     # be enough to speak up uninvited.
-    if not (gating_domain_terms(question) or CATALOG_NAME_INTENT_RE.search(question)):
+    specific = specific_domain_terms(question)
+    strong = gating_domain_terms(question)
+    weak_only = bool(specific) and not strong
+    if not (strong or CATALOG_NAME_INTENT_RE.search(question) or weak_only):
         return AutoScanDecision("none")
     if mentions_other_game(question):
         return AutoScanDecision("none")
@@ -679,8 +683,15 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     # silent. This lets mod-related questions like "What is this zombie
     # event id?" be answered even when they never literally say "mod".
     context_lookup = getattr(knowledge, "public_ask_context", None)
-    context = str(context_lookup(question)) if callable(context_lookup) else ""
-    if context.strip() and specific_term_in_context(question, context):
+    anchors = specific_domain_terms(question)
+    try:
+        context = str(context_lookup(question, anchors=anchors)) if callable(context_lookup) else ""
+    except TypeError:  # a lookup without the anchors hook (tests, older fakes)
+        context = str(context_lookup(question)) if callable(context_lookup) else ""
+    if context.strip() and (
+        specific_term_in_context(question, context)
+        or (weak_only and context_overlap_terms(question, context) >= 2)
+    ):
         return AutoScanDecision(
             "answer",
             confidence=100,
