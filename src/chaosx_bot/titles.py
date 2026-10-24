@@ -34,8 +34,30 @@ Rules:
 Answer with the title alone, nothing else."""
 
 
-def fallback_title(*, tier: str, messages: int, contributions: int, active_days: int) -> str:
-    """A deterministic pompous title when no model is available (or declined)."""
+LADDER_FALLBACK_FORMS = (
+    "Herald of the Ladder",
+    "Chronicler of the Chaos Record",
+    "Marshal of the Rising Tide",
+    "Chancellor of the Endless Thread",
+)
+
+_ORDINALS = ("Second", "Third", "Fourth", "Fifth", "Sixth")
+
+
+def fallback_title(
+    *, tier: str, messages: int, contributions: int, active_days: int, slot: int = 0
+) -> str:
+    """A deterministic pompous title when no model is available (or declined).
+
+    `slot` keeps a member's ladder titles apart: the first title keeps the classic form, and later ones
+    are worded as "Second Herald of the Ladder, World Collapse Class" and so on, so a member never shows
+    the same title twice even when every model call fails.
+    """
+    if slot > 0:
+        form = LADDER_FALLBACK_FORMS[(slot - 1) % len(LADDER_FALLBACK_FORMS)]
+        ordinal = _ORDINALS[slot - 1] if slot - 1 < len(_ORDINALS) else f"Number {slot + 1}"
+        stamp = f"{tier} Class" if tier else ""
+        return ", ".join(part for part in (f"{ordinal} {form}", stamp) if part)
     if contributions >= 3:
         return "Grand Architect of Ideas"
     if messages >= 200:
