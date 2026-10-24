@@ -117,6 +117,57 @@ def scrub_names(text: str, names: Iterable[str], replacement: str = "a member") 
     return cleaned
 
 
+# --- Discord markdown repair -------------------------------------------------
+# Model-written answers keep producing markdown Discord renders badly: `####` headings, a heading glued
+# to the paragraph above it, `[source]` citations that look like broken links, and bare identifiers
+# (`hoi4_portrait_source.json`) whose underscores Discord turns into italics. Hoops (2026-10-24):
+# "the bot has broken markdown formatting when it is responding." Repair it before sending instead of
+# hoping the prompt is obeyed.
+_CODE_SEGMENT_RE = re.compile(r"(```.*?```|`[^`\n]*`)", re.S)
+_DEEPER_HEADING_RE = re.compile(r"(?m)^#{4,}\s*")
+_GLUED_HEADING_RE = re.compile(r"(?m)([^\n])\n(#{1,3} )")
+_CITATION_RE = re.compile(r"(?<![\w\]`])\[([^\]\n]{2,60})\](?!\()")
+_UNDERSCORE_IDENT_RE = re.compile(
+    r"(?<![\w`./\\-])([A-Za-z0-9][\w./\\-]*_[A-Za-z0-9_./\\-]+)(?![\w`])"
+)
+
+
+def _repair_prose(segment: str) -> str:
+    segment = _GLUED_HEADING_RE.sub(r"\1\n\n\2", segment)
+    segment = _DEEPER_HEADING_RE.sub("### ", segment)
+    segment = _CITATION_RE.sub(lambda m: f"`{m.group(1).strip()}`", segment)
+    segment = _UNDERSCORE_IDENT_RE.sub(lambda m: f"`{m.group(1)}`", segment)
+    return segment
+
+
+def repair_discord_markdown(text: str) -> str:
+    """Make model-written markdown render correctly in Discord.
+
+    Code spans and fenced blocks are left byte-for-byte alone, so a path or command that is already
+    backticked cannot be double-wrapped. Never raises: formatting must not cost a member their answer.
+    """
+    try:
+        body = str(text or "")
+        if not body:
+            return body
+        parts = _CODE_SEGMENT_RE.split(body)
+        repaired = "".join(
+            part if index % 2 else _repair_prose(part) for index, part in enumerate(parts)
+        )
+        repaired = re.sub(r"\n{3,}", "\n\n", repaired).strip()
+        # An odd number of `**` leaves bold open to the end of the message: close it on that line.
+        if repaired.count("**") % 2:
+            lines = repaired.split("\n")
+            for index, line in enumerate(lines):
+                if line.count("**") % 2:
+                    lines[index] = line.rstrip() + "**"
+                    break
+            repaired = "\n".join(lines)
+        return repaired
+    except Exception:  # pragma: no cover - defensive
+        return str(text or "")
+
+
 def block(*parts: object) -> str:
     """Join message parts with a blank line between them, dropping anything empty.
 

@@ -297,7 +297,17 @@ from .activity import (
     tier_progress,
     voting_weight,
 )
-from .formatting import block, bullets, heading, kv, numbered, scrub_names, section, small
+from .formatting import (
+    block,
+    bullets,
+    heading,
+    kv,
+    numbered,
+    repair_discord_markdown,
+    scrub_names,
+    section,
+    small,
+)
 from .guild_stats import GuildCountsCache
 from .routine_posts import (
     refresh_repo,
@@ -608,6 +618,12 @@ def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | 
 
 
 def _chunk(text: str, limit: int = 1900) -> list[str]:
+    """Split a long answer into Discord-sized parts without breaking markdown.
+
+    A split inside a fenced code block used to leave the second message with an unterminated fence, so
+    everything after the cut rendered as code. Each part now closes the fence it inherited and reopens it
+    with the same language on the next part.
+    """
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -620,7 +636,19 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
             cut = limit
         chunks.append(text[:cut])
         text = text[cut:].lstrip()
-    return chunks
+
+    balanced: list[str] = []
+    open_fence = ""
+    for chunk in chunks:
+        body = f"{open_fence}\n{chunk}" if open_fence else chunk
+        fences = re.findall(r"(?m)^```(\w*)", body)
+        if len(fences) % 2:
+            open_fence = "```" + fences[-1]
+            body = f"{body.rstrip()}\n```"
+        else:
+            open_fence = ""
+        balanced.append(body)
+    return balanced
 
 
 def _profile_excerpt(profile: str, limit: int = 240) -> str:
@@ -741,7 +769,7 @@ def sanitize_public_ask_output(output: str) -> str:
         return PUBLIC_ASK_REDIRECT
     if looks_like_code_dump(cleaned):
         return PUBLIC_ASK_REDIRECT
-    return redact_internal_infrastructure(cleaned)
+    return repair_discord_markdown(redact_internal_infrastructure(cleaned))
 
 
 def looks_like_code_dump(text: str) -> bool:
