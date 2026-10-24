@@ -22,7 +22,13 @@ CHAT_MESSAGE = (
     "I feel like using deepseek official api will be cheaper than third party provider?"
 )
 
-CONTEXT = "1. … New Ore — whoever controls the state gains access to it"
+# A realistic retrieval result: the fixture has to look like what the live index returns for a project
+# question (it names the mod, its events, clusters, playtests and hoi4 mechanics), because the gate now asks
+# whether a specific project term from the message actually appears in what was retrieved.
+CONTEXT = (
+    "1. … New Ore — whoever controls the state gains access to it; the mod adds this event chain.\n"
+    "2. … the Zombie Outbreak event, clusters, the next playtest queue and hoi4 mechanics."
+)
 
 
 def _settings() -> Settings:

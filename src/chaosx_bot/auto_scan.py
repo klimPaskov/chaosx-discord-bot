@@ -33,14 +33,51 @@ AUTO_SCAN_QUESTION_TERMS = {
 AUTO_SCAN_DOMAIN_TERMS = {
     "chaos redux",
     "chaosx",
+    "chaos meter",
+    "chaos",
+    "meter",
+    "world end",
+    "world-end",
+    "evolution stage",
     "hoi4",
     "hearts of iron",
     "mod",
+    "modding",
     "event",
+    "event chain",
     "scenario",
     "cluster",
+    "focus tree",
+    "national focus",
+    "focus",
+    "decision",
+    "scripted gui",
+    "gui",
+    "localisation",
+    "localization",
+    "portrait",
+    "icon",
+    "3d model",
+    "model",
+    "map",
+    "state",
+    "province",
+    "division",
+    "template",
+    "save game",
+    "save",
+    "error log",
+    "crash",
+    "game rule",
+    "compatibility",
+    "load order",
+    "balance",
+    "ai",
     "testing",
     "playtest",
+    "tier",
+    "ladder",
+    "ideas",
     "bug",
     "issue",
     "suggestion",
@@ -50,21 +87,59 @@ AUTO_SCAN_DOMAIN_TERMS = {
     "reaction role",
     "community",
     "comfyui",
+    "comfyui workflow",
     "mcp",
+    "agent tools",
+    "live tools",
+    "hoi4 mod setup",
+    "mod setup",
     "hoi4 agent tools",
     "agentic modding",
     "agentic",
     "codex",
     "hermes agent",
     "lora",
+    "lora training",
+    "runpod",
     "workflow json",
+    "steam workshop",
+    "workshop",
+    "tutorial",
+    "walkthrough",
+    "devlog",
+    "discord invite",
+    "invite",
+    "roadmap",
+    "changelog",
+    "version",
+    "update",
+    "release",
+    "download",
+    "soundtrack",
+    "ko-fi",
+    "kofi",
+    "donation",
+    "donations",
+    "patreon",
+    "support the project",
+    "music",
+    "loading screen",
+    "country",
+    "wargoal",
+    "frontline",
+    "navy",
+    "airforce",
+    "equipment",
 }
 AUTO_SCAN_GROUNDED_CONTEXT_TERMS = {
     "chaos redux",
     "chaosx",
+    "chaos",
+    "chaos meter",
     "hoi4",
     "hearts of iron",
     "mod",
+    "modding",
 }
 AUTO_SCAN_BLOCK_TERMS = {
     "ignore previous",
@@ -176,24 +251,183 @@ def is_question_like(content: str) -> bool:
     return bool(QUESTION_PREFIX_RE.search(text))
 
 
-def _contains_normalized_phrase(text: str, phrase: str) -> bool:
-    """Phrase match with plural tolerance.
+def _token_stems(token: str) -> set[str]:
+    """Candidate stems for one token, so inflection stops mattering.
 
-    Members write "mcps", "mods", "workflows", not the singular the term list uses, and an exact
-    space-delimited match missed them: "what are the mcps used for?" carried no domain signal at all, so
-    the bot stayed silent on a plain project question (Hoops, 2026-10-24). "s" covers almost every case;
-    "es" is only added for sibilant endings so "mod" never matches "modes".
+    A candidate set rather than one stem: "modes" yields {modes, mode} and "mod" yields {mod}, so the two
+    never collide; "mods" yields {mods, mod} and matches. Handles plurals ("mcps", "focuses"), gerunds
+    ("modding") and past tense ("tested"), including the doubled-consonant forms.
+    """
+    word = token.strip("'\"")
+    stems = {word}
+    if not word or len(word) <= 2:
+        return stems
+    if word.endswith("'s") and len(word) > 4:
+        stems.add(word[:-2])
+    if word.endswith("ies") and len(word) > 4:
+        stems.add(word[:-3] + "y")
+    if word.endswith("es") and len(word) > 3:
+        # "boxes"/"matches"/"focuses" lose the whole "es"; "modes"/"houses" only lose the "s", so a
+        # candidate like "mod" is never produced from "modes".
+        stems.add(word[:-1])
+        if word[:-2].endswith(("s", "x", "z", "ch", "sh")):
+            stems.add(word[:-2])
+    elif word.endswith("s") and len(word) > 3 and not word.endswith(("ss", "us", "is")):
+        stems.add(word[:-1])
+    if word.endswith("ss") and len(word) > 4:
+        stems.add(word[:-1])
+    if word.endswith("ing") and len(word) > 5:
+        stem = word[:-3]
+        stems.add(stem)
+        if len(stem) > 3 and stem[-1] == stem[-2]:
+            stems.add(stem[:-1])
+    if word.endswith("ed") and len(word) > 4:
+        stem = word[:-2]
+        stems.add(stem)
+        if len(stem) > 3 and stem[-1] == stem[-2]:
+            stems.add(stem[:-1])
+    return {stem for stem in stems if stem}
+
+
+def _tokens_match(left: str, right: str) -> bool:
+    return bool(_token_stems(left) & _token_stems(right))
+
+
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    """Stem-aware phrase match over already-normalized text.
+
+    Members write "mcps", "chaos meters", "focuses", "modding" — not the singular the term list uses, and
+    the old exact space-delimited comparison silently dropped those messages: "what are the mcps used
+    for?" and "what modes does the chaos meter have?" carried no domain signal and got no answer at all
+    (Hoops, 2026-10-24).
     """
     normalized_phrase = normalize_scan_text(phrase)
     if not normalized_phrase:
         return False
-    haystack = f" {text} "
-    if f" {normalized_phrase} " in haystack:
+    if f" {normalized_phrase} " in f" {text} ":
         return True
-    if f" {normalized_phrase}s " in haystack:
-        return True
-    if normalized_phrase.endswith(("s", "x", "z", "ch", "sh")):
-        return f" {normalized_phrase}es " in haystack
+    term_tokens = normalized_phrase.split()
+    haystack = text.split()
+    span = len(term_tokens)
+    if span > len(haystack):
+        return False
+    for start in range(0, len(haystack) - span + 1):
+        if all(
+            _tokens_match(haystack[start + offset], term_tokens[offset])
+            for offset in range(span)
+        ):
+            return True
+    return False
+
+
+# Other games come up constantly in a HOI4 community; a question about one of them is not a Chaos Redux
+# question and must never be answered uninvited just because it says "mod" or "map".
+OTHER_GAME_TERMS = frozenset(
+    {
+        "minecraft",
+        "factorio",
+        "stellaris",
+        "europa universalis",
+        "eu4",
+        "crusader kings",
+        "ck3",
+        "victoria 3",
+        "victoria3",
+        "rimworld",
+        "cities skylines",
+        "terraria",
+        "skyrim",
+        "fallout",
+        "gta",
+        "fortnite",
+        "valorant",
+        "league of legends",
+        "dota",
+        "world of warcraft",
+        "age of empires",
+        "total war",
+        "civilization",
+        "baldurs gate",
+        "cyberpunk",
+        "satisfactory",
+        "oxygen not included",
+        "project zomboid",
+        "mount and blade",
+        "hearts of iron 3",
+        "hoi3",
+        "darkest hour",
+        "kaserreich",
+        "kaiserreich",
+        "the new order",
+        "tno",
+        "old world blues",
+        "owb",
+    }
+)
+PROJECT_ANCHOR_TERMS = ("chaos redux", "chaosx", "chaos meter", "chaos")
+
+
+def mentions_other_game(content: str) -> bool:
+    """True when the message is about another game and says nothing anchoring it to this project."""
+    text = normalize_scan_text(content)
+    if any(_contains_normalized_phrase(text, term) for term in PROJECT_ANCHOR_TERMS):
+        return False
+    return any(_contains_normalized_phrase(text, term) for term in OTHER_GAME_TERMS)
+
+
+# The retrieval below never comes back empty (it falls back to a fixed digest), so "context is non-empty"
+# is not evidence that the message was about the project. Require real lexical overlap with what came back.
+CONTEXT_STOPWORDS = frozenset(
+    {
+        "about", "after", "again", "also", "another", "any", "anyone", "anything", "are", "because",
+        "been", "before", "being", "both", "can", "could", "does", "doing", "done", "down", "each",
+        "even", "ever", "every", "from", "have", "having", "here", "how", "into", "just", "know",
+        "like", "make", "many", "more", "most", "much", "must", "need", "only", "other", "over",
+        "please", "quick", "really", "should", "some", "something", "still", "such", "than", "that",
+        "their", "them", "then", "there", "these", "they", "thing", "things", "this", "those",
+        "through", "today", "under", "very", "want", "well", "were", "what", "when", "where", "which",
+        "while", "will", "with", "would", "your", "yours", "youre", "thanks", "thank", "hello",
+        "sorry", "okay", "yeah", "lol", "btw", "please", "current", "build", "player", "new",
+    }
+)
+
+
+def context_overlap_terms(question: str, context: str) -> int:
+    """How many distinct content words of the question appear in the retrieved context (stem-compared)."""
+    context_stems = _context_stems(context)
+    if not context_stems:
+        return 0
+    words = {
+        word
+        for word in normalize_scan_text(question).split()
+        if len(word) >= 4 and word not in CONTEXT_STOPWORDS
+    }
+    return sum(1 for word in words if _token_stems(word) & context_stems)
+
+
+def _context_stems(context: str) -> set[str]:
+    stems: set[str] = set()
+    for token in normalize_scan_text(context or "").split():
+        stems |= _token_stems(token)
+    return stems
+
+
+def specific_term_in_context(question: str, context: str) -> bool:
+    """True when a project-specific term from the message actually shows up in the retrieved context.
+
+    The retrieval always returns something (a fixed digest is the last fallback), so "the lookup was not
+    empty" proves nothing: "how do I balance my budget" and "any ideas for dinner" both came back with
+    text and were answered uninvited. What separates them from a real question is that no specific project
+    term of theirs appears in what was retrieved.
+    """
+    context_stems = _context_stems(context)
+    if not context_stems:
+        return False
+    for term in specific_domain_terms(question):
+        term_stems = {stem for token in normalize_scan_text(term).split() for stem in _token_stems(token)}
+        term_stems = {stem for stem in term_stems if len(stem) >= 3}
+        if term_stems and term_stems & context_stems:
+            return True
     return False
 
 
@@ -209,11 +443,17 @@ def has_domain_signal(content: str) -> bool:
 # reach the project-context lookup.
 AUTO_SCAN_GENERIC_DOMAIN_TERMS = {
     "access",
-    "bug",
     "community",
+    "country",
+    "download",
+    "equipment",
     "issue",
+    "model",
+    "music",
     "server",
     "suggestion",
+    "update",
+    "version",
 }
 
 
@@ -360,6 +600,8 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
         return AutoScanDecision("none")
     if is_blocked_for_auto_answer(question):
         return AutoScanDecision("none")
+    if OTHER_BOT_CONTEXT_RE.search(question):
+        return AutoScanDecision("none")
 
     explicit = _explicit_catalog_answer(question, knowledge=knowledge)
     if explicit.acted:
@@ -388,11 +630,13 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     # auto-answered with "grounded Chaos Redux question" at confidence 100.
     # Require a real project anchor, a specific second domain term, or
     # catalog-name intent before treating the lookup as grounding.
-    if not (
-        has_grounded_context_signal(question)
-        or CATALOG_NAME_INTENT_RE.search(question)
-        or specific_domain_terms(question)
-    ):
+    # A specific project term (chaos meter, focus tree, live tools, ComfyUI, ...) or catalog intent is
+    # required. The old branch accepted ANY grounded signal, and "mod"/"modding" live in that set, so
+    # "minecraft mods are fun" and "is modding hard?" both reached an answer; a bare generic word must not
+    # be enough to speak up uninvited.
+    if not (specific_domain_terms(question) or CATALOG_NAME_INTENT_RE.search(question)):
+        return AutoScanDecision("none")
+    if mentions_other_game(question):
         return AutoScanDecision("none")
 
     if STATUS_RE.search(question):
@@ -407,7 +651,7 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     # event id?" be answered even when they never literally say "mod".
     context_lookup = getattr(knowledge, "public_ask_context", None)
     context = str(context_lookup(question)) if callable(context_lookup) else ""
-    if context.strip():
+    if context.strip() and specific_term_in_context(question, context):
         return AutoScanDecision(
             "answer",
             confidence=100,
