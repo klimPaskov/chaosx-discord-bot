@@ -423,12 +423,41 @@ def specific_term_in_context(question: str, context: str) -> bool:
     context_stems = _context_stems(context)
     if not context_stems:
         return False
-    for term in specific_domain_terms(question):
+    for term in gating_domain_terms(question):
         term_stems = {stem for token in normalize_scan_text(term).split() for stem in _token_stems(token)}
         term_stems = {stem for stem in term_stems if len(stem) >= 3}
         if term_stems and term_stems & context_stems:
             return True
     return False
+
+
+# Words that are project vocabulary but also ordinary English, so on their own they do not prove the message
+# is about the project: the live index returns mod docs for "state" and "balance" no matter what the sentence
+# means, and "what state are you in" / "how do I balance my budget" were answered uninvited because of it.
+# A weak term only gates when a second specific term backs it up, or when it is part of a phrase ("chaos
+# meter", "focus tree", "save game", "error log").
+AUTO_SCAN_WEAK_TERMS = {
+    "ai",
+    "balance",
+    "country",
+    "download",
+    "equipment",
+    "map",
+    "model",
+    "music",
+    "state",
+    "update",
+    "version",
+}
+
+
+def gating_domain_terms(content: str) -> list[str]:
+    """Specific terms strong enough to justify speaking up uninvited."""
+    terms = specific_domain_terms(content)
+    strong = [term for term in terms if " " in term or term not in AUTO_SCAN_WEAK_TERMS]
+    if strong:
+        return strong
+    return terms if len(set(terms)) >= 2 else []
 
 
 def has_domain_signal(content: str) -> bool:
@@ -634,7 +663,7 @@ def classify_auto_answer(content: str, *, knowledge: Knowledge, settings: Settin
     # required. The old branch accepted ANY grounded signal, and "mod"/"modding" live in that set, so
     # "minecraft mods are fun" and "is modding hard?" both reached an answer; a bare generic word must not
     # be enough to speak up uninvited.
-    if not (specific_domain_terms(question) or CATALOG_NAME_INTENT_RE.search(question)):
+    if not (gating_domain_terms(question) or CATALOG_NAME_INTENT_RE.search(question)):
         return AutoScanDecision("none")
     if mentions_other_game(question):
         return AutoScanDecision("none")
