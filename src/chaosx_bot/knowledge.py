@@ -14,6 +14,9 @@ from .formatting import block, bullets, heading, section, small
 from .vault_index import refresh_vault_indexes, vault_indexes_are_stale
 
 LOGGER = logging.getLogger("chaosx.knowledge")
+
+# Knowledge is a frozen dataclass, so this cache lives at module level: (db path, doc path) -> lowercased text.
+_DOC_CONTENT_CACHE: dict[tuple[str, str], str] = {}
 from .indexer import (
     CatalogReadError,
     INDEX_SCHEMA_VERSION,
@@ -433,6 +436,34 @@ class Knowledge:
         """
         self.ensure_index()
         rows = self._public_ask_ranked_rows(query, limit)
+        # BM25 ordering happily returns a strong document that never mentions the subject: "what is next on
+        # the roadmap?" surfaced specs and the bot's own help video while
+        # tooling/mod-setup/docs/21_roadmap_backlog.md sat outside the window. When the caller names the
+        # subject, rows that actually contain it come first and the ranking fills the rest.
+        if anchors:
+            anchor_words = {
+                token
+                for anchor in anchors
+                for token in str(anchor).casefold().split()
+                if len(token) >= 4
+            }
+            if anchor_words:
+                hit, rest = [], []
+                for row in rows:
+                    content = self._doc_content(row[0])
+                    if content and any(word in content for word in anchor_words):
+                        hit.append(row)
+                    else:
+                        rest.append(row)
+                if not hit:
+                    # Nothing in the ranked window mentions the subject at all: fetch documents that do
+                    # rather than answering from documents that merely share vocabulary with the question.
+                    for word in sorted(anchor_words):
+                        extra = self._public_ask_fts_rows(f'"{word}"', 2)
+                        if extra:
+                            hit = extra
+                            break
+                rows = (hit + rest)[:limit]
         terms = expand_terms(_query_terms(query))
         snippets: list[str] = []
         total = 0
@@ -454,6 +485,22 @@ class Knowledge:
             snippets.append(item)
             total += len(item)
         return "\n".join(snippets)
+
+    def _doc_content(self, path: str) -> str:
+        """Lowercased document text, or "" when the path is gone."""
+        key = (str(self.db_path), path)
+        if key in _DOC_CONTENT_CACHE:
+            return _DOC_CONTENT_CACHE[key]
+        conn = connect(self.db_path)
+        try:
+            row = conn.execute("SELECT content FROM source_docs WHERE path = ?", (path,)).fetchone()
+        finally:
+            conn.close()
+        text = (row[0] or "").casefold() if row else ""
+        if len(_DOC_CONTENT_CACHE) > 512:
+            _DOC_CONTENT_CACHE.clear()
+        _DOC_CONTENT_CACHE[key] = text
+        return text
 
     def _public_ask_ranked_rows(self, query: str, limit: int) -> list[tuple]:
         """Best available retrieval for a natural-language question, never empty.
