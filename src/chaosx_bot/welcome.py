@@ -66,7 +66,7 @@ def build_welcome_text(
     """The message posted in the welcome channel."""
     name = member.display_name
     lines = [
-        f"**Welcome, {name}.**",
+        f"**{pick(member, OPENERS)}**",
         "",
         _personal_line(member, known_facts=known_facts),
         "",
@@ -83,8 +83,9 @@ def build_welcome_text(
         "I watch the channels and keep this place tidy, so rule-breaking gets handled whether or not a "
         "moderator is around — and every action is explained to the person it affects.",
     ]
+    lines.append("")
+    lines.append(f"-# {pick(member, CLOSERS)}")
     if member_count:
-        lines.append("")
         lines.append(f"-# Member #{member_count:,} · Chaos Redux · Hearts of Iron IV")
     return "\n".join(lines)
 
@@ -124,10 +125,44 @@ def build_welcome_dm(
     return "\n".join(lines)
 
 
-class WelcomeView(discord.ui.View):
-    """Action buttons under the welcome card."""
+class WelcomeActionButton(discord.ui.Button):
+    """One themed action: scenario roll, lore fragment, nation pick, bug checklist or event idea."""
 
+    def __init__(self, key: str) -> None:
+        spec = ACTIONS[key]
+        super().__init__(
+            label=spec["label"],
+            emoji=spec["emoji"],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"chaosx_welcome_{key}",
+            row=1,
+        )
+        self.key = key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        spec = ACTIONS[self.key]
+        item = pick(interaction.user, spec["items"], salt=3)
+        await interaction.response.send_message(f"{spec['title']}\n\n{item}", ephemeral=True)
+
+
+class WelcomeHelpButton(discord.ui.Button):
     def __init__(self) -> None:
+        super().__init__(
+            label="How to ask me",
+            emoji="🤖",
+            style=discord.ButtonStyle.secondary,
+            custom_id="chaosx_welcome_help",
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(HELP_EPHEMERAL, ephemeral=True)
+
+
+class WelcomeView(discord.ui.View):
+    """Links to the essentials, plus two rotating Chaos Redux actions."""
+
+    def __init__(self, member: discord.Member | None = None) -> None:
         super().__init__(timeout=None)
         self.add_item(
             discord.ui.Button(label="Read the rules", emoji="📕", style=discord.ButtonStyle.link,
@@ -140,15 +175,10 @@ class WelcomeView(discord.ui.View):
         self.add_item(
             discord.ui.Button(label="Watch the devlogs", emoji="▶️", style=discord.ButtonStyle.link, url=YOUTUBE_URL)
         )
-        # The "How to ask me" button is declared below as a decorated callback, so it is not added here.
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return True
-
-    @discord.ui.button(label="How to ask me", emoji="🤖", style=discord.ButtonStyle.secondary,
-                       custom_id="chaosx_welcome_help", row=1)
-    async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_message(HELP_EPHEMERAL, ephemeral=True)
+        self.add_item(WelcomeHelpButton())
+        offset = (int(member.id) % len(ACTION_ORDER)) if member is not None else 0
+        for step in range(2):
+            self.add_item(WelcomeActionButton(ACTION_ORDER[(offset + step) % len(ACTION_ORDER)]))
 
 
 def welcome_facts(state: Any, member: discord.Member) -> list[str]:
@@ -158,3 +188,186 @@ def welcome_facts(state: Any, member: discord.Member) -> list[str]:
     except Exception:
         facts = []
     return [str(fact) for fact in (facts or [])]
+
+
+# --- Chaos Redux flavour -------------------------------------------------------------------------------------
+# A long list, picked by member id, so two people joining back to back do not read the same greeting.
+
+OPENERS = [
+    "A new delegation has arrived in the capital.",
+    "Fresh boots on the ground, and the map is still red.",
+    "Another commander steps out of the briefing tent.",
+    "The war room just gained a chair.",
+    "New arrival — the front line is that way.",
+    "Somebody new just crossed the border.",
+    "A new name enters the ledger.",
+    "The general staff has been notified of your arrival.",
+    "New blood for the cause, and the cause needs it.",
+    "You have been assigned to the Chaos Redux theatre.",
+    "A new player joins the long game.",
+    "The archive has a new reader.",
+    "New arrival: please report to the situation room.",
+    "One more mind for the world-building.",
+    "The scenario writers have a new colleague.",
+    "Fresh recruit, no combat record yet.",
+    "You have entered the timeline at a delicate moment.",
+    "A new signature appears on the roster.",
+    "Someone opened the door and let the chaos in.",
+    "The map room is fuller tonight.",
+    "Another volunteer for the testing grounds.",
+    "New member detected. Morale unchanged, but noted.",
+    "The rebellion has a new face.",
+    "Welcome to the part of the war that gets written down.",
+]
+
+CLOSERS = [
+    "Ask something when you are ready — the archive is open.",
+    "Lurk if you like. Just read the rules first.",
+    "No forms here. Say hi, or don't.",
+    "The devlogs explain most of what this is.",
+    "Nothing here is finished, which is the interesting part.",
+    "Opinions welcome. Numbers welcome more.",
+    "If you break something, tell us how.",
+    "Questions are cheaper than assumptions.",
+    "You will be asked for specifics eventually. Start early.",
+    "Bring screenshots and error logs, not vibes.",
+    "The scenario list is longer than the changelog.",
+    "Everything here is a draft, including the rules.",
+]
+
+ACTIONS = {
+    "scenario": {
+        "label": "Roll a scenario",
+        "emoji": "🎲",
+        "title": "**Scenario roll**",
+        "items": [
+            "A neutral nation with one port and no navy declares war on a major.",
+            "Three civil wars fire in the same month, all in the same faction.",
+            "A puppet state gains independence during a peace conference.",
+            "The AI abandons a front line to garrison a single victory point.",
+            "A focus tree completes two mutually exclusive branches at once.",
+            "A landlocked country attempts a naval invasion.",
+            "A faction leader capitulates and its members keep fighting.",
+            "Supply collapses for an army standing still in friendly territory.",
+            "Two wars merge into one after a white peace that should not have been possible.",
+            "An event fires for a country that no longer exists.",
+            "A guarantee drags a neutral into a war started on another continent.",
+            "A division teleports across a strait it does not border.",
+            "A releasable nation appears with the wrong ideology.",
+            "A country joins a faction it is at war with.",
+            "A peace deal gives a nation territory it never occupied.",
+            "A civil war starts in a country with no organised opposition.",
+            "An expeditionary force is sent to a country being annexed.",
+            "A naval invasion lands on a province with no beach.",
+            "A puppet declares war on its overlord's ally.",
+            "Two scripted offensives trigger on the same tick and cancel each other.",
+        ],
+    },
+    "lore": {
+        "label": "Lore fragment",
+        "emoji": "📜",
+        "title": "**From the archive**",
+        "items": [
+            "The capital was moved twice before anyone agreed on the border.",
+            "Every faction claims the same founding document, differently edited.",
+            "The old rail network still defines where armies can actually go.",
+            "Three states share a single river and none of them admit it.",
+            "The treaty that ended the last war was never signed, only announced.",
+            "The northern ports were built for a navy that no longer exists.",
+            "The official history has two endings, both in print.",
+            "The disputed province has changed hands six times, twice in one week.",
+            "The army's doctrine manual is older than the state it serves.",
+            "One nation's founding myth is another's war crime.",
+            "The industrial belt was planned as a defensive line.",
+            "The currency is backed by a resource nobody can transport.",
+            "The last census was taken during a war and counted both sides.",
+            "The alliance charter has a clause nobody has ever invoked.",
+            "Two dialects, one border, no agreement on which came first.",
+            "The capital's garrison answers to a different ministry than the army.",
+            "The ceasefire line was drawn by someone who had never seen the terrain.",
+            "The oldest unit in the army has never fought.",
+            "The railway gauge changes at the most inconvenient border possible.",
+            "Every map of the region is wrong about the same lake.",
+        ],
+    },
+    "nation": {
+        "label": "Pick my nation",
+        "emoji": "🗺️",
+        "title": "**Try one of these**",
+        "items": [
+            "A small industrial power with no coastline and hostile neighbours.",
+            "A naval nation with a large fleet and nothing to fuel it.",
+            "A neutral state sitting on the only pass through the mountains.",
+            "A puppet with more factories than its overlord.",
+            "A country that starts with a civil war it cannot win quickly.",
+            "A one-province minor with a claim on a major's capital.",
+            "A nation whose entire army starts as reserves.",
+            "An agrarian state with three rivers and one railway.",
+            "A faction leader whose members do not border it.",
+            "A country that begins in a war it did not declare.",
+            "A buffer state that both sides guarantee.",
+            "A minor with a focus tree longer than its industry can support.",
+            "A state with ports but no access to open sea.",
+            "A nation that starts demobilised in a hostile region.",
+            "A country with two cores and one of them contested.",
+            "A small state with a single resource the world wants.",
+            "A nation with a large army and no supply network.",
+            "A minor whose only advantage is terrain.",
+            "A country that shares a border with everyone it distrusts.",
+            "A puppet that can break free within a year if played well.",
+        ],
+    },
+    "testing": {
+        "label": "Testing checklist",
+        "emoji": "🧪",
+        "title": "**Before you report a bug**",
+        "items": [
+            "Reproduce it twice, then write down the exact steps.",
+            "Check the error log after the moment it breaks, not before.",
+            "Note the date in-game and the save version.",
+            "Say which mods were loaded, in order.",
+            "Screenshot the tooltip, not just the map.",
+            "Test with a fresh save before blaming the scenario.",
+            "Check whether the same thing happens in vanilla.",
+            "Write what you expected, then what happened.",
+            "Mention the country you were playing.",
+            "Include whether debug mode was on.",
+        ],
+    },
+    "suggest": {
+        "label": "Suggest an event",
+        "emoji": "🎯",
+        "title": "**Event ideas**",
+        "items": [
+            "Post it in the event ideas forum with a title that says what happens.",
+            "Say which country it fires for and roughly when.",
+            "State the trigger, the effect, and what makes it interesting.",
+            "One event per thread beats a list of twenty ideas.",
+            "If it needs a new mechanic, say so up front.",
+        ],
+    },
+}
+
+ACTION_ORDER = ["scenario", "lore", "nation", "testing", "suggest"]
+
+REACTIONS = ["⚔️", "🔥", "🛡️", "📜", "🗺️", "⚙️", "🧪", "🎖️", "🌍", "📉", "🏭", "🕰️"]
+
+
+def pick(member: discord.Member, items: list, salt: int = 0) -> Any:
+    """Deterministic per member, different for each surface."""
+    return items[(int(member.id) // (salt + 1) + salt * 7) % len(items)]
+
+
+def reactions_for(member: discord.Member) -> list[str]:
+    """Three themed reactions, stable per member."""
+    start = int(member.id) % len(REACTIONS)
+    return [REACTIONS[(start + offset * 3) % len(REACTIONS)] for offset in range(3)]
+
+
+def persistent_view() -> discord.ui.View:
+    """Every action button at once, so any welcome card's buttons keep working after a restart."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(WelcomeHelpButton())
+    for key in ACTION_ORDER:
+        view.add_item(WelcomeActionButton(key))
+    return view

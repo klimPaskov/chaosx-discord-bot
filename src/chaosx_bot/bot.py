@@ -2574,7 +2574,7 @@ class ChaosXBot(discord.Client):
         self._voice_session = session if started else None
 
     async def setup_hook(self) -> None:
-        self.add_view(welcome.WelcomeView())
+        self.add_view(welcome.persistent_view())
         await self.store.init()
         # /admin model persists a switch, so re-apply it here: the choice must outlive a restart.
         from . import model_switch
@@ -3929,11 +3929,16 @@ class ChaosXBot(discord.Client):
         if channel is not None:
             text = welcome.build_welcome_text(member, member_count=member.guild.member_count, known_facts=facts)
             try:
-                await channel.send(
+                sent_card = await channel.send(
                     text,
-                    view=welcome.WelcomeView(),
+                    view=welcome.WelcomeView(member),
                     allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=False),
                 )
+                for emoji in welcome.reactions_for(member):
+                    try:
+                        await sent_card.add_reaction(emoji)
+                    except (discord.Forbidden, discord.HTTPException):
+                        break
             except (discord.Forbidden, discord.HTTPException) as exc:
                 tier_logger.warning("welcome card failed for %s: %s", member.id, exc)
         try:
