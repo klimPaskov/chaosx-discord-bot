@@ -15,6 +15,8 @@ need tools and project-rule context.
 
 from __future__ import annotations
 
+import urllib.request
+
 import inspect
 import json
 import os
@@ -235,3 +237,74 @@ async def direct_chat_completion_stream(
                 content = delta.get("content") or ""
                 if reasoning or content:
                     yield reasoning, content
+
+
+_IMAGE_SAFETY_SYSTEM = (
+    "You are a strict content-safety classifier for a Discord server about a Hearts of Iron IV mod. "
+    "Look at the image and answer with JSON only: "
+    '{"sexual": true|false, "gore": true|false, "nazi": true|false, "confidence": 0.0-1.0, "what": "<= 12 words"}. '
+    "sexual = nudity, sexual acts, sexualised minors, or explicit imagery. gore = mutilated bodies, real wounds, "
+    "graphic death. nazi = swastikas, SS insignia or other hate symbols. A historical game screenshot, a map, a "
+    "uniform photo or a stylised portrait is NOT gore or sexual. When unsure, set confidence below 0.5."
+)
+
+
+async def describe_image_safety(image_url: str, *, model: str = "", provider: str = "") -> dict:
+    """Ask the model what an attachment contains. Returns the parsed verdict, or {} when it cannot tell.
+
+    Verified against the live provider on 2026-10-25: deepseek-flash accepts image_url content parts and described
+    a test image correctly, so NSFW/gore screening needs no extra service.
+    """
+    import base64
+    import json as _json
+
+    from .config import load_settings
+
+    settings = load_settings()
+
+    def _key_name() -> str:
+        joined = f"{provider or getattr(settings, 'ask_provider', '')}{model or getattr(settings, 'ask_model', '')}".lower()
+        return "DEEPSEEK_API_KEY" if "deepseek" in joined else "OPENAI_API_KEY"
+
+    def _base() -> str:
+        joined = f"{provider or getattr(settings, 'ask_provider', '')}{model or getattr(settings, 'ask_model', '')}".lower()
+        return "https://api.deepseek.com/v1" if "deepseek" in joined else "https://api.openai.com/v1"
+
+    url = image_url
+    if not url.startswith("http"):
+        try:
+            with open(url, "rb") as handle:
+                url = "data:image/png;base64," + base64.b64encode(handle.read()).decode()
+        except OSError:
+            return {}
+    payload = {
+        "model": model or getattr(settings, "ask_model", ""),
+        "max_tokens": 120,
+        "messages": [
+            {"role": "system", "content": _IMAGE_SAFETY_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Classify this attachment."},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ],
+            },
+        ],
+    }
+    request = urllib.request.Request(
+        f"{_base()}/chat/completions",
+        data=_json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {resolve_api_key(_key_name())}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            body = _json.load(response)
+        text = (body["choices"][0]["message"].get("content") or "").strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end == -1:
+            return {}
+        return _json.loads(text[start : end + 1])
+    except Exception as exc:
+        print(f"[vision] classify failed: {type(exc).__name__}: {exc}", flush=True)
+        return {}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import base64
 import hashlib
 import inspect
@@ -349,8 +350,9 @@ from .routine_posts import (
 from .answer_cache import AnswerCache
 from .capabilities import probe_capabilities
 from .denial_guard import corrective_prompt, is_denial
+from . import ask_api
 from . import engagement
-from . import knowledge_gaps, member_memory, moderation_cases
+from . import knowledge_gaps, member_memory, moderation_cases, moderation_guard
 from . import server_live
 from . import server_ops
 from .answer_panel import build_answer_panel, suggest_actions
@@ -5203,6 +5205,11 @@ class ChaosXBot(discord.Client):
             await guild.leave()
 
     async def on_message(self, message: discord.Message) -> None:
+        if not hasattr(self, "guard"):
+            self.guard = ModerationGuard(self)
+        self.guard.note(message)
+        if message.guild is not None and not (message.author and message.author.bot):
+            asyncio.create_task(self.guard.inspect(message))
         # Internal restricted-persona scan runs BEFORE any capture so a
         # flagged message can never enter memory/history/profile contexts.
         if await self._handle_restricted_persona(message):
@@ -6390,6 +6397,231 @@ async def _analyse_video_path(
 
 # Command answers that should carry the private panel (quick actions, thumbs, settings).
 PANEL_COMMANDS = {"ask"}
+
+
+MODERATION_WINDOW_MINUTES = 30
+MODERATION_BUFFER_SIZE = 12
+
+
+class ModerationGuard:
+    """Watches every message the bot can see and acts on § 7, with an explanation each way.
+
+    Safety rails: staff and the owner are exempt, the bot never touches itself, dry-run logs instead of acting, and
+    bans of established members wait for the owner's ✅ in #moderator-only.
+    """
+
+    def __init__(self, bot: "ChaosXBot") -> None:
+        self.bot = bot
+        self.recent: dict[int, list[moderation_guard.Message]] = {}
+        self.dry_run = bool(getattr(bot.settings, "moderation_dry_run", True))
+        self.started_at = discord.utils.utcnow()
+
+    def note(self, message: discord.Message) -> None:
+        if message.author is None or message.author.bot:
+            return
+        buffer = self.recent.setdefault(message.author.id, [])
+        buffer.append(
+            moderation_guard.Message(
+                id=message.id,
+                channel_id=getattr(message.channel, "id", 0),
+                author_id=message.author.id,
+                content=message.content or "",
+                created_at=message.created_at or discord.utils.utcnow(),
+                attachment_kinds=tuple(
+                    "image" if str(getattr(a, "content_type", "")).startswith("image/") else "file"
+                    for a in getattr(message, "attachments", []) or []
+                ),
+            )
+        )
+        del buffer[:-MODERATION_BUFFER_SIZE]
+
+    async def inspect(self, message: discord.Message) -> None:
+        """Decide, then act or escalate. Never raises into the gateway."""
+        try:
+            await self._inspect(message)
+        except Exception as exc:
+            print(f"[guard] inspection failed: {type(exc).__name__}: {exc}", flush=True)
+
+    async def _inspect(self, message: discord.Message) -> None:
+        author = message.author
+        guild = getattr(message, "guild", None)
+        if guild is None or author is None or author.bot:
+            return
+        if guild.id != self.bot.settings.allowed_guild_id:
+            return
+        # Enforcement starts from the moment the engine went live (Hoops, 2026-10-25): history is scanned and
+        # reported, never punished.
+        if message.created_at < self.started_at:
+            return
+        if author.id == self.bot.settings.owner_id:
+            return
+        member = author
+        perms = getattr(member, "guild_permissions", None)
+        staff = bool(perms and (perms.manage_messages or perms.kick_members or perms.ban_members))
+        if staff:
+            return
+
+        buffer = list(self.recent.get(author.id, []))
+        if not buffer:
+            return
+        # Screen image attachments with the model before judging (§ 4.1).
+        for attachment in getattr(message, "attachments", []) or []:
+            if not str(getattr(attachment, "content_type", "")).startswith("image/"):
+                continue
+            verdict = await ask_api.describe_image_safety(str(attachment.url))
+            if verdict and (verdict.get("sexual") or verdict.get("gore") or verdict.get("nazi")):
+                if float(verdict.get("confidence") or 0) >= 0.5:
+                    for entry in buffer:
+                        if entry.id == message.id:
+                            entry.has_sexual_or_gore = True
+
+        warnings = moderation_cases.warning_count(self.bot.settings.db_path, author.id)
+        verdict = moderation_guard.analyse(
+            buffer,
+            warnings_on_record=warnings,
+            member_is_established=moderation_cases.is_established(self.bot.settings.db_path, author.id),
+        )
+        if verdict.action == "none":
+            return
+
+        if verdict.unsure:
+            await self._to_moderators(
+                moderation_guard.unsure_request(
+                    verdict, author=author.display_name, author_id=author.id, sample=buffer[-1].content
+                )
+            )
+            moderation_cases.record_action(
+                self.bot.settings.db_path,
+                user_id=author.id,
+                action="escalate",
+                rule=verdict.rule,
+                reason=verdict.reason,
+                dry_run=True,
+            )
+            return
+
+        if verdict.needs_owner_approval and verdict.action == "ban":
+            await self._to_moderators(
+                moderation_guard.approval_request(
+                    verdict, author=author.display_name, author_id=author.id, sample=buffer[-1].content
+                ),
+                view=ModerationApprovalView(self.bot, verdict=verdict, target_id=author.id, message=message),
+            )
+            return
+
+        await self.enforce(message, verdict)
+
+    async def _to_moderators(self, text: str, *, view: discord.ui.View | None = None) -> None:
+        channel = self.bot.get_channel(int(self.bot.settings.moderator_channel_id))
+        if channel is None:
+            print("[guard] moderator channel not found", flush=True)
+            return
+        await channel.send(text, view=view, allowed_mentions=safe_allowed_mentions())
+
+    async def enforce(self, message: discord.Message, verdict) -> None:
+        author = message.author
+        dm_text, channel_text = moderation_guard.explain(verdict)
+        if self.dry_run:
+            print(
+                f"[guard][dry-run] {author.id} {verdict.action} rule {verdict.rule} - {verdict.reason}",
+                flush=True,
+            )
+            moderation_cases.record_action(
+                self.bot.settings.db_path,
+                user_id=author.id,
+                action=verdict.action,
+                rule=verdict.rule,
+                reason=verdict.reason,
+                dry_run=True,
+            )
+            return
+
+        deleted = 0
+        for message_id in verdict.delete_message_ids:
+            try:
+                await message.channel.get_partial_message(message_id).delete()
+                deleted += 1
+            except Exception:
+                continue
+
+        try:
+            await author.send(dm_text)
+        except Exception:
+            pass
+        if channel_text:
+            try:
+                await message.channel.send(channel_text, allowed_mentions=safe_allowed_mentions())
+            except Exception:
+                pass
+
+        action = verdict.action
+        if action == "warn":
+            pass
+        elif action in {"timeout", "timeout_and_kick"}:
+            minutes = 60 if action == "timeout" else 60 * 24 * 3
+            try:
+                until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+                await author.timeout(until, reason=verdict.reason)
+            except Exception as exc:
+                print(f"[guard] timeout failed: {type(exc).__name__}: {exc}", flush=True)
+            if action == "timeout_and_kick":
+                try:
+                    await author.kick(reason=verdict.reason)
+                except Exception as exc:
+                    print(f"[guard] kick failed: {type(exc).__name__}: {exc}", flush=True)
+        elif action == "ban":
+            try:
+                await author.ban(reason=verdict.reason, delete_message_seconds=86400)
+            except Exception as exc:
+                print(f"[guard] ban failed: {type(exc).__name__}: {exc}", flush=True)
+
+        moderation_cases.record_action(
+            self.bot.settings.db_path,
+            user_id=author.id,
+            action=action,
+            rule=verdict.rule,
+            reason=verdict.reason,
+            actor_id=self.bot.user.id if self.bot.user else None,
+        )
+        print(f"[guard] {action} on {author.id} ({verdict.rule}) deleted={deleted}", flush=True)
+
+
+class ModerationApprovalView(discord.ui.View):
+    """Owner-only ✅/❌ on a ban the guard wants to make."""
+
+    def __init__(self, bot: "ChaosXBot", *, verdict, target_id: int, message: discord.Message) -> None:
+        super().__init__(timeout=3600)
+        self.bot = bot
+        self.verdict = verdict
+        self.target_id = target_id
+        self.original = message
+
+    async def _allowed(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.bot.settings.owner_id:
+            await interaction.response.send_message("Owner only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Approve", emoji="✅", style=discord.ButtonStyle.danger)
+    async def approve(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        if not await self._allowed(interaction):
+            return
+        guard = getattr(self.bot, "guard", None)
+        member = interaction.guild.get_member(self.target_id) if interaction.guild else None
+        if guard is not None and member is not None:
+            await guard.enforce(self.original, self.verdict)
+            text = f"Approved — {self.verdict.action} on <@{self.target_id}> (§ {self.verdict.rule})."
+        else:
+            text = "That member is already gone."
+        await interaction.response.edit_message(content=text, view=None)
+
+    @discord.ui.button(label="Leave alone", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def dismiss(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        if not await self._allowed(interaction):
+            return
+        await interaction.response.edit_message(
+            content=f"Ignored — no action on <@{self.target_id}>.", view=None
+        )
 
 
 class MemoryForgetView(discord.ui.View):

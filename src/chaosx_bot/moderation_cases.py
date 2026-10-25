@@ -131,3 +131,90 @@ def case_messages(db_path: str | Path, case_id: int) -> list[dict]:
         return json.loads(row[0] or "[]")
     except json.JSONDecodeError:
         return []
+
+
+def _actions_conn(db_path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), timeout=15)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS moderation_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            rule TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            actor_id INTEGER,
+            dry_run INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    return conn
+
+
+def record_action(
+    db_path: str | Path,
+    *,
+    user_id: int,
+    action: str,
+    rule: str = "",
+    reason: str = "",
+    actor_id: int | None = None,
+    dry_run: bool = False,
+) -> int:
+    conn = _actions_conn(db_path)
+    try:
+        cursor = conn.execute(
+            "INSERT INTO moderation_actions (created_at, user_id, action, rule, reason, actor_id, dry_run) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_iso_now(), int(user_id), action, rule, reason[:300], actor_id, 1 if dry_run else 0),
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+    finally:
+        conn.close()
+
+
+def warning_count(db_path: str | Path, user_id: int, *, days: int = 90) -> int:
+    """How many real (non-dry-run) warnings this member has on record inside the window."""
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    conn = _actions_conn(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM moderation_actions WHERE user_id = ? AND action = 'warn' "
+            "AND dry_run = 0 AND created_at >= ?",
+            (int(user_id), since),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row[0] or 0)
+
+
+def is_established(db_path: str | Path, user_id: int, *, min_messages: int = 40) -> bool:
+    """A member with real history gets the benefit of owner approval before a ban.
+
+    Hoops, 2026-10-25: "New members should usually be less forgiven." Accounts with little history are the ones
+    that spam, so they are banned autonomously; only members who have actually taken part wait for the owner."""
+    conn = sqlite3.connect(str(db_path), timeout=15)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM message_archive WHERE author_id = ? AND visibility = 'public'",
+            (int(user_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row[0] or 0) >= min_messages
+
+
+def recent_actions(db_path: str | Path, *, limit: int = 10) -> list[tuple[str, int, str, str, int]]:
+    conn = _actions_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT created_at, user_id, action, rule, dry_run FROM moderation_actions ORDER BY id DESC LIMIT ?",
+            (max(1, limit),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(str(r[0]), int(r[1]), str(r[2]), str(r[3]), int(r[4])) for r in rows]

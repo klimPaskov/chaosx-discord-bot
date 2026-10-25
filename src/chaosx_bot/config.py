@@ -150,12 +150,12 @@ class Settings(BaseSettings):
                     data[key] = None
         return data
 
-    chaos_redux_repo: Path = Field(default=Path.home() / "projects/chaos_redux")
+    chaos_redux_repo: Path = Field(default=Path("/home/klim/projects/chaos_redux"))
     focus_tree_repo: Path | None = Field(default=None, description="Optional live mod checkout used to discover focus trees; defaults to chaos_redux_repo")
     focus_tree_graphs_enabled: bool = Field(default=True, description="Render public focus-tree graphs through HOI4 Agent Tools MCP")
     focus_mcp_command: str = Field(default="npx", description="Executable used to launch the HOI4 Agent Tools MCP server")
     focus_mcp_args: str = Field(default="-y hoi4-agent-tools@1.2.0", description="Shell-style arguments for the HOI4 Agent Tools MCP command")
-    focus_mcp_config_path: Path = Field(default=Path.home() / ".config/hoi4-agent-tools/config.json")
+    focus_mcp_config_path: Path = Field(default=Path("/home/klim/.config/hoi4-agent-tools/config.json"))
     focus_mcp_workspace_id: str = Field(default="", description="Optional exact HOI4 Agent Tools workspace ID")
     focus_mcp_workspace_name: str = Field(default="chaos_redux", description="Workspace name discovered through hoi4.mods when no exact ID is configured")
     focus_mcp_timeout_seconds: int = Field(default=300, ge=30, le=900)
@@ -171,7 +171,7 @@ class Settings(BaseSettings):
     scripted_gui_max_previews: int = Field(default=2, ge=1, le=6)
     scripted_gui_preview_width: int = Field(default=1920, ge=320, le=3840)
     scripted_gui_preview_height: int = Field(default=1080, ge=200, le=2160)
-    hermes_bin: Path = Field(default=Path.home() / ".local/bin/hermes")
+    hermes_bin: Path = Field(default=Path("/home/klim/.local/bin/hermes"))
     hermes_profile: str = Field(default="chaos_redux")
     hermes_timeout_seconds: int = Field(default=900, ge=30, le=1800)
     admin_ask_timeout_seconds: int = Field(default=0, ge=0, le=86400, description="Max seconds for /admin ask Hermes runs; 0 disables the subprocess timeout")
@@ -203,6 +203,8 @@ class Settings(BaseSettings):
     qoder_repowiki_path: Path | None = Field(default=None, description="Qoder repo-knowledge store root (e.g. .../knowledges/chaos_redux/master__en-US) indexed as an extra knowledge root")
     extra_knowledge_roots: str = Field(default="", description="Colon-separated name=/abs/path extra knowledge roots indexed as public tooling docs")
     memory_exclude_channels: str = Field(default="", description="Comma-separated channel ids whose messages never feed durable member memory")
+    moderation_dry_run: bool = Field(default=True, description="Log moderation decisions without acting")
+    moderator_channel_id: int = Field(default=1395464062367698977, description="Channel for unsure cases and ban approvals")
     community_notes_enabled: bool = Field(default=True, description="Write approved public suggestions/event ideas to the Chaos Redux vault")
     community_event_specs_folder: str = Field(default="Events/Event Specs", description="Vault-relative folder for approved community event idea specs")
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")
