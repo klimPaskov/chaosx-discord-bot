@@ -84,6 +84,11 @@ def build_welcome_text(
         "moderator is around — and every action is explained to the person it affects.",
     ]
     lines.append("")
+    lines.append("**Your first moves**")
+    offset = int(member.id) % len(CHECKLIST)
+    for step in range(3):
+        lines.append(f"☐ {CHECKLIST[(offset + step) % len(CHECKLIST)]}")
+    lines.append("")
     lines.append(f"-# {pick(member, CLOSERS)}")
     if member_count:
         lines.append(f"-# Member #{member_count:,} · Chaos Redux · Hearts of Iron IV")
@@ -115,6 +120,11 @@ def build_welcome_dm(
         "**About me, since I will be around.** I answer questions, and I also keep the server safe: I remove "
         "spam, gore, doxxing and slurs, and I can warn, time out or ban on my own. Anything I do comes with an "
         "explanation, by DM and in the channel, and you can appeal to Hoops McCann if you think I got it wrong.",
+        "",
+        "**Three things to do today**",
+        f"☐ Read <#{RULES_CHANNEL_ID}> — numbered § 1 to § 8.",
+        f"☐ Say hi in <#{INTRO_CHANNEL_ID}>.",
+        "☐ Ask me one question.",
         "",
         "**Your privacy.** I keep a short profile of what you talk about here so answers fit you better. "
         "`/memory` shows exactly what I have, and wipes it if you ask. Anything you tell me in DMs stays out "
@@ -365,6 +375,19 @@ ACTIONS = {
 }
 
 ACTION_ORDER = ["scenario", "lore", "nation", "testing", "suggest"]
+
+
+CHECKLIST = [
+    f"Skim the rules in <#{RULES_CHANNEL_ID}> — § 1 to § 8, a minute at most.",
+    f"Say hi in <#{INTRO_CHANNEL_ID}> so people know who arrived.",
+    "Ask @ChaosX one question — events, scenarios, testing, whatever you are curious about.",
+    "Watch one devlog so you know what actually exists yet.",
+    f"Report the first bug you find in <#{ISSUES_CHANNEL_ID}> — specifics, not vibes.",
+    "Suggest an event in the event-ideas forum, one idea per thread.",
+    "Open the modding channels if you want the dev side of this.",
+    "Read the pinned message in #📕┃rules so you know what gets you banned.",
+]
+
 
 def pick(member: discord.Member, items: list, salt: int = 0) -> Any:
     """Deterministic per member, different for each surface."""
