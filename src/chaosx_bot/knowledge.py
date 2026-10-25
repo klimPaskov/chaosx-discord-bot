@@ -376,12 +376,23 @@ class Knowledge:
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (*params, limit),
+                (*params, max(limit * 4, 12)),
             ).fetchall()
         finally:
             conn.close()
         if not rows:
             return f"No indexed results for `{query}`."
+        # Chunked source files win FTS on keyword overlap but answer badly for "how does testing work": a paragraph
+        # of a third-party module outranks the page that explains it. Unless the question is about code, whole
+        # documents come first and chunks follow, so both remain reachable.
+        codey = any(
+            hint in query.lower()
+            for hint in ("function", "code", "error", "traceback", "rust", "python", "typescript", "file", "line ", "mcp")
+        )
+        if not codey:
+            rows = sorted(rows, key=lambda row: (1 if "#" in row[0] else 0, row[5]))[:limit]
+        else:
+            rows = rows[:limit]
         lines = [f"## Search results for `{query}`"]
         for i, (path, source_class, commit, indexed_at, snip, _rank) in enumerate(rows, 1):
             item = f"{i}. `{path}`\n   {snip}"
@@ -1090,10 +1101,23 @@ def _term_weight(term: str) -> int:
     return 3 if len(term) >= 6 else 1
 
 
+# Question scaffolding carries no signal: ranking on "how", "does" and "work" puts a transcript that happens to use
+# those words above the page that answers the question. Content words only.
+_QUERY_STOPWORDS = {
+    "a", "about", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by", "can", "could", "did", "do",
+    "does", "doing", "for", "from", "get", "got", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its",
+    "just", "like", "me", "my", "no", "not", "of", "on", "or", "our", "should", "so", "some", "that", "the", "their",
+    "them", "then", "there", "these", "they", "this", "to", "up", "us", "was", "we", "were", "what", "when", "where",
+    "which", "who", "why", "will", "with", "work", "works", "working", "would", "you", "your",
+}
+
+
 def _fts_query(query: str) -> str:
     # Same hyphen/quoting treatment as _fts_and_query; see its docstring.
-    tokens = re.findall(r"[A-Za-z0-9_]+", query)
-    return " OR ".join(f'"{t}"' for t in tokens[:8]) or '""'
+    tokens = [token for token in re.findall(r"[A-Za-z0-9_]+", query)]
+    content = [token for token in tokens if token.lower() not in _QUERY_STOPWORDS]
+    chosen = content or tokens
+    return " OR ".join(f'"{t}"' for t in chosen[:10]) or '""'
 
 
 def _fts_and_query(query: str) -> str:

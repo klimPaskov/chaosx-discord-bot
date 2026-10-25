@@ -37,7 +37,7 @@ _NITRO_RE = re.compile(r"(?i)free\s+nitro|steam[\s-]?gift|nitro\s+gift|airdrop")
 # Blunt on purpose: a false positive here is a warning that a human can undo, a false negative is a member left
 # with a slur in the channel.
 _SLUR_RE = re.compile(
-    r"(?i)\b(n[i1]gg(?:er|a)|f[a4]gg?[o0]t|k[i1]ke|sp[i1]c|ch[i1]nk|tr[a4]nny|ret[a4]rd|"
+    r"(?i)\b(n[i1]gg(?:er|a)|f[a4]g(?:g[o0]t)?|k[i1]ke|sp[i1]c|ch[i1]nk|tr[a4]nny|ret[a4]rd|"
     r"r[a4]pe\s+(?:you|her|him|them))\b"
 )
 _THREAT_RE = re.compile(
@@ -191,13 +191,17 @@ def analyse(
     lowered = f" {latest.content.lower()} "
     insults = [word for word in INSULT_WORDS if f" {word} " in lowered]
     if insults:
-        # Friendly banter and jokes are the whole reason this path stays at warn level.
+        # Aimed at somebody beats merely rude: "shut up you moron" is a decision the bot can take alone, while a
+        # stray insult word with no target stays a question for the moderators (Hoops, 2026-10-25: automatic).
+        targeted = (" you " in lowered) or ("<@" in latest.content) or any(
+            marker in lowered for marker in (" shut up ", " stfu ", " nobody asked ", " kys ")
+        )
         return Verdict(
             action="warn",
             rule="2.1",
             reason=f"insulting another member ({insults[0]})",
-            confidence=0.6,
-            unsure=len(insults) < 2 and len(latest.content) < 120,
+            confidence=0.75 if targeted else 0.55,
+            unsure=(not targeted) and len(insults) < 2 and len(latest.content) < 120,
         )
 
     return Verdict(action="none", confidence=1.0, reason="nothing actionable")

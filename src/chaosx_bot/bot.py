@@ -7924,7 +7924,11 @@ async def run_voice_ask(
     if not request:
         return ""
     source_paths_allowed = public_ask_wants_sources(request)
-    reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+    # The FTS query is synchronous SQLite; on a large index it blocks the loop for seconds, and every
+    # interaction pressed in that window dies on Discord's 3-second ack limit. Run it off the loop.
+    reference_context = await asyncio.to_thread(
+        bot.knowledge.public_ask_context, request, include_sources=source_paths_allowed
+    )
     rejection = public_ask_rejection_reason(request, reference_context=reference_context)
     if rejection:
         return rejection
@@ -8108,7 +8112,11 @@ async def run_voice_ask_stream(
     if not request:
         return
     source_paths_allowed = public_ask_wants_sources(request)
-    reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+    # The FTS query is synchronous SQLite; on a large index it blocks the loop for seconds, and every
+    # interaction pressed in that window dies on Discord's 3-second ack limit. Run it off the loop.
+    reference_context = await asyncio.to_thread(
+        bot.knowledge.public_ask_context, request, include_sources=source_paths_allowed
+    )
     rejection = public_ask_rejection_reason(request, reference_context=reference_context)
     if rejection:
         yield rejection
@@ -8252,7 +8260,11 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     channel_id = getattr(message.channel, "id", None)
     command_name = "reply ask" if parent_bot_message_id else "mention ask"
     source_paths_allowed = public_ask_wants_sources(request)
-    reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+    # The FTS query is synchronous SQLite; on a large index it blocks the loop for seconds, and every
+    # interaction pressed in that window dies on Discord's 3-second ack limit. Run it off the loop.
+    reference_context = await asyncio.to_thread(
+        bot.knowledge.public_ask_context, request, include_sources=source_paths_allowed
+    )
     memory_context = await fetch_message_ask_chain_context(bot, bot_message_id=parent_bot_message_id, guild_id=guild_id, channel_id=channel_id, public_only=True)
     domain_context = reference_context or memory_context
     rejection = public_ask_rejection_reason(request, reference_context=domain_context)
@@ -9222,7 +9234,11 @@ async def run_hermes_command(
     if not owner_only:
         if rate_bucket == "ask":
             source_paths_allowed = public_ask_wants_sources(request)
-            reference_context = bot.knowledge.public_ask_context(request, include_sources=source_paths_allowed)
+            # The FTS query is synchronous SQLite; on a large index it blocks the loop for seconds, and every
+            # interaction pressed in that window dies on Discord's 3-second ack limit. Run it off the loop.
+            reference_context = await asyncio.to_thread(
+                bot.knowledge.public_ask_context, request, include_sources=source_paths_allowed
+            )
             rejection = public_ask_rejection_reason(request, reference_context=reference_context)
             if rejection:
                 await interaction.response.send_message(rejection, ephemeral=not public, allowed_mentions=safe_allowed_mentions())

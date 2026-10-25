@@ -370,6 +370,44 @@ def parse_extra_roots(spec: str | None) -> list[tuple[str, Path]]:
     return roots
 
 
+CODE_SUFFIXES = {".rs", ".ts", ".tsx", ".js", ".mjs", ".py"}
+CODE_CHUNK_CHARS = 1400
+_FUNC_START_RE = re.compile(
+    r"^\s*(pub(\([^)]*\))?\s+)?(async\s+)?(fn|def|function|class|impl|const|export|struct|enum|trait)\b"
+)
+
+
+def split_code_doc(rel: str, text: str, size: int = CODE_CHUNK_CHARS) -> list[tuple[str, str]]:
+    """Break a source file into readable chunks, preferring function boundaries.
+
+    A 2,000-line module indexed as one document dilutes its own best paragraph: the answer exists but ranks below
+    a changelog line. Splitting keeps each doc about one function or block, and every chunk carries the file path
+    so the answer can still say where it lives.
+    """
+    if len(text) <= size:
+        return [(rel, text)]
+    lines = text.splitlines()
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        starts_symbol = bool(_FUNC_START_RE.match(line))
+        if current and (length + len(line) > size) and (starts_symbol or length > size // 2):
+            chunks.append(current)
+            # keep a one-line overlap so a function signature is not orphaned from its body
+            current = current[-1:] if current[-1].strip() else []
+            length = sum(len(item) + 1 for item in current)
+        current.append(line)
+        length += len(line) + 1
+    if current:
+        chunks.append(current)
+    out: list[tuple[str, str]] = []
+    for index, block in enumerate(chunks, start=1):
+        body = "\n".join(block)
+        out.append((f"{rel}#{index}", f"// {rel} (part {index} of {len(chunks)})\n{body}" if rel.endswith((".rs", ".ts", ".tsx", ".js", ".mjs")) else f"# {rel} (part {index} of {len(chunks)})\n{body}"))
+    return out
+
+
 def is_tooling_indexable(root: Path, path: Path) -> bool:
     rel = path.relative_to(root)
     if set(rel.parts) & TOOLING_SKIP_DIRS:
@@ -544,16 +582,22 @@ def rebuild_index(
                 if not text:
                     continue
                 rel = path.relative_to(root).as_posix()
-                public_path = f"tooling/{name}/{rel}"
-                conn.execute(
-                    """
-                    INSERT INTO source_docs(path, source_class, file_type, commit_sha, mtime, content_hash, indexed_at, content)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (public_path, "tooling_doc", path.suffix.lower().lstrip("."), commit, path.stat().st_mtime, hash_text(text), indexed_at, text),
-                )
-                docs += 1
-                tooling_docs += 1
+                file_type = path.suffix.lower().lstrip(".")
+                if path.suffix.lower() in CODE_SUFFIXES:
+                    pieces = split_code_doc(rel, text)
+                else:
+                    pieces = [(rel, text)]
+                for piece_rel, piece_text in pieces:
+                    public_path = f"tooling/{name}/{piece_rel}"
+                    conn.execute(
+                        """
+                        INSERT INTO source_docs(path, source_class, file_type, commit_sha, mtime, content_hash, indexed_at, content)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (public_path, "tooling_doc", file_type, commit, path.stat().st_mtime, hash_text(piece_text), indexed_at, piece_text),
+                    )
+                    docs += 1
+                    tooling_docs += 1
         events = _load_events(conn, catalog_root, indexed_at)
         scenarios = _load_scenarios(conn, catalog_root, indexed_at)
         clusters = _load_clusters(conn, catalog_root, indexed_at)
