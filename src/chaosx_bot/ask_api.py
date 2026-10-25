@@ -308,3 +308,53 @@ async def describe_image_safety(image_url: str, *, model: str = "", provider: st
     except Exception as exc:
         print(f"[vision] classify failed: {type(exc).__name__}: {exc}", flush=True)
         return {}
+
+
+_MOD_SCREEN_SYSTEM = (
+    "You screen Discord messages for rule violations in a Hearts of Iron IV mod server. Rules: § 2.1 insulting a "
+    "member, § 2.2 slurs/hate speech/threats, § 2.4 real-world politics used to attack, § 3.4 spam or the same "
+    "link across channels, § 4.3 scam links, § 5.1 revealing personal information (real names, addresses, phone "
+    "numbers, emails, socials, IPs, photos of someone's home). Joking banter between friends is NOT a violation; "
+    "misspellings and leetspeak still count. Reply with JSON only: "
+    '{"findings": [{"index": 0, "rule": "5.1", "reason": "<= 12 words", "confidence": 0.0-1.0}]} '
+    "Return an empty findings list when nothing applies. Never speculate about context you do not have."
+)
+
+
+async def classify_messages_batch(items: list[str], *, model: str = "", provider: str = "") -> list[dict]:
+    """Model-based screening for a batch of messages — catches misspellings and context that regexes miss."""
+    import json as _json
+
+    from .config import load_settings
+
+    settings = load_settings()
+    chosen_model = model or getattr(settings, "ask_model", "")
+    joined = f"{provider or getattr(settings, 'ask_provider', '')}{chosen_model}".lower()
+    base = "https://api.deepseek.com/v1" if "deepseek" in joined else "https://api.openai.com/v1"
+    key_name = "DEEPSEEK_API_KEY" if "deepseek" in joined else "OPENAI_API_KEY"
+    numbered = "\n".join(f"[{index}] {text[:400]}" for index, text in enumerate(items))
+    payload = {
+        "model": chosen_model,
+        "max_tokens": 900,
+        "messages": [
+            {"role": "system", "content": _MOD_SCREEN_SYSTEM},
+            {"role": "user", "content": f"Screen these messages:\n{numbered}"},
+        ],
+    }
+    request = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=_json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {resolve_api_key(key_name)}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            body = _json.load(response)
+        text = (body["choices"][0]["message"].get("content") or "").strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end == -1:
+            return []
+        return list(_json.loads(text[start : end + 1]).get("findings") or [])
+    except Exception as exc:
+        print(f"[screen] batch failed: {type(exc).__name__}: {exc}", flush=True)
+        return []

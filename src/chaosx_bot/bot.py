@@ -6518,6 +6518,23 @@ class ModerationGuard:
             return
         await channel.send(text, view=view, allowed_mentions=safe_allowed_mentions())
 
+    async def _block_reminder(self, author, rule: str = "") -> None:
+        """Tell the owner who was banned so they can block them too — Discord will not let a bot block.
+
+        Hoops, 2026-10-25: "on obvious cases, the bot should automatically block the user for me as well."
+        The API has no bot-side block, so this is the closest the platform allows: one message with the id, the
+        name and the profile link, so blocking is one tap away.
+        """
+        try:
+            owner = await self.bot.fetch_user(int(self.bot.settings.owner_id))
+            await owner.send(
+                f"**Banned autonomously** — `{author.display_name}` (id `{author.id}`), rule "
+                f"**§ {rule}**.\n"
+                f"Block them from your side if you want them gone completely: https://discord.com/users/{author.id}"
+            )
+        except Exception as exc:
+            print(f"[guard] block reminder failed: {type(exc).__name__}: {exc}", flush=True)
+
     async def enforce(self, message: discord.Message, verdict) -> None:
         author = message.author
         dm_text, channel_text = moderation_guard.explain(verdict)
@@ -6536,6 +6553,7 @@ class ModerationGuard:
             )
             return
 
+        self._last_rule = verdict.rule
         deleted = 0
         for message_id in verdict.delete_message_ids:
             try:
@@ -6583,6 +6601,8 @@ class ModerationGuard:
             reason=verdict.reason,
             actor_id=self.bot.user.id if self.bot.user else None,
         )
+        if action == "ban":
+            await self._block_reminder(author, verdict.rule)
         print(f"[guard] {action} on {author.id} ({verdict.rule}) deleted={deleted}", flush=True)
 
 
