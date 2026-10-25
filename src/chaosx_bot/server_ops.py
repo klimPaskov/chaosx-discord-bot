@@ -315,10 +315,15 @@ def context_block(
     channel: Any,
     referenced_message: Any = None,
     mentioned_members: list[Any] | None = None,
+    channels: list[Any] | None = None,
 ) -> str:
     lines = [f"Guild: {guild.name if guild else 'unknown'}"]
     if channel is not None:
         lines.append(f"Current channel: #{getattr(channel, 'name', 'unknown')} (id {getattr(channel, 'id', '?')})")
+    if channels:
+        # Ids beat names: Discord renders names with emoji and pipes, and the owner types plain words.
+        listing = ", ".join(f"{getattr(item, 'name', item)} (id {getattr(item, 'id', item)})" for item in channels[:80])
+        lines.append(f"Channels: {listing}")
     members = mentioned_members or []
     if members:
         lines.append(
@@ -360,6 +365,16 @@ async def _member(guild: discord.Guild, target: Any) -> discord.Member:
     raise PlanError(f"I cannot find a member called `{raw}` in this server.")
 
 
+_CHANNEL_NOISE = {"the", "and", "of", "channel", "chat", "text", "general"}
+
+
+def _channel_tokens(name: str) -> set[str]:
+    """Words that identify a channel, with emoji, pipes, dashes and filler removed."""
+    text = str(name or "").lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return {token for token in text.split() if len(token) > 2 and token not in _CHANNEL_NOISE}
+
+
 def _role(guild: discord.Guild, target: Any) -> discord.Role:
     raw = str(target or "").strip().strip("<@&>")
     if raw.isdigit():
@@ -385,10 +400,28 @@ def _channel(guild: discord.Guild, target: Any, current: Any) -> Any:
         if current is None:
             raise PlanError("Which channel? I do not have one in view here.")
         return current
-    cleaned = raw.lstrip("#").lower()
+    cleaned = raw.lstrip("#").strip().lower()
     for channel in guild.channels:
         if channel.name.lower() == cleaned:
             return channel
+    # Hoops types "jazz and conversation"; Discord shows "💬┃jazz-and-conversation". Compare the words.
+    wanted = _channel_tokens(cleaned)
+    if wanted:
+        best: tuple[int, Any] | None = None
+        ambiguous = False
+        for channel in guild.channels:
+            have = _channel_tokens(channel.name)
+            if not have or not wanted.issubset(have):
+                continue
+            score = len(have & wanted)
+            if best is None or score > best[0]:
+                best, ambiguous = (score, channel), False
+            elif score == best[0]:
+                ambiguous = True
+        if best is not None and not ambiguous:
+            return best[1]
+        if best is not None and ambiguous:
+            raise PlanError(f"More than one channel matches `{raw}` — send the channel link.")
     raise PlanError(f"I cannot find a channel called `{raw}` in this server.")
 
 
@@ -417,6 +450,7 @@ async def execute(bot: Any, plan: Plan, *, guild: discord.Guild, channel: Any, a
     reason = f"ChaosX server management by {author_id}"
 
     if action == "purge":
+        channel = _channel(guild, args.get("channel"), channel)
         if channel is None:
             raise PlanError("I need a channel to delete messages in.")
         count = int(args.get("count") or 100)
@@ -434,8 +468,26 @@ async def execute(bot: Any, plan: Plan, *, guild: discord.Guild, channel: Any, a
         elif args.get("contains"):
             needle = str(args["contains"]).lower()
             kwargs["check"] = lambda m, needle=needle: needle in (m.content or "").lower()
-        deleted = await channel.purge(**kwargs)
-        return f"Deleted {len(deleted)} message(s) in #{getattr(channel, 'name', 'this channel')}."
+        if not until_id:
+            deleted = await channel.purge(**kwargs)
+            return f"Deleted {len(deleted)} message(s) in #{getattr(channel, 'name', 'this channel')}."
+        # "From latest up to that message" is unbounded: Discord deletes 100 at a time, so keep going until the
+        # boundary is reached, then delete the boundary message itself.
+        boundary = kwargs.pop("after")
+        kwargs.pop("limit", None)
+        total = 0
+        while total < MAX_PURGE:
+            batch_limit = min(100, MAX_PURGE - total)
+            batch = await channel.purge(limit=batch_limit, after=boundary, reason=reason, check=kwargs.get("check"))
+            total += len(batch)
+            if len(batch) < batch_limit:
+                break
+        try:
+            await boundary.delete()
+            total += 1
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+        return f"Deleted {total} message(s) in #{getattr(channel, 'name', 'this channel')}, up to and including the one you linked."
 
     if action == "set_channel_permissions":
         target_channel = _channel(guild, args.get("channel"), channel)

@@ -350,6 +350,7 @@ from .answer_cache import AnswerCache
 from .capabilities import probe_capabilities
 from .denial_guard import corrective_prompt, is_denial
 from . import engagement
+from . import server_live
 from . import server_ops
 from .answer_panel import build_answer_panel, suggest_actions
 from .grounding import citations, is_ungrounded_refusal, unverified_citations
@@ -6352,7 +6353,11 @@ async def _server_ops_plan(bot: ChaosXBot, request: str, *, guild, channel, refe
     if not server_ops.looks_like_management(request):
         return None
     context = server_ops.context_block(
-        guild=guild, channel=channel, referenced_message=reference, mentioned_members=members or []
+        guild=guild,
+        channel=channel,
+        referenced_message=reference,
+        mentioned_members=members or [],
+        channels=list(guild.text_channels) if guild is not None else None,
     )
     plan = await server_ops.plan_from_text(bot, request, context=context)
     if plan is None:
@@ -6512,6 +6517,15 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         channel_id=channel_id or 0,
         scope="admin",
     )
+    # Live, exact data for this request: channel ids, roles, member ids and (for history/moderation asks) a real
+    # read of the channels involved. Without it the owner path answered "I cannot read the server".
+    try:
+        live_context = await server_live.gather(bot, message.guild, owner_request)
+    except Exception as exc:
+        print(f"[server_live] gather failed: {type(exc).__name__}: {exc}", flush=True)
+        live_context = ""
+    if live_context:
+        owner_context = (owner_context + "\n\n" + live_context) if owner_context else live_context
     prompt = build_owner_prompt(
         owner_request=owner_request,
         guild_name=guild_name,
@@ -8625,6 +8639,14 @@ async def run_hermes_command(
             # asked for outside information. A fallback search still informs the answer, just without a picture.
             evidence_enabled=bot.settings.web_evidence_enabled and wants_web_evidence_image(request),
         )
+    if owner_only:
+        try:
+            live_context = await server_live.gather(bot, interaction.guild, owner_request)
+        except Exception as exc:
+            print(f"[server_live] gather failed: {type(exc).__name__}: {exc}", flush=True)
+            live_context = ""
+        if live_context:
+            owner_context = (owner_context + "\n\n" + live_context) if owner_context else live_context
     prompt = (
         build_owner_prompt(
             owner_request=owner_request,

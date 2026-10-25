@@ -137,10 +137,25 @@ class FakeChannel:
 
     async def purge(self, **kwargs):
         self.purged.append(kwargs)
-        return [1, 2, 3]
+        limit = kwargs.get("limit") or 100
+        # 250 messages sit between the boundary and the newest one, so the range needs three passes.
+        remaining = 250 - sum(len(p.get("_returned", [])) for p in self.purged[:-1])
+        returned = list(range(min(limit, max(0, remaining))))
+        self.purged[-1]["_returned"] = returned
+        return returned
 
     async def fetch_message(self, message_id):
-        return f"message-{message_id}"
+        channel = self
+
+        class Boundary:
+            id = message_id
+            deleted = False
+
+            async def delete(self, **_kwargs):
+                self.deleted = True
+                channel.boundary_deleted = True
+
+        return Boundary()
 
     async def edit(self, **kwargs):
         self.edits.append(kwargs)
@@ -239,9 +254,12 @@ def test_execute_purge_without_a_boundary():
     assert guild.channels[0].purged[0]["limit"] == 3
 
 
-def test_execute_purge_up_to_a_message():
+def test_execute_purge_up_to_a_message_walks_the_whole_range():
     summary, guild = run(validate(Plan("purge", {"count": 50, "until_message_id": "123"})))
-    assert guild.channels[0].purged[0]["after"] == "message-123"
+    assert int(guild.channels[0].purged[0]["after"].id) == 123
+    assert "Deleted 251 message(s)" in summary  # 250 in the range plus the linked message itself
+    assert sum(len(entry["_returned"]) for entry in guild.channels[0].purged) == 250
+    assert getattr(guild.channels[0], "boundary_deleted", False) is True
 
 
 def test_execute_timeout_and_untimeout():
@@ -297,3 +315,30 @@ def test_everyone_can_be_the_permission_target():
     summary = asyncio.run(server_ops.execute(None, plan, guild=guild, channel=guild.channels[0], author_id=1))
     assert "@@everyone" not in summary
     assert guild.channels[0].permissions[-1][0] is guild.default_role
+
+
+def test_a_channel_is_found_by_the_words_hoops_types():
+    guild = FakeGuild()
+    decorated = FakeChannel("💬┃jazz-and-conversation")
+    decorated.id = 555
+    guild.channels.append(decorated)
+    plan = validate(Plan("purge", {"channel": "jazz and conversation", "count": 10}))
+    summary = asyncio.run(server_ops.execute(None, plan, guild=guild, channel=guild.channels[0], author_id=1))
+    assert "jazz-and-conversation" in summary
+    assert decorated.purged and not guild.channels[0].purged  # purged the named channel, not the current one
+
+
+def test_channel_tokens_ignore_emoji_and_filler():
+    assert server_ops._channel_tokens("💬┃jazz-and-conversation") == {"jazz", "conversation"}
+    assert server_ops._channel_tokens("#general-chat") == set()
+
+
+def test_an_ambiguous_channel_is_refused():
+    guild = FakeGuild()
+    for name, cid in (("💬┃jazz-and-conversation", 601), ("🎷┃jazz-talk", 602)):
+        channel = FakeChannel(name)
+        channel.id = cid
+        guild.channels.append(channel)
+    plan = validate(Plan("slowmode", {"channel": "jazz", "seconds": 5}))
+    with pytest.raises(PlanError, match="More than one channel"):
+        asyncio.run(server_ops.execute(None, plan, guild=guild, channel=guild.channels[0], author_id=1))
