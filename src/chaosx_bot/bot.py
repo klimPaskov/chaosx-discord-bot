@@ -352,6 +352,7 @@ from .answer_cache import AnswerCache
 from .capabilities import probe_capabilities
 from .denial_guard import corrective_prompt, is_denial
 from . import ask_api
+from . import answer_panel
 from . import banter_budget
 from . import engagement
 from . import knowledge_gaps, member_memory, moderation_cases, moderation_guard
@@ -1267,6 +1268,19 @@ async def _attach_answer_panel(
             show_feedback=show_feedback,
         )
         await sent.edit(view=view)
+        try:
+            from .panel_state import remember as _remember_panel
+
+            _remember_panel(
+                bot.settings.db_path,
+                message_id=sent.id,
+                question=question,
+                answer=answer,
+                user_id=user_id,
+                actions=actions,
+            )
+        except Exception as exc:
+            print(f"[engage] panel state not stored: {type(exc).__name__}: {exc}", flush=True)
         await bot.store.audit(
             actor_id=user_id,
             guild_id=sent.guild.id if sent.guild else None,
@@ -2576,6 +2590,7 @@ class ChaosXBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.add_view(welcome.persistent_view())
+        self.add_dynamic_items(answer_panel.PanelItem)
         self.loop.create_task(self._watch_loop_lag())
         await self.store.init()
         # /admin model persists a switch, so re-apply it here: the choice must outlive a restart.

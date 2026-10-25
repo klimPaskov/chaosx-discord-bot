@@ -15,7 +15,7 @@ from typing import Any
 
 import discord
 
-from . import engagement
+from . import engagement, panel_state
 from . import knowledge_gaps
 from .ask_api import direct_chat_completion_stream
 from .hermes_bridge import PUBLIC_ASK_BOUNDARY, build_public_prompt
@@ -330,15 +330,17 @@ class AnswerPanelView(discord.ui.View):
         self.user_id = user_id
         self.message_id = message_id
         self.show_feedback = show_feedback
-        for label, prompt in (actions or [])[:_MAX_BUTTONS]:
-            self.add_item(self._action_button(label, prompt))
+        for index, (label, prompt) in enumerate((actions or [])[:_MAX_BUTTONS]):
+            self.add_item(self._action_button(label, prompt, index=index))
         if show_feedback:
             self.add_item(self._like_button())
             self.add_item(self._dislike_button())
             self.add_item(self._dismiss_button())
 
-    def _action_button(self, label: str, prompt: str) -> discord.ui.Button:
-        button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
+    def _action_button(self, label: str, prompt: str, *, index: int = 0) -> discord.ui.Button:
+        # Stable custom id: the same button keeps working after a restart, and the row it sits on can be rebuilt
+        # from what was stored against the message.
+        button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"cxfb:act{index}")
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
             if label.strip().lower().startswith("check my setup"):
@@ -407,7 +409,9 @@ class AnswerPanelView(discord.ui.View):
         )
 
     def _like_button(self) -> discord.ui.Button:
-        button = discord.ui.Button(label="Helpful", emoji="👍", style=discord.ButtonStyle.success)
+        button = discord.ui.Button(
+            label="Helpful", emoji="👍", style=discord.ButtonStyle.success, custom_id="cxfb:up"
+        )
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
             await self._rate(interaction, "up")
@@ -416,7 +420,9 @@ class AnswerPanelView(discord.ui.View):
         return button
 
     def _dislike_button(self) -> discord.ui.Button:
-        button = discord.ui.Button(label="Not helpful", emoji="👎", style=discord.ButtonStyle.danger)
+        button = discord.ui.Button(
+            label="Not helpful", emoji="👎", style=discord.ButtonStyle.danger, custom_id="cxfb:down"
+        )
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
             await self._rate(interaction, "down")
@@ -425,7 +431,9 @@ class AnswerPanelView(discord.ui.View):
         return button
 
     def _dismiss_button(self) -> discord.ui.Button:
-        button = discord.ui.Button(label="Hide feedback", emoji="❌", style=discord.ButtonStyle.secondary)
+        button = discord.ui.Button(
+            label="Hide feedback", emoji="❌", style=discord.ButtonStyle.secondary, custom_id="cxfb:hide"
+        )
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
             await interaction.response.send_message(
@@ -468,7 +476,111 @@ def build_answer_panel(
         show_feedback=show_feedback,
     )
     # Always last, always private: the settings panel is not part of the feedback prompt.
-    settings = discord.ui.Button(label="Settings", emoji="⚙️", style=discord.ButtonStyle.secondary)
+    settings = discord.ui.Button(
+        label="Settings", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="cxfb:set"
+    )
     settings.callback = view.settings_callback
     view.add_item(settings)
     return view
+
+
+_PANEL_KEYS = {
+    "up": ("Helpful", "👍", discord.ButtonStyle.success),
+    "down": ("Not helpful", "👎", discord.ButtonStyle.danger),
+    "hide": ("Hide feedback", "❌", discord.ButtonStyle.secondary),
+    "set": ("Settings", "⚙️", discord.ButtonStyle.secondary),
+}
+
+
+async def handle_panel_click(interaction: discord.Interaction, key: str) -> None:
+    """Answer a panel click using the panel's stored subject, not in-memory objects.
+
+    This is what makes old panels work: the question, answer and quick actions come back from the database keyed
+    by the message the button sits under, so a click works after any number of restarts.
+    """
+    bot = interaction.client
+    message = interaction.message
+    message_id = getattr(message, "id", None)
+    db_path = _db_path(bot)
+    state = panel_state.load(db_path, message_id) if (db_path and message_id) else None
+    fallback = (message.content if message and message.content else "")
+    question = (state or {}).get("question") or fallback
+    answer = (state or {}).get("answer") or fallback
+    actions = (state or {}).get("actions") or []
+    view = AnswerPanelView(
+        bot,
+        question=question,
+        answer=answer,
+        user_id=interaction.user.id,
+        message_id=message_id,
+        actions=None,
+        show_feedback=False,
+    )
+    if key in ("up", "down"):
+        await view._rate(interaction, key)
+        return
+    if key == "set":
+        await view.settings_callback(interaction)
+        return
+    if key == "hide":
+        await interaction.response.send_message(
+            "How long should I stop asking for feedback?",
+            ephemeral=True,
+            view=DismissView(bot, user_id=interaction.user.id),
+        )
+        return
+    if key.startswith("act"):
+        index = int(key[3:])
+        if index >= len(actions):
+            await interaction.response.send_message(
+                "That option is not available any more — ask me again.", ephemeral=True
+            )
+            return
+        label, prompt = actions[index]
+        if str(label).strip().lower().startswith("check my setup"):
+            await interaction.response.send_modal(SetupCheckModal(bot))
+            return
+        await interaction.response.defer(thinking=False)
+        text = await followup_answer(bot, question=question, answer=answer, prompt=prompt)
+        parts = _split(text)
+        if not parts:
+            await interaction.followup.send(
+                "I could not find anything more on that.", allowed_mentions=discord.AllowedMentions.none()
+            )
+            return
+        for part in parts:
+            await interaction.followup.send(part, allowed_mentions=discord.AllowedMentions.none())
+
+
+class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<key>up|down|hide|set|act\d+)"):
+    """Catches panel buttons on any message, including ones posted before the last restart."""
+
+    def __init__(self, key: str) -> None:
+        label, emoji, style = _PANEL_KEYS.get(key, ("More", None, discord.ButtonStyle.secondary))
+        super().__init__(
+            discord.ui.Button(label=label, emoji=emoji, style=style, custom_id=f"cxfb:{key}")
+        )
+        self.key = key
+
+    @classmethod
+    def from_custom_id(
+        cls, interaction: discord.Interaction, item: discord.ui.Item[Any], match: Any, /
+    ) -> "PanelItem":
+        return cls(match["key"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await handle_panel_click(interaction, self.key)
+        except Exception as exc:  # pragma: no cover - Discord only
+            import logging
+
+            logging.getLogger("chaosx.answer_panel").exception("panel click failed: %s", exc)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("That did not go through — try again.", ephemeral=True)
+                else:
+                    await interaction.response.send_message(
+                        "That did not go through — try again.", ephemeral=True
+                    )
+            except Exception:
+                pass
