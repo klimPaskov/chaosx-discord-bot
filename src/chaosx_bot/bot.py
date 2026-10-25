@@ -349,6 +349,8 @@ from .routine_posts import (
 from .answer_cache import AnswerCache
 from .capabilities import probe_capabilities
 from .denial_guard import corrective_prompt, is_denial
+from . import engagement
+from .answer_panel import build_answer_panel, suggest_actions
 from .grounding import citations, is_ungrounded_refusal, unverified_citations
 from .live_facts import set_capability_summary
 from .runtime_status import (
@@ -1160,6 +1162,43 @@ async def reply_with_chunks(
     return first_sent
 
 
+async def _attach_answer_panel(
+    bot: ChaosXBot, *, sent: discord.Message, question: str, answer: str, user_id: int
+) -> None:
+    """Put the private panel under a public answer once the model has picked this answer's quick actions.
+
+    Runs as a task so the answer is never delayed by it: the message goes out immediately and gains its
+    buttons a moment later. Any failure leaves the answer untouched.
+    """
+    try:
+        actions = await suggest_actions(bot, question=question, answer=answer)
+        # Feedback is offered under AUTONOMOUS answers only (Hoops, 2026-10-24) — a manual /ask can still be
+        # rated with the 👍/👎 reactions — and the member can hide the prompt for a while or for good.
+        try:
+            show_feedback = engagement.feedback_prompt_allows(bot.settings.db_path, user_id)
+        except Exception:
+            show_feedback = True
+        view = build_answer_panel(
+            bot,
+            question=question,
+            answer=answer,
+            user_id=user_id,
+            message_id=sent.id,
+            actions=actions,
+            show_feedback=show_feedback,
+        )
+        await sent.edit(view=view)
+        await bot.store.audit(
+            actor_id=user_id,
+            guild_id=sent.guild.id if sent.guild else None,
+            channel_id=sent.channel.id if sent.channel else None,
+            command="answer panel",
+            summary=", ".join(label for label, _prompt in actions)[:200],
+        )
+    except Exception as exc:
+        print(f"[engage] answer panel failed: {type(exc).__name__}: {exc}", flush=True)
+
+
 async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.auto_scan_enabled or bot.user is None:
         return False
@@ -1205,6 +1244,20 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         return False
 
     if decision.action == "answer":
+        # A member can switch unprompted answers off (or on for a while) from the panel under any answer;
+        # that choice outranks the server-wide setting for them alone.
+        try:
+            if not engagement.auto_answer_allows(bot.settings.db_path, message.author.id):
+                await record_auto_scan_event(
+                    bot,
+                    AutoScanDecision("shadow", confidence=decision.confidence, reason="member turned unprompted answers off"),
+                    message,
+                    bot_message_id=None,
+                    response="",
+                )
+                return False
+        except Exception as exc:
+            print(f"[engage] auto-answer preference check failed: {type(exc).__name__}: {exc}", flush=True)
         if not bot.settings.auto_scan_auto_answer_enabled or not await bot.store.automation_enabled(AUTO_QA_AUTOMATION_NAME):
             return False
         limit = bot.settings.auto_scan_answer_limit_per_user_hour
@@ -1224,6 +1277,16 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer model failure", summary=reason)
             return False
         first_sent = await reply_with_chunks(message, model_output, evidence=evidence)
+        if first_sent is not None:
+            asyncio.create_task(
+                _attach_answer_panel(
+                    bot,
+                    sent=first_sent,
+                    question=decision.question or message.content or "",
+                    answer=model_output,
+                    user_id=message.author.id,
+                )
+            )
         prompt_hash_value = result.prompt_hash
         if first_sent:
             try:
@@ -5148,7 +5211,55 @@ class ChaosXBot(discord.Client):
         return True
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        await self.handle_answer_rating(payload)
         await self.handle_access_reaction(payload, added=True)
+
+    async def handle_answer_rating(self, payload: discord.RawReactionActionEvent) -> None:
+        """👍/👎 reactions rate any ChaosX answer — the only way to rate one it did not send by itself.
+
+        The feedback panel only appears under autonomous answers (Hoops, 2026-10-24); a /ask answer is rated
+        here instead. Repeat reactions and the panel buttons land on one row per message/member/rating.
+        """
+        if self.user is None or payload.user_id == self.user.id or payload.guild_id is None:
+            return
+        rating = {"\U0001F44D": "up", "\U0001F44E": "down"}.get(str(payload.emoji))
+        if rating is None:
+            return
+        channel = self.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(payload.channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+        if message.author.id != self.user.id:
+            return
+        db_path = self.settings.db_path
+        try:
+            if engagement.message_rating(db_path, message.id, payload.user_id) == rating:
+                return
+            question, answer = engagement.stored_turn(db_path, message.id)
+            engagement.record_feedback(
+                db_path,
+                user_id=payload.user_id,
+                rating=rating,
+                message_id=message.id,
+                question=question,
+                answer=answer or (message.content or ""),
+                comment="(rated by reaction)",
+            )
+            await self.store.audit(
+                actor_id=payload.user_id,
+                guild_id=payload.guild_id,
+                channel_id=payload.channel_id,
+                command="answer rating",
+                summary=f"{rating} reaction",
+            )
+        except Exception as exc:  # a reaction must never break anything else
+            print(f"[engage] reaction rating failed: {type(exc).__name__}: {exc}", flush=True)
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
         await self.handle_access_reaction(payload, added=False)
@@ -10368,6 +10479,23 @@ def register_commands(bot: ChaosXBot) -> None:
             ephemeral=True,
             allowed_mentions=safe_allowed_mentions(),
         )
+
+    @admin.command(name="feedback", description="Review member ratings and notes on answers.")
+    @app_commands.describe(days="How far back to look (default 7).")
+    async def admin_feedback(interaction: discord.Interaction, days: int = 7) -> None:
+        if not await owner_gate(interaction, settings):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            summary = engagement.feedback_summary(settings.db_path, days=max(1, min(days, 365)))
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"Could not read feedback: `{type(exc).__name__}`", ephemeral=True
+            )
+            return
+        for part in _chunk(summary):
+            if part:
+                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
     @admin.command(name="health", description="Check ChaosX runtime health.")
     async def admin_health(interaction: discord.Interaction) -> None:
