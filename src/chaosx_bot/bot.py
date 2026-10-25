@@ -6394,6 +6394,10 @@ async def try_server_ops_message(bot: ChaosXBot, message: discord.Message, reque
         await message.reply(str(exc), mention_author=False, allowed_mentions=safe_allowed_mentions())
         return True
     if any(item.needs_confirmation for item in plans):
+        # A request like "tell me who was blamed, then delete up to that message" must be answered before the
+        # destructive step, not swallowed by it (Hoops, 2026-10-25: the report is the evidence for the ban).
+        if re.search(r"(?i)\b(tell me|who|what|why|report|explain|summari[sz]e|list)\b", request):
+            await run_admin_ask_message(bot, message, request)
         await message.reply(
             f"{server_ops.describe_all(plans)} — confirm?",
             view=ServerOpsConfirmView(
