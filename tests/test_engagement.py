@@ -1,10 +1,15 @@
 """Per-member answer settings, feedback storage and the panel's quick-action parsing."""
 
+import asyncio
 import json
 import sqlite3
 
 from chaosx_bot import engagement
 from chaosx_bot.answer_panel import build_answer_panel
+
+
+def asyncio_run(coro):
+    return asyncio.run(coro)
 
 
 def test_default_is_answer_me(tmp_path):
@@ -200,3 +205,73 @@ def test_dismiss_controls_use_the_red_cross():
     dismiss = DismissView(None, user_id=1)
     forever = next(child for child in dismiss.children if getattr(child, "label", None) == "Hide permanently")
     assert str(forever.emoji) == "❌"
+
+
+class _FakeResponse(_FakeInteraction):
+    def __init__(self):
+        super().__init__()
+        self.modal = None
+        self.followup = self
+        self.response = self
+
+    async def send_modal(self, modal):
+        self.modal = modal
+
+    async def edit_message(self, **kwargs):
+        self.sent.append(kwargs)
+
+
+def _bot_with_db(tmp_path):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(settings=SimpleNamespace(db_path=tmp_path / "e.db"))
+
+
+def test_pressing_helpful_opens_a_private_box_and_stores_the_thumb(tmp_path):
+    bot = _bot_with_db(tmp_path)
+    view = build_answer_panel(bot=bot, question="what is the chaos meter?", answer="It fills.", user_id=1, message_id=99)
+    like = next(child for child in view.children if getattr(child, "label", None) == "Helpful")
+    interaction = _FakeResponse()
+    asyncio_run(like.callback(interaction))
+    assert interaction.modal is not None
+    assert interaction.modal.title == "What was helpful?"
+    assert interaction.modal.note.required is False  # they can submit it empty
+    assert engagement.message_rating(bot.settings.db_path, 99, 1) == "up"
+
+
+def test_pressing_not_helpful_asks_what_went_wrong(tmp_path):
+    bot = _bot_with_db(tmp_path)
+    view = build_answer_panel(bot=bot, question="q", answer="a", user_id=1, message_id=100)
+    dislike = next(child for child in view.children if getattr(child, "label", None) == "Not helpful")
+    interaction = _FakeResponse()
+    asyncio_run(dislike.callback(interaction))
+    assert interaction.modal.title == "What was wrong?"
+    assert "wrong or missing" in interaction.modal.note.placeholder
+
+
+def test_the_box_saves_the_explanation_and_thanks_privately(tmp_path):
+    bot = _bot_with_db(tmp_path)
+    view = build_answer_panel(bot=bot, question="q", answer="a", user_id=1, message_id=101)
+    dislike = next(child for child in view.children if getattr(child, "label", None) == "Not helpful")
+    interaction = _FakeResponse()
+    asyncio_run(dislike.callback(interaction))
+    modal = interaction.modal
+    modal.note._value = "it named a file I could not find"
+    submit = _FakeResponse()
+    asyncio_run(modal.on_submit(submit))
+    assert submit.sent and submit.sent[-1].get("ephemeral") is True
+    summary = engagement.feedback_summary(bot.settings.db_path, days=7)
+    assert "it named a file I could not find" in summary
+
+
+def test_an_empty_explanation_is_fine(tmp_path):
+    bot = _bot_with_db(tmp_path)
+    view = build_answer_panel(bot=bot, question="q", answer="a", user_id=1, message_id=102)
+    like = next(child for child in view.children if getattr(child, "label", None) == "Helpful")
+    interaction = _FakeResponse()
+    asyncio_run(like.callback(interaction))
+    modal = interaction.modal
+    modal.note._value = ""
+    submit = _FakeResponse()
+    asyncio_run(modal.on_submit(submit))
+    assert engagement.message_rating(bot.settings.db_path, 102, 1) == "up"

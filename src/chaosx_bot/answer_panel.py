@@ -130,50 +130,43 @@ async def followup_answer(bot: Any, *, question: str, answer: str, prompt: str) 
     return reply or "I could not reach my knowledge base just now — ask me again in a moment."
 
 
-class FeedbackNoteModal(discord.ui.Modal, title="What was wrong?"):
-    def __init__(self, bot: Any, *, feedback_id: int, user_id: int) -> None:
-        super().__init__()
+class FeedbackModal(discord.ui.Modal):
+    """The private box Hoops asked for: press 👍 or 👎 and say why, in a text box only you see.
+
+    The rating is already stored when this opens, so dismissing the box still counts the thumb; submitting it
+    adds the note.
+    """
+
+    def __init__(self, bot: Any, *, feedback_id: int, rating: str) -> None:
+        helpful = rating != "down"
+        super().__init__(title="What was helpful?" if helpful else "What was wrong?")
         self.bot = bot
         self.feedback_id = feedback_id
-        self.user_id = user_id
+        self.rating = rating
         self.note = discord.ui.TextInput(
-            label="Your note",
+            label="Why?" if helpful else "What went wrong?",
             style=discord.TextStyle.paragraph,
-            placeholder="What did I get wrong, or what would have helped?",
+            placeholder=(
+                "What did it get right? Anything you would add?"
+                if helpful
+                else "What was wrong or missing? What would have helped?"
+            ),
             max_length=1000,
-            required=True,
+            required=False,
         )
         self.add_item(self.note)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+        text = str(self.note.value or "").strip()
         db_path = _db_path(self.bot)
         saved = False
-        if db_path:
+        if text and db_path:
             try:
-                saved = engagement.add_feedback_comment(db_path, self.feedback_id, str(self.note.value))
+                saved = engagement.add_feedback_comment(db_path, self.feedback_id, text)
             except Exception as exc:
                 print(f"[panel] feedback note failed: {type(exc).__name__}: {exc}", flush=True)
-        await interaction.response.send_message(
-            "Thanks — saved. It goes into the review queue." if saved else "I could not save that note.",
-            ephemeral=True,
-        )
-
-
-class FeedbackThanksView(discord.ui.View):
-    def __init__(self, bot: Any, *, feedback_id: int, user_id: int) -> None:
-        super().__init__(timeout=900)
-        self.bot = bot
-        self.feedback_id = feedback_id
-        self.user_id = user_id
-
-    @discord.ui.button(label="Add a note", emoji="📝", style=discord.ButtonStyle.secondary)
-    async def add_note(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:  # pragma: no cover
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("That is not your feedback.", ephemeral=True)
-            return
-        await interaction.response.send_modal(
-            FeedbackNoteModal(self.bot, feedback_id=self.feedback_id, user_id=self.user_id)
-        )
+        thanks = "Thanks — saved with your note." if saved else "Thanks — noted."
+        await interaction.response.send_message(thanks, ephemeral=True)
 
 
 class SettingsView(discord.ui.View):
@@ -344,17 +337,10 @@ class AnswerPanelView(discord.ui.View):
             print(f"[panel] feedback insert failed: {type(exc).__name__}: {exc}", flush=True)
             await interaction.response.send_message("I could not save that.", ephemeral=True)
             return
-        if rating == "down":
-            await interaction.response.send_message(
-                "Thanks — noted. If you tell me what was wrong I can use it.", 
-                ephemeral=True,
-                view=FeedbackThanksView(self.bot, feedback_id=feedback_id, user_id=interaction.user.id),
-            )
-        else:
-            await interaction.response.send_message(
-                "Thanks — saved.", ephemeral=True,
-                view=FeedbackThanksView(self.bot, feedback_id=feedback_id, user_id=interaction.user.id),
-            )
+        # The rating is in the database before the box opens, so closing the box still counts the thumb.
+        await interaction.response.send_modal(
+            FeedbackModal(self.bot, feedback_id=feedback_id, rating=rating)
+        )
 
     def _like_button(self) -> discord.ui.Button:
         button = discord.ui.Button(label="Helpful", emoji="👍", style=discord.ButtonStyle.success)
