@@ -6433,6 +6433,53 @@ async def _audit_server_op(bot: ChaosXBot, plan, author_id: int, guild, channel,
         print(f"[server_ops] audit failed: {type(exc).__name__}: {exc}", flush=True)
 
 
+async def _preview_plans(bot: ChaosXBot, plans, *, guild, channel) -> str:
+    """Show exactly what a destructive plan will delete, before the ✅ (Hoops, 2026-10-25).
+
+    A wrong reply-link or the wrong channel is invisible in "delete 412 messages"; it is obvious in a list of the
+    newest and oldest messages with authors and dates. Read-only: nothing is removed here.
+    """
+    lines: list[str] = []
+    for plan in plans:
+        if plan.action not in {"purge", "delete_channel"}:
+            continue
+        try:
+            target = server_ops._channel(guild, plan.args.get("channel"), channel)
+            boundary = None
+            if plan.args.get("until_message_id"):
+                boundary = await target.fetch_message(int(str(plan.args["until_message_id"]).strip()))
+            limit = server_ops.MAX_PURGE + 1
+            messages = [message async for message in target.history(limit=limit, after=boundary, oldest_first=False)]
+        except Exception as exc:
+            lines.append(f"Preview unavailable: {type(exc).__name__}")
+            continue
+        if not messages:
+            lines.append(f"**Preview** — no messages in that range on #{getattr(target, 'name', target.id)}.")
+            continue
+        capped = len(messages) > server_ops.MAX_PURGE
+        count = server_ops.MAX_PURGE if capped else len(messages)
+        newest = messages[:3]
+        oldest = messages[-3:] if len(messages) > 3 else []
+        where = f"#{getattr(target, 'name', target.id)}" + (" (channel deleted after)" if plan.action == "delete_channel" else "")
+        body = [f"**Preview** — {count}{'+' if capped else ''} message(s) from {where}"]
+        for message in newest:
+            body.append(
+                f"- {discord.utils.format_dt(message.created_at, 'f')} · {message.author.display_name} "
+                f"· `{message.id}` · {(message.content or '[no text]')[:60]}"
+            )
+        if oldest:
+            body.append("- …")
+            for message in oldest:
+                body.append(
+                    f"- {discord.utils.format_dt(message.created_at, 'f')} · {message.author.display_name} "
+                    f"· `{message.id}` · {(message.content or '[no text]')[:60]}"
+                )
+        if boundary is not None:
+            body.append(f"- stops at `{boundary.id}` by {boundary.author.display_name} (kept)")
+        lines.append("\n".join(body))
+    return "\n\n".join(lines)
+
+
 async def _snapshot_evidence(bot: ChaosXBot, plan, *, guild, channel, author_id: int) -> str:
     """Write the messages this plan will delete into moderation_cases and name the case."""
     try:
@@ -6545,8 +6592,9 @@ async def try_server_ops_message(bot: ChaosXBot, message: discord.Message, reque
         # destructive step, not swallowed by it (Hoops, 2026-10-25: the report is the evidence for the ban).
         if re.search(r"(?i)\b(tell me|who|what|why|report|explain|summari[sz]e|list)\b", request):
             await run_admin_ask_message(bot, message, request)
+        preview = await _preview_plans(bot, plans, guild=message.guild, channel=message.channel)
         await message.reply(
-            f"{server_ops.describe_all(plans)} — confirm?",
+            f"{server_ops.describe_all(plans)} — confirm?" + (f"\n\n{preview}" if preview else ""),
             view=ServerOpsConfirmView(
                 bot, plans=plans, guild=message.guild, channel=message.channel, author_id=message.author.id
             ),
@@ -10516,8 +10564,9 @@ def register_commands(bot: ChaosXBot) -> None:
                     await interaction.response.send_message(str(exc), ephemeral=True)
                     return
                 if any(item.needs_confirmation for item in plans):
+                    preview = await _preview_plans(bot, plans, guild=interaction.guild, channel=interaction.channel)
                     await interaction.response.send_message(
-                        f"{server_ops.describe_all(plans)} — confirm?",
+                        f"{server_ops.describe_all(plans)} — confirm?" + (f"\n\n{preview}" if preview else ""),
                         ephemeral=True,
                         view=ServerOpsConfirmView(
                             bot,
