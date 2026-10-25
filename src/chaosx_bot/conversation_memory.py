@@ -978,11 +978,15 @@ async def compact_user_profile_if_due(
             n = int(count_row["n"]) if count_row is not None else 0
             if not force and n < threshold:
                 return False
+            excluded = _excluded_channels(settings)
+            channel_clause = ""
+            if excluded:
+                channel_clause = " AND channel_id NOT IN (" + ",".join("?" for _ in excluded) + ")"
             rows = await (
                 await db.execute(
                     "SELECT author_name, content FROM message_archive "
-                    "WHERE author_id = ? AND visibility = 'public' ORDER BY id ASC LIMIT ?",
-                    (author_id, USER_PROFILE_INSPECT_LIMIT),
+                    f"WHERE author_id = ? AND visibility = 'public'{channel_clause} ORDER BY id ASC LIMIT ?",
+                    (author_id, *excluded, USER_PROFILE_INSPECT_LIMIT),
                 )
             ).fetchall()
             last_row = await (
@@ -1076,11 +1080,21 @@ async def compact_user_profile_if_due(
     try:
         from . import member_memory
 
-        member_memory.absorb_profile(db_path, author_id, new_profile)
+        member_memory.absorb_profile(db_path, author_id, new_profile, confidence=0.75, source="profile")
         member_memory.compact(db_path, author_id)
     except Exception as exc:
         print(f"[memory] durable facts failed for {author_id}: {type(exc).__name__}: {exc}", flush=True)
     return True
+
+
+def _excluded_channels(settings: Any) -> list[int]:
+    """Channels whose messages may flavour chat style but must never become durable facts."""
+    raw = str(getattr(settings, "memory_exclude_channels", "") or "")
+    out: list[int] = []
+    for piece in re.split(r"[,\s]+", raw.strip()):
+        if piece.isdigit():
+            out.append(int(piece))
+    return out
 
 
 def _chunk_transcript(transcript: str, chunk_chars: int) -> list[str]:
@@ -1104,7 +1118,13 @@ USER_PROFILE_SYSTEM = (
     "You maintain a compact, factual memory of one Discord community member for a bot that answers them and "
     "talks about them. Write the profile the prompt asks for: third person, plain prose or short bullet points, "
     "under 1200 characters, only facts supported by the messages given. No preamble, no headings, no meta "
-    "commentary, no quotes of whole messages. Keep the owner's real name out of it."
+    "commentary, no quotes of whole messages. Keep the owner's real name out of it.\n\n"
+    "Exercise judgement, do not transcribe. Nerds joke constantly: statements made as a joke, bait, sarcasm, "
+    "hyperbole, roleplay or a hypothetical are NOT facts about the person and must be left out — including "
+    "first-person ones such as a member announcing an identity as a bit. Only record something when it is "
+    "stated seriously and consistently. Claims about a member from other people count too, but weigh them "
+    "lower than the member's own serious statements, and drop them when they are clearly banter, an insult, or "
+    "something the person denied. When in doubt, leave it out: a missing detail is harmless, a false one is not."
 )
 
 

@@ -202,6 +202,7 @@ class Settings(BaseSettings):
     obsidian_vault_path: Path = Field(default=Path("/mnt/c/Users/klimp/Documents/Chaos Redux Vault"), description="Chaos Redux Obsidian/LLM wiki vault path")
     qoder_repowiki_path: Path | None = Field(default=None, description="Qoder repo-knowledge store root (e.g. .../knowledges/chaos_redux/master__en-US) indexed as an extra knowledge root")
     extra_knowledge_roots: str = Field(default="", description="Colon-separated name=/abs/path extra knowledge roots indexed as public tooling docs")
+    memory_exclude_channels: str = Field(default="", description="Comma-separated channel ids whose messages never feed durable member memory")
     community_notes_enabled: bool = Field(default=True, description="Write approved public suggestions/event ideas to the Chaos Redux vault")
     community_event_specs_folder: str = Field(default="Events/Event Specs", description="Vault-relative folder for approved community event idea specs")
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")

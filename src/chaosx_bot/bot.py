@@ -672,6 +672,41 @@ def _cap_memory(text: str, limit: int) -> str:
     return cut.rstrip() + "\n…(older memory trimmed)"
 
 
+def _owner_action_memory(bot: ChaosXBot, *, limit: int = 6) -> str:
+    """What the owner already did, so a new request can be answered against the record (Hoops, 2026-10-25).
+
+    Cases carry what was preserved before a purge; the audit log carries the actions themselves. Owner scope:
+    members never see this block.
+    """
+    lines: list[str] = []
+    try:
+        for case_id, created_at, action, count, summary in moderation_cases.latest_cases(
+            bot.settings.db_path, limit=limit
+        ):
+            lines.append(
+                f"- case #{case_id} · {created_at[:10]} · {action} · {count} message(s) preserved · {summary[:120]}"
+            )
+    except Exception:
+        pass
+    try:
+        conn = sqlite3.connect(str(bot.settings.db_path), timeout=10)
+        try:
+            rows = conn.execute(
+                "SELECT created_at, command, summary FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        finally:
+            conn.close()
+        for created_at, command, summary in rows:
+            text = f"- {str(created_at)[:16]} · {command} · {str(summary)[:110]}"
+            if text not in lines:
+                lines.append(text)
+    except Exception:
+        pass
+    if not lines:
+        return ""
+    return "Owner action memory (your own recent decisions; cite them when relevant):\n" + "\n".join(lines)
+
+
 def _profile_excerpt(profile: str, limit: int = 240) -> str:
     """Compact first-lines excerpt of a profile body for the all-users dump.
 
@@ -8849,6 +8884,13 @@ async def run_hermes_command(
             # asked for outside information. A fallback search still informs the answer, just without a picture.
             evidence_enabled=bot.settings.web_evidence_enabled and wants_web_evidence_image(request),
         )
+    if owner_only:
+        try:
+            audit_memory = _owner_action_memory(bot, limit=6)
+            if audit_memory:
+                owner_context = f"{owner_context}\n\n{audit_memory}"
+        except Exception as exc:
+            print(f"[audit memory] failed: {type(exc).__name__}: {exc}", flush=True)
     if owner_only:
         try:
             live_context = await server_live.gather(bot, interaction.guild, owner_request)

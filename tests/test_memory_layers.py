@@ -36,8 +36,12 @@ def test_seeing_a_fact_again_raises_its_rank(tmp_path):
 
 def test_compaction_keeps_the_table_bounded(tmp_path):
     db = tmp_path / "m.db"
-    for index in range(30):
-        member_memory.absorb_profile(db, 11, f"Facts\n- Distinct detail number {index} about the member here.")
+    words = ["ardennes", "bulwark", "cadence", "dynamo", "ember", "falcon", "granite", "harbour", "isobar",
+             "juniper", "kelvin", "lantern", "mosaic", "nimbus", "obsidian", "plateau", "quarry", "rivet",
+             "sable", "tundra", "umber", "vellum", "willow", "xenon", "yarrow", "zephyr", "almanac", "basalt",
+             "cinder", "doldrum"]
+    for index, word in enumerate(words):
+        member_memory.absorb_profile(db, 11, f"Facts\n- The {word} project he mentioned in message {index} matters.")
     removed = member_memory.compact(db, 11, keep=5)
     remaining = sqlite3.connect(db).execute("SELECT COUNT(*) FROM user_memory_facts WHERE author_id=11").fetchone()[0]
     assert remaining == 5 and removed > 0
@@ -111,3 +115,43 @@ def test_evidence_is_saved_before_the_messages_go(tmp_path):
     assert [m["id"] for m in stored] == ["1", "2"]
     assert stored[0]["jump"].startswith("https://discord.com/channels/999/111/")
     assert moderation_cases.latest_cases(db)[0][3] == 2
+
+
+def test_a_contradiction_supersedes_the_old_fact(tmp_path):
+    db = tmp_path / "c2.db"
+    member_memory.remember(db, 3, "Plays Hearts of Iron IV daily with the same group of friends.")
+    member_memory.remember(db, 3, "I stopped playing Hearts of Iron IV and uninstalled it last week.")
+    active = member_memory.durable_facts(db, 3, with_age=False)
+    assert len(active) == 1
+    assert "stopped playing" in active[0]
+
+
+def test_near_duplicates_share_one_slot(tmp_path):
+    db = tmp_path / "d2.db"
+    member_memory.remember(db, 4, "Prefers short answers over long explanations about mechanics.")
+    assert member_memory.remember(db, 4, "Dislikes long replies and prefers short answers about mechanics.") in {"merged", "new"}
+    conn = sqlite3.connect(db)
+    active = conn.execute("SELECT COUNT(*) FROM user_memory_facts WHERE author_id=4 AND status='active'").fetchone()[0]
+    assert active == 1
+
+
+def test_facts_carry_when_they_were_last_heard(tmp_path):
+    db = tmp_path / "a2.db"
+    member_memory.remember(db, 5, "Runs a small Arma community on the side.")
+    assert any("heard today" in fact for fact in member_memory.durable_facts(db, 5))
+
+
+def test_jokes_never_become_facts(tmp_path):
+    db = tmp_path / "j2.db"
+    assert member_memory.remember(db, 6, "I am so gay for this update honestly lol") == "skipped"
+    assert member_memory.remember(db, 6, "just kidding, I do not actually live in Berlin") == "skipped"
+    assert member_memory.durable_facts(db, 6, with_age=False) == []
+
+
+def test_digest_reports_the_layers(tmp_path):
+    db = tmp_path / "g2.db"
+    member_memory.remember(db, 7, "Volunteers as a playtest organiser for the mod team.")
+    data = member_memory.digest(db, days=7)
+    assert data["new_facts"] >= 1
+    assert data["active_members"] >= 1
+    assert "quiet_members" in data and "recent_facts" in data
