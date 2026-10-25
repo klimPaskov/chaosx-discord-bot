@@ -52,6 +52,10 @@ _ADDRESS_RE = re.compile(
     r"(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|court|ct|way)\b"
 )
 
+# Reputation cost per action, mirroring activity.MODERATION_XP_PENALTY so the member is told the same number the
+# tier calculation charges.
+XP_COST: dict[str, int] = {"warn": 40, "timeout": 100, "timeout_and_kick": 250, "kick": 250, "ban": 1000}
+
 INSULT_WORDS = {
     "idiot", "moron", "retard", "dumbass", "imbecile", "faggot", "nigger", "kys", "loser", "clown",
     "worthless", "pathetic", "trash", "scum",
@@ -207,17 +211,27 @@ def next_step(warnings_on_record: int) -> tuple[str, str]:
     return "ban", "7.4"
 
 
-def explain(verdict: Verdict, *, rules_channel_mention: str = "#📕┃rules") -> tuple[str, str]:
+def explain(
+    verdict: Verdict, *, author_id: int | None = None, rules_channel_mention: str = "#📕┃rules"
+) -> tuple[str, str]:
     """(DM to the member, channel notice). Both cite the rule, so nobody has to guess."""
     if verdict.action == "none":
         return "", ""
     citation = f"§ {verdict.rule}" if verdict.rule else "the server rules"
+    cost = XP_COST.get(verdict.action, 1)
+    reputation = (
+        f"This also costs **{cost} XP** on your chaos tier — warnings, timeouts and kicks lower your tier value.\n"
+        if cost
+        else ""
+    )
     dm = (
         f"**{verdict.action.replace('_', ' ').title()}** — {verdict.reason}.\n"
         f"Rule: **{citation}** in {rules_channel_mention}.\n"
+        f"{reputation}"
         "If you think this is wrong, reply here or appeal to a moderator."
     )
-    channel = f"Message removed — {verdict.reason} ({citation})."
+    who = f"<@{author_id}> — " if author_id else ""
+    channel = f"{who}message removed: {verdict.reason} ({citation})."
     return dm, channel
 
 

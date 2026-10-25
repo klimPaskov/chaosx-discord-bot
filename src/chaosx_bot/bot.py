@@ -6537,7 +6537,7 @@ class ModerationGuard:
 
     async def enforce(self, message: discord.Message, verdict) -> None:
         author = message.author
-        dm_text, channel_text = moderation_guard.explain(verdict)
+        dm_text, channel_text = moderation_guard.explain(verdict, author_id=author.id)
         if self.dry_run:
             print(
                 f"[guard][dry-run] {author.id} {verdict.action} rule {verdict.rule} - {verdict.reason}",

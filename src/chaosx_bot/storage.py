@@ -10,7 +10,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from .activity import BONUS_DAILY_CAP, contribution_xp, parse_day, tier_for_xp
+from .activity import MODERATION_XP_PENALTY, apply_moderation_penalty, BONUS_DAILY_CAP, contribution_xp, parse_day, tier_for_xp
 
 AUDIT_WRITE_FAILURES = 0
 """Count of audit rows dropped after every retry failed.
@@ -1543,6 +1543,28 @@ class Store:
                 ") GROUP BY user_id HAVING SUM(xp) > 0"
             )
             totals = [(int(u), float(x or 0)) for u, x in await cur.fetchall()]
+            # Reputation: warnings, timeouts and kicks cost XP, so the tier, the role and the progress bar all
+            # reflect the rules the member broke. Dry-run rows are ignored — nothing happened, nothing is owed.
+            penalties: dict[int, float] = {}
+            try:
+                penalty_rows = await db.execute(
+                    "SELECT user_id, "
+                    "SUM(CASE action WHEN 'warn' THEN ? WHEN 'timeout' THEN ? "
+                    "WHEN 'timeout_and_kick' THEN ? WHEN 'kick' THEN ? WHEN 'ban' THEN ? ELSE 0 END) "
+                    "FROM moderation_actions WHERE dry_run = 0 GROUP BY user_id",
+                    (
+                        MODERATION_XP_PENALTY["warn"],
+                        MODERATION_XP_PENALTY["timeout"],
+                        MODERATION_XP_PENALTY["timeout_and_kick"],
+                        MODERATION_XP_PENALTY["kick"],
+                        MODERATION_XP_PENALTY["ban"],
+                    ),
+                )
+                penalties = {int(u): float(p or 0) for u, p in await penalty_rows.fetchall()}
+            except Exception:
+                penalties = {}  # no moderation table yet, or nothing recorded
+            totals = [(u, apply_moderation_penalty(xp, penalties.get(u, 0.0))) for u, xp in totals]
+            totals = [(u, xp) for u, xp in totals if xp > 0]
             stamp = datetime.now(timezone.utc).isoformat()
             rows = [
                 (user_id, round(xp, 3), tier_for_xp(xp), stamp)

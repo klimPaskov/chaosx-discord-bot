@@ -31,6 +31,23 @@ TIERS: tuple[tuple[str, int], ...] = (
 # chaos_tier_0 = §G, tier_1 = §Y, tier_2 = §O, tier_3 = §R, tier_4/tier_final = §0 (dark), and the
 # meter value follows the same ramp. These are the Discord equivalents, kept readable as a name
 # colour (the mod's §0 is near-black, so the two darkest tiers use dark reds instead).
+# Hoops, 2026-10-25: "warnings should lower ones chaos tier value a little bit, like lowering their
+# reputation." Tiers are XP, so a warning is an XP debt rather than a second counter nobody looks at.
+MODERATION_XP_PENALTY: dict[str, float] = {
+    "warn": 40.0,
+    "timeout": 100.0,
+    "timeout_and_kick": 250.0,
+    "kick": 250.0,
+    "ban": 1000.0,
+}
+MODERATION_XP_FLOOR = 0.0
+
+
+def apply_moderation_penalty(xp: float, penalty: float) -> float:
+    """XP after reputational damage, never below the floor."""
+    return max(MODERATION_XP_FLOOR, float(xp) - max(0.0, float(penalty)))
+
+
 TIER_COLORS: dict[str, int] = {
     "Calm World": 0x4C9C2E,
     "Gathering Storm": 0xE3C000,
