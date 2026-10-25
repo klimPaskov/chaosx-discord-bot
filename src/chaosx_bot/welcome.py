@@ -78,6 +78,7 @@ def build_welcome_text(
         f"» Say hello in <#{INTRO_CHANNEL_ID}> if you want to be known here.",
         f"» Ask me anything with `@ChaosX` or `/ask` — mechanics, testing, a bug you hit, or how the mod is built.",
         f"» Bugs and test notes go in <#{ISSUES_CHANNEL_ID}> so they do not get lost in chat.",
+        f"» Devlogs and showcases: {YOUTUBE_URL}",
         "",
         "I watch the channels and keep this place tidy, so rule-breaking gets handled whether or not a "
         "moderator is around — and every action is explained to the person it affects.",
