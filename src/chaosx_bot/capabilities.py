@@ -33,7 +33,7 @@ def probe_capabilities(*, members_intent: bool = True) -> dict:
         "live server, GitHub and playtest data",
         "the knowledge base (repo, vault, catalog)",
         "the Chaos Redux modding tooling docs (HOI4 Agent Tools MCP, ComfyUI workflows, the agentic modding setup)",
-        "the project's official links (YouTube, donation page, Steam Workshop, GitHub)",
+        "the project's official links (YouTube, donation page, GitHub)",
         "web search and reading web pages",
     ]
     if checks["yt-dlp"]:

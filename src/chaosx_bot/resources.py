@@ -35,12 +35,6 @@ OFFICIAL_RESOURCES: tuple[Resource, ...] = (
         when="if someone wants to support the mod's development",
     ),
     Resource(
-        key="steam",
-        label="Steam Workshop page",
-        url="https://steamcommunity.com/sharedfiles/filedetails/?id=2983516043",
-        when="subscribing to or installing the mod",
-    ),
-    Resource(
         key="github",
         label="Chaos Redux repository",
         url="https://github.com/klimPaskov/Chaos-Redux",
@@ -127,8 +121,11 @@ def resources_block() -> str:
     return (
         "\nOfficial Chaos Redux links (authoritative — these are the only URLs you may give a member; "
         "never invent, guess, shorten or reconstruct a link, and offer the relevant one when someone asks "
-        "about videos, tutorials, the modding setup, the modding tools, installing the mod, supporting the "
-        "project, or contributing):\n" + "\n".join(lines) + "\n"
+        "about videos, tutorials, the modding setup, the modding tools, supporting the project, or "
+        "contributing):\n" + "\n".join(lines) + "\n\n"
+        "The mod itself is not released yet: there is no Steam Workshop page or download link. If someone asks "
+        "where to get it, say it is coming soon and offer the devlogs instead. Never produce a workshop or "
+        "download URL.\n"
     )
 
 
