@@ -714,8 +714,13 @@ class AnswerPanelView(discord.ui.View):
         db_path = _db_path(self.bot)
         pref = engagement.get_pref(db_path, interaction.user.id) if db_path else {}
         state = engagement.describe_auto_answer(pref) if pref else "unknown"
-        # A popup dismisses itself; an ephemeral message with eight buttons lingers in the channel instead.
-        await interaction.response.send_modal(SettingsModal(self.bot, user_id=interaction.user.id))
+        # Discord modals accept only text inputs (components of type 4), so a dropdown window is impossible: the
+        # private panel is the closest thing to a popup that can hold buttons.
+        await interaction.response.send_message(
+            f"**How I answer you** — currently {state}.\nPick what you want; this only affects you.",
+            ephemeral=True,
+            view=SettingsView(self.bot, user_id=interaction.user.id),
+        )
 
 
 def build_answer_panel(

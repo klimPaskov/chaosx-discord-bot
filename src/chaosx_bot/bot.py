@@ -2689,6 +2689,7 @@ class ChaosXBot(discord.Client):
         await self.webhook_server.start()
         await self.update_application_description()
         register_commands(self)
+        print(f"[commands] tree has {len(self.tree.get_commands())}: {sorted(c.name for c in self.tree.get_commands())}", flush=True)
         if self.settings.command_guild_id:
             guild = discord.Object(id=self.settings.command_guild_id)
             self.tree.copy_global_to(guild=guild)
