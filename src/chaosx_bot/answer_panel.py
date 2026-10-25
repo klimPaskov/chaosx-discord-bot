@@ -492,7 +492,7 @@ _PANEL_KEYS = {
 }
 
 
-async def handle_panel_click(interaction: discord.Interaction, key: str) -> None:
+async def handle_panel_click(interaction: discord.Interaction, key: str, *, deferred: bool = False) -> None:
     """Answer a panel click using the panel's stored subject, not in-memory objects.
 
     This is what makes old panels work: the question, answer and quick actions come back from the database keyed
@@ -540,7 +540,8 @@ async def handle_panel_click(interaction: discord.Interaction, key: str) -> None
         if str(label).strip().lower().startswith("check my setup"):
             await interaction.response.send_modal(SetupCheckModal(bot))
             return
-        await interaction.response.defer(thinking=False)
+        if not deferred:
+            await interaction.response.defer(thinking=False)
         text = await followup_answer(bot, question=question, answer=answer, prompt=prompt)
         parts = _split(text)
         if not parts:
@@ -563,14 +564,23 @@ class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<k
         self.key = key
 
     @classmethod
-    def from_custom_id(
+    async def from_custom_id(
         cls, interaction: discord.Interaction, item: discord.ui.Item[Any], match: Any, /
     ) -> "PanelItem":
+        # discord.py awaits this factory, so it must be a coroutine: returning an instance from a sync method made
+        # every click die with "object PanelItem can't be used in 'await' expression" (Hoops, 2026-10-25).
         return cls(match["key"])
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        print(f"[panel] click {self.key} by {interaction.user.id} on {getattr(interaction.message, 'id', 0)}", flush=True)
         try:
-            await handle_panel_click(interaction, self.key)
+            # Acknowledge before touching the database: Discord allows three seconds, and a click that lands during a
+            # stall must still be answered rather than dying as "did not respond in time".
+            deferred = False
+            if self.key.startswith("act") and not interaction.response.is_done():
+                await interaction.response.defer(thinking=False)
+                deferred = True
+            await handle_panel_click(interaction, self.key, deferred=deferred)
         except Exception as exc:  # pragma: no cover - Discord only
             import logging
 

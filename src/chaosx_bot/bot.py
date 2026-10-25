@@ -2591,6 +2591,7 @@ class ChaosXBot(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(welcome.persistent_view())
         self.add_dynamic_items(answer_panel.PanelItem)
+        print("[panel] dynamic items registered — cxfb:* buttons route to the panel handler", flush=True)
         self.loop.create_task(self._watch_loop_lag())
         self._install_stall_watchdog()
         await self.store.init()
