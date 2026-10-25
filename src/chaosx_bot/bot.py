@@ -1175,7 +1175,7 @@ async def reply_with_chunks(
 
 
 async def _attach_answer_panel(
-    bot: ChaosXBot, *, sent: discord.Message, question: str, answer: str, user_id: int
+    bot: ChaosXBot, *, sent: discord.Message, question: str, answer: str, user_id: int, force_feedback: bool = False
 ) -> None:
     """Put the private panel under a public answer once the model has picked this answer's quick actions.
 
@@ -1187,7 +1187,9 @@ async def _attach_answer_panel(
         # Feedback is offered under AUTONOMOUS answers only (Hoops, 2026-10-24) — a manual /ask can still be
         # rated with the 👍/👎 reactions — and the member can hide the prompt for a while or for good.
         try:
-            show_feedback = engagement.feedback_prompt_allows(bot.settings.db_path, user_id)
+            # Autonomous answers respect the member's "hide feedback" choice; an answer they asked for always
+            # gets the thumbs (Hoops, 2026-10-25), because pressing one is what opens the private box.
+            show_feedback = force_feedback or engagement.feedback_prompt_allows(bot.settings.db_path, user_id)
         except Exception:
             show_feedback = True
         view = build_answer_panel(
@@ -6271,6 +6273,10 @@ async def _analyse_video_path(
     )
 
 
+# Command answers that should carry the private panel (quick actions, thumbs, settings).
+PANEL_COMMANDS = {"ask"}
+
+
 class ServerOpsConfirmView(discord.ui.View):
     """✅ before anything irreversible: a ban or a deleted channel is not a typo to shrug off."""
 
@@ -6615,6 +6621,17 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
         content = part
         if i == 0:
             first_sent = await message.reply(content, mention_author=False, allowed_mentions=safe_allowed_mentions())
+            if first_sent is not None:
+                asyncio.create_task(
+                    _attach_answer_panel(
+                        bot,
+                        sent=first_sent,
+                        question=request,
+                        answer=content,
+                        user_id=message.author.id,
+                        force_feedback=True,
+                    )
+                )
         else:
             await message.channel.send(content, allowed_mentions=safe_allowed_mentions())
     if first_sent:
@@ -8910,6 +8927,19 @@ async def run_hermes_command(
             if i == 0:
                 first_sent = sent
     first_sent_id = getattr(first_sent, "id", None)
+    if first_sent is not None and command_name in PANEL_COMMANDS:
+        # Asked-for answers carry the same private panel as autonomous ones: quick actions, thumbs (which open
+        # the explanation box) and the settings gear (Hoops, 2026-10-25).
+        asyncio.create_task(
+            _attach_answer_panel(
+                bot,
+                sent=first_sent,
+                question=request,
+                answer=output,
+                user_id=interaction.user.id,
+                force_feedback=True,
+            )
+        )
     if owner_only and first_sent_id is not None:
         # Admin task output stays in the admin memory partition only.
         await mark_messages_admin(bot.settings.db_path, [first_sent_id])

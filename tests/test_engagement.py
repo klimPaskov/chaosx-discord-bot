@@ -275,3 +275,14 @@ def test_an_empty_explanation_is_fine(tmp_path):
     submit = _FakeResponse()
     asyncio_run(modal.on_submit(submit))
     assert engagement.message_rating(bot.settings.db_path, 102, 1) == "up"
+
+
+def test_the_owner_can_see_who_rates_and_what_they_said(tmp_path):
+    db = tmp_path / "e.db"
+    first = engagement.record_feedback(db, user_id=77, rating="up", question="q1")
+    engagement.add_feedback_comment(db, first, "clear and short")
+    engagement.record_feedback(db, user_id=88, rating="down", question="q2")
+    summary = engagement.feedback_summary(db, days=30)
+    assert "Who rates me:" in summary
+    assert "<@77> — 👍 1 · 👎 0" in summary
+    assert "clear and short" in summary

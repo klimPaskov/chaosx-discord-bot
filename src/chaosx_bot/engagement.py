@@ -263,6 +263,13 @@ def feedback_summary(db_path: str | Path, *, days: int = 7, limit: int = 20) -> 
             (since, limit),
         ).fetchall()
         overall = conn.execute("SELECT COUNT(*) FROM answer_feedback").fetchone()[0]
+        raters = conn.execute(
+            """
+            SELECT user_id, SUM(rating = 'up') AS up, SUM(rating = 'down') AS down, COUNT(*) AS total
+            FROM answer_feedback WHERE created_at >= ? GROUP BY user_id ORDER BY total DESC LIMIT 5
+            """,
+            (since,),
+        ).fetchall()
     finally:
         conn.close()
     counts = {rating: count for rating, count in totals}
@@ -271,6 +278,11 @@ def feedback_summary(db_path: str | Path, *, days: int = 7, limit: int = 20) -> 
         f"· all time {overall}",
         "",
     ]
+    if raters:
+        lines.append("Who rates me:")
+        for user_id, up, down, total in raters:
+            lines.append(f"  <@{user_id}> — 👍 {up or 0} · 👎 {down or 0} ({total} rated)")
+        lines.append("")
     if not rows:
         lines.append("No notes or dislikes in this window.")
         return "\n".join(lines)
