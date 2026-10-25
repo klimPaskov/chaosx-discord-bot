@@ -57,6 +57,7 @@ class CatalogReadError(RuntimeError):
     """The authoritative XLSX catalog could not be read safely."""
 
 SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_source_docs_path ON source_docs(path);
 CREATE TABLE IF NOT EXISTS index_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

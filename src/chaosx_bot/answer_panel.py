@@ -111,10 +111,18 @@ async def followup_answer(bot: Any, *, question: str, answer: str, prompt: str) 
             from .auto_scan import specific_domain_terms
 
             anchors = specific_domain_terms(f"{question} {prompt}")
+            # Same synchronous FTS as the main ask path: on the loop it stalls every interaction for seconds, and a
+            # click landing in that window expires before it can be acknowledged (10062).
             try:
-                context = str(knowledge.public_ask_context(f"{question} {prompt}", anchors=anchors))
+                context = str(
+                    await asyncio.to_thread(
+                        knowledge.public_ask_context, f"{question} {prompt}", anchors=anchors
+                    )
+                )
             except TypeError:
-                context = str(knowledge.public_ask_context(f"{question} {prompt}"))
+                context = str(
+                    await asyncio.to_thread(knowledge.public_ask_context, f"{question} {prompt}")
+                )
         except Exception as exc:
             print(f"[panel] follow-up context failed: {type(exc).__name__}: {exc}", flush=True)
     full_prompt = build_public_prompt(

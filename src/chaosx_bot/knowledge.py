@@ -475,6 +475,12 @@ class Knowledge:
         the answering model always has docs/notes/code ground truth to use.
         """
         self.ensure_index()
+        # Retrieval costs seconds on a 27k-document index; the same question asked twice should not pay twice,
+        # and a quick action re-asks the original question with a prompt appended, so repeats are common.
+        cache_key = (str(self.db_path), query.strip().casefold(), limit, bool(include_sources), tuple(anchors or ()))
+        cached = _ASK_CONTEXT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
         rows = self._public_ask_ranked_rows(query, limit)
         # BM25 ordering happily returns a strong document that never mentions the subject: "what is next on
         # the roadmap?" surfaced specs and the bot's own help video while
@@ -524,7 +530,11 @@ class Knowledge:
                 break
             snippets.append(item)
             total += len(item)
-        return "\n".join(snippets)
+        result = "\n".join(snippets)
+        if len(_ASK_CONTEXT_CACHE) > 128:
+            _ASK_CONTEXT_CACHE.clear()
+        _ASK_CONTEXT_CACHE[cache_key] = result
+        return result
 
     def _doc_content(self, path: str) -> str:
         """Lowercased document text, or "" when the path is gone."""
@@ -590,9 +600,12 @@ class Knowledge:
                     take(self._public_ask_fts_rows(phrase, limit))
                 if len(rows) >= limit:
                     break
-        # 2. All terms, then any term.
-        if terms:
+        # 2. All terms, then any term — each only if the earlier stage left gaps. The loosest query is the
+        #    expensive one (it scores every document that shares a single word), so it must not run once the
+        #    stricter stages have already filled the answer.
+        if terms and len(rows) < limit:
             take(self._public_ask_fts_rows(" AND ".join(f'"{t}"' for t in terms[:8]), limit))
+        if terms and len(rows) < limit:
             # Deeper pool for the loosest query so the per-source cap has a spread to choose from.
             take(self._public_ask_fts_rows(" OR ".join(f'"{t}"' for t in terms[:10]), limit * 4))
         # 3. Filename matches, but only to fill gaps: a file's head is usually not its answer, so
@@ -689,29 +702,36 @@ class Knowledge:
             vault_allow = " OR ".join(
                 f"d.path LIKE 'vault/{root}/%'" for root in sorted(VAULT_ALLOWED_ROOTS)
             )
+            # Two stages: let FTS cut the match set down with plain bm25 first, then apply the path weighting to
+            # that small window. Ordering the whole match set by a CASE expression made every question touch
+            # ~27k documents and took 12s, which is long enough to expire the interaction that asked for it.
             return conn.execute(
                 f"""
-                SELECT d.path, d.source_class,
-                       snippet(source_docs_fts, 2, '', '', ' … ', 90) AS snip,
-                       bm25(source_docs_fts) AS rank
-                FROM source_docs_fts
-                JOIN source_docs d ON d.id = source_docs_fts.rowid
-                WHERE source_docs_fts MATCH ?
-                  AND d.source_class NOT IN ({", ".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)})
-                  AND NOT (
-                      d.path LIKE 'vault/%'
-                      AND NOT ({vault_allow})
-                  )
-                ORDER BY bm25(source_docs_fts) - CASE
+                SELECT path, source_class, snip, rank FROM (
+                    SELECT d.path AS path, d.source_class AS source_class,
+                           snippet(source_docs_fts, 2, '', '', ' … ', 90) AS snip,
+                           bm25(source_docs_fts) AS rank
+                    FROM source_docs_fts
+                    JOIN source_docs d ON d.id = source_docs_fts.rowid
+                    WHERE source_docs_fts MATCH ?
+                      AND d.source_class NOT IN ({", ".join("?" for _ in PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES)})
+                      AND NOT (
+                          d.path LIKE 'vault/%'
+                          AND NOT ({vault_allow})
+                      )
+                    ORDER BY bm25(source_docs_fts)
+                    LIMIT ?
+                )
+                ORDER BY rank - CASE
                             -- curated vault knowledge answers questions; plans/handoffs and test
                             -- baselines merely repeat project words and used to win on that alone
-                            WHEN d.path LIKE 'vault/%' THEN 3.0
-                            WHEN d.path LIKE 'qoder/%' THEN 1.5
+                            WHEN path LIKE 'vault/%' THEN 3.0
+                            WHEN path LIKE 'qoder/%' THEN 1.5
                             ELSE 0.0
                          END
                 LIMIT ?
                 """,
-                (safe_query, *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES), limit),
+                (safe_query, *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES), max(limit * 6, 60), limit),
             ).fetchall()
         finally:
             conn.close()
@@ -1121,6 +1141,9 @@ _QUERY_STOPWORDS = {
     "them", "then", "there", "these", "they", "this", "to", "up", "us", "was", "we", "were", "what", "when", "where",
     "which", "who", "why", "will", "with", "work", "works", "working", "would", "you", "your",
 }
+
+
+_ASK_CONTEXT_CACHE: dict[tuple, str] = {}
 
 
 def _fts_query(query: str) -> str:
