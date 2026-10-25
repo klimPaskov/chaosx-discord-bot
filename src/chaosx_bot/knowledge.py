@@ -128,13 +128,24 @@ class Knowledge:
         thread.start()
 
     def _refresh_worker(self) -> None:
-        try:
-            self._ensure_index_sync()
-        except BaseException as exc:  # recorded, then re-raised so the thread reports it too
-            object.__setattr__(self, "_refresh_error", exc)
-            raise
-        finally:
-            object.__setattr__(self, "_refresh_in_flight", False)
+        # A manual rebuild holds the write lock; the refresh must wait its turn instead of dying with a traceback
+        # and leaving `_refresh_in_flight` looking like a crash to anyone reading the log.
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                self._ensure_index_sync()
+                object.__setattr__(self, "_refresh_error", None)
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == attempts:
+                    object.__setattr__(self, "_refresh_error", exc)
+                    print(f"[index] refresh gave up after {attempt} attempt(s): {exc}", flush=True)
+                    break
+                time.sleep(20 * attempt)
+            except BaseException as exc:  # recorded, then re-raised so the thread reports it too
+                object.__setattr__(self, "_refresh_error", exc)
+                raise
+        object.__setattr__(self, "_refresh_in_flight", False)
 
     def _refresh_vault_indexes_if_stale(self) -> bool:
         """Regenerate the vault's index files when a deletion left stale listings behind.
