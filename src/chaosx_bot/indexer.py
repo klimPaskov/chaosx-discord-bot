@@ -36,7 +36,12 @@ QODER_TEXT_EXTENSIONS = {".md", ".txt"}
 QODER_SKIP_DIRS = {".git", "__pycache__", ".obsidian"}
 # Extra knowledge roots: agentic-modding toolchains (MCP servers, ComfyUI workflow
 # packs, mod-setup kits). Indexed verbatim under `tooling/<name>/...` as public docs.
-TOOLING_TEXT_EXTENSIONS = {".md", ".txt", ".json", ".yml", ".yaml"}
+# Tooling repos are indexed for what they *do*, not only what they say: the app that detects Codex lives in
+# Rust, and a docs-only index cannot explain why detection fails on macOS.
+TOOLING_TEXT_EXTENSIONS = {
+    ".md", ".txt", ".json", ".yml", ".yaml",
+    ".rs", ".ts", ".tsx", ".js", ".mjs", ".py", ".toml", ".css", ".html",
+}
 TOOLING_SKIP_DIRS = {
     ".git", ".venv", "node_modules", "__pycache__", ".pytest_cache",
     "dist", "build", "coverage", "tmp",

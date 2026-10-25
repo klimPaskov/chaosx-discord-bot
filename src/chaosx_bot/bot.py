@@ -2592,6 +2592,7 @@ class ChaosXBot(discord.Client):
         self.add_view(welcome.persistent_view())
         self.add_dynamic_items(answer_panel.PanelItem)
         self.loop.create_task(self._watch_loop_lag())
+        self._install_stall_watchdog()
         await self.store.init()
         # /admin model persists a switch, so re-apply it here: the choice must outlive a restart.
         from . import model_switch
@@ -3969,6 +3970,46 @@ class ChaosXBot(discord.Client):
             )
         except Exception:
             pass
+
+    def _install_stall_watchdog(self) -> None:
+        """A thread outside the event loop, so a stall can be attributed instead of just measured.
+
+        The async watchdog only wakes up after the stall is over, which tells us it happened but not what caused
+        it. This thread watches a heartbeat: if the loop stops beating for two seconds it dumps the stack of the
+        thread that runs the loop, naming the exact function that is blocking every interaction.
+        """
+        import threading
+        import traceback
+
+        state = {"beat": time.monotonic(), "reported": 0.0}
+
+        async def beat() -> None:
+            while True:
+                state["beat"] = time.monotonic()
+                await asyncio.sleep(0.5)
+
+        def watch() -> None:
+            while True:
+                time.sleep(0.5)
+                gap = time.monotonic() - state["beat"]
+                if gap < 2.0 or time.monotonic() - state["reported"] < 30:
+                    continue
+                state["reported"] = time.monotonic()
+                frames = sys._current_frames()
+                loop_thread = None
+                for thread_id, frame in frames.items():
+                    stack = traceback.format_stack(frame)
+                    if any("run_until_complete" in line or "base_events.py" in line for line in stack):
+                        loop_thread = (thread_id, stack)
+                        break
+                if loop_thread is None:
+                    tier_logger.warning("event loop silent for %.1fs (stack unavailable)", gap)
+                    continue
+                tail = "".join(loop_thread[1][-4:])
+                tier_logger.warning("event loop blocked %.1fs by:\n%s", gap, tail.strip())
+
+        threading.Thread(target=watch, name="loop-stall-watchdog", daemon=True).start()
+        self.loop.create_task(beat())
 
     async def _watch_loop_lag(self) -> None:
         """Log when the event loop stalls, because a stall longer than 3s makes every button and command time out.
