@@ -350,6 +350,7 @@ from .answer_cache import AnswerCache
 from .capabilities import probe_capabilities
 from .denial_guard import corrective_prompt, is_denial
 from . import engagement
+from . import knowledge_gaps, member_memory, moderation_cases
 from . import server_live
 from . import server_ops
 from .answer_panel import build_answer_panel, suggest_actions
@@ -446,9 +447,7 @@ CONTEXT_ATTACHMENT_CUES = (
     "the one",
 )
 
-BOT_DESCRIPTION = (
-    "Chaos Redux answers, agentic HOI4 modding help, MCP setup and troubleshooting"
-)
+BOT_DESCRIPTION = "Chaos Redux answers + agentic HOI4 modding and MCP help"
 AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
 AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
 AUTO_BANTER_AUTOMATION_NAME = "auto_bot_topic_banter"
@@ -1745,7 +1744,7 @@ def _event_label(event_id: str) -> str:
 
 MODDING_QUICK_ACTIONS: list[tuple[str, str]] = [
     ("Install the MCPs", "How do I install the HOI4 Agent Tools and HOI4 Live Tools MCP servers?"),
-    ("A server won't start", "My MCP server or the Mod Setup app errors during setup — how do I fix it?"),
+    ("Check my setup", "check my setup"),
     ("What can Agent Tools do?", "What can the HOI4 Agent Tools MCP check in my mod?"),
 ]
 
@@ -2374,6 +2373,14 @@ class ChaosXBot(discord.Client):
             profile = _cap_memory(await user_profile_for(self.settings.db_path, user_id), 1500)
         except Exception:
             profile = ""
+        try:
+            from . import member_memory
+
+            long_term = member_memory.facts_block(self.settings.db_path, user_id)
+        except Exception:
+            long_term = ""
+        if long_term:
+            profile = f"{profile}\n\n{long_term}" if profile else long_term
         display: str | None = None
         role: str | None = None
         for guild in self.guilds:
@@ -6350,6 +6357,33 @@ async def _analyse_video_path(
 PANEL_COMMANDS = {"ask"}
 
 
+class MemoryForgetView(discord.ui.View):
+    """Self-only: delete everything ChaosX remembers about the presser."""
+
+    def __init__(self, bot: ChaosXBot, *, user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.user_id = user_id
+
+    @discord.ui.button(label="Forget everything about me", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def forget(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This is someone else's memory view.", ephemeral=True)
+            return
+        try:
+            removed = member_memory.forget(self.bot.settings.db_path, interaction.user.id)
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"That failed: `{type(exc).__name__}`", ephemeral=True
+            )
+            return
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"Deleted {removed} saved fact(s) and your summary. I will build it again from new messages.",
+            view=None,
+        )
+
+
 class ServerOpsConfirmView(discord.ui.View):
     """✅ before anything irreversible: a ban or a deleted channel is not a typo to shrug off."""
 
@@ -6399,12 +6433,46 @@ async def _audit_server_op(bot: ChaosXBot, plan, author_id: int, guild, channel,
         print(f"[server_ops] audit failed: {type(exc).__name__}: {exc}", flush=True)
 
 
+async def _snapshot_evidence(bot: ChaosXBot, plan, *, guild, channel, author_id: int) -> str:
+    """Write the messages this plan will delete into moderation_cases and name the case."""
+    try:
+        target = server_ops._channel(guild, plan.args.get("channel"), channel)
+        boundary = None
+        if plan.args.get("until_message_id"):
+            try:
+                boundary = await target.fetch_message(int(str(plan.args["until_message_id"]).strip()))
+            except Exception:
+                boundary = None
+        messages = await moderation_cases.snapshot_messages(target, after=boundary)
+        case_id = moderation_cases.save_case(
+            bot.settings.db_path,
+            actor_id=author_id,
+            guild_id=getattr(guild, "id", None),
+            channel_id=getattr(target, "id", None),
+            action=plan.action,
+            summary=server_ops.describe(plan),
+            messages=messages,
+        )
+        if not messages:
+            return f"(case #{case_id}: nothing readable to preserve)"
+        return f"Evidence saved as case #{case_id} ({len(messages)} message(s) with ids and jump links)."
+    except Exception as exc:
+        print(f"[cases] snapshot failed: {type(exc).__name__}: {exc}", flush=True)
+        return ""
+
+
 async def _run_server_plans(bot: ChaosXBot, plans, *, guild, channel, author_id: int) -> str:
     """Run each plan in order. A refusal stops the batch before the rest would happen on a wrong guess."""
     lines: list[str] = []
     for index, plan in enumerate(plans, start=1):
         try:
+            # Evidence first: whatever this plan destroys is written down before it goes (Hoops, 2026-10-25).
+            evidence = ""
+            if plan.action in {"purge", "delete_channel"}:
+                evidence = await _snapshot_evidence(bot, plan, guild=guild, channel=channel, author_id=author_id)
             summary = await server_ops.execute(bot, plan, guild=guild, channel=channel, author_id=author_id)
+            if evidence:
+                summary = f"{summary} {evidence}"
         except server_ops.PlanError as exc:
             lines.append(f"⏹️ Stopped at step {index}: {exc}" if len(plans) > 1 else f"Not done: {exc}")
             break
@@ -9983,6 +10051,43 @@ def register_commands(bot: ChaosXBot) -> None:
             _result, output = answer
             bot.answer_cache.put(question, output, commit=bot.knowledge.commit_sha())
 
+    @bot.tree.command(name="memory", description="See what ChaosX remembers about you, or forget it.")
+    async def chaosx_memory(interaction: discord.Interaction) -> None:
+        db_path = bot.settings.db_path
+        try:
+            profile = await user_profile_for(db_path, interaction.user.id)
+            facts = member_memory.durable_facts(db_path, interaction.user.id)
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"I could not read my memory: `{type(exc).__name__}`", ephemeral=True
+            )
+            return
+        if not profile and not facts:
+            await interaction.response.send_message(
+                "I have nothing saved about you yet — I build it from messages I can see here.",
+                ephemeral=True,
+                view=MemoryForgetView(bot, user_id=interaction.user.id),
+            )
+            return
+        lines = ["## What I remember about you", ""]
+        if facts:
+            lines.append("**Kept long-term**")
+            lines.extend(f"- {fact}" for fact in facts)
+            lines.append("")
+        if profile:
+            body = profile.strip()
+            lines.append("**Recent summary**")
+            lines.append(body[:1500] + ("…" if len(body) > 1500 else ""))
+        text = "\n".join(lines)
+        for index, part in enumerate(_chunk(text)):
+            kwargs = {"ephemeral": True, "allowed_mentions": safe_allowed_mentions()}
+            if index == 0:
+                await interaction.response.send_message(
+                    part, view=MemoryForgetView(bot, user_id=interaction.user.id), **kwargs
+                )
+            else:
+                await interaction.followup.send(part, **kwargs)
+
     @bot.tree.command(
         name="modding",
         description="Overview of agentic HOI4 modding: Mod Setup app, MCP servers, skills, portrait workflows.",
@@ -10843,6 +10948,10 @@ def register_commands(bot: ChaosXBot) -> None:
         if feedback_days > 0:
             try:
                 text += block(section(f"Answer feedback (last {feedback_days}d)"), engagement.feedback_summary(settings.db_path, days=min(feedback_days, 365)))
+                gaps = knowledge_gaps.open_gaps(settings.db_path)
+                if gaps:
+                    gap_lines = [f"- “{topic}” — {count} 👎 — e.g. {(sample or '')[:90]}" for topic, count, sample in gaps]
+                    text += block(section("Open knowledge gaps"), "\n".join(gap_lines))
             except Exception as exc:
                 text += block(section("Answer feedback"), f"Could not read: `{type(exc).__name__}`")
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin health", summary="health check")

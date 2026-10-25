@@ -16,6 +16,7 @@ from typing import Any
 import discord
 
 from . import engagement
+from . import knowledge_gaps
 from .ask_api import direct_chat_completion_stream
 from .hermes_bridge import PUBLIC_ASK_BOUNDARY, build_public_prompt
 
@@ -169,6 +170,45 @@ class FeedbackModal(discord.ui.Modal):
         await interaction.response.send_message(thanks, ephemeral=True)
 
 
+class SetupCheckModal(discord.ui.Modal, title="Check your modding setup"):
+    """Collect what the member has, then hand back a checklist they can act on locally.
+
+    ChaosX cannot inspect a member's disk or running processes, so this asks for the two things that decide the
+    diagnosis — their platform and the exact failure — instead of guessing at paths or ports.
+    """
+
+    def __init__(self, bot: Any) -> None:
+        super().__init__(title="Check your modding setup")
+        self.bot = bot
+        self.platform = discord.ui.TextInput(
+            label="OS and agent",
+            placeholder="Windows 11, Claude Code (or Codex / Cursor / OpenCode)",
+            max_length=120,
+            required=True,
+        )
+        self.symptom = discord.ui.TextInput(
+            label="What happens?",
+            style=discord.TextStyle.paragraph,
+            placeholder="Paste the error text, or what the app/MCP server does instead of starting.",
+            max_length=1000,
+            required=True,
+        )
+        self.add_item(self.platform)
+        self.add_item(self.symptom)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+        checklist = (
+            "## Setup check\n"
+            "I cannot see your machine, so here is the order that finds the break fastest:\n"
+            "1. **Mod Setup app** — run it and let it finish; it wires the tooling. If it errored, that message is the cause, not a symptom.\n"
+            "2. **Servers registered** — in your agent, list MCP servers. `hoi4-agent-tools` and `hoi4-live-tools` should both appear and show as connected.\n"
+            "3. **Agent Tools needs your mod folder** — point it at the folder holding `common/` and `events/`, not the game install.\n"
+            "4. **Live Tools needs the game running** — launch HOI4 with debug enabled, load a save, then ask it for the error log. A dead game looks like a dead server.\n"
+            "5. **Still failing?** Paste the exact error and the app version in this thread — with that I can name the piece that broke."
+        )
+        await interaction.response.send_message(checklist, ephemeral=True)
+
+
 class SettingsView(discord.ui.View):
     """Per-user control over unprompted answers."""
 
@@ -301,6 +341,9 @@ class AnswerPanelView(discord.ui.View):
         button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            if label.strip().lower().startswith("check my setup"):
+                await interaction.response.send_modal(SetupCheckModal(self.bot))
+                return
             # Public on purpose (Hoops, 2026-10-24): pressing a quick action is a member asking the bot something
             # in the channel, so everyone gets the answer; only the settings and feedback panels stay private.
             await interaction.response.defer(thinking=False)
@@ -337,6 +380,11 @@ class AnswerPanelView(discord.ui.View):
             print(f"[panel] feedback insert failed: {type(exc).__name__}: {exc}", flush=True)
             await interaction.response.send_message("I could not save that.", ephemeral=True)
             return
+        if rating == "down":
+            try:
+                knowledge_gaps.record_dislike(db_path, question=self.question)
+            except Exception as exc:
+                print(f"[panel] gap record failed: {type(exc).__name__}: {exc}", flush=True)
         # The rating is in the database before the box opens, so closing the box still counts the thumb.
         await interaction.response.send_modal(
             FeedbackModal(self.bot, feedback_id=feedback_id, rating=rating)

@@ -1072,6 +1072,14 @@ async def compact_user_profile_if_due(
             await db.commit()
     except Exception:
         return False
+    # Second memory layer (Hoops, 2026-10-25): the durable facts survive the next profile rewrite.
+    try:
+        from . import member_memory
+
+        member_memory.absorb_profile(db_path, author_id, new_profile)
+        member_memory.compact(db_path, author_id)
+    except Exception as exc:
+        print(f"[memory] durable facts failed for {author_id}: {type(exc).__name__}: {exc}", flush=True)
     return True
 
 
