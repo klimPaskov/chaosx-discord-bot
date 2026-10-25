@@ -271,6 +271,34 @@ class ActionModal(discord.ui.Modal):
             )
 
 
+class ForgetConfirmView(discord.ui.View):
+    """Deleting memory is irreversible, so it takes a second, deliberate press."""
+
+    def __init__(self, bot: Any, *, user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.user_id = user_id
+
+    @discord.ui.button(label="Yes, delete everything", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        db_path = _db_path(self.bot)
+        if not db_path:
+            await interaction.response.send_message("I cannot reach my memory store.", ephemeral=True)
+            return
+        removed = member_memory.forget(db_path, self.user_id)
+        await interaction.response.edit_message(
+            content=(
+                f"Done — {removed} saved fact{'s' if removed != 1 else ''} about you deleted, and your profile "
+                "with it. I will start fresh from what you say next."
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Keep my memory", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Nothing deleted. Your memory is intact.", view=None)
+
+
 class MemoryView(discord.ui.View):
     """What ChaosX actually has on file for this member, and a way to wipe it."""
 
@@ -312,11 +340,123 @@ class MemoryView(discord.ui.View):
         if not db_path:
             await interaction.response.send_message("I cannot reach my memory store.", ephemeral=True)
             return
-        removed = member_memory.forget(db_path, self.user_id)
-        await interaction.response.edit_message(
-            content=f"Done — {removed} saved fact{'s' if removed != 1 else ''} about you deleted. I will start fresh.",
-            view=None,
+        facts = member_memory.durable_facts(db_path, self.user_id, limit=200)
+        await interaction.response.send_message(
+            f"This deletes **{len(facts)} saved fact{'s' if len(facts) != 1 else ''}** about you and your profile. "
+            "It cannot be undone.",
+            ephemeral=True,
+            view=ForgetConfirmView(self.bot, user_id=self.user_id),
         )
+
+
+class SettingsModal(discord.ui.Modal, title="ChaosX settings"):
+    """A real popup: three dropdowns, one Save, and nothing left hanging in the channel."""
+
+    def __init__(self, bot: Any, *, user_id: int) -> None:
+        super().__init__()
+        self.bot = bot
+        self.user_id = user_id
+        db_path = _db_path(bot)
+        pref = engagement.get_pref(db_path, user_id) if db_path else {}
+
+        self.answer = discord.ui.Select(
+            placeholder="When should I answer you?",
+            options=[
+                discord.SelectOption(label="Answer me automatically", value="auto:on", emoji="🤖"),
+                discord.SelectOption(label="Only when I ask", value="auto:off", emoji="🙋"),
+                discord.SelectOption(label="Answer for 24 hours", value="auto:24", emoji="⏱️"),
+            ],
+            min_values=1,
+            max_values=1,
+            required=False,
+        )
+        self.detail = discord.ui.Select(
+            placeholder="How much detail?",
+            options=[
+                discord.SelectOption(label="Short answers", value="detail:concise", emoji="✂️"),
+                discord.SelectOption(label="Explain the reasoning", value="detail:detailed", emoji="📖"),
+            ],
+            min_values=1,
+            max_values=1,
+            required=False,
+        )
+        self.feedback = discord.ui.Select(
+            placeholder="Feedback prompt",
+            options=[
+                discord.SelectOption(label="Keep asking after answers", value="fb:on", emoji="👍"),
+                discord.SelectOption(label="Hide it for 24 hours", value="fb:24", emoji="🌙"),
+                discord.SelectOption(label="Hide it for a week", value="fb:week", emoji="📅"),
+                discord.SelectOption(label="Hide it permanently", value="fb:never", emoji="❌"),
+            ],
+            min_values=1,
+            max_values=1,
+            required=False,
+        )
+        self.add_item(self.answer)
+        self.add_item(self.detail)
+        self.add_item(self.feedback)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+        db_path = _db_path(self.bot)
+        if not db_path:
+            await interaction.response.send_message("I cannot reach my settings store.", ephemeral=True)
+            return
+        changes: list[str] = []
+        choice = (self.answer.values or [""])[0]
+        if choice == "auto:on":
+            engagement.set_auto_answer(db_path, self.user_id, enabled=True, hours=None)
+            changes.append("answering you automatically")
+        elif choice == "auto:off":
+            engagement.set_auto_answer(db_path, self.user_id, enabled=False, hours=None)
+            changes.append("only answering when you ask")
+        elif choice == "auto:24":
+            engagement.set_auto_answer(db_path, self.user_id, enabled=True, hours=24)
+            changes.append("answering you automatically for 24 hours")
+
+        choice = (self.detail.values or [""])[0]
+        if choice == "detail:concise":
+            engagement.set_detail_level(db_path, self.user_id, "concise")
+            changes.append("short answers")
+        elif choice == "detail:detailed":
+            engagement.set_detail_level(db_path, self.user_id, "detailed")
+            changes.append("answers with reasoning")
+
+        choice = (self.feedback.values or [""])[0]
+        if choice == "fb:on":
+            engagement.dismiss_feedback_prompt(db_path, self.user_id, hours=0)
+            changes.append("feedback prompt back on")
+        elif choice in ("fb:24", "fb:week", "fb:never"):
+            hours = {"fb:24": 24, "fb:week": 24 * 7, "fb:never": None}[choice]
+            engagement.dismiss_feedback_prompt(db_path, self.user_id, hours=hours)
+            changes.append({"fb:24": "feedback hidden for 24 hours", "fb:week": "feedback hidden for a week", "fb:never": "feedback hidden permanently"}[choice])
+
+        pref = engagement.get_pref(db_path, self.user_id)
+        summary = engagement.describe_auto_answer(pref)
+        text = (
+            "**Saved.** " + ("; ".join(changes) + ".\n" if changes else "Nothing changed.\n")
+            + f"Unprompted answers: **{summary}**."
+        )
+        await interaction.response.send_message(
+            text, ephemeral=True, view=MemoryShortcutView(self.bot, user_id=self.user_id)
+        )
+
+
+class MemoryShortcutView(discord.ui.View):
+    """Offered right after saving, so what the bot remembers is one press away."""
+
+    def __init__(self, bot: Any, *, user_id: int) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.user_id = user_id
+
+    @discord.ui.button(label="What I remember", emoji="🧠", style=discord.ButtonStyle.secondary)
+    async def show_memory(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        view = MemoryView(self.bot, user_id=self.user_id)
+        await interaction.response.send_message(view.render(), ephemeral=True, view=view)
+
+    @discord.ui.button(label="Settings again", emoji="⚙️", style=discord.ButtonStyle.secondary)
+    async def again(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        await interaction.response.send_modal(SettingsModal(self.bot, user_id=self.user_id))
 
 
 class SettingsView(discord.ui.View):
@@ -467,7 +607,9 @@ class AnswerPanelView(discord.ui.View):
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
             if label.strip().lower().startswith("check my setup"):
-                await interaction.response.send_modal(SetupCheckModal(self.bot))
+                await interaction.response.send_modal(
+                    ActionModal(self.bot, question=self.question, answer=self.answer, message_id=message_id)
+                )
                 return
             # Public on purpose (Hoops, 2026-10-24): pressing a quick action is a member asking the bot something
             # in the channel, so everyone gets the answer; only the settings and feedback panels stay private.
@@ -572,11 +714,8 @@ class AnswerPanelView(discord.ui.View):
         db_path = _db_path(self.bot)
         pref = engagement.get_pref(db_path, interaction.user.id) if db_path else {}
         state = engagement.describe_auto_answer(pref) if pref else "unknown"
-        await interaction.response.send_message(
-            f"**How I answer you** — currently {state}.\nPick what you want; this only affects you.",
-            ephemeral=True,
-            view=SettingsView(self.bot, user_id=interaction.user.id),
-        )
+        # A popup dismisses itself; an ephemeral message with eight buttons lingers in the channel instead.
+        await interaction.response.send_modal(SettingsModal(self.bot, user_id=interaction.user.id))
 
 
 def build_answer_panel(
