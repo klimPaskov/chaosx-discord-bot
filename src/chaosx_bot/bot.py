@@ -350,6 +350,7 @@ from .answer_cache import AnswerCache
 from .capabilities import probe_capabilities
 from .denial_guard import corrective_prompt, is_denial
 from . import engagement
+from . import server_ops
 from .answer_panel import build_answer_panel, suggest_actions
 from .grounding import citations, is_ungrounded_refusal, unverified_citations
 from .live_facts import set_capability_summary
@@ -6269,6 +6270,141 @@ async def _analyse_video_path(
     )
 
 
+class ServerOpsConfirmView(discord.ui.View):
+    """✅ before anything irreversible: a ban or a deleted channel is not a typo to shrug off."""
+
+    def __init__(self, bot: ChaosXBot, *, plans, guild, channel, author_id: int) -> None:
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.plans = plans
+        self.guild = guild
+        self.channel = channel
+        self.author_id = author_id
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only Hoops can confirm this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", emoji="✅", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer()
+        summary = await _run_server_plans(
+            self.bot, self.plans, guild=self.guild, channel=self.channel, author_id=self.author_id
+        )
+        self.stop()
+        await interaction.edit_original_response(content=summary, view=None)
+
+    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await self._guard(interaction):
+            return
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled — nothing was changed.", view=None)
+
+
+async def _audit_server_op(bot: ChaosXBot, plan, author_id: int, guild, channel, summary: str) -> None:
+    try:
+        await bot.store.audit(
+            actor_id=author_id,
+            guild_id=getattr(guild, "id", None),
+            channel_id=getattr(channel, "id", None),
+            command=f"server {plan.action}",
+            summary=summary[:400],
+        )
+    except Exception as exc:
+        print(f"[server_ops] audit failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+async def _run_server_plans(bot: ChaosXBot, plans, *, guild, channel, author_id: int) -> str:
+    """Run each plan in order. A refusal stops the batch before the rest would happen on a wrong guess."""
+    lines: list[str] = []
+    for index, plan in enumerate(plans, start=1):
+        try:
+            summary = await server_ops.execute(bot, plan, guild=guild, channel=channel, author_id=author_id)
+        except server_ops.PlanError as exc:
+            lines.append(f"⏹️ Stopped at step {index}: {exc}" if len(plans) > 1 else f"Not done: {exc}")
+            break
+        except discord.Forbidden:
+            lines.append(
+                f"{'⏹️ Stopped: ' if len(plans) > 1 else ''}I am missing a permission for that. My role needs "
+                "Manage Channels / Manage Roles / Manage Messages / Moderate Members / Ban Members as needed, "
+                "and it must sit above any role I have to touch."
+            )
+            break
+        except discord.HTTPException as exc:
+            lines.append(f"{'⏹️ Stopped: ' if len(plans) > 1 else ''}Discord refused that: {exc.text or type(exc).__name__}")
+            break
+        except Exception as exc:
+            print(f"[server_ops] {plan.action} failed: {type(exc).__name__}: {exc}", flush=True)
+            lines.append(f"{'⏹️ Stopped: ' if len(plans) > 1 else ''}That failed: `{type(exc).__name__}`.")
+            break
+        await _audit_server_op(bot, plan, author_id, guild, channel, summary)
+        lines.append(f"✅ {summary}" if len(plans) == 1 else f"{index}. ✅ {summary}")
+    return "\n".join(lines)
+
+
+async def _server_ops_plan(bot: ChaosXBot, request: str, *, guild, channel, reference=None, members=None):
+    """None when this is not a management request at all; otherwise a Plan or a refusal string."""
+    if not server_ops.looks_like_management(request):
+        return None
+    context = server_ops.context_block(
+        guild=guild, channel=channel, referenced_message=reference, mentioned_members=members or []
+    )
+    plan = await server_ops.plan_from_text(bot, request, context=context)
+    if plan is None:
+        return "none"
+    return plan
+
+
+async def try_server_ops_message(bot: ChaosXBot, message: discord.Message, request: str) -> bool:
+    """Owner-only: act on a plain-language management request, or return False to answer it normally."""
+    if message.guild is None or message.author.id != bot.settings.owner_id:
+        return False
+    reference = None
+    if message.reference is not None:
+        if message.reference.cached_message is not None:
+            reference = message.reference.cached_message
+        elif message.reference.message_id:
+            try:
+                reference = await message.channel.fetch_message(message.reference.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                reference = None
+    plan = await _server_ops_plan(
+        bot,
+        request,
+        guild=message.guild,
+        channel=message.channel,
+        reference=reference,
+        members=list(getattr(message, "mentions", []) or []),
+    )
+    if plan is None or plan == "none":
+        return False
+    try:
+        plans = [server_ops.validate(item) for item in plan]
+    except server_ops.PlanError as exc:
+        await message.reply(str(exc), mention_author=False, allowed_mentions=safe_allowed_mentions())
+        return True
+    if any(item.needs_confirmation for item in plans):
+        await message.reply(
+            f"{server_ops.describe_all(plans)} — confirm?",
+            view=ServerOpsConfirmView(
+                bot, plans=plans, guild=message.guild, channel=message.channel, author_id=message.author.id
+            ),
+            mention_author=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return True
+    summary = await _run_server_plans(
+        bot, plans, guild=message.guild, channel=message.channel, author_id=message.author.id
+    )
+    await message.reply(summary, mention_author=False, allowed_mentions=safe_allowed_mentions())
+    return True
+
+
 async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.mention_ask_enabled or bot.user is None:
         return False
@@ -6310,6 +6446,8 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
         return True
 
     if message.author.id == bot.settings.owner_id:
+        if await try_server_ops_message(bot, message, request):
+            return True
         await run_admin_ask_message(
             bot,
             message,
@@ -10101,6 +10239,39 @@ def register_commands(bot: ChaosXBot) -> None:
                 allowed_mentions=safe_allowed_mentions(),
             )
             return
+        if interaction.guild is not None and interaction.user.id == bot.settings.owner_id:
+            plan = await _server_ops_plan(
+                bot, request, guild=interaction.guild, channel=interaction.channel
+            )
+            if plan not in (None, "none"):
+                try:
+                    plans = [server_ops.validate(item) for item in plan]
+                except server_ops.PlanError as exc:
+                    await interaction.response.send_message(str(exc), ephemeral=True)
+                    return
+                if any(item.needs_confirmation for item in plans):
+                    await interaction.response.send_message(
+                        f"{server_ops.describe_all(plans)} — confirm?",
+                        ephemeral=True,
+                        view=ServerOpsConfirmView(
+                            bot,
+                            plans=plans,
+                            guild=interaction.guild,
+                            channel=interaction.channel,
+                            author_id=interaction.user.id,
+                        ),
+                    )
+                    return
+                await interaction.response.defer(ephemeral=True, thinking=True)
+                summary = await _run_server_plans(
+                    bot,
+                    plans,
+                    guild=interaction.guild,
+                    channel=interaction.channel,
+                    author_id=interaction.user.id,
+                )
+                await interaction.followup.send(summary, ephemeral=True, allowed_mentions=safe_allowed_mentions())
+                return
         await run_owner_hermes(bot, interaction, request, command_name="admin ask", use_operator_model=True)
 
     @admin.command(
