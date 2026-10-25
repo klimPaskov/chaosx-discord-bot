@@ -67,7 +67,7 @@ uv run chaosx-bot
 
 ## 6. First Discord checks
 
-In the target server, as Hoops/Klim only:
+In the target server, as the owner only:
 
 ```text
 /health

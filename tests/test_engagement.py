@@ -286,3 +286,12 @@ def test_the_owner_can_see_who_rates_and_what_they_said(tmp_path):
     assert "Who rates me:" in summary
     assert "<@77> — 👍 1 · 👎 0" in summary
     assert "clear and short" in summary
+
+
+def test_a_fixed_action_set_reaches_the_panel():
+    actions = [("Install the MCPs", "how do I install them?"), ("A server won't start", "it errors")]
+    view = build_answer_panel(
+        bot=None, question="q", answer="a", user_id=1, message_id=5, actions=actions
+    )
+    labels = [getattr(child, "label", None) for child in view.children]
+    assert "Install the MCPs" in labels and "A server won't start" in labels
