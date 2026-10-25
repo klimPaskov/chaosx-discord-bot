@@ -10480,25 +10480,9 @@ def register_commands(bot: ChaosXBot) -> None:
             allowed_mentions=safe_allowed_mentions(),
         )
 
-    @admin.command(name="feedback", description="Review member ratings and notes on answers.")
-    @app_commands.describe(days="How far back to look (default 7).")
-    async def admin_feedback(interaction: discord.Interaction, days: int = 7) -> None:
-        if not await owner_gate(interaction, settings):
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            summary = engagement.feedback_summary(settings.db_path, days=max(1, min(days, 365)))
-        except Exception as exc:
-            await interaction.response.send_message(
-                f"Could not read feedback: `{type(exc).__name__}`", ephemeral=True
-            )
-            return
-        for part in _chunk(summary):
-            if part:
-                await interaction.followup.send(part, ephemeral=True, allowed_mentions=safe_allowed_mentions())
-
     @admin.command(name="health", description="Check ChaosX runtime health.")
-    async def admin_health(interaction: discord.Interaction) -> None:
+    @app_commands.describe(feedback_days="Include member answer feedback from the last N days (0 = skip).")
+    async def admin_health(interaction: discord.Interaction, feedback_days: int = 0) -> None:
         if not await owner_gate(interaction, settings):
             return
         guilds = ", ".join(f"{g.name}({g.id})" for g in bot.guilds) or "none"
@@ -10512,6 +10496,13 @@ def register_commands(bot: ChaosXBot) -> None:
             f"Visible guilds: {guilds}"
         )
         text += block(section("Command latency"), bullets(command_timings_lines()))
+        # Feedback lives here rather than in its own subcommand: /admin is at Discord's 25-subcommand ceiling and
+        # Hoops wants few, consolidated admin commands.
+        if feedback_days > 0:
+            try:
+                text += block(section(f"Answer feedback (last {feedback_days}d)"), engagement.feedback_summary(settings.db_path, days=min(feedback_days, 365)))
+            except Exception as exc:
+                text += block(section("Answer feedback"), f"Could not read: `{type(exc).__name__}`")
         await bot.store.audit(actor_id=interaction.user.id, guild_id=interaction.guild_id, channel_id=interaction.channel_id, command="admin health", summary="health check")
         await interaction.response.send_message(text, ephemeral=True, allowed_mentions=safe_allowed_mentions())
 
