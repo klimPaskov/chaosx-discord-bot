@@ -15,7 +15,7 @@ from typing import Any
 
 import discord
 
-from . import engagement, panel_state
+from . import engagement, member_memory, panel_state
 from . import knowledge_gaps
 from .ask_api import direct_chat_completion_stream
 from .hermes_bridge import PUBLIC_ASK_BOUNDARY, build_public_prompt
@@ -178,43 +178,145 @@ class FeedbackModal(discord.ui.Modal):
         await interaction.response.send_message(thanks, ephemeral=True)
 
 
-class SetupCheckModal(discord.ui.Modal, title="Check your modding setup"):
-    """Collect what the member has, then hand back a checklist they can act on locally.
+# A modal is only worth showing if it asks for the two things that decide the answer. Which two depends on the
+# topic: a setup failure is a platform plus an error, a broken event is a name plus intended behaviour. Matching on
+# the question keeps one modal flexible instead of a canned form for setup and nothing for everything else.
+MODAL_TOPICS: list[tuple[tuple[str, ...], str, tuple[tuple[str, str, bool], ...]]] = [
+    (
+        ("setup", "install", "mcp", "codex", "cursor", "claude", "agent", "app", "server", "detect", "start"),
+        "Check your modding setup",
+        (
+            ("OS and agent", "Windows 11, Claude Code (or Codex / Cursor / OpenCode)", False),
+            ("What happens?", "Paste the error text, or what the app/MCP server does instead of starting.", True),
+        ),
+    ),
+    (
+        ("test", "tester", "qa", "playtest", "bug", "crash", "error log", "broken"),
+        "Tell me about the bug",
+        (
+            ("Game and mod version", "HOI4 1.16, Chaos Redux build from the devlog", False),
+            ("What you did, and what happened", "Steps, then what you saw. Paste the error.log line if you have it.", True),
+        ),
+    ),
+    (
+        ("event", "scenario", "focus", "tree", "decision", "mechanic"),
+        "Check the event or focus",
+        (
+            ("Which event or focus?", "Name or id, and the file it lives in if you know", False),
+            ("Intended vs actual", "What should happen when it fires, and what happens instead.", True),
+        ),
+    ),
+    (
+        ("lore", "world", "nation", "history", "story", "faction"),
+        "Check it against the lore",
+        (
+            ("Nation, region or faction", "e.g. a country tag or a region name", False),
+            ("What you are building", "The idea you want to keep consistent with the setting.", True),
+        ),
+    ),
+]
 
-    ChaosX cannot inspect a member's disk or running processes, so this asks for the two things that decide the
-    diagnosis — their platform and the exact failure — instead of guessing at paths or ports.
-    """
+DEFAULT_MODAL_SPEC = (
+    "More detail, better answer",
+    (
+        ("What are you actually doing?", "The step you are on, the tool you are using, the version.", False),
+        ("What do you want me to look at?", "The exact symptom or the part you are unsure about.", True),
+    ),
+)
 
-    def __init__(self, bot: Any) -> None:
-        super().__init__(title="Check your modding setup")
+
+def modal_spec_for(question: str) -> tuple[str, tuple[tuple[str, str, bool], ...]]:
+    """Pick the questions worth asking for this topic; falls back to a generic pair."""
+    lowered = (question or "").lower()
+    for keywords, title, fields in MODAL_TOPICS:
+        if any(keyword in lowered for keyword in keywords):
+            return title, fields
+    return DEFAULT_MODAL_SPEC
+
+
+class ActionModal(discord.ui.Modal):
+    """Topic-shaped follow-up questions, answered with the same grounded pipeline as any other ask."""
+
+    def __init__(self, bot: Any, *, question: str, answer: str, message_id: int) -> None:
+        title, fields = modal_spec_for(question)
+        super().__init__(title=title[:45] or "More detail")
         self.bot = bot
-        self.platform = discord.ui.TextInput(
-            label="OS and agent",
-            placeholder="Windows 11, Claude Code (or Codex / Cursor / OpenCode)",
-            max_length=120,
-            required=True,
-        )
-        self.symptom = discord.ui.TextInput(
-            label="What happens?",
-            style=discord.TextStyle.paragraph,
-            placeholder="Paste the error text, or what the app/MCP server does instead of starting.",
-            max_length=1000,
-            required=True,
-        )
-        self.add_item(self.platform)
-        self.add_item(self.symptom)
+        self.question = question
+        self.answer = answer
+        self.message_id = message_id
+        self.inputs: list[discord.ui.TextInput] = []
+        for label, placeholder, paragraph in fields[:2]:
+            item = discord.ui.TextInput(
+                label=label[:45],
+                placeholder=placeholder[:100],
+                style=discord.TextStyle.paragraph if paragraph else discord.TextStyle.short,
+                max_length=1000 if paragraph else 120,
+                required=True,
+            )
+            self.inputs.append(item)
+            self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
-        checklist = (
-            "## Setup check\n"
-            "I cannot see your machine, so here is the order that finds the break fastest:\n"
-            "1. **Mod Setup app** — run it and let it finish; it wires the tooling. If it errored, that message is the cause, not a symptom.\n"
-            "2. **Servers registered** — in your agent, list MCP servers. `hoi4-agent-tools` and `hoi4-live-tools` should both appear and show as connected.\n"
-            "3. **Agent Tools needs your mod folder** — point it at the folder holding `common/` and `events/`, not the game install.\n"
-            "4. **Live Tools needs the game running** — launch HOI4 with debug enabled, load a save, then ask it for the error log. A dead game looks like a dead server.\n"
-            "5. **Still failing?** Paste the exact error and the app version in this thread — with that I can name the piece that broke."
+        details = "\n".join(f"{item.label}: {item.value}" for item in self.inputs)
+        prompt = f"{(self.inputs[0].value if self.inputs else '')[:400]}\n{details}"
+        try:
+            text = await followup_answer(self.bot, question=self.question, answer=self.answer, prompt=prompt)
+            parts = _split(text)
+            for part in parts:
+                await interaction.followup.send(part, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            print(f"[panel] modal answer failed: {type(exc).__name__}: {exc}", flush=True)
+            await interaction.followup.send(
+                "That did not go through — try again.", ephemeral=True
+            )
+
+
+class MemoryView(discord.ui.View):
+    """What ChaosX actually has on file for this member, and a way to wipe it."""
+
+    def __init__(self, bot: Any, *, user_id: int) -> None:
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.user_id = user_id
+
+    def render(self) -> str:
+        db_path = _db_path(self.bot)
+        if not db_path:
+            return "I cannot reach my memory store right now."
+        try:
+            facts = member_memory.durable_facts(db_path, self.user_id, limit=25)
+        except Exception as exc:
+            return f"I could not read your memory: {type(exc).__name__}"
+        if not facts:
+            return "Nothing saved about you yet. I learn from what you say in the server — mention your setup, your mod, what you are stuck on."
+        header = f"**What I remember about you** ({len(facts)})"
+        footer = "-# Say “forget that I …” and I will drop the matching line."
+        body: list[str] = []
+        used = len(header) + len(footer) + 8
+        for fact in facts:
+            line = f"• {fact}"
+            if used + len(line) + 1 > 1900:
+                body.append(f"-# …and {len(facts) - len(body)} more")
+                break
+            body.append(line)
+            used += len(line) + 1
+        return "\n".join([header, "", *body, "", footer])
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    @discord.ui.button(label="Forget everything about me", emoji="❌", style=discord.ButtonStyle.danger)
+    async def wipe(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        db_path = _db_path(self.bot)
+        if not db_path:
+            await interaction.response.send_message("I cannot reach my memory store.", ephemeral=True)
+            return
+        removed = member_memory.forget(db_path, self.user_id)
+        await interaction.response.edit_message(
+            content=f"Done — {removed} saved fact{'s' if removed != 1 else ''} about you deleted. I will start fresh.",
+            view=None,
         )
-        await interaction.response.send_message(checklist, ephemeral=True)
 
 
 class SettingsView(discord.ui.View):
@@ -248,6 +350,19 @@ class SettingsView(discord.ui.View):
     @discord.ui.button(label="For 24 hours", style=discord.ButtonStyle.secondary)
     async def day(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
         await self._apply(interaction, enabled=True, hours=24)
+
+    @discord.ui.button(label="What I remember", emoji="🧠", style=discord.ButtonStyle.secondary)
+    async def remember_view(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        view = MemoryView(self.bot, user_id=self.user_id)
+        await interaction.response.send_message(view.render(), ephemeral=True, view=view)
+
+    @discord.ui.button(label="Hide feedback", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def hide_feedback(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            "How long should I stop asking for feedback?",
+            ephemeral=True,
+            view=DismissView(self.bot, user_id=self.user_id),
+        )
 
     @discord.ui.button(label="Short answers, please", style=discord.ButtonStyle.secondary)
     async def short(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
@@ -546,7 +661,9 @@ async def handle_panel_click(interaction: discord.Interaction, key: str, *, defe
             return
         label, prompt = actions[index]
         if str(label).strip().lower().startswith("check my setup"):
-            await interaction.response.send_modal(SetupCheckModal(bot))
+            await interaction.response.send_modal(
+                ActionModal(bot, question=question, answer=answer, message_id=message_id)
+            )
             return
         if not deferred:
             await interaction.response.defer(thinking=False)
@@ -622,7 +739,9 @@ class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<k
                         label = str(actions[index][0])
                 except Exception:
                     label = ""
-                wants_modal = label.strip().lower().startswith("check my setup")
+                wants_modal = any(
+                    word in label.strip().lower() for word in ("check", "diagnose", "verify", "inspect")
+                )
             if self.key.startswith("act") and not wants_modal and not interaction.response.is_done():
                 await interaction.response.defer(thinking=False)
                 deferred = True
