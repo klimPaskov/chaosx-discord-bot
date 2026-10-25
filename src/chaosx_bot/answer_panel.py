@@ -362,6 +362,22 @@ class AnswerPanelView(discord.ui.View):
         button.callback = callback
         return button
 
+    async def on_error(self, interaction, error, item) -> None:  # pragma: no cover - Discord only
+        import logging
+
+        logging.getLogger("chaosx.answer_panel").exception("panel item %s failed", getattr(item, "label", item))
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "That did not go through. I logged it — try again in a moment.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "That did not go through. I logged it — try again in a moment.", ephemeral=True
+                )
+        except Exception:
+            pass
+
     async def _rate(self, interaction: discord.Interaction, rating: str) -> None:
         db_path = _db_path(self.bot)
         if not db_path:

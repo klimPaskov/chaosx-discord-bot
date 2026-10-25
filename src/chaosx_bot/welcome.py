@@ -125,6 +125,22 @@ def build_welcome_dm(
     return "\n".join(lines)
 
 
+class WelcomeViewBase(discord.ui.View):
+    """Shared error handling: a broken button must say so rather than appear to do nothing."""
+
+    async def on_error(self, interaction, error, item) -> None:  # pragma: no cover - Discord only
+        import logging
+
+        logging.getLogger("chaosx.welcome").exception("welcome item %s failed", getattr(item, "label", item))
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("That did not go through — try again.", ephemeral=True)
+            else:
+                await interaction.response.send_message("That did not go through — try again.", ephemeral=True)
+        except Exception:
+            pass
+
+
 class WelcomeActionButton(discord.ui.Button):
     """One themed action: scenario roll, lore fragment, nation pick, bug checklist or event idea."""
 
@@ -159,7 +175,7 @@ class WelcomeHelpButton(discord.ui.Button):
         await interaction.response.send_message(HELP_EPHEMERAL, ephemeral=True)
 
 
-class WelcomeView(discord.ui.View):
+class WelcomeView(WelcomeViewBase):
     """Links to the essentials, plus two rotating Chaos Redux actions."""
 
     def __init__(self, member: discord.Member | None = None) -> None:
@@ -350,24 +366,17 @@ ACTIONS = {
 
 ACTION_ORDER = ["scenario", "lore", "nation", "testing", "suggest"]
 
-REACTIONS = ["⚔️", "🔥", "🛡️", "📜", "🗺️", "⚙️", "🧪", "🎖️", "🌍", "📉", "🏭", "🕰️"]
-
-
 def pick(member: discord.Member, items: list, salt: int = 0) -> Any:
     """Deterministic per member, different for each surface."""
     return items[(int(member.id) // (salt + 1) + salt * 7) % len(items)]
 
 
-def reactions_for(member: discord.Member) -> list[str]:
-    """Three themed reactions, stable per member."""
-    start = int(member.id) % len(REACTIONS)
-    return [REACTIONS[(start + offset * 3) % len(REACTIONS)] for offset in range(3)]
-
-
-def persistent_view() -> discord.ui.View:
+def persistent_view() -> WelcomeViewBase:
     """Every action button at once, so any welcome card's buttons keep working after a restart."""
-    view = discord.ui.View(timeout=None)
-    view.add_item(WelcomeHelpButton())
-    for key in ACTION_ORDER:
-        view.add_item(WelcomeActionButton(key))
+    view = WelcomeViewBase(timeout=None)
+    items: list[discord.ui.Button] = [WelcomeHelpButton()]
+    items.extend(WelcomeActionButton(key) for key in ACTION_ORDER)
+    for index, item in enumerate(items):
+        item.row = 1 + index // 4  # two rows of at most four, so the row limit is never hit
+        view.add_item(item)
     return view

@@ -209,6 +209,10 @@ class Settings(BaseSettings):
         default="1396551514469699765",
         description="Comma-separated channels where ChaosX answers casual chat freely, without a mention or a question",
     )
+    banter_hour_limit: int = Field(
+        default=10,
+        description="Hidden hourly cap on casual/banter replies per member outside banter channels. 0 disables it.",
+    )
     community_notes_enabled: bool = Field(default=True, description="Write approved public suggestions/event ideas to the Chaos Redux vault")
     community_event_specs_folder: str = Field(default="Events/Event Specs", description="Vault-relative folder for approved community event idea specs")
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")

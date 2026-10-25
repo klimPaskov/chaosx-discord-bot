@@ -352,6 +352,7 @@ from .answer_cache import AnswerCache
 from .capabilities import probe_capabilities
 from .denial_guard import corrective_prompt, is_denial
 from . import ask_api
+from . import banter_budget
 from . import engagement
 from . import knowledge_gaps, member_memory, moderation_cases, moderation_guard
 from . import server_live
@@ -2575,6 +2576,7 @@ class ChaosXBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.add_view(welcome.persistent_view())
+        self.loop.create_task(self._watch_loop_lag())
         await self.store.init()
         # /admin model persists a switch, so re-apply it here: the choice must outlive a restart.
         from . import model_switch
@@ -3917,6 +3919,21 @@ class ChaosXBot(discord.Client):
         except (discord.Forbidden, discord.HTTPException) as exc:
             tier_logger.warning("new member tier role failed for %s: %s", member.id, exc)
 
+    async def _watch_loop_lag(self) -> None:
+        """Log when the event loop stalls, because a stall longer than 3s makes every button and command time out.
+
+        Discord drops an interaction if the bot has not acknowledged it within three seconds, and the bot then
+        reports "did not respond in time". Blocking work on the loop is the usual culprit, so record the stalls
+        with a timestamp instead of guessing later.
+        """
+        interval = 2.0
+        while True:
+            started = time.monotonic()
+            await asyncio.sleep(interval)
+            drift = (time.monotonic() - started) - interval
+            if drift > 1.5:
+                tier_logger.warning("event loop stalled for %.1fs — interactions pressed then will time out", drift)
+
     async def _send_welcome(self, member: discord.Member) -> None:
         """Post the personalised welcome card and DM the same member.
 
@@ -3934,11 +3951,6 @@ class ChaosXBot(discord.Client):
                     view=welcome.WelcomeView(member),
                     allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=False),
                 )
-                for emoji in welcome.reactions_for(member):
-                    try:
-                        await sent_card.add_reaction(emoji)
-                    except (discord.Forbidden, discord.HTTPException):
-                        break
             except (discord.Forbidden, discord.HTTPException) as exc:
                 tier_logger.warning("welcome card failed for %s: %s", member.id, exc)
         try:
@@ -6995,12 +7007,29 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
         casual = BOT_TOPIC_RE.sub(" ", message.content or "").strip(" ,.-!") or "hi"
         if len(casual) <= 140 and "?" not in casual and not has_domain_signal(casual):
             decision = AutoScanDecision("banter", confidence=80, reason="talking to the bot by name, no question")
+            if not banter_budget.allow(
+                message.author.id,
+                bot.settings.banter_hour_limit,
+                exempt=message.author.id == bot.settings.owner_id,
+            ):
+                # Budget spent: stay quiet. No refusal, no counter, nothing the member can see.
+                return True
             await run_mention_banter(bot, message, casual, decision)
+            banter_budget.note(message.author.id)
             return True
     if not request:
         if message.author.id == bot.settings.owner_id:
             guidance = "Send an admin request after the mention, or reply to a ChaosX answer with the admin request."
         else:
+            # An empty or unusable ask is exactly the abusive pattern the hidden budget exists for: it costs the
+            # same as banter, and once the hour is spent the bot stops answering it rather than nagging.
+            if not banter_budget.allow(
+                message.author.id,
+                bot.settings.banter_hour_limit,
+                exempt=message.author.id == bot.settings.owner_id,
+            ):
+                return True
+            banter_budget.note(message.author.id)
             guidance = "Ask me a Chaos Redux question after the mention or in your reply, like `@ChaosX how does Zombie Outbreak work?`"
         await message.reply(guidance, mention_author=False, allowed_mentions=safe_allowed_mentions())
         return True
