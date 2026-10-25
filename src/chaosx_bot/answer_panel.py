@@ -559,6 +559,31 @@ async def handle_panel_click(interaction: discord.Interaction, key: str, *, defe
             return
         for part in parts:
             await interaction.followup.send(part, allowed_mentions=discord.AllowedMentions.none())
+        # The action has been used, so remove it: a row of spent buttons invites clicks that do nothing.
+        try:
+            if interaction.message is not None:
+                await interaction.message.edit(
+                    view=build_answer_panel(
+                        bot,
+                        question=question,
+                        answer=answer,
+                        user_id=interaction.user.id,
+                        message_id=message_id,
+                        actions=[],
+                        show_feedback=True,
+                    )
+                )
+                if db_path:
+                    panel_state.remember(
+                        db_path,
+                        message_id=message_id,
+                        question=question,
+                        answer=answer,
+                        user_id=interaction.user.id,
+                        actions=[],
+                    )
+        except Exception as exc:
+            print(f"[panel] could not clear used actions: {type(exc).__name__}: {exc}", flush=True)
 
 
 class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<key>up|down|hide|set|act\d+)"):
@@ -583,9 +608,22 @@ class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<k
         print(f"[panel] click {self.key} by {interaction.user.id} on {getattr(interaction.message, 'id', 0)}", flush=True)
         try:
             # Acknowledge before touching the database: Discord allows three seconds, and a click that lands during a
-            # stall must still be answered rather than dying as "did not respond in time".
+            # stall must still be answered rather than dying as "did not respond in time". The exception is an action
+            # that opens a modal, because a modal has to be the *first* response to its interaction.
             deferred = False
-            if self.key.startswith("act") and not interaction.response.is_done():
+            wants_modal = False
+            if self.key.startswith("act"):
+                label = ""
+                try:
+                    state = panel_state.load(_db_path(interaction.client), interaction.message.id)
+                    index = int(self.key[3:])
+                    actions = (state or {}).get("actions") or []
+                    if index < len(actions):
+                        label = str(actions[index][0])
+                except Exception:
+                    label = ""
+                wants_modal = label.strip().lower().startswith("check my setup")
+            if self.key.startswith("act") and not wants_modal and not interaction.response.is_done():
                 await interaction.response.defer(thinking=False)
                 deferred = True
             await handle_panel_click(interaction, self.key, deferred=deferred)
@@ -593,6 +631,10 @@ class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<k
             import logging
 
             logging.getLogger("chaosx.answer_panel").exception("panel click failed: %s", exc)
+            # An expired or already-answered interaction cannot be replied to; telling the member "try again"
+            # only adds noise on top of a click Discord already showed as failed.
+            if isinstance(exc, (discord.errors.InteractionResponded, discord.errors.NotFound)):
+                return
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send("That did not go through — try again.", ephemeral=True)
