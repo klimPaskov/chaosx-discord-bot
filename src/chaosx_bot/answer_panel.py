@@ -230,7 +230,7 @@ class SettingsView(discord.ui.View):
             "Saved — I will explain the reasoning and the steps.", ephemeral=True, view=self
         )
 
-    @discord.ui.button(label="Off for a week", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Off for a week", emoji="❌", style=discord.ButtonStyle.danger)
     async def week_off(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
         db_path = _db_path(self.bot)
         if not db_path:
@@ -271,7 +271,7 @@ class DismissView(discord.ui.View):
     async def week(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
         await self._apply(interaction, 24 * 7, "hidden for a week")
 
-    @discord.ui.button(label="Hide permanently", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Hide permanently", emoji="❌", style=discord.ButtonStyle.danger)
     async def forever(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
         await self._apply(interaction, None, "hidden permanently")
 
@@ -308,17 +308,20 @@ class AnswerPanelView(discord.ui.View):
         button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            # Public on purpose (Hoops, 2026-10-24): pressing a quick action is a member asking the bot something
+            # in the channel, so everyone gets the answer; only the settings and feedback panels stay private.
+            await interaction.response.defer(thinking=False)
             text = await followup_answer(
                 self.bot, question=self.question, answer=self.answer, prompt=prompt
             )
             parts = _split(text)
             if not parts:
-                await interaction.followup.send("I could not find anything more on that.", ephemeral=True)
+                await interaction.followup.send(
+                    "I could not find anything more on that.", allowed_mentions=discord.AllowedMentions.none()
+                )
                 return
-            await interaction.followup.send(parts[0], ephemeral=True)
-            for part in parts[1:]:
-                await interaction.followup.send(part, ephemeral=True)
+            for part in parts:
+                await interaction.followup.send(part, allowed_mentions=discord.AllowedMentions.none())
 
         button.callback = callback
         return button
@@ -372,7 +375,7 @@ class AnswerPanelView(discord.ui.View):
         return button
 
     def _dismiss_button(self) -> discord.ui.Button:
-        button = discord.ui.Button(label="Hide feedback", emoji="✖️", style=discord.ButtonStyle.secondary)
+        button = discord.ui.Button(label="Hide feedback", emoji="❌", style=discord.ButtonStyle.secondary)
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
             await interaction.response.send_message(

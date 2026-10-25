@@ -141,3 +141,62 @@ def test_member_answer_context_reflects_their_choices(tmp_path):
     engagement.record_feedback(db, user_id=11, rating="down")
     context = engagement.member_answer_context(db, 11)
     assert "1 helpful, 1 not helpful" in context
+
+
+class _FakeInteraction:
+    def __init__(self):
+        self.deferred = {}
+        self.sent = []
+        self.user = type("U", (), {"id": 1})()
+        self.response = self
+        self.followup = self
+
+    async def defer(self, **kwargs):
+        self.deferred.update(kwargs)
+
+    async def send_message(self, *a, **kw):
+        self.sent.append(kw)
+
+    async def send(self, *a, **kw):
+        self.sent.append(kw)
+
+
+def test_quick_action_answers_in_the_channel(monkeypatch):
+    import asyncio
+
+    from chaosx_bot import answer_panel
+
+    async def fake_followup(*_a, **_kw):
+        return "More detail here."
+
+    monkeypatch.setattr(answer_panel, "followup_answer", fake_followup)
+    view = build_answer_panel(
+        bot=None,
+        question="what is the chaos meter?",
+        answer="It fills.",
+        user_id=1,
+        message_id=2,
+        actions=[("Explain the stages", "explain the stages")],
+    )
+    button = next(child for child in view.children if getattr(child, "label", None) == "Explain the stages")
+    interaction = _FakeInteraction()
+    asyncio.run(button.callback(interaction))
+    assert interaction.deferred == {"thinking": False}
+    assert interaction.sent and all("ephemeral" not in kw for kw in interaction.sent), interaction.sent
+
+
+def test_dismiss_controls_use_the_red_cross():
+    from chaosx_bot.answer_panel import DismissView, SettingsView
+
+    panel = build_answer_panel(
+        bot=None, question="q", answer="a", user_id=1, message_id=2,
+        actions=[("One", "one?")], show_feedback=True,
+    )
+    hide = next(child for child in panel.children if getattr(child, "label", None) == "Hide feedback")
+    assert str(hide.emoji) == "❌"
+    settings = SettingsView(None, user_id=1)
+    off_week = next(child for child in settings.children if getattr(child, "label", None) == "Off for a week")
+    assert str(off_week.emoji) == "❌"
+    dismiss = DismissView(None, user_id=1)
+    forever = next(child for child in dismiss.children if getattr(child, "label", None) == "Hide permanently")
+    assert str(forever.emoji) == "❌"
