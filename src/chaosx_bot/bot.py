@@ -35,6 +35,7 @@ from .auth import (
 from .auto_scan import (
     BOT_TOPIC_RE,
     AutoScanDecision,
+    has_domain_signal,
     classify_mention_banter,
     classify_message,
     looks_like_catalog_lookup,
@@ -355,6 +356,7 @@ from . import engagement
 from . import knowledge_gaps, member_memory, moderation_cases, moderation_guard
 from . import server_live
 from . import server_ops
+from . import welcome
 from .answer_panel import build_answer_panel, suggest_actions
 from .grounding import citations, is_ungrounded_refusal, unverified_citations
 from .live_facts import set_capability_summary
@@ -2572,6 +2574,7 @@ class ChaosXBot(discord.Client):
         self._voice_session = session if started else None
 
     async def setup_hook(self) -> None:
+        self.add_view(welcome.WelcomeView())
         await self.store.init()
         # /admin model persists a switch, so re-apply it here: the choice must outlive a restart.
         from . import model_switch
@@ -3897,6 +3900,10 @@ class ChaosXBot(discord.Client):
         """
         if member.guild is None or int(member.guild.id) != int(self.settings.allowed_guild_id):
             return
+        try:
+            await self._send_welcome(member)
+        except Exception as exc:  # a failed greeting must never break the join handling
+            tier_logger.warning("welcome failed for %s: %s", member.id, exc)
         if not self.settings.tier_roles_enabled:
             return
         try:
@@ -3909,6 +3916,30 @@ class ChaosXBot(discord.Client):
             tier_logger.info("new member %s -> %s", member.display_name, TIERS[0][0])
         except (discord.Forbidden, discord.HTTPException) as exc:
             tier_logger.warning("new member tier role failed for %s: %s", member.id, exc)
+
+    async def _send_welcome(self, member: discord.Member) -> None:
+        """Post the personalised welcome card and DM the same member.
+
+        The card carries action buttons, so the member can go straight to the rules, the introduction thread or
+        the mod without being told to hunt for a channel. Both surfaces use what is actually known about the
+        member, and a failure in either one is logged rather than raised.
+        """
+        facts = welcome.welcome_facts(self.state, member) if getattr(self, "state", None) else []
+        channel = member.guild.get_channel(welcome.WELCOME_CHANNEL_ID)
+        if channel is not None:
+            text = welcome.build_welcome_text(member, member_count=member.guild.member_count, known_facts=facts)
+            try:
+                await channel.send(
+                    text,
+                    view=welcome.WelcomeView(),
+                    allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=False),
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                tier_logger.warning("welcome card failed for %s: %s", member.id, exc)
+        try:
+            await member.send(welcome.build_welcome_dm(member, known_facts=facts))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            tier_logger.info("welcome DM blocked for %s: %s", member.id, exc)
 
     async def _backfill_calm_world(self, guild: discord.Guild, roles: dict[str, Any], when: str) -> int:
         """Put every member who has never earned chaos on the ladder at Calm World.
@@ -6918,6 +6949,28 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
     replies_to_known_chain = known_parent_turn is not None
     replies_to_bot = replies_to_known_chain or reply_resolved_to_bot(message, bot.user.id)
     if not mentioned and not name_addressed and not replies_to_bot:
+        # Designated banter channels: ordinary chat gets a reply instead of silence, so "hi" in
+        # #bot-spam is answered the way a person would answer it (Hoops, 2026-10-25).
+        banter_ids = {
+            int(part)
+            for part in (bot.settings.banter_channel_ids or "").split(",")
+            if part.strip().isdigit()
+        }
+        if (
+            channel_id in banter_ids
+            and message.author.id != bot.settings.owner_id
+            and message.author.id != bot.user.id
+        ):
+            casual = (message.content or "").strip()
+            if (
+                casual
+                and len(casual) <= 200
+                and not looks_like_catalog_lookup(casual)
+                and not has_domain_signal(casual)
+            ):
+                decision = AutoScanDecision("banter", confidence=80, reason="casual chat in a banter channel")
+                await run_mention_banter(bot, message, casual, decision)
+                return True
         return False
 
     request = extract_message_ask_request(
@@ -6928,6 +6981,17 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
         name_addressed=name_addressed,
     )
 
+    if name_addressed and not mentioned and message.author.id != bot.settings.owner_id:
+        # Somebody is talking to the bot by name, not asking a docs question: "bro do your job chaosx",
+        # "chaosx you're slacking". Answer it as chat instead of quoting the how-to-ask line at them
+        # (Hoops, 2026-10-25: it should always answer when it is mentioned).
+        # Strip the name itself: "chaosx" is a domain term, so leaving it in would send the
+        # message down the formal ask path and get silence instead of a reply.
+        casual = BOT_TOPIC_RE.sub(" ", message.content or "").strip(" ,.-!") or "hi"
+        if len(casual) <= 140 and "?" not in casual and not has_domain_signal(casual):
+            decision = AutoScanDecision("banter", confidence=80, reason="talking to the bot by name, no question")
+            await run_mention_banter(bot, message, casual, decision)
+            return True
     if not request:
         if message.author.id == bot.settings.owner_id:
             guidance = "Send an admin request after the mention, or reply to a ChaosX answer with the admin request."
@@ -6952,7 +7016,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
     # Direct @ChaosX mentions that are purely casual/social get the playful
     # banter path instead of the formal public ask (Hoops 2026-08-26). Real
     # questions and domain asks fall through to the normal public ask path.
-    if mentioned and not replies_to_known_chain:
+    if (mentioned or name_addressed) and not replies_to_known_chain:
         banter = classify_mention_banter(
             message.content or "",
             request,
@@ -8123,9 +8187,8 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     # awaited when the prompt is assembled.
     facts_task = asyncio.create_task(
         bot.facts_block_for_request(
-            owner_request if owner_only else request,
-            requester_id=interaction.user.id,
-            always_identity=owner_only,
+            request,
+            requester_id=message.author.id,
         )
     )
     # Web grounding: always available so the model can reach the web when it

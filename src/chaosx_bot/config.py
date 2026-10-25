@@ -205,6 +205,10 @@ class Settings(BaseSettings):
     memory_exclude_channels: str = Field(default="", description="Comma-separated channel ids whose messages never feed durable member memory")
     moderation_dry_run: bool = Field(default=True, description="Log moderation decisions without acting")
     moderator_channel_id: int = Field(default=1395464062367698977, description="Channel for unsure cases and ban approvals")
+    banter_channel_ids: str = Field(
+        default="1396551514469699765",
+        description="Comma-separated channels where ChaosX answers casual chat freely, without a mention or a question",
+    )
     community_notes_enabled: bool = Field(default=True, description="Write approved public suggestions/event ideas to the Chaos Redux vault")
     community_event_specs_folder: str = Field(default="Events/Event Specs", description="Vault-relative folder for approved community event idea specs")
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")
