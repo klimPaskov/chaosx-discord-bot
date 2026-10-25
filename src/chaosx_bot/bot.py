@@ -1076,6 +1076,7 @@ async def generate_auto_scan_model_response(
             web_context=web_context,
             model_name=bot.settings.ask_model if looks_like_model_identity_question(user_message) else "",
             cost_context=_cost_lookup_block(settings=bot.settings, text=user_message),
+            member_prefs=_member_answer_context(bot, message.author.id),
         )
     elif decision.action == "banter":
         prompt = build_auto_scan_banter_prompt(
@@ -1139,6 +1140,15 @@ def evidence_file(image: EvidenceImage | None) -> discord.File | None:
     if image is None or not image.png:
         return None
     return discord.File(io.BytesIO(image.png), filename=image.filename)
+
+
+def _member_answer_context(bot: ChaosXBot, user_id: int) -> str:
+    """Their answer style and thumb history, for the prompt. Never fatal: preferences are a nicety."""
+    try:
+        return engagement.member_answer_context(bot.settings.db_path, user_id)
+    except Exception as exc:
+        print(f"[engage] member context failed: {type(exc).__name__}: {exc}", flush=True)
+        return ""
 
 
 async def reply_with_chunks(

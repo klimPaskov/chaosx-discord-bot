@@ -442,8 +442,11 @@ def build_public_prompt(
     return f"{PUBLIC_ASK_BOUNDARY}\n{context}{user}{facts}{users}{members}{referenced}{memory}{conversation}{rules}{channels}{channel_feed}{web}{reference}{resources_block()}{addressed}\n\nCommunity user question:\n{user_request.strip()}\n"
 
 
-def build_auto_scan_answer_prompt(*, user_message: str, guild_name: str | None, channel_name: str | None, reference_context: str, gate_reason: str, conversation_context: str = "", user_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", known_users: str = "", server_members: str = "", referenced_users: str = "", web_context: str = "", model_name: str = "", cost_context: str = "") -> str:
+def build_auto_scan_answer_prompt(*, user_message: str, guild_name: str | None, channel_name: str | None, reference_context: str, gate_reason: str, conversation_context: str = "", user_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", known_users: str = "", server_members: str = "", referenced_users: str = "", web_context: str = "", model_name: str = "", cost_context: str = "", member_prefs: str = "") -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; gate_reason={gate_reason or 'unknown'}"
+    if member_prefs.strip():
+        # Their own settings and thumb history, phrased as guidance — never announced to the member.
+        context += f"\nHow this member likes to be answered: {member_prefs.strip()}"
     if model_name.strip():
         context += f"; you are running on the {display_model_name(model_name)} model"
     if cost_context.strip():

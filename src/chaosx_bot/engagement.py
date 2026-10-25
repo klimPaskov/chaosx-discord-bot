@@ -427,3 +427,23 @@ def stored_turn(db_path: str | Path, message_id: int | str) -> tuple[str, str]:
     if not row:
         return "", ""
     return str(row[0] or ""), str(row[1] or "")
+
+
+def member_answer_context(db_path: str | Path, user_id: int | str) -> str:
+    """A short, honest note about how this member likes to be answered.
+
+    Used to personalise the prompt: their chosen answer style plus what their thumbs have said so far. It
+    never invents a preference — with no signal it returns just the style line or nothing at all.
+    """
+    pref = get_pref(db_path, user_id)
+    profile = user_feedback_profile(db_path, user_id)
+    parts: list[str] = []
+    style = (pref.get("detail_level") or "").strip().lower()
+    if style == "concise":
+        parts.append("This member asked for short answers: lead with the answer, at most a few lines.")
+    elif style == "detailed":
+        parts.append("This member asked for detailed answers: explain the reasoning and the steps.")
+    up, down = profile["up"], profile["down"]
+    if up or down:
+        parts.append(f"Their history with your answers: {up} helpful, {down} not helpful — adjust rather than mention it.")
+    return " ".join(parts)

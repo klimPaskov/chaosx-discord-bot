@@ -129,3 +129,15 @@ def test_rating_the_same_message_twice_keeps_one_row(tmp_path):
 def test_stored_turn_survives_a_missing_table(tmp_path):
     db = tmp_path / "empty.db"
     assert engagement.stored_turn(db, 123) == ("", "")
+
+
+def test_member_answer_context_reflects_their_choices(tmp_path):
+    db = tmp_path / "e.db"
+    assert engagement.member_answer_context(db, 11) == ""
+    engagement.set_detail_level(db, 11, "concise")
+    context = engagement.member_answer_context(db, 11)
+    assert "short answers" in context
+    engagement.record_feedback(db, user_id=11, rating="up")
+    engagement.record_feedback(db, user_id=11, rating="down")
+    context = engagement.member_answer_context(db, 11)
+    assert "1 helpful, 1 not helpful" in context

@@ -208,6 +208,28 @@ class SettingsView(discord.ui.View):
     async def day(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
         await self._apply(interaction, enabled=True, hours=24)
 
+    @discord.ui.button(label="Short answers, please", style=discord.ButtonStyle.secondary)
+    async def short(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        db_path = _db_path(self.bot)
+        if not db_path:
+            await interaction.response.send_message("I cannot reach my settings store.", ephemeral=True)
+            return
+        engagement.set_detail_level(db_path, self.user_id, "concise")
+        await interaction.response.send_message(
+            "Saved — I will keep your answers short.", ephemeral=True, view=self
+        )
+
+    @discord.ui.button(label="Detail is fine", style=discord.ButtonStyle.secondary)
+    async def detailed(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        db_path = _db_path(self.bot)
+        if not db_path:
+            await interaction.response.send_message("I cannot reach my settings store.", ephemeral=True)
+            return
+        engagement.set_detail_level(db_path, self.user_id, "detailed")
+        await interaction.response.send_message(
+            "Saved — I will explain the reasoning and the steps.", ephemeral=True, view=self
+        )
+
     @discord.ui.button(label="Off for a week", style=discord.ButtonStyle.danger)
     async def week_off(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
         db_path = _db_path(self.bot)
