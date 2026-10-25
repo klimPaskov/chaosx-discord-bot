@@ -3919,6 +3919,42 @@ class ChaosXBot(discord.Client):
         except (discord.Forbidden, discord.HTTPException) as exc:
             tier_logger.warning("new member tier role failed for %s: %s", member.id, exc)
 
+    async def _welcome_personal(self, member: discord.Member) -> None:
+        """Greet them for what they actually answered in onboarding, and remember it.
+
+        The onboarding answers are not readable through the API, but the roles they grant are. Once those appear,
+        the member gets one short paragraph written for their case (new to modding, testing, lore, …) and the same
+        facts are stored, so the bot already knows them when they start talking.
+        """
+        facts = welcome.personal_facts(member)
+        if not facts:
+            return
+        db_path = self.settings.db_path
+        known = " ".join(member_memory.durable_facts(db_path, member.id, limit=40))
+        if any(fact.split(" in ")[0] in known for fact in facts):
+            return
+        paragraph = welcome.personal_paragraph(member)
+        if paragraph:
+            try:
+                await member.send(f"**Since you told us:** {paragraph}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        for fact in facts:
+            try:
+                member_memory.remember(db_path, member.id, fact, confidence=0.9, source="onboarding")
+            except Exception:
+                continue
+        try:
+            await self.store.audit(
+                actor_id=member.id,
+                guild_id=member.guild.id if member.guild else None,
+                channel_id=None,
+                command="welcome personalisation",
+                summary=", ".join(facts)[:200],
+            )
+        except Exception:
+            pass
+
     async def _watch_loop_lag(self) -> None:
         """Log when the event loop stalls, because a stall longer than 3s makes every button and command time out.
 
@@ -3957,6 +3993,21 @@ class ChaosXBot(discord.Client):
             await member.send(welcome.build_welcome_dm(member, known_facts=facts))
         except (discord.Forbidden, discord.HTTPException) as exc:
             tier_logger.info("welcome DM blocked for %s: %s", member.id, exc)
+        await self._welcome_personal(member)
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        """Catch onboarding answers: they are applied as roles a moment after the member joins."""
+        if after.guild is None or int(after.guild.id) != int(self.settings.allowed_guild_id):
+            return
+        added = {role.name for role in after.roles} - {role.name for role in before.roles}
+        if not added:
+            return
+        tracked = set(welcome.SKILL_ROLES) | set(welcome.INTEREST_ROLES)
+        if added & tracked:
+            try:
+                await self._welcome_personal(after)
+            except Exception as exc:
+                tier_logger.warning("onboarding personalisation failed for %s: %s", after.id, exc)
 
     async def _backfill_calm_world(self, guild: discord.Guild, roles: dict[str, Any], when: str) -> int:
         """Put every member who has never earned chaos on the ladder at Calm World.

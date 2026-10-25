@@ -84,11 +84,6 @@ def build_welcome_text(
         "moderator is around — and every action is explained to the person it affects.",
     ]
     lines.append("")
-    lines.append("**Your first moves**")
-    offset = int(member.id) % len(CHECKLIST)
-    for step in range(3):
-        lines.append(f"☐ {CHECKLIST[(offset + step) % len(CHECKLIST)]}")
-    lines.append("")
     lines.append(f"-# {pick(member, CLOSERS)}")
     if member_count:
         lines.append(f"-# Member #{member_count:,} · Chaos Redux · Hearts of Iron IV")
@@ -120,11 +115,6 @@ def build_welcome_dm(
         "**About me, since I will be around.** I answer questions, and I also keep the server safe: I remove "
         "spam, gore, doxxing and slurs, and I can warn, time out or ban on my own. Anything I do comes with an "
         "explanation, by DM and in the channel, and you can appeal to Hoops McCann if you think I got it wrong.",
-        "",
-        "**Three things to do today**",
-        f"☐ Read <#{RULES_CHANNEL_ID}> — numbered § 1 to § 8.",
-        f"☐ Say hi in <#{INTRO_CHANNEL_ID}>.",
-        "☐ Ask me one question.",
         "",
         "**Your privacy.** I keep a short profile of what you talk about here so answers fit you better. "
         "`/memory` shows exactly what I have, and wipes it if you ask. Anything you tell me in DMs stays out "
@@ -377,18 +367,6 @@ ACTIONS = {
 ACTION_ORDER = ["scenario", "lore", "nation", "testing", "suggest"]
 
 
-CHECKLIST = [
-    f"Skim the rules in <#{RULES_CHANNEL_ID}> — § 1 to § 8, a minute at most.",
-    f"Say hi in <#{INTRO_CHANNEL_ID}> so people know who arrived.",
-    "Ask @ChaosX one question — events, scenarios, testing, whatever you are curious about.",
-    "Watch one devlog so you know what actually exists yet.",
-    f"Report the first bug you find in <#{ISSUES_CHANNEL_ID}> — specifics, not vibes.",
-    "Suggest an event in the event-ideas forum, one idea per thread.",
-    "Open the modding channels if you want the dev side of this.",
-    "Read the pinned message in #📕┃rules so you know what gets you banned.",
-]
-
-
 def pick(member: discord.Member, items: list, salt: int = 0) -> Any:
     """Deterministic per member, different for each surface."""
     return items[(int(member.id) // (salt + 1) + salt * 7) % len(items)]
@@ -403,3 +381,77 @@ def persistent_view() -> WelcomeViewBase:
         item.row = 1 + index // 4  # two rows of at most four, so the row limit is never hit
         view.add_item(item)
     return view
+
+
+# Roles granted by onboarding answers. The bot cannot read a member's onboarding replies, but it can read the roles
+# those replies awarded, which is enough to write the welcome for what they actually said.
+SKILL_ROLES = {
+    "Skill · New to modding": (
+        "brand new to modding — and that is fine. Nothing here assumes you have ever opened a mod folder. Start by "
+        "watching a devlog, ask me anything without worrying about sounding basic, and if you want to try making "
+        "something, the modding channels are open to you from day one.",
+        "New to HOI4 modding",
+    ),
+    "Skill · Learning": (
+        "learning to mod — so expect tutorials rather than lectures. The agentic setup (Codex, the MCP tools, "
+        "AGENTS.md) is the shortest path from an idea to something that runs, and I can walk you through it.",
+        "Learning HOI4 modding",
+    ),
+    "Skill · Ships mods": (
+        "experienced at shipping mods — so skip the hand-holding. The dev channels and the tooling threads are "
+        "where the real work happens, and testers are always short. If you want to contribute, say so and I will "
+        "point you at what is unfinished.",
+        "Experienced HOI4 modder",
+    ),
+}
+
+INTEREST_ROLES = {
+    "Interest · Events": (
+        "Events and scenarios are your thing, so the event ideas forum is the place to be — one idea per thread, "
+        "with the country and the trigger.",
+        "Interested in events and scenarios",
+    ),
+    "Interest · Testing": (
+        "Testing and bug reports, which is the most useful thing anyone can do here. Reproduce it twice, grab the "
+        "error log, and say what you expected. That makes a bug fixable in minutes instead of weeks.",
+        "Interested in testing and bug reports",
+    ),
+    "Interest · Modding": (
+        "Modding and the MCP tooling, so you will want the agentic setup: Agent Tools reads a mod folder, Live "
+        "Tools drives the running game. Ask me about either.",
+        "Interested in modding and MCP tooling",
+    ),
+    "Interest · Lore": (
+        "Lore and worldbuilding, so the lore channel and the introduction thread are yours. The map is not "
+        "finished and the arguments about it are ongoing.",
+        "Interested in lore and worldbuilding",
+    ),
+}
+
+
+def onboarding_answers(member: discord.Member) -> dict[str, list[str]]:
+    """What the member's onboarding roles say about them."""
+    names = {role.name for role in getattr(member, "roles", []) or []}
+    return {
+        "skill": [name for name in SKILL_ROLES if name in names],
+        "interest": [name for name in INTEREST_ROLES if name in names],
+    }
+
+
+def personal_paragraph(member: discord.Member) -> str:
+    """A paragraph written for the answers they gave, or empty when they skipped onboarding."""
+    answers = onboarding_answers(member)
+    parts: list[str] = []
+    for name in answers["skill"][:1]:
+        parts.append(SKILL_ROLES[name][0])
+    interests = [INTEREST_ROLES[name][0] for name in answers["interest"][:1]]
+    parts.extend(interests)
+    return " ".join(parts)
+
+
+def personal_facts(member: discord.Member) -> list[str]:
+    """Durable facts to remember, so the bot knows them before they say a word."""
+    answers = onboarding_answers(member)
+    facts = [SKILL_ROLES[name][1] for name in answers["skill"][:1]]
+    facts += [INTEREST_ROLES[name][1] for name in answers["interest"][:2]]
+    return facts
