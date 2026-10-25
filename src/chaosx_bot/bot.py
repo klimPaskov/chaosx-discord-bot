@@ -217,7 +217,7 @@ from .playtest_reminders import (
     strip_schedule_json,
 )
 from .rate_limit import FixedWindowRateLimiter, RateLimitResult
-from .resources import help_resources_section
+from .resources import OFFICIAL_RESOURCES, help_resources_section
 from .server_intel import (
     IntelFacts,
     archive_fallback,
@@ -446,7 +446,9 @@ CONTEXT_ATTACHMENT_CUES = (
     "the one",
 )
 
-BOT_DESCRIPTION = "Chaos Redux community knowledge bot"
+BOT_DESCRIPTION = (
+    "Chaos Redux answers, agentic HOI4 modding help, MCP setup and troubleshooting"
+)
 AUTO_QA_AUTOMATION_NAME = "auto_question_answering"
 AUTO_WARNING_AUTOMATION_NAME = "auto_soft_rule_warnings"
 AUTO_BANTER_AUTOMATION_NAME = "auto_bot_topic_banter"
@@ -1175,7 +1177,14 @@ async def reply_with_chunks(
 
 
 async def _attach_answer_panel(
-    bot: ChaosXBot, *, sent: discord.Message, question: str, answer: str, user_id: int, force_feedback: bool = False
+    bot: ChaosXBot,
+    *,
+    sent: discord.Message,
+    question: str,
+    answer: str,
+    user_id: int,
+    force_feedback: bool = False,
+    actions: list[tuple[str, str]] | None = None,
 ) -> None:
     """Put the private panel under a public answer once the model has picked this answer's quick actions.
 
@@ -1183,7 +1192,8 @@ async def _attach_answer_panel(
     buttons a moment later. Any failure leaves the answer untouched.
     """
     try:
-        actions = await suggest_actions(bot, question=question, answer=answer)
+        if actions is None:
+            actions = await suggest_actions(bot, question=question, answer=answer)
         # Feedback is offered under AUTONOMOUS answers only (Hoops, 2026-10-24) — a manual /ask can still be
         # rated with the 👍/👎 reactions — and the member can hide the prompt for a while or for good.
         try:
@@ -1232,6 +1242,26 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     if auto_scan_channel_excluded(message, bot.settings):
         return False
     mentioned = any(user.id == bot.user.id for user in getattr(message, "mentions", []) or [])
+    if not mentioned:
+        # Hoops pings the bot's ROLE (a <@&id> mention), which is not a user mention; Discord shows it looking
+        # exactly like a bot ping, so treat a role named like the bot, or the bot's own top role, as addressing it.
+        bot_names = {
+            str(getattr(bot.user, "name", "") or "").replace(" ", "").lower(),
+            str(getattr(bot.user, "display_name", "") or "").replace(" ", "").lower(),
+        }
+        me_top = None
+        try:
+            me_top = message.guild.me.top_role if message.guild is not None else None
+        except Exception:
+            me_top = None
+        for role in getattr(message, "role_mentions", []) or []:
+            role_name = str(getattr(role, "name", "") or "").replace(" ", "").lower()
+            if role_name and role_name in bot_names:
+                mentioned = True
+                break
+            if me_top is not None and role.id == me_top.id:
+                mentioned = True
+                break
     if mentioned or referenced_message_id(message):
         return False
     # Only direct @ChaosX mentions/replies (handled by handle_message_ask) or
@@ -1697,12 +1727,38 @@ def _event_label(event_id: str) -> str:
     return f"event `{value or 'unknown'}`"
 
 
+MODDING_QUICK_ACTIONS: list[tuple[str, str]] = [
+    ("Install the MCPs", "How do I install the HOI4 Agent Tools and HOI4 Live Tools MCP servers?"),
+    ("A server won't start", "My MCP server or the Mod Setup app errors during setup — how do I fix it?"),
+    ("What can Agent Tools do?", "What can the HOI4 Agent Tools MCP check in my mod?"),
+]
+
+
+def modding_help_text() -> str:
+    """Short, doc-grounded overview of the agentic modding stack, with only the relevant links."""
+    wanted = ("Agent Tools", "Live Tools", "Mod Setup", "Agentic HOI4 Modding", "portrait")
+    links = [resource for resource in OFFICIAL_RESOURCES if any(key.lower() in resource.label.lower() for key in wanted)]
+    link_block = "\n".join(f"- {resource.label} — {resource.url}" for resource in links)
+    return f"""## Agentic HOI4 modding — the pieces
+- **HOI4 Mod Setup** — the desktop app that installs and wires the tooling for you. Start here; it sets everything up in one go instead of hand-installing each part.
+- **HOI4 Agent Tools (MCP)** — the static side. It reads your mod folder so an agent can inspect focus trees, events, scripted GUIs, ideas and map/tech data, and catch script mistakes while you edit.
+- **HOI4 Live Tools (MCP)** — the running-game side. It launches HOI4 in debug, loads a save, fires events, answers popups, advances time and reads the error log back.
+- **Agent skills** — the agent kit bundles these into repeatable workflows instead of one-off prompts.
+- **ComfyUI portrait workflows** — the portrait pack for generating HOI4 leader portraits.
+
+Ask me about any of it: which tool does what, a setup that fails, an MCP server that will not start, or a script that breaks in game — same way as anything else, `/ask` or just mention `@ChaosX`.
+
+### Links
+{link_block}"""
+
+
 def community_help_text() -> str:
     return f"""## ChaosX community help
 Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing notes, and cleaner idea/report drafts.
 
 ### Ask
-- `/ask question:<text>` — uses AI to answer any Chaos Redux question. You can also ask by directly mentioning `@ChaosX <question>`.
+- `/modding` — quick overview of agentic HOI4 modding: the Mod Setup app, both MCP servers, skills and portrait workflows, with buttons to ask further.
+- ChaosX also answers **agentic HOI4 modding** questions: the HOI4 Mod Setup app, the Agent Tools and Live Tools MCP servers, skills, and the ComfyUI portrait workflows. Installing them, which server does what, a setup that errors out, or an MCP server that will not start — ask the same way and it will walk you through it.
 - Reply to a ChaosX answer to continue that conversation. ChaosX remembers what was discussed in that reply chain.
 
 ### Look things up
@@ -9902,11 +9958,43 @@ def register_commands(bot: ChaosXBot) -> None:
             command_name="ask",
             public=visibility != "private",
             rate_bucket="ask",
-            use_ask_model=True,
+            # Owner surfaces always think at the top effort (Hoops, 2026-10-25); members get the fast ask model.
+            use_operator_model=interaction.user.id == bot.settings.owner_id,
+            use_ask_model=interaction.user.id != bot.settings.owner_id,
         )
         if answer is not None and visibility != "private":
             _result, output = answer
             bot.answer_cache.put(question, output, commit=bot.knowledge.commit_sha())
+
+    @bot.tree.command(
+        name="modding",
+        description="Overview of agentic HOI4 modding: Mod Setup app, MCP servers, skills, portrait workflows.",
+    )
+    async def chaosx_modding(interaction: discord.Interaction) -> None:
+        text = modding_help_text()
+        parts = _chunk(text)
+        first = None
+        for index, part in enumerate(parts):
+            if index == 0:
+                first = await interaction.response.send_message(
+                    part, allowed_mentions=safe_allowed_mentions()
+                )
+            else:
+                first = first or await interaction.followup.send(
+                    part, allowed_mentions=safe_allowed_mentions()
+                )
+        if first is not None:
+            asyncio.create_task(
+                _attach_answer_panel(
+                    bot,
+                    sent=first,
+                    question="agentic HOI4 modding overview",
+                    answer=text,
+                    user_id=interaction.user.id,
+                    force_feedback=True,
+                    actions=MODDING_QUICK_ACTIONS,
+                )
+            )
 
     @bot.tree.command(name="event", description="Look up an event by ID or name and show its chain, focus trees, and scripted GUIs.")
     async def chaosx_event(interaction: discord.Interaction, event: str, view: str = "overview") -> None:

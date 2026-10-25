@@ -47,7 +47,13 @@ USER_PROFILE_MAX_CHARS = 4000
 # Messages scanned when (re)building a user profile — scan the full archive.
 USER_PROFILE_INSPECT_LIMIT = 10000
 # Per-chunk transcript budget for thorough multi-part profile summarization.
-USER_PROFILE_CHUNK_CHARS = 20000
+# 20k slices were too large for the fast model: it answered with nothing and the profile stopped
+# updating. Smaller slices with a retry and a merge fallback keep the memory alive (Hoops, 2026-10-25).
+USER_PROFILE_CHUNK_CHARS = 6000
+# A member with thousands of messages produced ~33 slices, and the whole compaction ran past its timeout and
+# never wrote anything. Bound the work: the newest slices plus the existing profile carry the memory forward.
+MAX_PROFILE_SLICES = 6
+PROFILE_CALL_TIMEOUT_SECONDS = 60
 # Hard cap of the durable per-user message archive (newest kept). The archive
 # is the "nothing must get lost" store: per-channel window compaction never
 # touches it, so every user's full history survives until it has been folded
@@ -1011,23 +1017,41 @@ async def compact_user_profile_if_due(
     else:
         # Long histories are summarized in chunks, then all partial profiles
         # are merged into the final thorough profile.
-        slices = _chunk_transcript(transcript, USER_PROFILE_CHUNK_CHARS)
+        slices = _chunk_transcript(transcript, USER_PROFILE_CHUNK_CHARS)[-MAX_PROFILE_SLICES:]
         partials: list[str] = []
         for slice_text in slices:
             chunk_prompt = f"{_USER_PROFILE_CHUNK_PROMPT}\n\nUser messages (slice):\n{slice_text}"
             try:
-                partial = (await summarize(chunk_prompt)).strip()
+                partial = (await asyncio.wait_for(summarize(chunk_prompt), timeout=PROFILE_CALL_TIMEOUT_SECONDS)).strip()
             except Exception:
                 partial = ""
+            if not partial:
+                # One retry on a shorter slice: a slice the model ignores costs that whole stretch of history.
+                try:
+                    partial = (
+                        await asyncio.wait_for(
+                            summarize(f"{_USER_PROFILE_CHUNK_PROMPT}\n\nUser messages (slice):\n{slice_text[:3000]}"),
+                            timeout=PROFILE_CALL_TIMEOUT_SECONDS,
+                        )
+                    ).strip()
+                except Exception:
+                    partial = ""
             if partial:
                 partials.append(partial)
+            else:
+                print(f"[memory] slice of {len(slice_text)} chars summarised to nothing (author {author_id})", flush=True)
         if not partials:
             return False
         merge_prompt = f"{_USER_PROFILE_MERGE_PROMPT}{existing}\n\nPartial profiles:\n" + "\n\n---\n\n".join(partials)
         try:
-            new_profile = (await summarize(merge_prompt)).strip()
+            new_profile = (
+                await asyncio.wait_for(summarize(merge_prompt), timeout=PROFILE_CALL_TIMEOUT_SECONDS * 2)
+            ).strip()
         except Exception:
-            return False
+            new_profile = ""
+        if not new_profile:
+            # The merge is a convenience; the partials already contain the facts.
+            new_profile = "\n\n".join(partials)[: USER_PROFILE_MAX_CHARS]
     if not new_profile:
         return False
 
@@ -1068,29 +1092,42 @@ def _chunk_transcript(transcript: str, chunk_chars: int) -> list[str]:
     return chunks
 
 
+USER_PROFILE_SYSTEM = (
+    "You maintain a compact, factual memory of one Discord community member for a bot that answers them and "
+    "talks about them. Write the profile the prompt asks for: third person, plain prose or short bullet points, "
+    "under 1200 characters, only facts supported by the messages given. No preamble, no headings, no meta "
+    "commentary, no quotes of whole messages. Keep the owner's real name out of it."
+)
+
+
 async def run_user_profile_compaction_if_due(settings: Any, author_id: int, *, force: bool = False) -> bool:
     """Background user-profile compaction glue (same public Hermes bridge)."""
 
     async def _summarize(prompt: str) -> str:
         from .bot import sanitize_public_ask_output  # lazy: bot imports this module
+        from .ask_api import direct_chat_completion_stream
 
-        result = await run_hermes(
-            hermes_bin=settings.hermes_bin,
-            profile=settings.hermes_profile,
-            repo=settings.chaos_redux_repo,
-            prompt=prompt,
-            timeout_seconds=getattr(settings, "hermes_timeout_seconds", 300),
-            model=getattr(settings, "ask_model", None),
-            provider=getattr(settings, "ask_provider", None),
-            reasoning_effort=getattr(settings, "ask_reasoning_effort", None),
-            toolsets="safe",
-            ignore_rules=True,
-            activity_label="user profile compact",
-            actor_id=author_id,
-        )
-        if not result.ok:
+        # The Hermes CLI is not installed on every host (the interim Micro box has no hermes binary), and when it
+        # was missing this returned "" forever: profiles silently stopped updating on 2026-10-08 while the bot
+        # kept running. The direct API is the path every other model call uses now, so memory updates travel it.
+        chunks: list[str] = []
+        try:
+            async for _reasoning, content in direct_chat_completion_stream(
+                system=USER_PROFILE_SYSTEM,
+                user=prompt,
+                model=getattr(settings, "ask_model", "") or "",
+                provider=str(getattr(settings, "ask_provider", "") or ""),
+            ):
+                if content:
+                    chunks.append(content)
+        except Exception as exc:
+            print(f"[memory] profile compaction failed for {author_id}: {type(exc).__name__}: {exc}", flush=True)
             return ""
-        return sanitize_public_ask_output(result.stdout.strip())
+        text = "".join(chunks).strip()
+        if not text:
+            print(f"[memory] profile compaction produced no text for {author_id}", flush=True)
+            return ""
+        return sanitize_public_ask_output(text)
 
     return await compact_user_profile_if_due(settings.db_path, author_id, summarize=_summarize, force=force)
 

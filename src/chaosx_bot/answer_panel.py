@@ -373,7 +373,7 @@ class AnswerPanelView(discord.ui.View):
         button.callback = callback
         return button
 
-    async def settings_callback(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+    async def settings_callback(self, interaction: discord.Interaction, button: discord.ui.Button | None = None) -> None:
         db_path = _db_path(self.bot)
         pref = engagement.get_pref(db_path, interaction.user.id) if db_path else {}
         state = engagement.describe_auto_answer(pref) if pref else "unknown"
