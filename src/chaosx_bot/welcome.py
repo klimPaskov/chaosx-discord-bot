@@ -16,7 +16,6 @@ RULES_CHANNEL_ID = 1395464062367698974
 INTRO_CHANNEL_ID = 1523951448063479930
 WELCOME_CHANNEL_ID = 1395470053574574202
 ISSUES_CHANNEL_ID = 1490285093955309850
-MOD_WORKSHOP_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id=2983516043"
 YOUTUBE_URL = "https://www.youtube.com/@ChaosRedux"
 
 HELP_EPHEMERAL = (
@@ -71,8 +70,8 @@ def build_welcome_text(
         "",
         _personal_line(member, known_facts=known_facts),
         "",
-        "This server is for **Chaos Redux**, a total-conversion mod for Hearts of Iron IV — its events, "
-        "scenarios, mechanics and testing, plus agentic HOI4 modding and the MCP tooling that goes with it.",
+        "This server is for **Chaos Redux**, a mod for Hearts of Iron IV — its events, scenarios, mechanics and "
+        "testing, plus agentic HOI4 modding and the MCP tooling that goes with it.",
         "",
         "**Where to start**",
         f"» Read the rules in <#{RULES_CHANNEL_ID}> — they are numbered (§ 1–§ 8), and they are short.",
@@ -99,8 +98,8 @@ def build_welcome_dm(
     lines = [
         f"**Welcome to Chaos Redux, {name}.**",
         "",
-        "You just joined the server for a total-conversion mod for Hearts of Iron IV. No forms, no interrogation "
-        "— here is the whole of what you need:",
+        "You just joined the server for **Chaos Redux**, a mod for Hearts of Iron IV. No forms, no "
+        "interrogation — here is the whole of what you need:",
         "",
         f"**Rules** — <#{RULES_CHANNEL_ID}>. Numbered § 1 to § 8, readable in a minute. The short version: be "
         "decent, stay on topic, keep it safe.",
@@ -108,7 +107,7 @@ def build_welcome_dm(
         f"**Ask anything** — mention `@ChaosX` in a channel, or use `/ask`. Events, scenarios, mechanics, "
         "testing, the mod itself, or agentic HOI4 modding and MCP tools. It answers in the channel, and you can "
         "rate the answer.",
-        f"**The mod** — {MOD_WORKSHOP_URL}",
+        "**The mod** — coming soon.",
         f"**Videos and devlogs** — {YOUTUBE_URL}",
         "",
         "**About me, since I will be around.** I answer questions, and I also keep the server safe: I remove "
@@ -138,7 +137,7 @@ class WelcomeView(discord.ui.View):
                               url=f"https://discord.com/channels/1395459671598436533/{INTRO_CHANNEL_ID}")
         )
         self.add_item(
-            discord.ui.Button(label="Get the mod", emoji="🎮", style=discord.ButtonStyle.link, url=MOD_WORKSHOP_URL)
+            discord.ui.Button(label="Watch the devlogs", emoji="▶️", style=discord.ButtonStyle.link, url=YOUTUBE_URL)
         )
         # The "How to ask me" button is declared below as a decorated callback, so it is not added here.
 
