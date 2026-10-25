@@ -657,6 +657,22 @@ def _chunk(text: str, limit: int = 1900) -> list[str]:
     return balanced
 
 
+def _cap_memory(text: str, limit: int) -> str:
+    """Keep prompt memory bounded without cutting a fact in half at an arbitrary byte.
+
+    Stored profiles can run to 4000 characters and up to five of them ride in one prompt; the same profile used
+    to be injected whole for every named member (Hoops prefers compact synthesis).
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    boundary = max(cut.rfind("\n"), cut.rfind(". "))
+    if boundary > limit // 2:
+        cut = cut[: boundary + 1]
+    return cut.rstrip() + "\n…(older memory trimmed)"
+
+
 def _profile_excerpt(profile: str, limit: int = 240) -> str:
     """Compact first-lines excerpt of a profile body for the all-users dump.
 
@@ -2286,7 +2302,8 @@ class ChaosXBot(discord.Client):
                 recent = await user_history_for(self.settings.db_path, uid, scope="public")
             except Exception:
                 recent = ""
-            parts = [p for p in (profile, recent) if p]
+            parts = [_cap_memory(profile, 900), _cap_memory(recent, 600)]
+            parts = [part for part in parts if part]
             if parts:
                 blocks.append(f"Saved memory about {name} (user id {uid}):\n" + "\n".join(parts))
         if not blocks:
@@ -2354,7 +2371,7 @@ class ChaosXBot(discord.Client):
         except Exception:
             history = ""
         try:
-            profile = await user_profile_for(self.settings.db_path, user_id)
+            profile = _cap_memory(await user_profile_for(self.settings.db_path, user_id), 1500)
         except Exception:
             profile = ""
         display: str | None = None
