@@ -225,6 +225,11 @@ DEFAULT_MODAL_SPEC = (
 )
 
 
+def opens_modal(label: str) -> bool:
+    """An action that asks questions first, rather than answering right away."""
+    return any(word in str(label).strip().lower() for word in ("check", "diagnose", "verify", "inspect"))
+
+
 def modal_spec_for(question: str) -> tuple[str, tuple[tuple[str, str, bool], ...]]:
     """Pick the questions worth asking for this topic; falls back to a generic pair."""
     lowered = (question or "").lower()
@@ -264,6 +269,32 @@ class ActionModal(discord.ui.Modal):
             parts = _split(text)
             for part in parts:
                 await interaction.followup.send(part, allowed_mentions=discord.AllowedMentions.none())
+            # Same rule as a direct quick action: once it has been used, the button goes away.
+            try:
+                if interaction.message is not None:
+                    await interaction.message.edit(
+                        view=build_answer_panel(
+                            self.bot,
+                            question=self.question,
+                            answer=self.answer,
+                            user_id=interaction.user.id,
+                            message_id=self.message_id,
+                            actions=[],
+                            show_feedback=True,
+                        )
+                    )
+                    db_path = _db_path(self.bot)
+                    if db_path:
+                        panel_state.remember(
+                            db_path,
+                            message_id=self.message_id,
+                            question=self.question,
+                            answer=self.answer,
+                            user_id=interaction.user.id,
+                            actions=[],
+                        )
+            except Exception as inner:
+                print(f"[panel] could not clear used actions: {type(inner).__name__}: {inner}", flush=True)
         except Exception as exc:
             print(f"[panel] modal answer failed: {type(exc).__name__}: {exc}", flush=True)
             await interaction.followup.send(
@@ -800,7 +831,7 @@ async def handle_panel_click(interaction: discord.Interaction, key: str, *, defe
             )
             return
         label, prompt = actions[index]
-        if str(label).strip().lower().startswith("check my setup"):
+        if opens_modal(label):
             await interaction.response.send_modal(
                 ActionModal(bot, question=question, answer=answer, message_id=message_id)
             )
@@ -879,9 +910,7 @@ class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<k
                         label = str(actions[index][0])
                 except Exception:
                     label = ""
-                wants_modal = any(
-                    word in label.strip().lower() for word in ("check", "diagnose", "verify", "inspect")
-                )
+                wants_modal = opens_modal(label)
             if self.key.startswith("act") and not wants_modal and not interaction.response.is_done():
                 await interaction.response.defer(thinking=False)
                 deferred = True
