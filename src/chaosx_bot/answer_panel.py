@@ -424,9 +424,21 @@ class SettingsModal(discord.ui.Modal, title="ChaosX settings"):
             required=False,
         )
         # Modal selects must sit inside a Label (component type 18); bare action rows accept text inputs only.
+        self.memory = discord.ui.Select(
+            placeholder="Memory",
+            options=[
+                discord.SelectOption(label="Show what I remember", value="mem:show", emoji="🧠"),
+                discord.SelectOption(label="Forget everything about me", value="mem:forget", emoji="🗑️"),
+                discord.SelectOption(label="Leave my memory alone", value="mem:keep", emoji="➖"),
+            ],
+            min_values=1,
+            max_values=1,
+            required=False,
+        )
         self.add_item(discord.ui.Label(text="When should I answer you?", component=self.answer))
         self.add_item(discord.ui.Label(text="How much detail?", component=self.detail))
         self.add_item(discord.ui.Label(text="Feedback prompt", component=self.feedback))
+        self.add_item(discord.ui.Label(text="Memory", component=self.memory))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
         db_path = _db_path(self.bot)
@@ -468,6 +480,20 @@ class SettingsModal(discord.ui.Modal, title="ChaosX settings"):
             "**Saved.** " + ("; ".join(changes) + ".\n" if changes else "Nothing changed.\n")
             + f"Unprompted answers: **{summary}**."
         )
+        memory_choice = (self.memory.values or [""])[0]
+        if memory_choice == "mem:show":
+            view = MemoryView(self.bot, user_id=self.user_id)
+            await interaction.response.send_message(view.render(), ephemeral=True, view=view)
+            return
+        if memory_choice == "mem:forget":
+            count = len(member_memory.durable_facts(db_path, self.user_id, limit=200))
+            await interaction.response.send_message(
+                f"This deletes **{count} saved fact{'s' if count != 1 else ''}** about you and your profile. "
+                "It cannot be undone.",
+                ephemeral=True,
+                view=ForgetConfirmView(self.bot, user_id=self.user_id),
+            )
+            return
         await interaction.response.send_message(
             text, ephemeral=True, view=MemoryShortcutView(self.bot, user_id=self.user_id)
         )
