@@ -392,9 +392,10 @@ class SettingsModal(discord.ui.Modal, title="ChaosX settings"):
             max_values=1,
             required=False,
         )
-        self.add_item(self.answer)
-        self.add_item(self.detail)
-        self.add_item(self.feedback)
+        # Modal selects must sit inside a Label (component type 18); bare action rows accept text inputs only.
+        self.add_item(discord.ui.Label(text="When should I answer you?", component=self.answer))
+        self.add_item(discord.ui.Label(text="How much detail?", component=self.detail))
+        self.add_item(discord.ui.Label(text="Feedback prompt", component=self.feedback))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
         db_path = _db_path(self.bot)
@@ -714,13 +715,8 @@ class AnswerPanelView(discord.ui.View):
         db_path = _db_path(self.bot)
         pref = engagement.get_pref(db_path, interaction.user.id) if db_path else {}
         state = engagement.describe_auto_answer(pref) if pref else "unknown"
-        # Discord modals accept only text inputs (components of type 4), so a dropdown window is impossible: the
-        # private panel is the closest thing to a popup that can hold buttons.
-        await interaction.response.send_message(
-            f"**How I answer you** — currently {state}.\nPick what you want; this only affects you.",
-            ephemeral=True,
-            view=SettingsView(self.bot, user_id=interaction.user.id),
-        )
+        # A Label-wrapped select is legal in a modal (type 18), so settings really can be a window.
+        await interaction.response.send_modal(SettingsModal(self.bot, user_id=interaction.user.id))
 
 
 def build_answer_panel(
