@@ -10582,6 +10582,8 @@ def register_commands(bot: ChaosXBot) -> None:
                 body,
                 **(_view_kwargs(view) if last else {}),
                 allowed_mentions=safe_allowed_mentions(),
+                # Help is mostly links; embeds stack up under the message and bury the next part.
+                suppress_embeds=True,
             )
 
     playtest = app_commands.Group(name="playtest", description="Chaos Redux playtest commands")
@@ -10663,11 +10665,11 @@ def register_commands(bot: ChaosXBot) -> None:
         for index, part in enumerate(parts):
             if index == 0:
                 first = await interaction.response.send_message(
-                    part, allowed_mentions=safe_allowed_mentions()
+                    part, allowed_mentions=safe_allowed_mentions(), suppress_embeds=True
                 )
             else:
                 first = first or await interaction.followup.send(
-                    part, allowed_mentions=safe_allowed_mentions()
+                    part, allowed_mentions=safe_allowed_mentions(), suppress_embeds=True
                 )
         if first is not None:
             asyncio.create_task(
@@ -11050,6 +11052,7 @@ def register_commands(bot: ChaosXBot) -> None:
                 **(_view_kwargs(view) if last else {}),
                 ephemeral=True,
                 allowed_mentions=safe_allowed_mentions(),
+                suppress_embeds=True,
             )
 
     @admin.command(name="ask", description="Protected project/server request through Hermes.")
