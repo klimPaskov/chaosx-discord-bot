@@ -1774,7 +1774,7 @@ class Store:
             await db.execute(
                 "INSERT INTO operational_state(key, value, updated_at) VALUES(?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                (key, value, utcnow().isoformat()),
+                (key, value, datetime.now(timezone.utc).isoformat()),
             )
             await db.commit()
 
