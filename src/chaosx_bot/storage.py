@@ -1764,19 +1764,19 @@ class Store:
             await db.commit()
 
     async def state_get(self, key: str) -> str | None:
-        db = await self._db()
-        cur = await db.execute("SELECT value FROM operational_state WHERE key = ?", (key,))
-        row = await cur.fetchone()
+        async with self._connect() as db:
+            cur = await db.execute("SELECT value FROM operational_state WHERE key = ?", (key,))
+            row = await cur.fetchone()
         return str(row[0]) if row else None
 
     async def state_set(self, key: str, value: str) -> None:
-        db = await self._db()
-        await db.execute(
-            "INSERT INTO operational_state(key, value, updated_at) VALUES(?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (key, value, utcnow().isoformat()),
-        )
-        await db.commit()
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO operational_state(key, value, updated_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, utcnow().isoformat()),
+            )
+            await db.commit()
 
     async def routine_post_states(self, names: list[str]) -> dict[str, dict]:
         """Stored per-post state (period key, last check, last post) for the named post types."""
