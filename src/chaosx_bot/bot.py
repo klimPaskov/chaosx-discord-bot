@@ -4794,7 +4794,8 @@ class ChaosXBot(discord.Client):
             f"#[bot-spam] recent messages:\n{material or '(quiet)'}\n\n"
             f"Member to talk to: {target.display_name} ({target.messages} messages in the last few hours)\n"
             f"Some of what they said recently:\n{theirs or '(nothing usable)'}\n\n"
-            f"Write the message. Address them as <@{target.user_id}>."
+            f"Write the message, starting it with @member (that is how you address them - do not invent a user "
+            f"mention)."
         )
         result = await _public_model_completion(
             bot=self,
@@ -4807,6 +4808,8 @@ class ChaosXBot(discord.Client):
             actor_id=target.user_id,
         )
         line = repair_discord_markdown((result.stdout or "").strip()) if result.ok else ""
+        if line:
+            line = bot_spam_banter.finalize_line(line, target)
         if not line or line.upper().startswith("SKIP") or len(line) > 600:
             print(f"[banter] skipped ({decision.reason}): nothing usable from the model", flush=True)
             return

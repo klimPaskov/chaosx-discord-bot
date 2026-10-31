@@ -109,3 +109,26 @@ def test_quiet_hours_window_wraps_midnight():
     assert bsb.in_quiet_hours(datetime(2026, 10, 31, 23, 30, tzinfo=timezone.utc), "23-10")
     assert bsb.in_quiet_hours(datetime(2026, 10, 31, 6, 0, tzinfo=timezone.utc), "23-10")
     assert not bsb.in_quiet_hours(datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc), "23-10")
+
+
+def _target(**kw):
+    base = dict(user_id=333, display_name="Gamma", messages=4, last_seen=NOW, sample=())
+    base.update(kw)
+    return bsb.Activity(**base)
+
+
+def test_answer_mentions_only_the_chosen_member():
+    out = bsb.finalize_line("@member focus trees again? Bold of you.", _target())
+    assert out.startswith("<@333> focus trees again?")
+    wrong = bsb.finalize_line("<@111> focus trees again?", _target())
+    assert "<@111>" not in wrong and wrong.startswith("<@333>")
+
+
+def test_display_name_gets_the_mention_and_links_go():
+    out = bsb.finalize_line("Gamma, see https://example.com/x, that branch is doomed.", _target())
+    assert out.startswith("<@333>")
+    assert "http" not in out
+
+
+def test_a_line_with_no_reference_still_addresses_the_member():
+    assert bsb.finalize_line("That branch is doomed.", _target()).startswith("<@333>")

@@ -41,6 +41,29 @@ _SERIOUS_RE = re.compile(
 )
 
 
+_MENTION_RE = re.compile(r"<@!?\d+>|<@&\d+>")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def finalize_line(line: str, target: Activity) -> str:
+    """Force the line to address the chosen member and nobody else.
+
+    The model sees ids in the prompt and can copy the wrong one: a live probe produced a line mentioning the wrong
+    member. Any mention it emitted is removed, and the target is referenced exactly once - through the `@member`
+    placeholder when the model used it, through their display name when it wrote that instead, or by prefixing.
+    Links are removed as well (banter never links).
+    """
+    text = _MENTION_RE.sub("", line or "").strip()
+    text = _URL_RE.sub("", text).strip()
+    mention = f"<@{target.user_id}>"
+    if "@member" in text:
+        return text.replace("@member", mention, 1).strip()
+    name = (target.display_name or "").strip()
+    if name and name in text:
+        return text.replace(name, mention, 1).strip()
+    return f"{mention} {text}".strip()
+
+
 @dataclass(frozen=True)
 class Activity:
     """One member's recent activity, as counted from public channel history."""
