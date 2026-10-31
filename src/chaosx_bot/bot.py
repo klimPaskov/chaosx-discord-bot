@@ -189,6 +189,7 @@ from .hermes_bridge import (
     AUTO_SCAN_ANSWER_BOUNDARY,
     AUTO_SCAN_BANTER_BOUNDARY,
     AUTO_SCAN_WARNING_BOUNDARY,
+    BOT_SPAM_BANTER_BOUNDARY,
     PUBLIC_ASK_BOUNDARY,
     SYSTEM_BOUNDARY,
 )
@@ -220,6 +221,7 @@ from .playtest_reminders import (
 )
 from .rate_limit import FixedWindowRateLimiter, RateLimitResult
 from .resources import OFFICIAL_RESOURCES, help_resources_section
+from .link_policy import apply_link_policy, install_plain_message_defaults
 from .server_intel import (
     IntelFacts,
     archive_fallback,
@@ -309,6 +311,7 @@ from .formatting import (
     scrub_names,
     section,
     small,
+    trim_answer_filler,
 )
 from .guild_stats import GuildCountsCache
 from .routine_posts import (
@@ -355,7 +358,8 @@ from . import ask_api
 from . import answer_panel
 from . import banter_budget
 from . import engagement
-from . import knowledge_gaps, member_memory, moderation_cases, moderation_guard
+from . import bot_spam_banter, knowledge_gaps, member_memory, moderation_cases, moderation_guard
+from . import tooling_sync
 from . import server_live
 from . import server_ops
 from . import welcome
@@ -466,6 +470,15 @@ def _parse_member_reference(value: str) -> int:
     if match:
         return int(match.group(1))
     return int(text) if text.isdigit() else 0
+
+
+def _parse_when(value: str):
+    """ISO timestamp -> aware datetime; unparseable becomes the epoch so comparisons never raise."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _display_name_for(bot: object, user_id: int) -> str:
@@ -819,7 +832,7 @@ def _contains_guard_term(text: str, terms: set[str]) -> bool:
     )
 
 
-def sanitize_public_ask_output(output: str) -> str:
+def sanitize_public_ask_output(output: str, *, question: str | None = None, channel_id: int | None = None) -> str:
     cleaned = (output or "").strip()
     for _ in range(3):
         stripped = PUBLIC_ANSWER_LABEL_RE.sub("", cleaned, count=1).strip()
@@ -831,7 +844,11 @@ def sanitize_public_ask_output(output: str) -> str:
         return PUBLIC_ASK_REDIRECT
     if looks_like_code_dump(cleaned):
         return PUBLIC_ASK_REDIRECT
-    return repair_discord_markdown(redact_internal_infrastructure(cleaned))
+    repaired = trim_answer_filler(repair_discord_markdown(redact_internal_infrastructure(cleaned)))
+    if question is not None:
+        # Official links only when asked for, and never twice in one conversation (Hoops, 2026-10-31).
+        repaired = apply_link_policy(repaired, question=question, channel_id=channel_id)
+    return repaired
 
 
 def looks_like_code_dump(text: str) -> bool:
@@ -872,6 +889,9 @@ def reply_resolved_to_bot(message: discord.Message, bot_user_id: int | None) -> 
     author = getattr(resolved, "author", None)
     return bool(author and getattr(author, "id", None) == bot_user_id)
 
+
+# Announcement indices used recently per welcome channel, so wording does not repeat back to back.
+_recent_announcements: dict[int, list[int]] = {}
 
 FRAGMENT_MAX_WORDS = 8
 
@@ -1187,7 +1207,9 @@ async def generate_auto_scan_model_response(
         )
     output = ""
     if result.ok:
-        output = sanitize_public_ask_output(result.stdout.strip())
+        output = sanitize_public_ask_output(
+            result.stdout.strip(), question=user_message, channel_id=getattr(message.channel, "id", None)
+        )
     return result, output, evidence
 
 
@@ -1200,6 +1222,36 @@ def evidence_file(image: EvidenceImage | None) -> discord.File | None:
     if image is None or not image.png:
         return None
     return discord.File(io.BytesIO(image.png), filename=image.filename)
+
+
+async def send_private_answer(message: discord.Message, text: str) -> bool:
+    """Deliver an answer to the asker only. False when their DMs are closed, so the caller can fall back."""
+    try:
+        for part in _chunk(text):
+            await message.author.send(part, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        try:
+            await message.channel.send(
+                f"{message.author.mention} — your answers are set to private, but your DMs are closed, so I "
+                "could not deliver this one. Turn on DMs from server members, or set answers back to public with "
+                "the Hide answer button.",
+                allowed_mentions=targeted_mentions([message.author.id]),
+            )
+        except Exception:
+            pass
+        return True  # the member was told; do not post the answer publicly as a fallback
+    except (discord.HTTPException, OSError) as exc:
+        print(f"[private] delivery failed: {type(exc).__name__}: {exc}", flush=True)
+        return False
+    return True
+
+
+def _member_answers_private(bot: ChaosXBot, user_id: int) -> bool:
+    """True when this member asked for private answers (Settings -> Hide answer / go private)."""
+    try:
+        return engagement.visibility_pref(bot.settings.db_path, user_id) == "private"
+    except Exception:
+        return False
 
 
 def _member_answer_context(bot: ChaosXBot, user_id: int) -> str:
@@ -1949,6 +2001,8 @@ class ChaosXBot(discord.Client):
         # "0 members visible" and could not answer anything about users. The intent must also be enabled in the
         # Discord developer portal (Bot -> Privileged Gateway Intents -> Server Members).
         intents.members = settings.members_intent_enabled
+        # Plain text everywhere: no automatic link previews unless a send passes its own embed (Hoops, 2026-10-31).
+        install_plain_message_defaults()
         super().__init__(intents=intents, allowed_mentions=safe_allowed_mentions())
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
@@ -2734,6 +2788,12 @@ class ChaosXBot(discord.Client):
             self._routine_posts_task = asyncio.create_task(
                 self._routine_posts_worker(ROUTINE_POSTS_WORKER_INITIAL_DELAY_S),
                 name="chaosx-routine-posts",
+            )
+        if getattr(self, "_tooling_sync_task", None) is None or self._tooling_sync_task.done():
+            self._tooling_sync_task = asyncio.create_task(self._tooling_sync_worker(45), name="chaosx-tooling-sync")
+        if getattr(self, "_bot_spam_banter_task", None) is None or self._bot_spam_banter_task.done():
+            self._bot_spam_banter_task = asyncio.create_task(
+                self._bot_spam_banter_worker(90), name="chaosx-bot-spam-banter"
             )
         print(f"ChaosX logged in as {self.user} owner_id={self.settings.owner_id}")
 
@@ -4038,19 +4098,39 @@ class ChaosXBot(discord.Client):
         facts = welcome.welcome_facts(self.state, member) if getattr(self, "state", None) else []
         channel = member.guild.get_channel(welcome.WELCOME_CHANNEL_ID)
         if channel is not None:
-            text = welcome.build_welcome_text(member, member_count=member.guild.member_count, known_facts=facts)
+            # Short, varied, HOI4-flavoured announcement (Hoops, 2026-10-31). No card, no buttons, no account
+            # metadata: the orientation is in the DM.
+            recent = _recent_announcements.setdefault(channel.id, [])
+            index, opener = welcome.choose_announcement(recent)
+            text = welcome.build_welcome_text(member, opener=opener)
             try:
-                sent_card = await channel.send(
+                await channel.send(
                     text,
-                    view=welcome.WelcomeView(member),
                     allowed_mentions=discord.AllowedMentions(everyone=False, users=True, roles=False),
+                    suppress_embeds=True,
                 )
+                recent.append(index)
+                del recent[:-10]
             except (discord.Forbidden, discord.HTTPException) as exc:
-                tier_logger.warning("welcome card failed for %s: %s", member.id, exc)
+                tier_logger.warning("welcome announcement failed for %s: %s", member.id, exc)
+        # A member who refuses DMs simply gets no DM: the private welcome is never posted publicly instead
+        # (Hoops, 2026-10-31).
         try:
             await member.send(welcome.build_welcome_dm(member, known_facts=facts))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            tier_logger.info("welcome DM blocked for %s: %s", member.id, exc)
+        except discord.Forbidden as exc:
+            tier_logger.info("welcome DM blocked for %s (DMs closed): %s", member.id, exc)
+            try:
+                await self.store.audit(
+                    actor_id=member.id,
+                    guild_id=member.guild.id if member.guild else None,
+                    channel_id=None,
+                    command="welcome dm blocked",
+                    summary="member has DMs closed; no public fallback posted",
+                )
+            except Exception:
+                pass
+        except (discord.HTTPException, OSError) as exc:
+            tier_logger.warning("welcome DM failed for %s: %s", member.id, exc)
         await self._welcome_personal(member)
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
@@ -4609,6 +4689,144 @@ class ChaosXBot(discord.Client):
             now=utcnow(),
         )
         return [f"{_display_name_for(self, user_id)} ({tier_for_xp(tiers.get(user_id, 0.0))})" for user_id in user_ids]
+
+    async def _tooling_sync_worker(self, delay_seconds: int) -> None:
+        """Keep the tooling knowledge roots current, then let the index refresh what changed.
+
+        The interim host has no cron, so the `git pull` job for these clones never ran and Agentic HOI4 Modding sat
+        10 commits behind while the bot answered from the stale copy (found 2026-10-31).
+        """
+        await asyncio.sleep(max(20, delay_seconds))
+        while True:
+            settings = self.settings
+            roots = list(getattr(self.knowledge, "extra_roots", None) or [])
+            if settings.tooling_sync_enabled and roots:
+                try:
+                    results = await asyncio.to_thread(tooling_sync.sync_all, roots)
+                    self.tooling_sync_results = results
+                    for result in results:
+                        if result.state in {"updated", "error"}:
+                            print(
+                                f"[tooling] {result.name}: {result.state} {result.pulled} {result.error}".rstrip(),
+                                flush=True,
+                            )
+                    if any(result.state == "updated" for result in results):
+                        await asyncio.to_thread(self.knowledge._ensure_index_sync)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # never let a sync failure stop the loop
+                    print(f"[tooling] sync failed: {type(exc).__name__}: {exc}", flush=True)
+            await asyncio.sleep(max(300, int(settings.tooling_sync_interval_minutes) * 60))
+
+    async def _bot_spam_banter_worker(self, delay_seconds: int) -> None:
+        """Occasionally start a light conversation in #bot-spam with a recently active member.
+
+        Deterministic scheduling (see bot_spam_banter.plan): cadence, caps, quiet hours, exclusions and the target
+        are all decided in code; the model only writes the line. A failed or skipped attempt changes nothing.
+        """
+        await asyncio.sleep(max(60, delay_seconds))
+        while True:
+            try:
+                await self._maybe_post_bot_spam_banter()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[banter] tick failed: {type(exc).__name__}: {exc}", flush=True)
+            await asyncio.sleep(600)
+
+    async def _maybe_post_bot_spam_banter(self) -> None:
+        settings = self.settings
+        if not settings.bot_spam_banter_enabled:
+            return
+        channel_id = int(settings.bot_spam_banter_channel_id or 0)
+        channel = self.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            return
+        sources = [int(v) for v in str(settings.bot_spam_banter_source_channels or "").split(",") if v.strip().isdigit()]
+        if channel_id not in sources:
+            sources.append(channel_id)
+        now = utcnow()
+        raw_state = await self.store.state_get("bot_spam_banter")
+        try:
+            state = json.loads(raw_state) if raw_state else {}
+        except ValueError:
+            state = {}
+        messages = await self.store.archive_messages_between(
+            sources, (now - timedelta(hours=bot_spam_banter.RECENT_ACTIVITY_HOURS + 1)).isoformat(), limit=600
+        )
+        bot_ids = await self.store.known_bot_ids()
+        if self.user:
+            bot_ids.add(int(self.user.id))
+        history = [(uid, _parse_when(created), text) for uid, _cid, created, text in messages if uid not in bot_ids]
+        bot_spam = [(uid, _parse_when(created), text) for uid, cid, created, text in messages if cid == channel_id]
+        names: dict[int, str] = {}
+        for uid, _cid, _created, _text in messages:
+            names.setdefault(uid, _display_name_for(self, uid))
+        excluded = {int(settings.owner_id or 0)} | {int(v) for v in (settings.idle_banter_excluded_ids or [])}
+        excluded.discard(0)
+        last_post_at = state.get("last_post_at") or ""
+        last_was_ignored = bool(last_post_at) and not any(
+            cid == channel_id and uid not in bot_ids and _parse_when(created) > _parse_when(last_post_at)
+            for uid, cid, created, _text in messages
+        )
+        decision = bot_spam_banter.plan(
+            now=now,
+            history=history,
+            bot_spam=bot_spam,
+            state=state,
+            enabled=True,
+            quiet_hours=settings.bot_spam_banter_quiet_hours,
+            min_gap_minutes=int(settings.bot_spam_banter_min_gap_minutes),
+            max_per_day=int(settings.bot_spam_banter_max_per_day),
+            target_cooldown_hours=int(settings.bot_spam_banter_target_cooldown_hours),
+            excluded_ids=excluded,
+            opted_out=await self.store.opted_out_members("banter_optout"),
+            names=names,
+            last_was_ignored=last_was_ignored,
+        )
+        if not decision.post or decision.target is None:
+            return
+        target = decision.target
+        # Only #bot-spam's own recent messages are conversational material; the other channels contribute activity.
+        material = "\n".join(f"- {text}" for _uid, _when, text in bot_spam[-8:] if text)[:1200]
+        theirs = "\n".join(f"- {text}" for text in target.sample)[:800]
+        prompt = (
+            f"#[bot-spam] recent messages:\n{material or '(quiet)'}\n\n"
+            f"Member to talk to: {target.display_name} ({target.messages} messages in the last few hours)\n"
+            f"Some of what they said recently:\n{theirs or '(nothing usable)'}\n\n"
+            f"Write the message. Address them as <@{target.user_id}>."
+        )
+        result = await _public_model_completion(
+            bot=self,
+            system=BOT_SPAM_BANTER_BOUNDARY,
+            prompt=prompt,
+            model=settings.ask_model,
+            reasoning_effort=settings.ask_reasoning_effort,
+            timeout_seconds=min(60, int(settings.hermes_timeout_seconds or 60)),
+            activity_label="bot-spam banter",
+            actor_id=target.user_id,
+        )
+        line = repair_discord_markdown((result.stdout or "").strip()) if result.ok else ""
+        if not line or line.upper().startswith("SKIP") or len(line) > 600:
+            print(f"[banter] skipped ({decision.reason}): nothing usable from the model", flush=True)
+            return
+        sent = await channel.send(line, allowed_mentions=targeted_mentions([target.user_id]))
+        days = state.get("post_days") if isinstance(state.get("post_days"), dict) else {}
+        for key in [k for k in days if k < (now - timedelta(days=7)).date().isoformat()]:
+            del days[key]
+        days.setdefault(now.date().isoformat(), []).append(now.isoformat())
+        targets = state.get("targets") if isinstance(state.get("targets"), dict) else {}
+        targets[str(target.user_id)] = now.isoformat()
+        state.update({"last_post_at": now.isoformat(), "last_message_id": sent.id, "post_days": days, "targets": targets})
+        await self.store.state_set("bot_spam_banter", json.dumps(state))
+        print(f"[banter] posted in #bot-spam about {target.display_name}", flush=True)
+        await self.store.audit(
+            actor_id=target.user_id,
+            guild_id=getattr(getattr(channel, "guild", None), "id", None),
+            channel_id=channel_id,
+            command="bot-spam banter",
+            summary=f"{target.display_name}: {line[:160]}",
+        )
 
     async def _activity_worker(self, delay_seconds: int) -> None:
         await asyncio.sleep(max(0, delay_seconds))
@@ -8405,7 +8623,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     output = result.stdout.strip() or result.stderr.strip() or "No output."
     if result.timed_out:
         output = f"Hermes run timed out after {bot.settings.hermes_timeout_seconds}s. Try a narrower Chaos Redux question."
-    output = sanitize_public_ask_output(output)
+    output = sanitize_public_ask_output(output, question=request, channel_id=channel_id)
     memory_output = output
     if rate is not None:
         output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
@@ -8420,9 +8638,14 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     )
     await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command=command_name, summary=request)
     first_sent: discord.Message | None = None
+    dm_requested = _member_answers_private(bot, message.author.id)
+    private_set = False
     for i, part in enumerate(_chunk(output)):
         content = part
-        if i == 0:
+        if i == 0 and dm_requested:
+            # Private answers: delivered to the asker alone, and dismissable from their own view.
+            private_set = await send_private_answer(message, content)
+        elif i == 0:
             first_kwargs: dict[str, Any] = {
                 "mention_author": False,
                 "allowed_mentions": safe_allowed_mentions(),
@@ -8433,6 +8656,8 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
             first_sent = await message.reply(content, **first_kwargs)
         else:
             await message.channel.send(content, allowed_mentions=safe_allowed_mentions())
+    if private_set:
+        return
     if first_sent and result.ok and memory_output != PUBLIC_ASK_REDIRECT:
         await bot.store.record_message_ask_turn(
             mode="public",
@@ -9209,6 +9434,7 @@ async def run_hermes_command(
     *,
     command_name: str,
     public: bool = True,
+    ephemeral: bool = False,
     owner_only: bool = False,
     rate_bucket: str = "scripted",
     use_ask_model: bool = False,
@@ -9559,7 +9785,7 @@ async def run_hermes_command(
             "For very broad server actions, ask for a preview/scope first, then confirm execution."
         )
     if not owner_only and rate_bucket == "ask":
-        output = sanitize_public_ask_output(output)
+        output = sanitize_public_ask_output(output, question=request, channel_id=interaction.channel_id)
         memory_output = output
         if rate:
             output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
@@ -9618,7 +9844,7 @@ async def run_hermes_command(
                 )
             else:
                 followup_kwargs: dict[str, Any] = {
-                    "ephemeral": not public,
+                    "ephemeral": ephemeral or not public,
                     "allowed_mentions": safe_allowed_mentions(),
                 }
                 if i == 0 and should_record_reply_memory:
@@ -10612,8 +10838,10 @@ def register_commands(bot: ChaosXBot) -> None:
             # Owner surfaces always think at the top effort (Hoops, 2026-10-25); members get the fast ask model.
             use_operator_model=interaction.user.id == bot.settings.owner_id,
             use_ask_model=interaction.user.id != bot.settings.owner_id,
+            # Private answers: only the asker sees them, and Discord lets them dismiss it from their own view.
+            ephemeral=visibility == "private" or _member_answers_private(bot, interaction.user.id),
         )
-        if answer is not None and visibility != "private":
+        if answer is not None and visibility != "private" and not _member_answers_private(bot, interaction.user.id):
             _result, output = answer
             bot.answer_cache.put(question, output, commit=bot.knowledge.commit_sha())
 
@@ -11511,6 +11739,17 @@ def register_commands(bot: ChaosXBot) -> None:
             f"Visible guilds: {guilds}"
         )
         text += block(section("Command latency"), bullets(command_timings_lines()))
+        # Freshness of the tooling knowledge roots: the bot answers "does X exist" from these clones, so a stale
+        # clone is a wrong answer waiting to happen (that is how the 3D pipeline went missing).
+        results = getattr(bot, "tooling_sync_results", None) or []
+        if results:
+            text += block(section("Knowledge sources"), "\n".join(tooling_sync.describe(results)))
+        else:
+            text += block(
+                section("Knowledge sources"),
+                f"Tooling sync has not run yet (enabled=`{settings.tooling_sync_enabled}`, "
+                f"every `{settings.tooling_sync_interval_minutes}` min).",
+            )
         # Feedback lives here rather than in its own subcommand: /admin is at Discord's 25-subcommand ceiling and
         # Hoops wants few, consolidated admin commands.
         if feedback_days > 0:

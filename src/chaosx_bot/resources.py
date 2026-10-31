@@ -120,9 +120,11 @@ def resources_block() -> str:
     lines = [f"- {r.label} — {r.url} ({r.when})" for r in OFFICIAL_RESOURCES]
     return (
         "\nOfficial Chaos Redux links (authoritative — these are the only URLs you may give a member; "
-        "never invent, guess, shorten or reconstruct a link, and offer the relevant one when someone asks "
-        "about videos, tutorials, the modding setup, the modding tools, supporting the project, or "
-        "contributing):\n" + "\n".join(lines) + "\n\n"
+        "never invent, guess, shorten or reconstruct a link). Give a link only when the member asks for a tool, "
+        "app, repository, download, video or tutorial, or when the link is needed to do what they asked. An "
+        "answer that explains how something works carries no link. Never repeat a link that was already given "
+        "in this conversation (say \"the repo linked above\" instead), and never end an answer with a \"here is "
+        "the repo/playlist\" pointer:\n" + "\n".join(lines) + "\n\n"
         "The mod itself is not released yet: there is no Steam Workshop page or download link. If someone asks "
         "where to get it, say it is coming soon and offer the devlogs instead. Never produce a workshop or "
         "download URL.\n"

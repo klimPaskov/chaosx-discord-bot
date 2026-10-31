@@ -212,10 +212,14 @@ def block(*parts: object) -> str:
 
 # Appended to the system boundary so every model-written answer is skimmable instead of flat prose.
 STRUCTURE_RULE = (
-    "Format replies so they can be skimmed: open with a one-line answer, then use `##` or `###` headings "
-    "with `-` bullets (numbered steps when the order matters) for anything with more than two points, and "
-    "bold the key term in a bullet. Keep headings short, never nest more than two levels, and skip "
-    "formatting entirely for a one-line answer, a quick confirmation, or casual banter."
+    "STYLE: answer like a knowledgeable member chatting in Discord, not like a document. Lead with the direct "
+    "answer. Match the length to the question: a simple question gets one or two short paragraphs (usually under "
+    "120 words); a complex HOI4 modding question may run longer, but only with details that change what the "
+    "reader does. Write plain sentences. Use a short list only for real steps or three or more separate items, and "
+    "no headings unless a long answer has several distinct parts. No opening label or preamble (\"Short answer:\", "
+    "\"Great question\"), no closing summary, offer or sign-off (\"Let me know if...\", \"Hope this helps\"), and "
+    "never repeat what this conversation already said - build on it instead. Skip formatting entirely for a "
+    "one-line answer, a quick confirmation, or casual banter."
 )
 
 # Having live data available is not the same as being asked for it. Every ask path carries a live block so the
@@ -243,8 +247,42 @@ CAPABILITY_RULE = (
 )
 
 GROUNDING_RULE = (
-    "GROUNDING: when your answer depends on a specific mod file, name the file. If the knowledge base had "
-    "nothing on the point, say so in one line rather than filling the gap with general knowledge. Refuse only "
-    "when the thing genuinely does not exist after checking the knowledge base, the catalogs and the live data; "
-    "otherwise answer with what you found and name what is missing."
+    "GROUNDING: if the knowledge base had nothing on the point, say so in one line rather than filling the gap "
+    "with general knowledge. Refuse only when the thing genuinely does not exist after checking the knowledge "
+    "base, the catalogs and the live data; otherwise answer with what you found and name what is missing. "
+    "TOOL CAPABILITIES: a \"Capabilities found in the project repositories\" list in your material is generated "
+    "from the current repositories and outranks older notes. Describe what is listed with its real status - a "
+    "documented agent workflow (skill), a workflow with implementation code in the repo, or experimental - and "
+    "never upgrade a documented workflow into a finished one-click feature. Never state that a project tool, "
+    "workflow or feature does not exist or is not covered: if your material does not show it, say you are not "
+    "sure it exists rather than denying it."
 )
+
+
+# Labels and sign-offs the model adds on its own. The prompt asks it not to; this makes sure (Hoops, 2026-10-31:
+# answers must be direct, with no unnecessary introductory or concluding sentences).
+_LEAD_LABEL_RE = re.compile(
+    r"^\s*(?:\*\*)?(?:short|straight|quick|simple|honest|brief)\s+(?:answer|version|take)(?:\*\*)?\s*[:\-—–]+\s*",
+    re.IGNORECASE,
+)
+_LEAD_FILLER_RE = re.compile(r"^\s*(?:great|good|fair|nice) question[!.,—–-]*\s*", re.IGNORECASE)
+_TRAIL_FILLER_RE = re.compile(
+    r"\n+\s*(?:let me know if[^\n]*|hope (?:this|that) helps[^\n]*|feel free to ask[^\n]*|"
+    r"happy to (?:help|go deeper|dig in)[^\n]*|(?:if you (?:want|need|have)[^\n]{0,80}(?:just )?(?:ask|let me know)[^\n]*))\s*$",
+    re.IGNORECASE,
+)
+
+
+def trim_answer_filler(text: str) -> str:
+    """Drop a leading \"Short answer:\" style label and a trailing \"let me know\" sign-off."""
+    value = text or ""
+    stripped = _LEAD_LABEL_RE.sub("", value, count=1)
+    stripped = _LEAD_FILLER_RE.sub("", stripped, count=1)
+    if stripped != value and stripped[:1].islower():
+        stripped = stripped[:1].upper() + stripped[1:]
+    for _ in range(2):
+        updated = _TRAIL_FILLER_RE.sub("", stripped)
+        if updated == stripped:
+            break
+        stripped = updated
+    return stripped.strip() or value

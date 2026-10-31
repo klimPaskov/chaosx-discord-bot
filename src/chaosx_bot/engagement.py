@@ -28,6 +28,17 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     detail_level TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS answer_visibility_pref (
+    user_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'public',
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS answer_visibility (
+    message_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    hidden_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS answer_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id TEXT,
@@ -459,3 +470,55 @@ def member_answer_context(db_path: str | Path, user_id: int | str) -> str:
     if up or down:
         parts.append(f"Their history with your answers: {up} helpful, {down} not helpful — adjust rather than mention it.")
     return " ".join(parts)
+
+
+# --- answering in private ---------------------------------------------------------------------------------------
+
+VISIBILITY_MODES = {"public", "private"}
+
+
+def visibility_pref(db_path: str | Path, user_id: int | str) -> str:
+    """`public` (the default) or `private` - only that member ever sees their own answers."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT mode FROM answer_visibility_pref WHERE user_id = ?", (str(user_id),)).fetchone()
+    finally:
+        conn.close()
+    return "private" if row and row[0] == "private" else "public"
+
+
+def set_visibility_pref(db_path: str | Path, user_id: int | str, mode: str) -> str:
+    mode = "private" if str(mode).casefold() == "private" else "public"
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO answer_visibility_pref(user_id, mode, updated_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at",
+                (str(user_id), mode, datetime.now(timezone.utc).isoformat()),
+            )
+    finally:
+        conn.close()
+    return mode
+
+
+def hide_answer(db_path: str | Path, *, message_id: int | str, user_id: int | str) -> None:
+    """Remember that this member hid this answer from their own view."""
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO answer_visibility(message_id, user_id, hidden_at) VALUES(?, ?, ?)",
+                (str(message_id), str(user_id), datetime.now(timezone.utc).isoformat()),
+            )
+    finally:
+        conn.close()
+
+
+def hidden_answers(db_path: str | Path, user_id: int | str) -> set[str]:
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute("SELECT message_id FROM answer_visibility WHERE user_id = ?", (str(user_id),)).fetchall()
+    finally:
+        conn.close()
+    return {str(row[0]) for row in rows}

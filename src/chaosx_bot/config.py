@@ -277,6 +277,43 @@ class Settings(BaseSettings):
         default_factory=lambda: [110546365032968192],  # Holly — never a banter target (Hoops, 2026-09-23)
         description="Members idle banter must never target (the owner is always excluded in code as well)",
     )
+    tooling_sync_enabled: bool = Field(
+        default=True,
+        description=(
+            "Pull the tooling knowledge roots (Agentic HOI4 Modding, Agent Tools, Live Tools, Mod Setup, portraits) "
+            "from their branches and re-index the changed roots. Turn off to leave the clones alone."
+        ),
+    )
+    tooling_sync_interval_minutes: int = Field(
+        default=20, ge=5, le=720, description="How often to fetch the tooling knowledge roots"
+    )
+    bot_spam_banter_enabled: bool = Field(
+        default=True,
+        description=(
+            "Occasional spontaneous banter in #bot-spam, started by the bot and aimed at recently active members. "
+            "Only ever posts in bot_spam_banter_channel_id and never pings."
+        ),
+    )
+    bot_spam_banter_channel_id: int = Field(
+        default=1396551514469699765, description="#bot-spam — the only channel spontaneous banter may post in"
+    )
+    bot_spam_banter_source_channels: str = Field(
+        default="1525485352742031400,1395459672055480344,1396551514469699765",
+        description=(
+            "Comma-separated channels (#off-topic, #jazz-and-conversation, #bot-spam) read for recent activity and "
+            "topics. Only public messages, only the last few hours, and only as bounded context."
+        ),
+    )
+    bot_spam_banter_min_gap_minutes: int = Field(
+        default=180, ge=30, le=1440, description="Minimum gap between spontaneous banter posts"
+    )
+    bot_spam_banter_max_per_day: int = Field(default=3, ge=1, le=12, description="Daily cap on spontaneous banter posts")
+    bot_spam_banter_quiet_hours: str = Field(
+        default="23-10", description="Local-server hours (UTC) when no banter starts, e.g. 23-10"
+    )
+    bot_spam_banter_target_cooldown_hours: int = Field(
+        default=48, ge=1, le=720, description="How long before the same member can be the subject of banter again"
+    )
     idle_banter_enabled: bool = Field(
         default=False,
         description="Idle banter: bot may open a conversation in the banter channel after real silence. Off by default (Hoops 2026-09-23).",

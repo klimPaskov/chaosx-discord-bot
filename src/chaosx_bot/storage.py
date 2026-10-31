@@ -324,6 +324,11 @@ CREATE TABLE IF NOT EXISTS member_prefs (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS operational_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS activity_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -1689,6 +1694,25 @@ class Store:
             )
             return {int(row[0]): str(row[1]) for row in await cur.fetchall()}
 
+    async def archive_messages_between(
+        self, channel_ids: list[int], since_iso: str, *, limit: int = 400
+    ) -> list[tuple[int, int, str, str]]:
+        """(author_id, channel_id, created_at, content) for public messages in the given channels since a time.
+
+        Bounded on purpose: banter reads a few hours of a few channels, never the archive.
+        """
+        if not channel_ids:
+            return []
+        marks = ",".join("?" for _ in channel_ids)
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"SELECT author_id, channel_id, created_at, COALESCE(content, '') FROM message_archive "
+                f"WHERE channel_id IN ({marks}) AND created_at >= ? AND visibility = 'public' "
+                f"ORDER BY id DESC LIMIT ?",
+                (*[int(c) for c in channel_ids], since_iso, int(limit)),
+            )
+            return [(int(r[0]), int(r[1]), str(r[2]), str(r[3])) for r in await cur.fetchall() if r and r[0]]
+
     async def known_bot_ids(self) -> set[int]:
         async with self._connect() as db:
             cur = await db.execute("SELECT user_id FROM users WHERE COALESCE(is_bot, 0) = 1")
@@ -1738,6 +1762,21 @@ class Store:
                 (int(user_id), float(xp), str(tier), stamp),
             )
             await db.commit()
+
+    async def state_get(self, key: str) -> str | None:
+        db = await self._db()
+        cur = await db.execute("SELECT value FROM operational_state WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return str(row[0]) if row else None
+
+    async def state_set(self, key: str, value: str) -> None:
+        db = await self._db()
+        await db.execute(
+            "INSERT INTO operational_state(key, value, updated_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (key, value, utcnow().isoformat()),
+        )
+        await db.commit()
 
     async def routine_post_states(self, names: list[str]) -> dict[str, dict]:
         """Stored per-post state (period key, last check, last post) for the named post types."""

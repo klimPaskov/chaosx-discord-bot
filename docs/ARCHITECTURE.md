@@ -39,3 +39,54 @@
 - Removed from the user command surface: `/server`, `/hermes`, `/work`, `/admin config`, `/admin rollback`, `/search`, `/mechanic`, and tiny role-management commands.
 
 Keep the owner gate centralized and covered by tests whenever adding commands.
+
+## Answer shape and knowledge freshness (2026-10-31)
+
+These are behavioural contracts, not cosmetic preferences; each has tests.
+
+- **Plain messages.** Every bot message is sent with `suppress_embeds` unless the call passes its own `embed`
+  (`link_policy.install_plain_message_defaults`, installed in `ChaosXBot.__init__`). No automatic link previews
+  anywhere; `/help` and the status panels keep the embeds they build deliberately.
+- **Links only when wanted.** `link_policy.apply_link_policy` runs inside `sanitize_public_ask_output` for public
+  answers (mention, `/ask`, auto-scan, quick-action follow-ups). Project links survive only when the member asked
+  for a tool, app, repository, download, video or tutorial, or explicitly asked again; a link already given in the
+  channel within six hours is dropped, with its pointer sentence. Non-project URLs the answer cites are untouched.
+- **Concise answers.** `STRUCTURE_RULE` asks for a direct conversational answer with length matched to the
+  question; `formatting.trim_answer_filler` removes a leading "Short answer:" label and a trailing "let me know"
+  sign-off at the answer boundary.
+- **Capability answers come from the repositories.** `capability_catalog` walks every tooling root
+  (`CHAOSX_EXTRA_KNOWLEDGE_ROOTS`) and reads skills (`*/skills/*/SKILL.md`), subagents, `.tools/<name>/README.md`,
+  README sections, docs pages and ComfyUI workflow files. Each entry carries a derived status: `documented
+  workflow`, `workflow + implementation`, `implementation`, `experimental` or `contributor skill`.
+  `Knowledge.capability_context()` matches entries for the question and prepends them to
+  `public_ask_context()`, so "does X exist" is answered from the current repositories rather than from whichever
+  old note BM25 happened to rank. `GROUNDING_RULE` forbids claiming a project capability does not exist; the
+  fallback is "not sure".
+- **Freshness is the bot's job.** `tooling_sync` fetches every tooling root and fast-forwards it (detached-HEAD
+  checkouts such as the pinned MCP tag are reported as `pinned` and never moved). `ChaosXBot._tooling_sync_worker`
+  runs it every `CHAOSX_TOOLING_SYNC_INTERVAL_MINUTES` (20 by default) and asks the index to refresh.
+  `/admin health` prints the per-root state, commit and date. On a host serving a foreign index
+  (`CHAOSX_INDEX_AUTOREBUILD=0`) `Knowledge._refresh_changed_tooling` re-indexes only the changed tooling roots
+  instead of rebuilding the whole corpus.
+- **Regression guard.** `scripts/capability_regression.py` checks nine capability questions (3D, portraits, maps,
+  focus trees, MCP, ComfyUI, live testing) and three negative ones, first at retrieval level and, with `--model`,
+  end to end against the real prompt and model.
+
+## Welcome, privacy controls and banter
+
+- **Welcome is two surfaces.** `welcome.build_welcome_text` is a one-line announcement picked by
+  `choose_announcement` (24 variants, the last five are avoided), naming the member with a mention; it carries no
+  account metadata. `welcome.build_welcome_dm` is the orientation DM: what the community is for, what members do
+  here, the rules channel, privacy note, and an invitation. A member with DMs closed gets no DM and no public
+  fallback (the attempt is audited); only the public line is posted.
+- **"Hide answer" is honest about Discord's limits.** A channel message cannot be hidden from one viewer, and only
+  an ephemeral response can be dismissed by its own recipient. The panel's Hide answer button opens a private
+  `HideView` that records the hide for that member (`answer_visibility`) and offers switching their answers to
+  private delivery (`answer_visibility_pref`, honoured by `/ask` and by mention asks, which then arrive by DM).
+  Other members pressing the same button get their own switch, never this member's settings.
+- **Spontaneous banter.** `bot_spam_banter.plan` decides everything deterministically (enabled, quiet hours,
+  randomised gap, daily cap, live conversation in #bot-spam, a serious message in the channel, enough recent
+  activity, per-member cooldown, owner/bot/opt-out exclusions) and the model only writes one or two lines
+  (`BOT_SPAM_BANTER_BOUNDARY`, `SKIP` when the material gives it nothing). Only #bot-spam is ever posted in; the
+  mention renders the name without pinging; the last post getting no reply backs off for a day. State lives in
+  `operational_state` under `bot_spam_banter`.

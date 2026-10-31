@@ -36,8 +36,11 @@ from .indexer import (
     iter_qoder_indexable_files,
     iter_vault_indexable_files,
     rebuild_index,
+    refresh_tooling_roots,
+    tooling_tokens,
     _latest_tooling_mtime,
 )
+from . import capability_catalog
 
 MAX_EXCERPT_CHARS = 1400
 PRIVATE_SOURCE_CLASSES = {"accepted_source_specification", "planning_document"}
@@ -100,6 +103,7 @@ class Knowledge:
     _refresh_in_flight: bool = field(default=False, init=False, repr=False, compare=False)
     _refresh_thread: Any = field(default=None, init=False, repr=False, compare=False)
     _refresh_error: BaseException | None = field(default=None, init=False, repr=False, compare=False)
+    _capabilities: Any = field(default=None, init=False, repr=False, compare=False)
 
     def ensure_index(self) -> None:
         now = datetime.now(tz=timezone.utc).timestamp()
@@ -146,6 +150,47 @@ class Knowledge:
                 object.__setattr__(self, "_refresh_error", exc)
                 raise
         object.__setattr__(self, "_refresh_in_flight", False)
+
+    def _refresh_changed_tooling(self, old_commit: str, new_commit: str) -> list[str]:
+        """Re-index the tooling roots whose fingerprint moved; return their names."""
+        old, new = tooling_tokens(old_commit), tooling_tokens(new_commit)
+        changed = [(name, root) for name, root in (self.extra_roots or []) if name in new and old.get(name) != new[name]]
+        if not changed:
+            return []
+        written = refresh_tooling_roots(self.db_path, changed, old_commit=old_commit, new_commit=new_commit)
+        _ASK_CONTEXT_CACHE.clear()
+        _DOC_CONTENT_CACHE.clear()
+        object.__setattr__(self, "_capabilities", None)
+        print(f"[index] refreshed tooling roots {[n for n, _ in changed]}: {written} docs", flush=True)
+        return [name for name, _root in changed]
+
+    def capabilities(self) -> list:
+        """The capability catalog for the tooling roots, rebuilt when any root's revision changes."""
+        roots = [(name, Path(root)) for name, root in (self.extra_roots or [])]
+        if not roots:
+            return []
+        now = time.time()
+        cached = getattr(self, "_capabilities", None)
+        if cached and now - cached[0] < 60:
+            return cached[2]
+        revisions = {name: capability_catalog.root_revision(root) for name, root in roots}
+        if cached and cached[1] == revisions:
+            object.__setattr__(self, "_capabilities", (now, revisions, cached[2], cached[3]))
+            return cached[2]
+        catalog = capability_catalog.build_catalog(roots)
+        dates = {name: rev.split(" ", 1)[1] for name, rev in revisions.items() if " " in rev}
+        object.__setattr__(self, "_capabilities", (now, revisions, catalog, dates))
+        return catalog
+
+    def capability_context(self, query: str, limit: int = 6) -> str:
+        try:
+            catalog = self.capabilities()
+            entries = capability_catalog.match(catalog, query, limit=limit)
+            dates = (getattr(self, "_capabilities", None) or (0, {}, [], {}))[3]
+            return capability_catalog.render(entries, freshness=dates)
+        except Exception as exc:  # the catalog is an aid; retrieval must still answer without it
+            print(f"[capabilities] lookup failed: {type(exc).__name__}: {exc}", flush=True)
+            return ""
 
     def _refresh_vault_indexes_if_stale(self) -> bool:
         """Regenerate the vault's index files when a deletion left stale listings behind.
@@ -202,7 +247,9 @@ class Knowledge:
             or vault_indexes_refreshed
         )
         if needs_rebuild and not self.autorebuild and count > 0 and scenarios > 0:
-            # Serving an index built elsewhere: leave it alone rather than replacing it with this host's revision.
+            # Serving an index built elsewhere: leave the mod/vault corpus alone rather than replacing it with this
+            # host's revision — but the tooling clones here ARE authoritative, so their rows follow the clones.
+            self._refresh_changed_tooling(meta.get("commit_sha") or "", current_commit)
             return
         if needs_rebuild:
             try:
@@ -531,6 +578,11 @@ class Knowledge:
             snippets.append(item)
             total += len(item)
         result = "\n".join(snippets)
+        # What the tool repositories say exists, ahead of the ranked excerpts: BM25 ranked plan documents above the
+        # 3D pipeline skill, and the answer then denied the workflow existed (Hoops, 2026-10-31).
+        capabilities = self.capability_context(query)
+        if capabilities:
+            result = f"{capabilities}\n\n{result}" if result else capabilities
         if len(_ASK_CONTEXT_CACHE) > 128:
             _ASK_CONTEXT_CACHE.clear()
         _ASK_CONTEXT_CACHE[cache_key] = result

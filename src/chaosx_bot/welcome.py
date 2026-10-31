@@ -1,14 +1,16 @@
-"""Personalised welcome card and DM for new members.
+"""The welcome experience: a short public announcement and a private DM.
 
-Two surfaces, one voice: a welcome card in the welcome channel with action buttons, and a short DM that tells a
-new member what this place is, where to start, and how to talk to the bot. Both use what is actually known about
-the member (name, when the account was made) instead of a fixed template.
+Two surfaces, deliberately different (Hoops, 2026-10-31). The channel post is two or three lines of varied,
+HOI4-flavoured server voice. The DM is the orientation: what this community is for, what a member can do here,
+and an invitation to explore - friendly, concise, with no account metadata and no wall of promotional text.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+
+import random
 
 import discord
 
@@ -27,34 +29,19 @@ HELP_EPHEMERAL = (
 )
 
 
-def _account_age(member: discord.Member) -> str:
-    created = member.created_at
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    days = max((datetime.now(timezone.utc) - created).days, 0)
-    if days < 1:
-        return "made today"
-    if days < 30:
-        return f"{days} day{'s' if days != 1 else ''} old"
-    if days < 365:
-        months = days // 30
-        return f"{months} month{'s' if months != 1 else ''} old"
-    years = days // 365
-    return f"{years} year{'s' if years != 1 else ''} old"
-
-
 def _personal_line(member: discord.Member, *, known_facts: list[str] | None = None) -> str:
-    """One line that could only have been written for this member."""
+    """One short line for the member, built only from things this server knows about them.
+
+    No Discord account metadata: not when the account was created, how old it is, or any flag on it (Hoops,
+    2026-10-31: "Do not display their Discord account age, account creation date, or other account metadata").
+    """
     name = member.display_name
-    age = _account_age(member)
     facts = [fact for fact in (known_facts or []) if fact][:1]
     if facts:
-        return f"{name} — {facts[0]}."
+        return f"**{name}** — {facts[0]}."
     if member.bot:
-        return f"{name} — another bot joining the party."
-    if "new" in age or "today" in age:
-        return f"{name} — a brand new account, so welcome twice."
-    return f"{name} — account {age}, good to have you here."
+        return f"**{name}** — a bot joining the party."
+    return f"**{name}** just walked in."
 
 
 def build_welcome_text(
@@ -62,32 +49,15 @@ def build_welcome_text(
     *,
     member_count: int | None = None,
     known_facts: list[str] | None = None,
+    opener: str | None = None,
 ) -> str:
-    """The message posted in the welcome channel."""
-    name = member.display_name
-    lines = [
-        f"**{pick(member, OPENERS)}**",
-        "",
-        _personal_line(member, known_facts=known_facts),
-        "",
-        "This server is for **Chaos Redux**, a mod for Hearts of Iron IV — its events, scenarios, mechanics and "
-        "testing, plus agentic HOI4 modding and the MCP tooling that goes with it.",
-        "",
-        "**Where to start**",
-        f"» Read the rules in <#{RULES_CHANNEL_ID}> — they are numbered (§ 1–§ 8), and they are short.",
-        f"» Say hello in <#{INTRO_CHANNEL_ID}> if you want to be known here.",
-        f"» Ask me anything with `@ChaosX` or `/ask` — mechanics, testing, a bug you hit, or how the mod is built.",
-        f"» Bugs and test notes go in <#{ISSUES_CHANNEL_ID}> so they do not get lost in chat.",
-        f"» Devlogs and showcases: {YOUTUBE_URL}",
-        "",
-        "I watch the channels and keep this place tidy, so rule-breaking gets handled whether or not a "
-        "moderator is around — and every action is explained to the person it affects.",
-    ]
-    lines.append("")
-    lines.append(f"-# {pick(member, CLOSERS)}")
-    if member_count:
-        lines.append(f"-# Member #{member_count:,} · Chaos Redux · Hearts of Iron IV")
-    return "\n".join(lines)
+    """The short public announcement in the welcome channel.
+
+    Hoops (2026-10-31): much shorter than the old card, creative and varied, and no account metadata. The long
+    orientation now lives in the private DM, so this is two or three lines that read like the server talking.
+    """
+    line = opener or pick(member, ANNOUNCEMENTS)
+    return f"{line.replace('{user}', f'<@{member.id}>')}"
 
 
 def build_welcome_dm(
@@ -95,34 +65,35 @@ def build_welcome_dm(
     *,
     known_facts: list[str] | None = None,
 ) -> str:
-    """The DM a new member gets. Short, useful, no wall of text."""
+    """The private DM a new member gets: what this place is, what to do, and an invitation."""
     name = member.display_name
     lines = [
-        f"**Welcome to Chaos Redux, {name}.**",
+        pick(member, DM_OPENERS).format(name=name),
         "",
-        "You just joined the server for **Chaos Redux**, a mod for Hearts of Iron IV. No forms, no "
-        "interrogation — here is the whole of what you need:",
+        "This is the community around **Chaos Redux**, a Hearts of Iron IV mod — plus the wider craft of making "
+        "HOI4 mods with AI: focus trees, events, decisions, maps, portraits, 3D models, and code that checks its "
+        "own work.",
         "",
-        f"**Rules** — <#{RULES_CHANNEL_ID}>. Numbered § 1 to § 8, readable in a minute. The short version: be "
-        "decent, stay on topic, keep it safe.",
-        f"**Say hi** — <#{INTRO_CHANNEL_ID}> if you want people to know who you are.",
-        f"**Ask anything** — mention `@ChaosX` in a channel, or use `/ask`. Events, scenarios, mechanics, "
-        "testing, the mod itself, or agentic HOI4 modding and MCP tools. It answers in the channel, and you can "
-        "rate the answer.",
-        "**The mod** — coming soon.",
-        f"**Videos and devlogs** — {YOUTUBE_URL}",
+        "**What people do here**",
+        f"» Learn the agentic HOI4 modding workflow — how to set up a coding agent on a mod and what it can do. {YOUTUBE_URL}",
+        "» Ask ChaosX, the server's bot, anything about modding: `@ChaosX how do focus trees handle prerequisites?` "
+        "or `/ask`. It answers in the channel, and you can rate the answer.",
+        "» Share what you are building, or borrow ideas from what others share — the event ideas forum and the "
+        "vibe-coding channels are where that happens.",
+        f"» Get help with something broken: ask in <#{ISSUES_CHANNEL_ID}> with the error and the steps.",
+        f"» Say who you are in <#{INTRO_CHANNEL_ID}> if you want to be known here.",
         "",
-        "**About me, since I will be around.** I answer questions, and I also keep the server safe: I remove "
-        "spam, gore, doxxing and slurs, and I can warn, time out or ban on my own. Anything I do comes with an "
-        "explanation, by DM and in the channel, and you can appeal to Hoops McCann if you think I got it wrong.",
+        f"**The only rule that matters up front** — the numbered rules are in <#{RULES_CHANNEL_ID}>, and they are "
+        "short: be decent, stay roughly on topic, keep it safe.",
         "",
-        "**Your privacy.** I keep a short profile of what you talk about here so answers fit you better. "
-        "`/memory` shows exactly what I have, and wipes it if you ask. Anything you tell me in DMs stays out "
-        "of the server.",
+        "**Your privacy.** ChaosX keeps a short profile of what you talk about here so its answers fit you better. "
+        "`/memory` shows exactly what it has and wipes it on request. Anything you say in DMs stays out of the server.",
         "",
-        "That's it. Ask something when you feel like it.",
+        "That's the whole briefing. Look around, lurk if you like, and ask something when you feel like it.",
     ]
-    return "\n".join(lines)
+    if known_facts and pick(member, (True, False), salt=5):
+        lines.insert(1, f"-# {known_facts[0]}")
+    return "\n".join(lines).strip()
 
 
 class WelcomeViewBase(discord.ui.View):
@@ -209,46 +180,40 @@ def welcome_facts(state: Any, member: discord.Member) -> list[str]:
 # --- Chaos Redux flavour -------------------------------------------------------------------------------------
 # A long list, picked by member id, so two people joining back to back do not read the same greeting.
 
-OPENERS = [
-    "A new delegation has arrived in the capital.",
-    "Fresh boots on the ground, and the map is still red.",
-    "Another commander steps out of the briefing tent.",
-    "The war room just gained a chair.",
-    "New arrival — the front line is that way.",
-    "Somebody new just crossed the border.",
-    "A new name enters the ledger.",
-    "The general staff has been notified of your arrival.",
-    "New blood for the cause, and the cause needs it.",
-    "You have been assigned to the Chaos Redux theatre.",
-    "A new player joins the long game.",
-    "The archive has a new reader.",
-    "New arrival: please report to the situation room.",
-    "One more mind for the world-building.",
-    "The scenario writers have a new colleague.",
-    "Fresh recruit, no combat record yet.",
-    "You have entered the timeline at a delicate moment.",
-    "A new signature appears on the roster.",
-    "Someone opened the door and let the chaos in.",
-    "The map room is fuller tonight.",
-    "Another volunteer for the testing grounds.",
-    "New member detected. Morale unchanged, but noted.",
-    "The rebellion has a new face.",
-    "Welcome to the part of the war that gets written down.",
+ANNOUNCEMENTS = [
+    "Another modder has entered the lobby. Welcome {user} — let's see what you'll create.",
+    "Reinforcements have arrived! {user} just joined the modding front.",
+    "{user} crossed the border and reported for duty. Welcome to Chaos Redux.",
+    "New arrival in the war room: {user}. The map is still red, so there's plenty to do.",
+    "{user} just opened the door and let the chaos in. Welcome.",
+    "The general staff has been notified: {user} is here.",
+    "Fresh boots on the ground — welcome, {user}.",
+    "{user} joined the timeline at a delicate moment. Welcome aboard.",
+    "A new signature appears on the roster: {user}. Welcome.",
+    "Someone handed {user} a modding folder and a map. Good luck, and welcome.",
+    "{user} has been assigned to the Chaos Redux theatre. Welcome.",
+    "New face, new focuses to write. Welcome, {user}.",
+    "The archive has a new reader — {user} just joined.",
+    "{user} arrived. Morale unchanged, but noted. Welcome.",
+    "Another volunteer for the testing grounds: {user}. Welcome.",
+    "Look busy, {user} is here. (Welcome.)",
+    "The rebellion has a new face. Welcome, {user}.",
+    "{user} stepped out of the briefing tent. Welcome to the front.",
+    "One more mind for the world-building — welcome, {user}.",
+    "The map room is fuller tonight. Welcome, {user}.",
+    "Fresh recruit, no combat record yet: {user}. Welcome.",
+    "{user} just walked in and the focus tree got longer. Welcome.",
+    "New delegation in the capital — {user} has arrived.",
+    "Another commander for a war that never quite ends: {user}. Welcome.",
 ]
 
-CLOSERS = [
-    "Ask something when you are ready — the archive is open.",
-    "Lurk if you like. Just read the rules first.",
-    "No forms here. Say hi, or don't.",
-    "The devlogs explain most of what this is.",
-    "Nothing here is finished, which is the interesting part.",
-    "Opinions welcome. Numbers welcome more.",
-    "If you break something, tell us how.",
-    "Questions are cheaper than assumptions.",
-    "You will be asked for specifics eventually. Start early.",
-    "Bring screenshots and error logs, not vibes.",
-    "The scenario list is longer than the changelog.",
-    "Everything here is a draft, including the rules.",
+DM_OPENERS = [
+    "**Welcome to Chaos Redux, {name}.**",
+    "**Hey {name} — welcome in.**",
+    "**Good to have you here, {name}.**",
+    "**Welcome, {name}. Glad you found the place.**",
+    "**Hi {name}, welcome to Chaos Redux.**",
+    "**You're in, {name}. Welcome.**",
 ]
 
 ACTIONS = {
@@ -365,6 +330,18 @@ ACTIONS = {
 }
 
 ACTION_ORDER = ["scenario", "lore", "nation", "testing", "suggest"]
+
+
+def choose_announcement(recent: list[int] | None = None) -> tuple[int, str]:
+    """Pick an announcement that has not been used in the last few joins.
+
+    Varied wording is the point (Hoops, 2026-10-31), and random.choice alone repeats annoyingly often on a small
+    pool. `recent` holds the indices used most recently, newest last.
+    """
+    recent = [index for index in (recent or []) if 0 <= index < len(ANNOUNCEMENTS)]
+    fresh = [index for index in range(len(ANNOUNCEMENTS)) if index not in recent[-5:]]
+    index = random.choice(fresh or list(range(len(ANNOUNCEMENTS))))
+    return index, ANNOUNCEMENTS[index]
 
 
 def pick(member: discord.Member, items: list, salt: int = 0) -> Any:

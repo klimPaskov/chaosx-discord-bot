@@ -859,3 +859,61 @@ def _load_clusters(conn: sqlite3.Connection, repo: Path, indexed_at: float) -> i
         )
         count += 1
     return count
+
+
+def tooling_tokens(commit: str) -> dict[str, str]:
+    """`tooling:<name>:<fingerprint>` parts of an index commit string, by root name."""
+    out: dict[str, str] = {}
+    for part in (commit or "").split("|"):
+        if part.startswith("tooling:"):
+            name = part.split(":", 2)[1]
+            out[name] = part
+    return out
+
+
+def refresh_tooling_roots(db_path: Path, roots: list[tuple[str, Path]], *, old_commit: str, new_commit: str) -> int:
+    """Re-index only the given tooling roots, leaving the mod, vault and Qoder rows exactly as they are.
+
+    A host that serves an index built elsewhere (``CHAOSX_INDEX_AUTOREBUILD=0``) must never rebuild the whole
+    corpus, but the tooling clones on that host *are* authoritative (they are GitHub clones), so their rows can be
+    replaced safely. Returns the number of documents written.
+    """
+    new_tokens = tooling_tokens(new_commit)
+    written = 0
+    indexed_at = time()
+    conn = connect(db_path)
+    with conn:
+        for name, root in roots:
+            root = Path(root).resolve()
+            conn.execute("DELETE FROM source_docs WHERE path >= ? AND path < ?", (f"tooling/{name}/", f"tooling/{name}0"))
+            for path in iter_tooling_indexable_files(root):
+                text = read_text(path)
+                if not text:
+                    continue
+                rel = path.relative_to(root).as_posix()
+                pieces = split_code_doc(rel, text) if path.suffix.lower() in CODE_SUFFIXES else [(rel, text)]
+                for piece_rel, piece_text in pieces:
+                    conn.execute(
+                        """
+                        INSERT INTO source_docs(path, source_class, file_type, commit_sha, mtime, content_hash, indexed_at, content)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (f"tooling/{name}/{piece_rel}", "tooling_doc", path.suffix.lower().lstrip("."), new_commit,
+                         path.stat().st_mtime, hash_text(piece_text), indexed_at, piece_text),
+                    )
+                    written += 1
+        refreshed = {name for name, _root in roots}
+        parts = []
+        for part in (old_commit or "").split("|"):
+            if part.startswith("tooling:") and part.split(":", 2)[1] in refreshed:
+                continue
+            parts.append(part)
+        parts += [new_tokens[name] for name in sorted(refreshed) if name in new_tokens]
+        total = conn.execute("SELECT COUNT(*) FROM source_docs WHERE path >= 'tooling/' AND path < 'tooling0'").fetchone()[0]
+        docs = conn.execute("SELECT COUNT(*) FROM source_docs").fetchone()[0]
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('commit_sha', ?)", ("|".join(p for p in parts if p),))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('tooling_doc_count', ?)", (str(total),))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('doc_count', ?)", (str(docs),))
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('tooling_refreshed_at', ?)", (str(indexed_at),))
+    conn.close()
+    return written

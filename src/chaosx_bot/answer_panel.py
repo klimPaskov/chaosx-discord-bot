@@ -101,7 +101,9 @@ async def suggest_actions(bot: Any, *, question: str, answer: str) -> list[tuple
     return actions or list(_FALLBACK_ACTIONS[: _MAX_BUTTONS])
 
 
-async def followup_answer(bot: Any, *, question: str, answer: str, prompt: str) -> str:
+async def followup_answer(
+    bot: Any, *, question: str, answer: str, prompt: str, channel_id: int | None = None
+) -> str:
     """Answer a quick-action press in more depth, with the same grounding as the original answer."""
     knowledge = getattr(bot, "knowledge", None)
     context = ""
@@ -136,6 +138,15 @@ async def followup_answer(bot: Any, *, question: str, answer: str, prompt: str) 
         source_paths_allowed=False,
     )
     reply = await _complete(bot, system=PUBLIC_ASK_BOUNDARY, prompt=full_prompt, label="follow-up")
+    if reply:
+        # The same public pass as every other answer: markdown repair, redaction and the link policy (a follow-up
+        # about a feature never re-posts the link the first answer already gave).
+        try:
+            from .bot import sanitize_public_ask_output  # lazy: bot imports this module
+
+            reply = sanitize_public_ask_output(reply, question=prompt, channel_id=channel_id)
+        except Exception as exc:
+            print(f"[panel] follow-up sanitize failed: {type(exc).__name__}: {exc}", flush=True)
     return reply or "I could not reach my knowledge base just now — ask me again in a moment."
 
 
@@ -265,7 +276,10 @@ class ActionModal(discord.ui.Modal):
         details = "\n".join(f"{item.label}: {item.value}" for item in self.inputs)
         prompt = f"{(self.inputs[0].value if self.inputs else '')[:400]}\n{details}"
         try:
-            text = await followup_answer(self.bot, question=self.question, answer=self.answer, prompt=prompt)
+            text = await followup_answer(
+                self.bot, question=self.question, answer=self.answer, prompt=prompt,
+                channel_id=getattr(interaction, "channel_id", None),
+            )
             parts = _split(text)
             for part in parts:
                 await interaction.followup.send(part, allowed_mentions=discord.AllowedMentions.none())
@@ -630,6 +644,79 @@ class DismissView(discord.ui.View):
         await self._apply(interaction, None, "hidden permanently")
 
 
+class HideView(discord.ui.View):
+    """The closest thing Discord allows to "hide this answer for me" on a public message.
+
+    A channel message cannot be hidden from one member: every client renders the same message, and the only
+    per-viewer message Discord understands is an ephemeral one, which must be an interaction response. So the hide
+    action does the two things that are actually supported - remember the answer as hidden for this member, and
+    switch their answers to private delivery, where pressing Dismiss really does remove it for them alone.
+    """
+
+    def __init__(self, bot: Any, *, message_id: int | None, user_id: int) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.message_id = message_id
+        self.user_id = user_id
+
+    async def _hide(self, interaction: discord.Interaction, *, also_private: bool) -> None:
+        if interaction.user.id != self.user_id:
+            # Someone else pressed a private control that was opened for another member: they get their own
+            # switch, never a change to this member's settings.
+            await interaction.response.send_message(
+                "That hide panel was opened by someone else. You can set your own answers to private in Settings.",
+                ephemeral=True,
+                view=SettingsShortcutView(self.bot, user_id=interaction.user.id),
+            )
+            return
+        db_path = _db_path(self.bot)
+        if db_path:
+            try:
+                if self.message_id:
+                    engagement.hide_answer(db_path, message_id=self.message_id, user_id=interaction.user.id)
+                if also_private:
+                    engagement.set_visibility_pref(db_path, interaction.user.id, "private")
+            except Exception as exc:
+                print(f"[panel] hide failed: {type(exc).__name__}: {exc}", flush=True)
+        note = "Your future answers from me will be private: only you see them, and you can dismiss them yourself."
+        await interaction.response.send_message(
+            "Hidden for you. Discord has no way to hide a channel message from one person, so the post stays for "
+            "everyone else" + (f". {note}" if also_private else ". " + note),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Hide and go private", emoji="🙈", style=discord.ButtonStyle.primary)
+    async def hide_private(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        await self._hide(interaction, also_private=True)
+
+    @discord.ui.button(label="Just remember I hid it", style=discord.ButtonStyle.secondary)
+    async def hide_only(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        await self._hide(interaction, also_private=False)
+
+    @discord.ui.button(label="Keep answers public", style=discord.ButtonStyle.secondary)
+    async def make_public(self, interaction: discord.Interaction, _b: discord.ui.Button) -> None:
+        db_path = _db_path(self.bot)
+        if db_path:
+            engagement.set_visibility_pref(db_path, interaction.user.id, "public")
+        await interaction.response.send_message("Okay — your answers stay public.", ephemeral=True)
+
+
+class SettingsShortcutView(discord.ui.View):
+    """One button into the settings window, for private answers and feedback."""
+
+    def __init__(self, bot: Any, *, user_id: int) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.user_id = user_id
+        button = discord.ui.Button(label="Settings", emoji="⚙️", style=discord.ButtonStyle.secondary)
+
+        async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            await interaction.response.send_modal(SettingsModal(self.bot, user_id=interaction.user.id))
+
+        button.callback = callback
+        self.add_item(button)
+
+
 class AnswerPanelView(discord.ui.View):
     """Buttons under an answer: model-suggested follow-ups, 👍/👎, the settings panel, dismiss."""
 
@@ -657,6 +744,8 @@ class AnswerPanelView(discord.ui.View):
             self.add_item(self._like_button())
             self.add_item(self._dislike_button())
             self.add_item(self._dismiss_button())
+        # Always available: hiding an answer you already got is not feedback.
+        self.add_item(self._hide_button())
 
     def _action_button(self, label: str, prompt: str, *, index: int = 0) -> discord.ui.Button:
         # Stable custom id: the same button keeps working after a restart, and the row it sits on can be rebuilt
@@ -673,7 +762,8 @@ class AnswerPanelView(discord.ui.View):
             # in the channel, so everyone gets the answer; only the settings and feedback panels stay private.
             await interaction.response.defer(thinking=False)
             text = await followup_answer(
-                self.bot, question=self.question, answer=self.answer, prompt=prompt
+                self.bot, question=self.question, answer=self.answer, prompt=prompt,
+                channel_id=getattr(interaction, "channel_id", None),
             )
             parts = _split(text)
             if not parts:
@@ -753,6 +843,19 @@ class AnswerPanelView(discord.ui.View):
         button.callback = callback
         return button
 
+    def _hide_button(self) -> discord.ui.Button:
+        button = discord.ui.Button(label="Hide answer", emoji="🙈", style=discord.ButtonStyle.secondary, custom_id="cxfb:hideans")
+
+        async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            await interaction.response.send_message(
+                "Discord can't hide a channel message from just you. Pick what to do instead:",
+                ephemeral=True,
+                view=HideView(self.bot, message_id=self.message_id, user_id=interaction.user.id),
+            )
+
+        button.callback = callback
+        return button
+
     def _dismiss_button(self) -> discord.ui.Button:
         button = discord.ui.Button(
             label="Hide feedback", emoji="❌", style=discord.ButtonStyle.secondary, custom_id="cxfb:hide"
@@ -808,6 +911,7 @@ _PANEL_KEYS = {
     "up": ("Helpful", "👍", discord.ButtonStyle.success),
     "down": ("Not helpful", "👎", discord.ButtonStyle.danger),
     "hide": ("Hide feedback", "❌", discord.ButtonStyle.secondary),
+    "hideans": ("Hide answer", "🙈", discord.ButtonStyle.secondary),
     "set": ("Settings", "⚙️", discord.ButtonStyle.secondary),
 }
 
@@ -842,6 +946,13 @@ async def handle_panel_click(interaction: discord.Interaction, key: str, *, defe
     if key == "set":
         await view.settings_callback(interaction)
         return
+    if key == "hideans":
+        await interaction.response.send_message(
+            "Discord can't hide a channel message from just you. Pick what to do instead:",
+            ephemeral=True,
+            view=HideView(bot, message_id=message_id, user_id=interaction.user.id),
+        )
+        return
     if key == "hide":
         await interaction.response.send_message(
             "How long should I stop asking for feedback?",
@@ -864,7 +975,10 @@ async def handle_panel_click(interaction: discord.Interaction, key: str, *, defe
             return
         if not deferred:
             await interaction.response.defer(thinking=False)
-        text = await followup_answer(bot, question=question, answer=answer, prompt=prompt)
+        text = await followup_answer(
+            bot, question=question, answer=answer, prompt=prompt,
+            channel_id=getattr(interaction, "channel_id", None),
+        )
         parts = _split(text)
         if not parts:
             await interaction.followup.send(
@@ -900,7 +1014,7 @@ async def handle_panel_click(interaction: discord.Interaction, key: str, *, defe
             print(f"[panel] could not clear used actions: {type(exc).__name__}: {exc}", flush=True)
 
 
-class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<key>up|down|hide|set|act\d+)"):
+class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<key>up|down|hide|hideans|set|act\d+)"):
     """Catches panel buttons on any message, including ones posted before the last restart."""
 
     def __init__(self, key: str) -> None:
