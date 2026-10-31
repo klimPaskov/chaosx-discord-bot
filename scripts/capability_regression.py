@@ -54,10 +54,12 @@ POSITIVE = [
     {"id": "model-wiring", "question": "how do 3d models get wired into hoi4 units?", "expect": ["3d", "3D"]},
 ]
 
+# A negative case asserts that no capability entry claims the feature. The repository-level entry always matches a
+# question that names the repo - it is a summary, not a claim - so the check is on the feature words.
 NEGATIVE = [
-    {"id": "vr", "question": "does the kit have a VR headset workflow?"},
-    {"id": "mobile", "question": "can HOI4 Agent Tools build a mobile app version of the mod?"},
-    {"id": "blockchain", "question": "does agentic hoi4 modding do blockchain or NFT content?"},
+    {"id": "vr", "question": "does the kit have a VR headset workflow?", "forbid": ["vr", "headset", "virtual reality"]},
+    {"id": "mobile", "question": "can HOI4 Agent Tools build a mobile app version of the mod?", "forbid": ["mobile app", "android", "ios "]},
+    {"id": "blockchain", "question": "does agentic hoi4 modding do blockchain or NFT content?", "forbid": ["blockchain", "nft", "crypto"]},
 ]
 
 
@@ -82,12 +84,18 @@ def retrieval_check(knowledge: Knowledge, catalog: list) -> list[dict]:
         rows.append({"id": case["id"], "kind": "positive", "ok": bool(hits), "matched": hits, "chars": len(context)})
     for case in NEGATIVE:
         entries = match(catalog, case["question"])
+        claimed = [
+            f"{e.repo}:{e.name}"
+            for e in entries
+            if e.kind not in {"repository"}
+            and any(word in f"{e.name} {e.summary}".casefold() for word in case.get("forbid", ()))
+        ]
         rows.append(
             {
                 "id": case["id"],
                 "kind": "negative",
-                "ok": not entries,
-                "matched": [f"{e.repo}:{e.name}" for e in entries],
+                "ok": not claimed,
+                "matched": claimed or [f"(summary only: {e.name})" for e in entries][:2],
                 "chars": 0,
             }
         )
