@@ -95,3 +95,74 @@ def test_hiding_an_answer_is_per_member(tmp_path):
     engagement.hide_answer(db, message_id=99, user_id=1)
     assert engagement.hidden_answers(db, 1) == {"99"}
     assert engagement.hidden_answers(db, 2) == set()
+
+
+# --- the public arrival message is Discord's, not the bot's (Hoops 2026-11-01) -------------------
+
+class FakeWelcomeChannel:
+    def __init__(self, channel_id: int) -> None:
+        self.id = channel_id
+        self.sent: list[str] = []
+
+    async def send(self, text: str, **_kwargs):
+        self.sent.append(text)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id=1)
+
+
+class DmMember(FakeMember):
+    def __init__(self, *, name="Recruit", user_id=987654321):
+        super().__init__(name=name, user_id=user_id)
+        self.dms: list[str] = []
+        self.guild = _FakeGuild()
+
+    async def send(self, text: str) -> None:
+        self.dms.append(text)
+
+
+class _FakeGuild:
+    def get_channel(self, _channel_id: int):
+        return _MEMBER_CHANNEL
+
+
+_MEMBER_CHANNEL = FakeWelcomeChannel(welcome.WELCOME_CHANNEL_ID)
+
+
+def _welcome_bot(public: bool):
+    from types import SimpleNamespace
+
+    bot = SimpleNamespace(
+        settings=SimpleNamespace(welcome_public_announcement=public),
+        state=None,
+    )
+
+    async def _personal(_member):
+        return None
+
+    bot._welcome_personal = _personal
+    return bot
+
+
+def _send(bot, member):
+    import asyncio
+
+    from chaosx_bot.bot import ChaosXBot
+
+    return asyncio.run(ChaosXBot._send_welcome(bot, member))
+
+
+def test_no_public_line_because_discord_posts_the_join_notice():
+    _MEMBER_CHANNEL.sent.clear()
+    member = DmMember()
+    _send(_welcome_bot(public=False), member)
+    assert _MEMBER_CHANNEL.sent == []
+    assert member.dms, "the private welcome still goes out"
+
+
+def test_themed_line_comes_back_only_when_the_flag_is_on():
+    _MEMBER_CHANNEL.sent.clear()
+    member = DmMember()
+    _send(_welcome_bot(public=True), member)
+    assert len(_MEMBER_CHANNEL.sent) == 1
+    assert f"<@{member.id}>" in _MEMBER_CHANNEL.sent[0]

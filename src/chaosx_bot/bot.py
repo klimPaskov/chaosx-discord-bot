@@ -4089,14 +4089,18 @@ class ChaosXBot(discord.Client):
                 tier_logger.warning("event loop stalled for %.1fs — interactions pressed then will time out", drift)
 
     async def _send_welcome(self, member: discord.Member) -> None:
-        """Post the personalised welcome card and DM the same member.
+        """DM the new member; the public arrival message is Discord's own join notice.
 
-        The card carries action buttons, so the member can go straight to the rules, the introduction thread or
-        the mod without being told to hunt for a channel. Both surfaces use what is actually known about the
-        member, and a failure in either one is logged rather than raised.
+        Hoops (2026-11-01): the greeting in the welcome channel was supposed to come from Discord, not from the
+        bot — Discord already posts its join notice there, so a bot line beside it is a duplicate. The public
+        personalisation lives in the server's native surfaces instead (welcome screen, onboarding questions,
+        Server Guide). `CHAOSX_WELCOME_PUBLIC_ANNOUNCEMENT=1` puts the themed line back if it is ever wanted.
         """
         facts = welcome.welcome_facts(self.state, member) if getattr(self, "state", None) else []
-        channel = member.guild.get_channel(welcome.WELCOME_CHANNEL_ID)
+        if self.settings.welcome_public_announcement:
+            channel = member.guild.get_channel(welcome.WELCOME_CHANNEL_ID)
+        else:
+            channel = None
         if channel is not None:
             # Short, varied, HOI4-flavoured announcement (Hoops, 2026-10-31). No card, no buttons, no account
             # metadata: the orientation is in the DM.

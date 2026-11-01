@@ -50,6 +50,14 @@ class Settings(BaseSettings):
             "who-is-this answer are empty. Must also be enabled in the Discord developer portal"
         ),
     )
+    welcome_public_announcement: bool = Field(
+        default=False,
+        description=(
+            "Also post a themed join line in the welcome channel. Off by default: Discord posts its own join "
+            "notice in the system channel, so a bot line beside it is a duplicate (Hoops 2026-11-01). The "
+            "server-voice greeting lives in the native surfaces instead — welcome screen, onboarding, Server Guide"
+        ),
+    )
     denial_guard_enabled: bool = Field(
         default=True,
         description=(
