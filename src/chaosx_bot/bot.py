@@ -301,6 +301,7 @@ from .activity import (
     tier_progress,
     voting_weight,
 )
+from . import emoji as custom_emoji
 from .formatting import (
     block,
     bullets,
@@ -833,7 +834,11 @@ def _contains_guard_term(text: str, terms: set[str]) -> bool:
 
 
 def sanitize_public_ask_output(output: str, *, question: str | None = None, channel_id: int | None = None) -> str:
-    cleaned = (output or "").strip()
+    # Tool-call markup (DeepSeek DSML, <tool_call> blocks) is never prose: strip it
+    # before any other repair so a raw call can never reach a public channel.
+    cleaned = strip_tool_call_markup((output or "").strip())
+    if not cleaned:
+        return ""
     for _ in range(3):
         stripped = PUBLIC_ANSWER_LABEL_RE.sub("", cleaned, count=1).strip()
         if stripped == cleaned:
@@ -1269,7 +1274,7 @@ async def reply_with_chunks(
     """Reply once, then continue safely in-channel if output exceeds Discord's limit."""
 
     first_sent: discord.Message | None = None
-    for index, part in enumerate(_chunk(text)):
+    for index, part in enumerate(_chunk(custom_emoji.render(text))):
         if index == 0:
             first_kwargs: dict[str, Any] = {
                 "mention_author": False,
@@ -2756,11 +2761,29 @@ class ChaosXBot(discord.Client):
         else:
             await self.tree.sync()
 
+    def _install_custom_emoji(self) -> None:
+        """Resolve the guild's custom emoji once so messages can use them by name."""
+        guild_id = getattr(self.settings, "allowed_guild_id", None)
+        guild = self.get_guild(guild_id) if guild_id else None
+        if guild is None:
+            return
+        count = custom_emoji.install(guild.emojis)
+        missing = custom_emoji.missing(custom_emoji.TIER_EMOJI_NAMES.values())
+        print(f"ChaosX custom emoji installed: {count}" + (f" (missing tiers: {missing})" if missing else ""))
+
+    async def on_guild_emojis_update(
+        self, guild: discord.Guild, before: Any, after: Any
+    ) -> None:
+        guild_id = getattr(self.settings, "allowed_guild_id", None)
+        if guild_id is None or guild.id == guild_id:
+            custom_emoji.install(guild.emojis)
+
     async def on_ready(self) -> None:
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="Chaos Redux ops"),
             status=discord.Status.online,
         )
+        self._install_custom_emoji()
         await self.leave_unauthorized_guilds()
         set_capability_summary(
             probe_capabilities(members_intent=bool(self.intents.members))["summary"]
@@ -7495,7 +7518,14 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             fallback_ignore_rules=False,
             fallback_provider=bot.settings.operator_provider,
         )
-    output = result.stdout.strip() or result.stderr.strip() or "No output."
+    output = strip_tool_call_markup(result.stdout.strip() or result.stderr.strip())
+    if not output:
+        # The model answered with nothing but a tool call the bot has no loop for.
+        # Say so plainly instead of posting the markup (or a blank message).
+        output = (
+            "That came back as a raw tool call instead of an answer, so nothing was sent or changed. "
+            "Ask again and I'll retry with the tools."
+        )
     if result.timed_out:
         output = (
             f"Hermes run timed out after {hermes_timeout}s. "
@@ -9797,7 +9827,14 @@ async def run_hermes_command(
         if rate:
             output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
     else:
-        output = redact_internal_infrastructure(output)
+        output = strip_tool_call_markup(redact_internal_infrastructure(output))
+        if not output:
+            # Owner commands (including /admin ask) must never post raw tool-call
+            # markup either: say the call did not run.
+            output = (
+                "That came back as a raw tool call instead of an answer, so nothing was sent or changed. "
+                "Ask again and I'll retry with the tools."
+            )
         memory_output = ""
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(

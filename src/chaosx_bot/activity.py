@@ -255,7 +255,10 @@ def has_perk(tier: str, key: str) -> bool:
 
 
 def tier_emoji(tier: str) -> str:
-    return TIER_EMOJI.get(tier, "🎲")
+    """The guild's custom tier icon when resolved, else the unicode ramp."""
+    from .emoji import tier as _custom_tier
+
+    return _custom_tier(tier) or TIER_EMOJI.get(tier, "🎲")
 
 
 def _utcnow_iso() -> str:

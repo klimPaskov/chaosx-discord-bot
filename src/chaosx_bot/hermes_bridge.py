@@ -172,17 +172,19 @@ def redact_public_reasoning(text: str) -> str:
 _CONFIG_LOCK = asyncio.Lock()
 
 
-_TOOL_MARKUP_BLOCK_RE = re.compile(
-    r"<\s*/?\s*[|｜]\s*(?:DSML|tool[▁_]?calls?|tool_call)\b[^>]*>.*?"
-    r"(?:<\s*/\s*[|｜]\s*(?:DSML|tool[▁_]?calls?|tool_call)\b[^>]*>|$)"
-    r"|<\s*/?\s*(?:tool_calls?|function_calls?|api_call|analysis)\b[^>]*>.*?(?:</\s*(?:tool_calls?|function_calls?|api_call|analysis)\s*>|$)",
-    re.DOTALL | re.IGNORECASE,
-)
-_TOOL_MARKUP_OPEN_RE = re.compile(
-    r"<\s*/?\s*[|｜]\s*(?:DSML|tool[▁_]?calls?|tool_call)\b"
-    r"|<\s*/?\s*(?:tool_calls?|function_calls?)\b",
+# DeepSeek's chat template wraps tool calls in FULLWIDTH bars, and the model doubles
+# them ("<｜｜DSML｜｜ calls>", nested "<｜｜DSML｜｜ invoke>" / "parameter" tags); some
+# builds emit "<|tool▁calls▁begin|>" instead. Accept a run of bars on either side —
+# matching a single bar missed every one of those and posted the raw call to Discord.
+_MARKUP_BAR = r"[|｜]"
+_MARKUP_NAME = r"(?:DSML|tool[▁_]?calls?|tool_call|function[▁_]?calls?)"
+_TOOL_MARKUP_TAG_RE = re.compile(
+    r"<\s*/?\s*" + _MARKUP_BAR + r"+\s*" + _MARKUP_NAME + r"\b[^>]*>"
+    r"|<\s*/?\s*(?:tool_calls?|function_calls?|api_call|analysis|thinking)\b[^>]*>",
     re.IGNORECASE,
 )
+# Bars in a Discord reply are markup residue, never prose.
+_MARKUP_RESIDUE_RE = re.compile(r"[|｜]{2,}|(?<![A-Za-z])DSML(?![A-Za-z])", re.IGNORECASE)
 
 
 def strip_tool_call_markup(raw: str) -> str:
@@ -196,12 +198,19 @@ def strip_tool_call_markup(raw: str) -> str:
     """
     if not raw:
         return ""
-    text = _TOOL_MARKUP_BLOCK_RE.sub(" ", raw)
-    cut = _TOOL_MARKUP_OPEN_RE.search(text)
-    if cut:
-        # An unmatched opener means the model was mid-call: drop it and the rest.
-        text = text[: cut.start()]
-    return text.strip()
+    tags = list(_TOOL_MARKUP_TAG_RE.finditer(raw))
+    if not tags:
+        return raw.strip()
+    # Keep the prose before the first tag and after the last one; everything between
+    # tags is call machinery — including nested invoke/parameter tags and the tool
+    # arguments sitting between them ("ls -a ~", a shell command). Pairing blocks
+    # with a regex is not enough: re.sub happily matches the open/close pairs in two
+    # separate passes and leaves the arguments behind.
+    text = (raw[: tags[0].start()] + " " + raw[tags[-1].end() :]).strip()
+    if _MARKUP_RESIDUE_RE.search(text):
+        # "<｜｜DSML｜｜ calls" without a closing ">" leaves bars/DSML in the prose.
+        return ""
+    return text
 
 
 def clean_hermes_answer(raw: str) -> str:

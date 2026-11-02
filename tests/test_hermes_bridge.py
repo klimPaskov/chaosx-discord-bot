@@ -225,3 +225,37 @@ def test_strip_tool_call_markup_keeps_prose() -> None:
     assert strip_tool_call_markup('Answer <tool_call>{"name":"web_search"}</tool_call>') == "Answer"
     mixed = "Costs ~$0.0002." + chr(10) + '<|DSML|calls><|DSML|invoke name="web_search"></|DSML|invoke></|DSML|calls>'
     assert strip_tool_call_markup(mixed) == "Costs ~$0.0002."
+
+
+def test_strip_tool_call_markup_drops_doubled_fullwidth_bars() -> None:
+    """The shape that reached Discord on 2026-11-02: doubled bars and nested tags.
+
+    DeepSeek wrote "<｜｜DSML｜｜ calls>" with two fullwidth bars, then nested
+    "<｜｜DSML｜｜ invoke>" / "parameter" tags holding a shell command. The old
+    regex matched a single bar and returned the whole call verbatim, so /admin ask
+    posted the shell command as its answer.
+    """
+    from chaosx_bot.hermes_bridge import clean_hermes_answer, strip_tool_call_markup
+
+    leaked = chr(10).join([
+        "<\uff5c\uff5cDSML\uff5c\uff5c calls>",
+        "<\uff5c\uff5cDSML\uff5c\uff5c invoke name=\"bash\">",
+        "<\uff5c\uff5cDSML\uff5c\uff5c parameter name=\"command\" string=\"true\">"
+        "ls -a ~ 2>/dev/null | head -50</\uff5c\uff5cDSML\uff5c\uff5c parameter>",
+        "</\uff5c\uff5cDSML\uff5c\uff5c invoke>",
+        "</\uff5c\uff5cDSML\uff5c\uff5c calls>",
+    ])
+    assert strip_tool_call_markup(leaked) == ""
+    assert clean_hermes_answer(leaked) == ""
+
+    with_prose = "The focus canvas is 100x88." + chr(10) + leaked
+    assert strip_tool_call_markup(with_prose) == "The focus canvas is 100x88."
+
+
+def test_strip_tool_call_markup_never_returns_tool_arguments() -> None:
+    """Arguments sit between tags, so pairing blocks must not leave them behind."""
+    from chaosx_bot.hermes_bridge import strip_tool_call_markup
+
+    assert strip_tool_call_markup('<|DSML|tool_calls><|DSML|invoke name="bash">rm -rf /tmp/x</|DSML|invoke></|DSML|tool_calls>') == ""
+    # Unterminated opener (the model was cut off mid-call).
+    assert strip_tool_call_markup('<\uff5c\uff5cDSML\uff5c\uff5c calls> <\uff5c\uff5cDSML\uff5c\uff5c invoke name="bash">') == ""
