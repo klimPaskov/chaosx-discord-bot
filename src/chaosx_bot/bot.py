@@ -2846,12 +2846,22 @@ class ChaosXBot(discord.Client):
     def _install_custom_emoji(self) -> None:
         """Resolve the server emoji from every guild in cache, and say so in the log."""
         count = custom_emoji.attach(self)
+        custom_emoji.install_outbound_hook()
         missing = custom_emoji.missing(custom_emoji.TIER_EMOJI_NAMES.values())
         probe = custom_emoji.tier("Rising Chaos")
         print(
             f"ChaosX custom emoji installed: {count} (tiers: {'ok' if probe else 'MISSING'})"
             + (f" (missing: {missing})" if missing else "")
         )
+
+    async def _emoji_refresh_loop(self) -> None:
+        """Re-read the guild emoji list, so an icon uploaded mid-session is usable immediately."""
+        while not self.is_closed():
+            await asyncio.sleep(600)
+            try:
+                custom_emoji.refresh()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[emoji] refresh failed: {type(exc).__name__}: {exc}", flush=True)
 
     async def on_guild_emojis_update(self, guild: discord.Guild, before: Any, after: Any) -> None:
         """Hoops adding or removing an icon takes effect without a restart."""
@@ -2863,6 +2873,8 @@ class ChaosXBot(discord.Client):
             status=discord.Status.online,
         )
         self._install_custom_emoji()
+        if not any(t.get_name() == "chaosx-emoji-refresh" for t in asyncio.all_tasks()):
+            asyncio.create_task(self._emoji_refresh_loop(), name="chaosx-emoji-refresh")
         await self.leave_unauthorized_guilds()
         set_capability_summary(
             probe_capabilities(members_intent=bool(self.intents.members))["summary"]

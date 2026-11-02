@@ -27,8 +27,11 @@ VAULT_ALLOWED_ROOTS = {
     "Content",
     "Events",
     "Planning",
+    "Reference",
     "SlopX",
+    "Systems",
     "Tooling",
+    "concepts",
 }
 VAULT_SKIP_DIRS = {".git", ".obsidian", ".trash", "Archive", "Scratch", "raw", "__pycache__"}
 VAULT_SKIP_FILES = {"important tokens.md", "index.md", "log.md", "SCHEMA.md", "Temp.md"}

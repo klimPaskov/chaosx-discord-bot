@@ -580,6 +580,11 @@ class Knowledge:
         result = "\n".join(snippets)
         # What the tool repositories say exists, ahead of the ranked excerpts: BM25 ranked plan documents above the
         # 3D pipeline skill, and the answer then denied the workflow existed (Hoops, 2026-10-31).
+        # What the server's own systems do (tiers, XP, testing, commands) outranks anything the
+        # ranked window happened to bring back: those notes are short and authoritative.
+        server_notes = self.server_note_context(query)
+        if server_notes:
+            result = f"{server_notes}\n\n{result}" if result else server_notes
         capabilities = self.capability_context(query)
         if capabilities:
             result = f"{capabilities}\n\n{result}" if result else capabilities
@@ -587,6 +592,51 @@ class Knowledge:
             _ASK_CONTEXT_CACHE.clear()
         _ASK_CONTEXT_CACHE[cache_key] = result
         return result
+
+    def server_note_context(self, query: str) -> str:
+        """The note that documents ChaosX's own systems, when the question is about the server itself.
+
+        BM25 prefers an event spec that says "chaos tiers" once over the note that defines the
+        ladder, so "how do tiers work" came back as "I don't know" (Hoops, 2026-11-02).
+        """
+        if not _is_server_question(query):
+            return ""
+        terms = [t for t in _query_terms(query) if len(t) > 2]
+        if not terms:
+            return ""
+        conn = connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT path, content FROM source_docs WHERE path LIKE 'vault/Systems/%'"
+            ).fetchall()
+        finally:
+            conn.close()
+        scored: list[tuple[int, str]] = []
+        for path, content in rows:
+            body = (content or "").casefold()
+            if not body:
+                continue
+            hits = sum(body.count(term) for term in terms)
+            hits += 8 * sum(1 for term in terms if term in path.casefold())
+            if hits:
+                scored.append((hits, path))
+        if not scored:
+            return ""
+        scored.sort(reverse=True)
+        parts: list[str] = []
+        budget = 2400
+        for _hits, path in scored[:2]:
+            excerpt = self._excerpt_for_terms(path, terms)
+            if not excerpt:
+                continue
+            item = f"{path}\n{excerpt}"
+            if len(item) > budget:
+                item = item[:budget]
+            parts.append(item)
+            budget -= len(item)
+            if budget <= 0:
+                break
+        return "\n\n".join(parts)
 
     def _doc_content(self, path: str) -> str:
         """Lowercased document text, or "" when the path is gone."""
@@ -613,6 +663,7 @@ class Knowledge:
         are spread across source folders: keyword-stuffed headers otherwise crowd out short, on-topic
         documents.
         """
+        server_q = _is_server_question(query)
         base_terms = _query_terms(query)
         terms = expand_terms(base_terms)
         rows: list[tuple] = []
@@ -649,17 +700,17 @@ class Knowledge:
             for size in range(min(4, len(base_terms)), 1, -1):
                 for start in range(0, len(base_terms) - size + 1):
                     phrase = '"' + " ".join(base_terms[start : start + size]) + '"'
-                    take(self._public_ask_fts_rows(phrase, limit))
+                    take(self._public_ask_fts_rows(phrase, limit, server_question=server_q))
                 if len(rows) >= limit:
                     break
         # 2. All terms, then any term — each only if the earlier stage left gaps. The loosest query is the
         #    expensive one (it scores every document that shares a single word), so it must not run once the
         #    stricter stages have already filled the answer.
         if terms and len(rows) < limit:
-            take(self._public_ask_fts_rows(" AND ".join(f'"{t}"' for t in terms[:8]), limit))
+            take(self._public_ask_fts_rows(" AND ".join(f'"{t}"' for t in terms[:8]), limit, server_question=server_q))
         if terms and len(rows) < limit:
             # Deeper pool for the loosest query so the per-source cap has a spread to choose from.
-            take(self._public_ask_fts_rows(" OR ".join(f'"{t}"' for t in terms[:10]), limit * 4))
+            take(self._public_ask_fts_rows(" OR ".join(f'"{t}"' for t in terms[:10]), limit * 4, server_question=server_q))
         # 3. Filename matches, but only to fill gaps: a file's head is usually not its answer, so
         #    this must never displace a matched-region snippet above.
         if len(rows) < limit:
@@ -748,7 +799,7 @@ class Knowledge:
         finally:
             conn.close()
 
-    def _public_ask_fts_rows(self, safe_query: str, limit: int) -> list[tuple]:
+    def _public_ask_fts_rows(self, safe_query: str, limit: int, *, server_question: bool = False) -> list[tuple]:
         conn = connect(self.db_path)
         try:
             vault_allow = " OR ".join(
@@ -775,6 +826,9 @@ class Knowledge:
                     LIMIT ?
                 )
                 ORDER BY rank - CASE
+                            -- A question about the server/bot itself is answered by the systems notes, not by
+                            -- an event spec that happens to mention "chaos tiers" in passing.
+                            WHEN ? = 1 AND path LIKE 'vault/Systems/%' THEN 3.0
                             -- curated vault knowledge answers questions; plans/handoffs and test
                             -- baselines merely repeat project words and used to win on that alone
                             WHEN path LIKE 'vault/%' THEN 3.0
@@ -783,7 +837,13 @@ class Knowledge:
                          END
                 LIMIT ?
                 """,
-                (safe_query, *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES), max(limit * 6, 60), limit),
+                (
+                    safe_query,
+                    *sorted(PUBLIC_ASK_EXCLUDED_SOURCE_CLASSES),
+                    1 if server_question else 0,
+                    max(limit * 6, 60),
+                    limit,
+                ),
             ).fetchall()
         finally:
             conn.close()
@@ -1171,6 +1231,32 @@ def _row_sort_key(row: tuple) -> tuple[int, float]:
     """Authority first, then relevance. bm25 is lower-is-better, so both parts sort ascending."""
     rank = float(row[3]) if len(row) > 3 and row[3] is not None else 0.0
     return (_authority(row[0]), rank)
+
+
+SERVER_QUESTION_HINTS = (
+    "server",
+    "discord",
+    "chaosx",
+    "bot",
+    "leaderboard",
+    "ladder",
+    "xp",
+    "chaos xp",
+    "perk",
+    "tier panel",
+    "my tier",
+    "ballot",
+    "quick action",
+    "slash command",
+    "reminder",
+    "hide me",
+)
+
+
+def _is_server_question(query: str) -> bool:
+    """True when the question is about the Discord server/bot rather than the mod's content."""
+    lowered = str(query).casefold()
+    return any(hint in lowered for hint in SERVER_QUESTION_HINTS)
 
 
 def _query_terms(query: str) -> list[str]:
