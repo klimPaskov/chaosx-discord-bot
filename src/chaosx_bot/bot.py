@@ -301,7 +301,6 @@ from .activity import (
     tier_progress,
     voting_weight,
 )
-from . import emoji as custom_emoji
 from .formatting import (
     block,
     bullets,
@@ -873,6 +872,65 @@ def looks_like_code_dump(text: str) -> bool:
     return matches >= 3
 
 
+class NeedsToolsError(Exception):
+    """Route a request straight to the tool-enabled run instead of the no-tools completion."""
+
+
+# Owner requests that ask for something to happen on the server need the tool-enabled
+# agent. The fast no-tools completion can only *describe* an action — and describing it
+# in the past tense is how the bot claimed a forum post that never existed (2026-11-02).
+_ACTION_VERB_RE = re.compile(
+    r"\b(post|posts|posting|send|sending|create|creating|edit|editing|update|updating|change|"
+    r"remove|removing|delete|deleting|pin|unpin|archive|lock|rename|move|give|add|adding|set|"
+    r"ban|kick|timeout|announce|publish|upload|fix|apply|redo|retry)\b",
+    re.IGNORECASE,
+)
+_ACTION_TARGET_RE = re.compile(
+    r"\b(post|thread|forum|channel|message|msgs?|announcement|role|member|user|nick|nickname|"
+    r"permission|permissions|pin|embed|reaction|tag|category|server|guild|voice|slowmode|topic|"
+    r"it|that|this)\b",
+    re.IGNORECASE,
+)
+# Statements that assert a completed change. Only actions get this guard; ordinary
+# answers ("the canvas is 397x153") never match.
+_COMPLETION_CLAIM_RE = re.compile(
+    r"(\bis live\b|\bnow live\b|\bposted in\b|\bhas been posted\b|\bhave posted\b|\bi posted\b|"
+    r"\bi've posted\b|\bhas been created\b|\bcreated the\b|\bhas been updated\b|\bupdated the\b|"
+    r"\bhas been edited\b|\bedited the\b|\bhas been deleted\b|\bdeleted the\b|\bremoved the\b|"
+    r"\bhas been removed\b|\bhas been pinned\b|\bpinned the\b|\bis pinned\b|\ball set\b|"
+    r"\bit is done\b|\bit's done\b|\bthat's done\b|\bdone —|\bposted\b|\bsent\b)",
+    re.IGNORECASE,
+)
+
+
+def admin_request_needs_tools(request: str) -> bool:
+    """True when the owner is asking for something to be done, not explained."""
+    text = (request or "").strip()
+    if not text:
+        return False
+    return bool(_ACTION_VERB_RE.search(text) and _ACTION_TARGET_RE.search(text))
+
+
+def claims_completed_action(output: str) -> bool:
+    """True when a reply asserts that a Discord/server change already happened."""
+    return bool(output and _COMPLETION_CLAIM_RE.search(output))
+
+
+def build_action_verification_prompt(*, request: str, claim: str) -> str:
+    return (
+        "A previous reply to the server owner claimed a change was completed. Verify it against the real state "
+        "before anyone relies on it. Do not perform the change now — verify only, read-only.\n\n"
+        f"Owner request: {request}\n\n"
+        f"Claimed reply: {claim}\n\n"
+        "Use your tools to read the actual Discord state (forum threads, channel messages, roles, members, pins) "
+        "and check whether the claimed change exists — match on the exact channel/post/title involved.\n"
+        "Answer with one line, exactly one of:\n"
+        "VERIFIED: <concrete evidence — ids, title, timestamp>\n"
+        "NOT DONE: <what is missing or different>\n"
+        "Nothing else."
+    )
+
+
 def public_ask_wants_sources(request: str) -> bool:
     text = request.casefold()
     return any(term in text for term in PUBLIC_ASK_SOURCE_REQUEST_TERMS)
@@ -1274,7 +1332,7 @@ async def reply_with_chunks(
     """Reply once, then continue safely in-channel if output exceeds Discord's limit."""
 
     first_sent: discord.Message | None = None
-    for index, part in enumerate(_chunk(custom_emoji.render(text))):
+    for index, part in enumerate(_chunk(text)):
         if index == 0:
             first_kwargs: dict[str, Any] = {
                 "mention_author": False,
@@ -2761,29 +2819,11 @@ class ChaosXBot(discord.Client):
         else:
             await self.tree.sync()
 
-    def _install_custom_emoji(self) -> None:
-        """Resolve the guild's custom emoji once so messages can use them by name."""
-        guild_id = getattr(self.settings, "allowed_guild_id", None)
-        guild = self.get_guild(guild_id) if guild_id else None
-        if guild is None:
-            return
-        count = custom_emoji.install(guild.emojis)
-        missing = custom_emoji.missing(custom_emoji.TIER_EMOJI_NAMES.values())
-        print(f"ChaosX custom emoji installed: {count}" + (f" (missing tiers: {missing})" if missing else ""))
-
-    async def on_guild_emojis_update(
-        self, guild: discord.Guild, before: Any, after: Any
-    ) -> None:
-        guild_id = getattr(self.settings, "allowed_guild_id", None)
-        if guild_id is None or guild.id == guild_id:
-            custom_emoji.install(guild.emojis)
-
     async def on_ready(self) -> None:
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="Chaos Redux ops"),
             status=discord.Status.online,
         )
-        self._install_custom_emoji()
         await self.leave_unauthorized_guilds()
         set_capability_summary(
             probe_capabilities(members_intent=bool(self.intents.members))["summary"]
@@ -7517,6 +7557,7 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             fallback_toolsets=None,
             fallback_ignore_rules=False,
             fallback_provider=bot.settings.operator_provider,
+            require_tools=admin_request_needs_tools(owner_request),
         )
     output = strip_tool_call_markup(result.stdout.strip() or result.stderr.strip())
     if not output:
@@ -7531,6 +7572,9 @@ async def run_admin_ask_message(bot: ChaosXBot, message: discord.Message, reques
             f"Hermes run timed out after {hermes_timeout}s. "
             "For very broad server actions, ask for a preview/scope first, then confirm execution."
         )
+    elif claims_completed_action(output):
+        # Never post a completion claim the bot cannot show happened.
+        output = await verify_owner_action_claim(bot, request=owner_request, claim=output)
     output = redact_internal_infrastructure(output)
     status = "ok" if result.ok else "failed"
     await bot.store.record_hermes_run(
@@ -7764,6 +7808,7 @@ async def _public_model_completion(
     fallback_toolsets: str | None = "safe",
     fallback_ignore_rules: bool = True,
     fallback_provider: str | None = None,
+    require_tools: bool = False,
     images: list[str] | None = None,
     attachment_text: str = "",
 ) -> HermesResult:
@@ -7785,6 +7830,10 @@ async def _public_model_completion(
     if attachment_text:
         user_part = user_part + "\n\n" + attachment_text
     try:
+        if require_tools:
+            # The no-tools completion can only describe an action; describing it in the
+            # past tense is what produced "posted in ..." for a post that never existed.
+            raise NeedsToolsError("action request needs the tool-enabled run")
         answer_chunks: list[str] = []
         async for reasoning_delta, content_delta in direct_chat_completion_stream(
             system=system,
@@ -7808,12 +7857,13 @@ async def _public_model_completion(
             await feed.finish(answer)
         return HermesResult(prompt_hash=digest, returncode=0, stdout=answer, stderr="")
     except Exception as exc:  # noqa: BLE001 - fall back for any direct-path failure
-        if feed is not None:
-            await feed.emit(f"\n[direct path failed: {exc!r} — switching to Hermes subprocess]", "")
-        try:
-            print(f"[chaosx-bot] direct completion failed ({exc!r}); falling back to Hermes subprocess", file=sys.stderr)
-        except Exception:
-            pass
+        if not isinstance(exc, NeedsToolsError):
+            if feed is not None:
+                await feed.emit(f"\n[direct path failed: {exc!r} — switching to Hermes subprocess]", "")
+            try:
+                print(f"[chaosx-bot] direct completion failed ({exc!r}); falling back to Hermes subprocess", file=sys.stderr)
+            except Exception:
+                pass
 
         async def feed_progress(activity: HermesRunActivity) -> None:
             if feed is not None:
@@ -7879,6 +7929,43 @@ async def _public_model_completion(
         if feed is not None:
             await feed.finish(answer)
         return result
+
+
+async def verify_owner_action_claim(bot: "ChaosXBot", *, request: str, claim: str) -> str:
+    """Read the real state back before a completion claim is posted.
+
+    Returns the claim untouched only when a tool-enabled run confirms the change exists;
+    otherwise an honest replacement naming what is missing. This is the difference between
+    "posted in #skills-tools-workflows" and a post that is actually there.
+    """
+    prompt = build_action_verification_prompt(request=request, claim=claim)
+    try:
+        result = await run_hermes(
+            hermes_bin=bot.settings.hermes_bin,
+            profile=bot.settings.hermes_profile,
+            repo=bot.settings.chaos_redux_repo,
+            prompt=prompt,
+            timeout_seconds=240,
+            model=bot.settings.operator_model,
+            provider=bot.settings.operator_provider,
+            reasoning_effort=bot.settings.operator_reasoning_effort,
+            toolsets=None,
+            ignore_rules=False,
+            activity_label="action read-back",
+        )
+        verdict = (result.stdout or "").strip()
+    except Exception as exc:  # a failed read-back is not a confirmation
+        verdict = f"NOT DONE: read-back failed ({type(exc).__name__})"
+    head = verdict.splitlines()[0].strip() if verdict else ""
+    if head.upper().startswith("VERIFIED"):
+        print(f"[honesty] action claim verified: {head[:160]}", flush=True)
+        return claim
+    detail = head.split(":", 1)[1].strip() if ":" in head else (head or "no read-back evidence")
+    print(f"[honesty] action claim NOT backed: {detail[:200]}", flush=True)
+    return (
+        "Careful — that did not actually happen. My read-back says: "
+        f"{detail[:400]}\n\nNothing was posted or changed. Say it again and I'll run it with the tools."
+    )
 
 
 async def _scan_history_background(
@@ -9728,6 +9815,7 @@ async def run_hermes_command(
                 fallback_toolsets=None if owner_stream else "safe",
                 fallback_ignore_rules=False if owner_stream else True,
                 fallback_provider=bot.settings.operator_provider if owner_stream else None,
+                require_tools=owner_stream and admin_request_needs_tools(request),
             )
         else:
             result = await run_hermes(
@@ -9827,6 +9915,8 @@ async def run_hermes_command(
         if rate:
             output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
     else:
+        if not result.timed_out and claims_completed_action(output):
+            output = await verify_owner_action_claim(bot, request=request, claim=output)
         output = strip_tool_call_markup(redact_internal_infrastructure(output))
         if not output:
             # Owner commands (including /admin ask) must never post raw tool-call
