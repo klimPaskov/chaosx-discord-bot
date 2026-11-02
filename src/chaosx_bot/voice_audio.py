@@ -1,8 +1,14 @@
 """Speech-to-text and text-to-speech helpers for the public voice channel.
 
-Both models load lazily and run on CPU: faster-whisper for speech recognition and Piper for
-speech synthesis. Piper is used because it costs nothing per word and runs ~11x faster than
-real time on the VPS, which keeps a public channel free to operate.
+Two shapes of host are supported, chosen by ``build_stt``/``build_tts``:
+
+* **Big host** (VPS/A1): local models, both lazy and CPU-only — faster-whisper for speech
+  recognition and Piper for speech synthesis. Piper costs nothing per word and runs ~11x faster
+  than real time there, which keeps a public channel free to operate.
+* **1/8-OCPU host** (the free Micro): the same local models measured 0.24x realtime (Whisper
+  ``base``) and 0.2x realtime (Piper medium) — a 3 s question took 12 s to transcribe, so a live
+  channel is impossible. There the recogniser is Groq's hosted Whisper (key: ``GROQ_API_KEY``) and
+  the voice is Edge's free neural set, which keeps the box to moving bytes.
 """
 
 from __future__ import annotations
@@ -10,8 +16,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 from threading import Lock
 
@@ -163,7 +172,154 @@ class TextToSpeech:
         return out_wav
 
 
-def build_tts(settings) -> TextToSpeech:
+class GroqSpeechToText:
+    """Hosted Whisper through Groq's OpenAI-compatible endpoint.
+
+    Used on a host whose CPU cannot run Whisper in real time. The request is a plain multipart
+    POST so no SDK is needed; every failure falls back to a local model when one is available,
+    because a voice channel that goes silent on a network blip reads as "the bot is broken".
+    """
+
+    ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "whisper-large-v3-turbo",
+        *,
+        fallback: SpeechToText | None = None,
+        timeout: float = 30.0,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.fallback = fallback
+        self.timeout = timeout
+
+    def transcribe(self, wav_path: Path, *, vad_filter: bool = True, prompt: bool = False) -> str:
+        try:
+            text = self._request(Path(wav_path), prompt=prompt)
+        except Exception as exc:  # network, quota, bad key: never cost the channel its answer
+            if self.fallback is None:
+                raise
+            logger.warning("voice STT cloud call failed (%s); using the local model instead", exc)
+            return self.fallback.transcribe(wav_path, vad_filter=vad_filter, prompt=prompt)
+        return _correct_domain_terms(" ".join(text.split()))
+
+    def _request(self, wav_path: Path, *, prompt: bool) -> str:
+        boundary = f"----chaosx{secrets.token_hex(12)}"
+        fields = {
+            "model": self.model,
+            "language": "en",
+            "response_format": "json",
+            "temperature": "0",
+        }
+        if prompt:
+            fields["prompt"] = STT_PROMPT
+        body = bytearray()
+        for name, value in fields.items():
+            body += (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+            ).encode("utf-8")
+        body += (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{wav_path.name}"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        ).encode("utf-8")
+        body += wav_path.read_bytes() + b"\r\n"
+        body += f"--{boundary}--\r\n".encode("utf-8")
+        request = urllib.request.Request(
+            self.ENDPOINT,
+            data=bytes(body),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "User-Agent": "chaosx-bot",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return str(payload.get("text", "") or "")
+
+
+class EdgeTextToSpeech:
+    """Edge's free neural voices, for a host too slow to synthesize locally.
+
+    Same ``render`` contract as the Piper ``TextToSpeech``: write a 48 kHz mono wav. ``length_scale``
+    is translated to Edge's rate percentage (1.30 = 30% longer = -23% rate).
+    """
+
+    def __init__(
+        self,
+        voice: str = "en-GB-RyanNeural",
+        length_scale: float = 1.30,
+        *,
+        timeout: float = 30.0,
+    ):
+        self.voice = voice
+        self.length_scale = length_scale
+        self.timeout = timeout
+
+    def render(self, text: str, out_wav: Path, length_scale: float | None = None) -> Path:
+        import asyncio
+
+        import edge_tts
+
+        pace = float(length_scale) if length_scale else self.length_scale
+        rate = f"{round((1.0 / pace - 1.0) * 100):+d}%"
+        mp3 = Path(tempfile.mkstemp(suffix=".mp3", dir=str(out_wav.parent))[1])
+
+        async def _save() -> None:
+            await edge_tts.Communicate(text, self.voice, rate=rate).save(str(mp3))
+
+        try:
+            asyncio.run(asyncio.wait_for(_save(), timeout=self.timeout))
+            subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(mp3),
+                 "-ar", "48000", "-ac", "1", str(out_wav)],
+                check=True,
+            )
+        finally:
+            mp3.unlink(missing_ok=True)
+        return out_wav
+
+
+def _installed(module: str) -> bool:
+    try:
+        __import__(module)
+    except Exception:
+        return False
+    return True
+
+
+def build_stt(settings):
+    """Pick the recogniser this host can actually run in real time.
+
+    ``auto`` -> hosted Whisper when ``GROQ_API_KEY`` is present, else the local model. A local model
+    is always kept as the cloud fallback so a Groq outage degrades latency instead of answers.
+    """
+    provider = str(getattr(settings, "voice_stt_provider", "auto") or "auto").strip().lower()
+    local = SpeechToText(settings.voice_stt_model)
+    if provider in ("auto", "groq"):
+        key = os.getenv("GROQ_API_KEY", "").strip()
+        if key:
+            model = getattr(settings, "voice_stt_groq_model", "whisper-large-v3-turbo")
+            logger.info("voice STT: hosted Whisper (%s) with local %s fallback", model, settings.voice_stt_model)
+            return GroqSpeechToText(key, model, fallback=local if _installed("faster_whisper") else None)
+        if provider == "groq":
+            logger.warning("voice STT provider=groq but GROQ_API_KEY is empty; falling back to local Whisper")
+    return local
+
+
+def build_tts(settings):
+    """Pick the synthesizer: Edge's free voices when installed, else local Piper."""
+    provider = str(getattr(settings, "voice_tts_provider", "auto") or "auto").strip().lower()
+    if provider == "edge" or (provider == "auto" and _installed("edge_tts")):
+        return EdgeTextToSpeech(
+            getattr(settings, "voice_tts_edge_voice", "en-GB-RyanNeural"),
+            length_scale=settings.voice_tts_length_scale,
+        )
     return TextToSpeech(
         settings.voice_tts_voice,
         speaker=os.getenv("CHAOSX_VOICE_TTS_SPEAKER", settings.voice_tts_speaker),

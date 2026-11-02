@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     voice_channel_id: Optional[int] = Field(default=None, description="Voice channel the bot listens in")
     voice_transcript_channel_id: Optional[int] = Field(default=None, description="Text channel that shares memory with voice: spoken questions and answers are archived here, so text asks in this channel and voice asks see each other. Blank keeps voice memory in the voice channel itself")
     voice_stt_model: str = Field(default="base", description="faster-whisper model size used for voice input")
+    voice_stt_provider: str = Field(
+        default="auto",
+        description="auto = hosted Whisper when GROQ_API_KEY is set, else the local model; local = faster-whisper "
+        "only; groq = hosted only (a missing key falls back to local)",
+    )
+    voice_stt_groq_model: str = Field(default="whisper-large-v3-turbo", description="Groq model used when voice STT runs in the cloud")
+    voice_tts_provider: str = Field(
+        default="auto",
+        description="auto = Edge's free neural voices when edge-tts is installed, else local Piper; piper = local only; "
+        "edge = hosted only",
+    )
+    voice_tts_edge_voice: str = Field(default="en-GB-RyanNeural", description="Edge neural voice used when voice TTS runs in the cloud")
     voice_tts_voice: str = Field(default="/srv/chaosx/piper-voices/en_GB-vctk-medium.onnx", description="Piper .onnx voice used to speak answers")
     voice_tts_speaker: str = Field(default="p254", description="Speaker id inside a multi-speaker Piper voice")
     voice_tts_length_scale: float = Field(default=1.30, ge=0.5, le=2.0, description="Piper pace: 1.0 native, 1.30 trailer pace")

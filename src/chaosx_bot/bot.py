@@ -170,7 +170,7 @@ from .web_grounding import WebGrounder, format_web_results_for_display
 from .web_sources import EvidenceImage
 from .vault_index import refresh_vault_indexes
 from .ask_api import DirectAskError, direct_chat_completion, direct_chat_completion_stream
-from .voice_audio import SpeechToText, build_tts
+from .voice_audio import build_stt, build_tts
 from .voice_chat import VoiceChatSession
 from .hermes_bridge import (
     HermesResult,
@@ -2654,7 +2654,7 @@ class ChaosXBot(discord.Client):
         if not isinstance(channel, discord.VoiceChannel):
             logger.warning("Voice chat enabled but channel %s is not a voice channel", channel_id)
             return
-        stt = SpeechToText(self.settings.voice_stt_model)
+        stt = build_stt(self.settings)
         tts = build_tts(self.settings)
 
         def _transcribe(path, unfiltered: bool = False):

@@ -27,6 +27,14 @@ dev = [
 video = [
     "faster-whisper>=1.0,<2",
     "yt-dlp>=2024.1",
+    # PyAV 19 dropped the `metadata_errors` kwarg faster-whisper 1.2.x passes to av.open(), so a
+    # fresh resolve breaks every transcription with a TypeError. Stay below it.
+    "av>=11,<19",
+]
+# Voice: Piper for a host with real CPU, Edge's free neural voices for the 1/8-OCPU Micro.
+voice = [
+    "piper-tts>=1.2",
+    "edge-tts>=7",
 ]
 
 [project.scripts]
