@@ -624,19 +624,49 @@ class Knowledge:
             return ""
         scored.sort(reverse=True)
         parts: list[str] = []
-        budget = 2400
-        for _hits, path in scored[:2]:
-            excerpt = self._excerpt_for_terms(path, terms)
+        budget = 3400
+        for _hits, path in scored[:1]:
+            excerpt = self._matching_paragraphs(path, terms, budget=budget)
             if not excerpt:
                 continue
             item = f"{path}\n{excerpt}"
-            if len(item) > budget:
-                item = item[:budget]
             parts.append(item)
             budget -= len(item)
             if budget <= 0:
                 break
         return "\n\n".join(parts)
+
+    def _matching_paragraphs(self, path: str, terms: list[str], *, budget: int = 3400) -> str:
+        """The paragraphs of a note that mention the question's terms, in document order."""
+        conn = connect(self.db_path)
+        try:
+            row = conn.execute("SELECT content FROM source_docs WHERE path = ?", (path,)).fetchone()
+        finally:
+            conn.close()
+        content = (row[0] if row else "") or ""
+        if not content:
+            return ""
+        # A short note fits as it is: the whole thing beats picking it apart.
+        if len(content) <= budget:
+            return content.strip()
+        blocks = [block.strip() for block in content.split("\n\n") if block.strip()]
+        ranked = []
+        for index, block in enumerate(blocks):
+            hits = sum(block.count(term) for term in terms)
+            if hits:
+                ranked.append((hits, index, block))
+        if not ranked:
+            return ""
+        keep: set[int] = set()
+        used = 0
+        for _hits, index, block in sorted(ranked, key=lambda r: (-r[0], r[1])):
+            if used + len(block) > budget:
+                continue
+            keep.add(index)
+            used += len(block)
+            if used >= budget * 0.95:
+                break
+        return "\n\n".join(blocks[i] for i in sorted(keep))
 
     def _doc_content(self, path: str) -> str:
         """Lowercased document text, or "" when the path is gone."""
@@ -1242,14 +1272,28 @@ SERVER_QUESTION_HINTS = (
     "ladder",
     "xp",
     "chaos xp",
+    "chaos meter",
     "perk",
     "tier panel",
     "my tier",
     "ballot",
     "quick action",
-    "slash command",
+    "slash",
+    "command",
+    "help",
     "reminder",
     "hide me",
+    "playtest",
+    "testing",
+    "testers",
+    "nominate",
+    "nomination",
+    "idea",
+    "suggestion",
+    "issue",
+    "warn",
+    "vote",
+    "title",
 )
 
 
