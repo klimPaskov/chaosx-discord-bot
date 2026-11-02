@@ -65,12 +65,17 @@ class VoiceReceiver:
     def __init__(self, vc: discord.VoiceClient, allowed_user_ids: Optional[set[int]] = None):
         self._vc = vc
         conn = vc._connection
+        if conn is None:
+            raise RuntimeError("voice client has no connection yet")
         self._conn = conn
-        # discord.py exposes the transport key as a list of ints; NaCl wants raw bytes.
-        raw_key = conn.secret_key
-        self._secret_key: bytes = raw_key if isinstance(raw_key, bytes) else bytes(raw_key)
+        # discord.py exposes the transport key as a list of ints; NaCl wants raw bytes. It can still
+        # be the MISSING sentinel right after connect (discord.py fills it from VOICE_READY), and
+        # bytes(MISSING) raised TypeError, which killed the session and made the bot join/leave in a
+        # loop. The receiver re-reads the key in _current_keys() when audio arrives, so an absent key
+        # here is not fatal.
+        self._secret_key: bytes = self._as_bytes(getattr(conn, "secret_key", None))
         self._dave_session = getattr(conn, "dave_session", None)
-        self._bot_ssrc: int = conn.ssrc
+        self._bot_ssrc: int = int(getattr(conn, "ssrc", 0) or 0)
         self._allowed_user_ids = allowed_user_ids or set()
         self._ssrc_to_user: dict[int, int] = {}
         self._buffers: dict[int, bytearray] = defaultdict(bytearray)
@@ -113,14 +118,19 @@ class VoiceReceiver:
 
     # --- SSRC -> user_id (SPEAKING opcode 5) ---
 
+    @staticmethod
+    def _as_bytes(raw) -> bytes:
+        """Raw transport key as bytes; MISSING/None/odd shapes become b"" instead of raising."""
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw)
+        try:
+            return bytes(raw) if raw else b""
+        except (TypeError, ValueError):
+            return b""
+
     def _current_keys(self):
         """Transport key + DAVE session as they are NOW: both are replaced on every voice reconnect."""
-        raw_key = getattr(self._conn, "secret_key", None)
-        try:
-            key = raw_key if isinstance(raw_key, bytes) else bytes(raw_key) if raw_key else b""
-        except Exception:
-            key = b""
-        return key, getattr(self._conn, "dave_session", None)
+        return self._as_bytes(getattr(self._conn, "secret_key", None)), getattr(self._conn, "dave_session", None)
 
     @staticmethod
     def _dbfs(pcm: bytes) -> float:
@@ -606,10 +616,20 @@ class VoiceChatSession:
             return False
         _log(f"joining #{self.channel} (id={self.channel.id})")
         self._apply_dave_mode()
-        self.vc = await self.channel.connect(self_deaf=False, self_mute=False)
-        self.joined_at = time.time()
-        self.receiver = VoiceReceiver(self.vc, allowed_user_ids=None)
-        self.receiver.start()
+        try:
+            self.vc = await self.channel.connect(self_deaf=False, self_mute=False)
+            self.joined_at = time.time()
+            self.receiver = VoiceReceiver(self.vc, allowed_user_ids=None)
+            self.receiver.start()
+        except Exception:
+            # Never leave a half-open voice connection behind: the member list then shows the bot
+            # flickering in and out of the channel as the caller retries.
+            if self.vc is not None and self.vc.is_connected():
+                try:
+                    await self.vc.disconnect()
+                except Exception:
+                    pass
+            raise
         _log(f"connected: gateway={getattr(self.vc, 'endpoint', '?')} region={getattr(self.vc, 'region', '?')}")
         _log(
             f"receiver started (bot_ssrc={self.receiver._bot_ssrc}, "

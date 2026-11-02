@@ -2649,6 +2649,10 @@ class ChaosXBot(discord.Client):
         """Join the configured public voice channel and answer spoken questions."""
         if getattr(self, "_voice_session", None) is not None or not self.settings.voice_enabled:
             return
+        # A voice start that keeps failing must not turn into a join/leave loop in the member list:
+        # back off between attempts and retry on this task instead of on every voice-state event.
+        if time.time() < getattr(self, "_voice_fail_until", 0.0):
+            return
         channel_id = self.settings.voice_channel_id
         channel = self.get_channel(channel_id) if channel_id else None
         if not isinstance(channel, discord.VoiceChannel):
@@ -2701,10 +2705,29 @@ class ChaosXBot(discord.Client):
         try:
             started = await session.start()
         except Exception:
-            logger.exception("Could not start voice chat")
+            self._voice_fails = getattr(self, "_voice_fails", 0) + 1
+            backoff = min(300.0, 20.0 * (2 ** (self._voice_fails - 1)))
+            self._voice_fail_until = time.time() + backoff
+            logger.exception(
+                "Could not start voice chat (attempt %d, next try in %.0fs)", self._voice_fails, backoff
+            )
+            retry_loop = getattr(self, "loop", None) or asyncio.get_running_loop()
+            retry_loop.create_task(self._retry_voice_chat_after(backoff))
             return
         # Only remember the session if it really joined; otherwise a later join can start afresh.
         self._voice_session = session if started else None
+        if started:
+            self._voice_fails = 0
+            self._voice_fail_until = 0.0
+
+    async def _retry_voice_chat_after(self, delay: float) -> None:
+        """Retry a failed voice join once, off the voice-state event (which fires far too often)."""
+        await asyncio.sleep(delay)
+        if getattr(self, "_voice_session", None) is not None or not self.settings.voice_enabled:
+            return
+        channel = self.get_channel(self.settings.voice_channel_id) if self.settings.voice_channel_id else None
+        if isinstance(channel, discord.VoiceChannel) and any(not member.bot for member in channel.members):
+            await self.start_voice_chat()
 
     async def setup_hook(self) -> None:
         self.add_view(welcome.persistent_view())
