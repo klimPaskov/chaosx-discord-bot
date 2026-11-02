@@ -29,7 +29,7 @@ TIER_EMOJI_NAMES: dict[str, str] = {
 }
 
 _MENTIONS: dict[str, str] = {}
-_TOKEN = re.compile(r":([A-Za-z0-9_]{2,32}):")
+_TOKEN = re.compile(r":([A-Za-z0-9_]{2,32}(?::[A-Za-z0-9_]{2,32})?):")
 
 
 def install(emojis: Iterable[object]) -> int:
@@ -67,7 +67,28 @@ def render(text: str) -> str:
     """Swap ``:emoji_name:`` tokens for real mentions; leave unknown tokens alone."""
     if not _MENTIONS or ":" not in text:
         return text
-    return _TOKEN.sub(lambda m: _MENTIONS.get(m.group(1), m.group(0)), text)
+    def swap(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        if name in _MENTIONS:
+            return _MENTIONS[name]
+        # Models sometimes spread a shortcode across two colons (":chaosx:tier3:"),
+        # which is the same icon — join the halves before giving up on it.
+        joined = name.replace(":", "_")
+        if joined in _MENTIONS:
+            return _MENTIONS[joined]
+        # A shortcode nobody has is a stray name, not prose: drop it instead of
+        # printing ":factory_vibes:" into a member's answer. Plain colons are safe
+        # because the token pattern needs a trailing colon and word characters only.
+        return "" if "_" in name else match.group(0)
+
+    return _TOKEN.sub(swap, text)
+
+
+def catalog_line() -> str:
+    """One-line inventory of the installed icons, as exact shortcodes."""
+    if not _MENTIONS:
+        return ""
+    return ", ".join(sorted(_MENTIONS))
 
 
 def missing(names: Iterable[str]) -> list[str]:

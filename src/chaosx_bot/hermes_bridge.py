@@ -314,13 +314,34 @@ async def _stop_process(proc: asyncio.subprocess.Process) -> None:
     await proc.communicate()
 
 
+def _emoji_guide() -> str:
+    """Tell the model which custom icons exist, so it reaches for them like a member would."""
+    try:
+        from .emoji import catalog_line
+
+        line = catalog_line()
+    except Exception:  # pragma: no cover - registry is optional
+        return ""
+    if not line:
+        return ""
+    return (
+        "\nThe server has its own custom emoji and you use them the way a person does: "
+        "spontaneously, only where they genuinely add tone — a joke landing, a cheer, sympathy, "
+        "popcorn for drama, a salute, a shrug at a bug. One or two at most, and most messages use "
+        "none; never in factual or technical answers, never as a substitute for words, never in "
+        "lists or headings. Write the icon inline (for example :factory_gg:) and it renders; never "
+        "name, explain, or list them.\n"
+        f"Available: {line}\n"
+    )
+
+
 def build_owner_prompt(*, owner_request: str, guild_name: str | None, channel_name: str | None, conversation_context: str = "", memory_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", model_name: str = "", cost_context: str = "") -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; Chaos Redux guild id=1395459671598436533"
     if model_name.strip():
         context += f"; you are running on the {display_model_name(model_name)} model"
     if cost_context.strip():
         context += "\n\n" + cost_context.strip()
-    return f"{SYSTEM_BOUNDARY}\n{context}{_conversation_block(conversation_context)}{_rules_block(server_rules)}{_channels_block(server_channels)}{_server_facts_block(server_facts)}{_owner_memory_block(memory_context)}\n\nOwner request:\n{owner_request.strip()}\n"
+    return f"{SYSTEM_BOUNDARY}{_emoji_guide()}\n{context}{_conversation_block(conversation_context)}{_rules_block(server_rules)}{_channels_block(server_channels)}{_server_facts_block(server_facts)}{_owner_memory_block(memory_context)}\n\nOwner request:\n{owner_request.strip()}\n"
 
 
 def _owner_memory_block(memory_context: str) -> str:
@@ -459,7 +480,7 @@ def build_public_prompt(
     addressed = ""
     if addressed_context.strip():
         addressed = f"\n{addressed_context.strip()}\n"
-    return f"{PUBLIC_ASK_BOUNDARY}\n{context}{user}{facts}{users}{members}{referenced}{memory}{conversation}{rules}{channels}{channel_feed}{web}{reference}{resources_block()}{addressed}\n\nCommunity user question:\n{user_request.strip()}\n"
+    return f"{PUBLIC_ASK_BOUNDARY}{_emoji_guide()}\n{context}{user}{facts}{users}{members}{referenced}{memory}{conversation}{rules}{channels}{channel_feed}{web}{reference}{resources_block()}{addressed}\n\nCommunity user question:\n{user_request.strip()}\n"
 
 
 def build_auto_scan_answer_prompt(*, user_message: str, guild_name: str | None, channel_name: str | None, reference_context: str, gate_reason: str, conversation_context: str = "", user_context: str = "", server_rules: str = "", server_channels: str = "", server_facts: str = "", known_users: str = "", server_members: str = "", referenced_users: str = "", web_context: str = "", model_name: str = "", cost_context: str = "", member_prefs: str = "") -> str:
@@ -475,7 +496,7 @@ def build_auto_scan_answer_prompt(*, user_message: str, guild_name: str | None, 
     web = ""
     if web_context.strip():
         web = f"\n{web_context.strip()}\n"
-    return f"{AUTO_SCAN_ANSWER_BOUNDARY}\n{context}{_user_block(user_context)}{_server_facts_block(server_facts)}{_known_users_block(known_users)}{_known_users_block(server_members)}{_known_users_block(referenced_users)}\n\nChaos Redux reference material for the model-generated answer (do not mention this material, notes, or that you reviewed it):\n{reference}{resources_block()}{_conversation_block(conversation_context)}{web}{_rules_block(server_rules)}{_channels_block(server_channels)}\n\nDiscord message to answer:\n{user_message.strip()}\n"
+    return f"{AUTO_SCAN_ANSWER_BOUNDARY}{_emoji_guide()}\n{context}{_user_block(user_context)}{_server_facts_block(server_facts)}{_known_users_block(known_users)}{_known_users_block(server_members)}{_known_users_block(referenced_users)}\n\nChaos Redux reference material for the model-generated answer (do not mention this material, notes, or that you reviewed it):\n{reference}{resources_block()}{_conversation_block(conversation_context)}{web}{_rules_block(server_rules)}{_channels_block(server_channels)}\n\nDiscord message to answer:\n{user_message.strip()}\n"
 
 
 def build_auto_scan_banter_prompt(
@@ -507,12 +528,12 @@ def build_auto_scan_banter_prompt(
     web = ""
     if web_context.strip():
         web = f"\n{web_context.strip()}\n"
-    return f"{AUTO_SCAN_BANTER_BOUNDARY}\n{context}{_user_block(user_context)}{_server_facts_block(server_facts)}{_known_users_block(known_users)}{_known_users_block(server_members)}{_conversation_block(conversation_context)}{reference}{web}{_rules_block(server_rules)}{_channels_block(server_channels)}\n\nDiscord message about ChaosX/the bot:\n{user_message.strip()}\n"
+    return f"{AUTO_SCAN_BANTER_BOUNDARY}{_emoji_guide()}\n{context}{_user_block(user_context)}{_server_facts_block(server_facts)}{_known_users_block(known_users)}{_known_users_block(server_members)}{_conversation_block(conversation_context)}{reference}{web}{_rules_block(server_rules)}{_channels_block(server_channels)}\n\nDiscord message about ChaosX/the bot:\n{user_message.strip()}\n"
 
 
 def build_auto_scan_warning_prompt(*, user_message: str, guild_name: str | None, channel_name: str | None, gate_reason: str, conversation_context: str = "", server_rules: str = "") -> str:
     context = f"Discord context: guild={guild_name or 'unknown'}, channel={channel_name or 'unknown'}; gate_reason={gate_reason or 'unknown'}"
-    return f"{AUTO_SCAN_WARNING_BOUNDARY}\n{context}{_conversation_block(conversation_context)}{_rules_block(server_rules)}\n\nDiscord message that triggered the soft warning gate:\n{user_message.strip()}\n"
+    return f"{AUTO_SCAN_WARNING_BOUNDARY}{_emoji_guide()}\n{context}{_conversation_block(conversation_context)}{_rules_block(server_rules)}\n\nDiscord message that triggered the soft warning gate:\n{user_message.strip()}\n"
 
 
 def prompt_hash(prompt: str) -> str:
