@@ -329,8 +329,9 @@ def _emoji_guide() -> str:
         "spontaneously, only where they genuinely add tone — a joke landing, a cheer, sympathy, "
         "popcorn for drama, a salute, a shrug at a bug. One or two at most, and most messages use "
         "none; never in factual or technical answers, never as a substitute for words, never in "
-        "lists or headings. Write the icon inline (for example :factory_gg:) and it renders; never "
-        "name, explain, or list them.\n"
+        "lists or headings. Write the icon inline exactly as :factory_gg: - the colons directly around "
+        "the name, no backticks and no code formatting, because a wrapped name shows up literally and "
+        "looks broken. Never name, explain, or list them.\n"
         f"Available: {line}\n"
     )
 

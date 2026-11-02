@@ -97,6 +97,12 @@ def tier(tier_name: str) -> str:
     return _MENTIONS.get(TIER_EMOJI_NAMES.get(tier_name, ""), "")
 
 
+# Models markdown-format the shortcode: ":`factory_ok`:" or "`:factory_ok:`". Both are the same
+# icon with a code span wrapped around it, and Discord renders neither (Hoops, 2026-11-02).
+_BACKTICK_INNER = re.compile(r":`([A-Za-z0-9_]{2,32}(?::[A-Za-z0-9_]{2,32})?)`:")
+_BACKTICK_WRAPPED = re.compile(r"`(:[A-Za-z0-9_]{2,32}(?::[A-Za-z0-9_]{2,32})?:)`")
+
+
 def render(text: str) -> str:
     """Swap ``:emoji_name:`` tokens for real mentions and repair mentions with dead IDs.
 
@@ -104,8 +110,13 @@ def render(text: str) -> str:
     ``<:name:id>`` would wrap it in a second pair of brackets and print garbage.
     """
     _ensure()
-    if _MENTIONS is None or ":" not in text:
+    if not _MENTIONS or ":" not in text:
         return text
+    # Unwrap code formatting around a shortcode before resolving anything: a member should never
+    # see ":`factory_ok`:" or "`:factory_ok:`" in an answer.
+    if "`" in text:
+        text = _BACKTICK_INNER.sub(r":\1:", text)
+        text = _BACKTICK_WRAPPED.sub(r"\1", text)
 
     def swap(match: "re.Match[str]") -> str:
         name, ident, token = match.group(1), match.group(2), match.group(3)
@@ -138,7 +149,12 @@ def missing(names: Iterable[str]) -> list[str]:
     return [n for n in names if n not in _MENTIONS]
 
 def install_outbound_hook() -> bool:
-    """Render shortcodes on every message ChaosX sends, whichever API path built it."""
+    """Render shortcodes on every message ChaosX sends, whichever API path built it.
+
+    discord.py 2.7 sends ordinary messages through ``HTTPClient.send_message``, while interaction
+    responses (panels, slash-command answers), follow-ups and webhooks all go through
+    ``HTTPClient.request`` with a JSON payload - so both layers are wrapped.
+    """
     import functools
 
     import discord
@@ -146,7 +162,16 @@ def install_outbound_hook() -> bool:
     http = discord.http.HTTPClient
     patched = 0
 
-    def wrap(method: str, *, payload_key: str | None = None) -> None:
+    def _render_content(payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("content"), str):
+            data["content"] = render(data["content"])
+        if isinstance(payload.get("content"), str):
+            payload["content"] = render(payload["content"])
+
+    def wrap(method: str, *, json_key: str | None = None) -> None:
         nonlocal patched
         original = getattr(http, method, None)
         if original is None or getattr(original, "_chaosx_rendered", False):
@@ -154,17 +179,11 @@ def install_outbound_hook() -> bool:
 
         @functools.wraps(original)
         async def wrapper(self, *args, **kwargs):
-            if payload_key is None:
+            if json_key is None:
                 if isinstance(kwargs.get("content"), str):
                     kwargs["content"] = render(kwargs["content"])
             else:
-                payload = kwargs.get(payload_key)
-                if isinstance(payload, dict):
-                    data = payload.get("data")
-                    if isinstance(data, dict) and isinstance(data.get("content"), str):
-                        data["content"] = render(data["content"])
-                    elif isinstance(payload.get("content"), str) and payload_key == "payload":
-                        payload["content"] = render(payload["content"])
+                _render_content(kwargs.get(json_key))
             return await original(self, *args, **kwargs)
 
         wrapper._chaosx_rendered = True  # type: ignore[attr-defined]
@@ -173,7 +192,6 @@ def install_outbound_hook() -> bool:
 
     wrap("send_message")
     wrap("edit_message")
-    wrap("create_interaction_response", payload_key="payload")
-    wrap("execute_webhook", payload_key="payload")
-    wrap("edit_webhook_message", payload_key="payload")
+    # Interaction callbacks, follow-ups and webhooks.
+    wrap("request", json_key="json")
     return bool(patched)
