@@ -711,10 +711,35 @@ class SettingsShortcutView(discord.ui.View):
         button = discord.ui.Button(label="Settings", emoji="⚙️", style=discord.ButtonStyle.secondary)
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            if not _claim_interaction(interaction):
+                return
             await interaction.response.send_modal(SettingsModal(self.bot, user_id=interaction.user.id))
 
         button.callback = callback
         self.add_item(button)
+
+
+_HANDLED_INTERACTIONS: set[int] = set()
+
+
+def _claim_interaction(interaction: discord.Interaction) -> bool:
+    """Claim a click for one handler only.
+
+    discord.py dispatches a component click to the dynamic PanelItem *and* to the view stored
+    on the message, so both ran for every cxfb:* button: the first deferred the interaction and
+    the second died on 40060 "already been acknowledged", which surfaced to Hoops as "That did
+    not go through" while the real answer had already gone out.
+    """
+    try:
+        ident = int(interaction.id)
+    except Exception:
+        return True
+    if ident in _HANDLED_INTERACTIONS:
+        return False
+    _HANDLED_INTERACTIONS.add(ident)
+    if len(_HANDLED_INTERACTIONS) > 5000:
+        _HANDLED_INTERACTIONS.clear()
+    return True
 
 
 class AnswerPanelView(discord.ui.View):
@@ -753,6 +778,8 @@ class AnswerPanelView(discord.ui.View):
         button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"cxfb:act{index}")
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            if not _claim_interaction(interaction):
+                return
             if label.strip().lower().startswith("check my setup"):
                 await interaction.response.send_modal(
                     ActionModal(self.bot, question=self.question, answer=self.answer, message_id=message_id)
@@ -827,6 +854,8 @@ class AnswerPanelView(discord.ui.View):
         )
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            if not _claim_interaction(interaction):
+                return
             await self._rate(interaction, "up")
 
         button.callback = callback
@@ -838,6 +867,8 @@ class AnswerPanelView(discord.ui.View):
         )
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            if not _claim_interaction(interaction):
+                return
             await self._rate(interaction, "down")
 
         button.callback = callback
@@ -847,6 +878,8 @@ class AnswerPanelView(discord.ui.View):
         button = discord.ui.Button(label="Hide answer", emoji="🙈", style=discord.ButtonStyle.secondary, custom_id="cxfb:hideans")
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            if not _claim_interaction(interaction):
+                return
             await interaction.response.send_message(
                 "Discord can't hide a channel message from just you. Pick what to do instead:",
                 ephemeral=True,
@@ -862,6 +895,8 @@ class AnswerPanelView(discord.ui.View):
         )
 
         async def callback(interaction: discord.Interaction) -> None:  # pragma: no cover - Discord only
+            if not _claim_interaction(interaction):
+                return
             await interaction.response.send_message(
                 "How long should I stop asking for feedback?",
                 ephemeral=True,
@@ -872,6 +907,8 @@ class AnswerPanelView(discord.ui.View):
         return button
 
     async def settings_callback(self, interaction: discord.Interaction, button: discord.ui.Button | None = None) -> None:
+        if interaction.response.is_done():
+            return
         db_path = _db_path(self.bot)
         pref = engagement.get_pref(db_path, interaction.user.id) if db_path else {}
         state = engagement.describe_auto_answer(pref) if pref else "unknown"
@@ -1033,6 +1070,8 @@ class PanelItem(discord.ui.DynamicItem[discord.ui.Button], template=r"cxfb:(?P<k
         return cls(match["key"])
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if not _claim_interaction(interaction):
+            return
         print(f"[panel] click {self.key} by {interaction.user.id} on {getattr(interaction.message, 'id', 0)}", flush=True)
         try:
             # Acknowledge before touching the database: Discord allows three seconds, and a click that lands during a

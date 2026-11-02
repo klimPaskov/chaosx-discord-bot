@@ -301,6 +301,7 @@ from .activity import (
     tier_progress,
     voting_weight,
 )
+from . import emoji as custom_emoji
 from .formatting import (
     block,
     bullets,
@@ -1332,7 +1333,7 @@ async def reply_with_chunks(
     """Reply once, then continue safely in-channel if output exceeds Discord's limit."""
 
     first_sent: discord.Message | None = None
-    for index, part in enumerate(_chunk(text)):
+    for index, part in enumerate(_chunk(custom_emoji.render(text))):
         if index == 0:
             first_kwargs: dict[str, Any] = {
                 "mention_author": False,
@@ -2819,11 +2820,26 @@ class ChaosXBot(discord.Client):
         else:
             await self.tree.sync()
 
+    def _install_custom_emoji(self) -> None:
+        """Resolve the server emoji from every guild in cache, and say so in the log."""
+        count = custom_emoji.attach(self)
+        missing = custom_emoji.missing(custom_emoji.TIER_EMOJI_NAMES.values())
+        probe = custom_emoji.tier("Rising Chaos")
+        print(
+            f"ChaosX custom emoji installed: {count} (tiers: {'ok' if probe else 'MISSING'})"
+            + (f" (missing: {missing})" if missing else "")
+        )
+
+    async def on_guild_emojis_update(self, guild: discord.Guild, before: Any, after: Any) -> None:
+        """Hoops adding or removing an icon takes effect without a restart."""
+        custom_emoji.refresh()
+
     async def on_ready(self) -> None:
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="Chaos Redux ops"),
             status=discord.Status.online,
         )
+        self._install_custom_emoji()
         await self.leave_unauthorized_guilds()
         set_capability_summary(
             probe_capabilities(members_intent=bool(self.intents.members))["summary"]

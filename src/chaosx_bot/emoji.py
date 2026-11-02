@@ -29,6 +29,8 @@ TIER_EMOJI_NAMES: dict[str, str] = {
 }
 
 _MENTIONS: dict[str, str] = {}
+# The client, so the map can rebuild itself if a startup race leaves it empty.
+_BOT = None
 _TOKEN = re.compile(r":([A-Za-z0-9_]{2,32}(?::[A-Za-z0-9_]{2,32})?):")
 
 
@@ -45,12 +47,36 @@ def install(emojis: Iterable[object]) -> int:
     return len(_MENTIONS)
 
 
+def attach(bot) -> int:
+    """Bind the client and resolve every guild's emoji right away."""
+    global _BOT
+    _BOT = bot
+    return refresh()
+
+
+def refresh() -> int:
+    """Re-read the emoji caches of every guild the bot can see."""
+    if _BOT is None:
+        return len(_MENTIONS)
+    _MENTIONS.clear()
+    for guild in getattr(_BOT, "guilds", []) or []:
+        install(getattr(guild, "emojis", []) or [])
+    return len(_MENTIONS)
+
+
+def _ensure() -> None:
+    """A startup race can leave the map empty; rebuild on first use instead of degrading."""
+    if not _MENTIONS and _BOT is not None:
+        refresh()
+
+
 def clear() -> None:
     _MENTIONS.clear()
 
 
 def get(name: str, fallback: str = "") -> str:
     """The emoji mention for ``name``, or ``fallback`` when the bot has not seen it."""
+    _ensure()
     return _MENTIONS.get(name, fallback)
 
 
@@ -60,11 +86,13 @@ def known(name: str) -> bool:
 
 def tier(tier_name: str) -> str:
     """Custom emoji for a tier label, or "" when the set is not installed."""
+    _ensure()
     return _MENTIONS.get(TIER_EMOJI_NAMES.get(tier_name, ""), "")
 
 
 def render(text: str) -> str:
     """Swap ``:emoji_name:`` tokens for real mentions; leave unknown tokens alone."""
+    _ensure()
     if not _MENTIONS or ":" not in text:
         return text
     def swap(match: "re.Match[str]") -> str:
@@ -86,6 +114,7 @@ def render(text: str) -> str:
 
 def catalog_line() -> str:
     """One-line inventory of the installed icons, as exact shortcodes."""
+    _ensure()
     if not _MENTIONS:
         return ""
     return ", ".join(sorted(_MENTIONS))
