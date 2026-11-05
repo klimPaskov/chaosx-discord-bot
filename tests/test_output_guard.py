@@ -76,6 +76,22 @@ def test_notes_phrasing_is_neutralised():
     assert strip_notes_phrasing("The drawer is full.") == "The drawer is full."
 
 
+def test_notes_rewrites_still_read_like_sentences():
+    # The real 2026-10-25 leak.
+    assert (
+        strip_notes_phrasing("I checked the Chaos Redux notes and they don't cover specific member identities.")
+        == "The Chaos Redux material doesn't cover specific member identities."
+    )
+    assert (
+        strip_notes_phrasing("I checked the Chaos Redux notes, but there's no entry for that country.")
+        == "There's no entry for that country."
+    )
+    assert (
+        strip_notes_phrasing("I don't have a record of that in my Chaos Redux notes.")
+        == "I don't have a record of that in the Chaos Redux material."
+    )
+
+
 def test_sanitize_outbound_handles_both_leaks_at_once():
     cleaned = sanitize_outbound("I checked the Chaos Redux notes [Mod readme] and there is no entry.")
     assert "notes" not in cleaned and "readme" not in cleaned

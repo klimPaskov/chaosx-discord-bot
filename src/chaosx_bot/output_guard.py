@@ -28,18 +28,35 @@ _SOURCE_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 
-_NOTES_PHRASES: tuple[tuple[re.Pattern[str], str], ...] = (
+_VERB = r"(?:checked|looked (?:at|through)|searched|read|reviewed|consulted)"
+_OBJECT = (
+    r"(?:the |my |our )?(?:chaos redux |project )?(?:reference )?"
+    r"(?:notes|vault|material|context|knowledge base|docs)"
+)
+
+def _capitalise(match: "re.Match[str]") -> str:
+    return match.group(1).upper()
+
+
+_NOTES_PHRASES: tuple[tuple[re.Pattern[str], object], ...] = (
+    # "I checked the Chaos Redux notes and they don't cover X" -> "The Chaos Redux material doesn't cover X"
     (
         re.compile(
-            r"(?i)\bI(?:'ve| have)? (?:checked|looked (?:at|through)|searched|read|reviewed) "
-            r"(?:the |my |our )?(?:chaos redux |project )?(?:reference )?(?:notes|vault|material|context)\b"
+            rf"(?i)\bI(?:'ve| have)? {_VERB} {_OBJECT}\b,? (?:and|but) (?:they|it) "
+            r"(?:don't|do not|doesn't|does not) cover\b"
         ),
-        "The Chaos Redux material",
+        "The Chaos Redux material doesn't cover",
     ),
+    # "I checked the Chaos Redux notes, but there's no entry" -> "There's no entry"
     (
-        re.compile(
-            r"(?i)\b(?:the |my |our )?(?:chaos redux |project )?reference (?:notes|material|context)\b"
-        ),
+        re.compile(rf"(?i)\bI(?:'ve| have)? {_VERB} {_OBJECT}\b,? (?:and|but)\s+([a-z])"),
+        _capitalise,
+    ),
+    # Any other first-person mention of the material becomes a plain subject.
+    (re.compile(rf"(?i)\bI(?:'ve| have)? {_VERB} {_OBJECT}\b"), "The Chaos Redux material"),
+    # Not first person: "that detail isn't in my reference notes".
+    (
+        re.compile(r"(?i)\b(?:the |my |our )?(?:chaos redux |project )?reference (?:notes|material|context)\b"),
         "the Chaos Redux material",
     ),
     (re.compile(r"(?i)\b(?:the |my |our )?chaos redux (?:notes|vault|material)\b"), "the Chaos Redux material"),
@@ -197,11 +214,16 @@ def strip_source_tags(text: str) -> str:
 
 
 def strip_notes_phrasing(text: str) -> str:
-    """Replace "I checked the Chaos Redux notes/vault…" with neutral wording."""
+    """Replace "I checked the Chaos Redux notes/vault…" with neutral wording.
+
+    The redaction has to read like a sentence afterwards: a member should never see the bot talk
+    about its notes, and should also never see a half-rewritten clause.
+    """
     cleaned = text or ""
     for pattern, replacement in _NOTES_PHRASES:
         cleaned = pattern.sub(replacement, cleaned)
     cleaned = re.sub(r"(?i)\bmaterial material\b", "material", cleaned)
+    cleaned = re.sub(r"^\s*the Chaos Redux material", "The Chaos Redux material", cleaned)
     return cleaned
 
 
