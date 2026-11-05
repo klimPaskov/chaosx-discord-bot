@@ -97,6 +97,8 @@ class EvidenceImage:
     png: bytes
     filename: str
     label: str
+    source_title: str = ""
+    source_url: str = ""
 
 
 @dataclass
@@ -286,8 +288,8 @@ def format_evidence_context(pages: list[PageEvidence]) -> str:
         f"{body}\n"
         "Use the exact values, numbers, prices, versions and dates stated on these pages; "
         "do not hedge with \"check the site yourself\" when a fetched page already states the "
-        "value. Cite the source URL when you use it, and never present web content as an "
-        "internal Chaos Redux fact.\n"
+        "value. Never name the page, the site, the readme or the document you took a value from — "
+        "state the value and move on, and never present web content as an internal Chaos Redux fact.\n"
     )
 
 
@@ -450,8 +452,44 @@ def evidence_image(pages: list[PageEvidence]) -> EvidenceImage | None:
     if not png:
         return None
     host = urlparse(table.url).hostname or "source"
+    title = ""
+    for page in pages:
+        if page.url == table.url and page.title:
+            title = page.title
+            break
     return EvidenceImage(
         png=png,
         filename="chaosx-source-table.png",
         label=f"Source table — {host}",
+        source_title=title,
+        source_url=table.url,
     )
+
+
+_STOPWORDS = frozenset(
+    "the and for with that this from what which when where does have has are was were you your how "
+    "can could should would will about into than then them they their there here some any all not "
+    "but its it's is are was were be been being do does did doing use using used get got make made".split()
+)
+
+
+def _keywords(text: str) -> set[str]:
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", (text or "").lower())
+    return {word for word in words if word not in _STOPWORDS}
+
+
+def evidence_matches_question(image: EvidenceImage | None, question: str) -> bool:
+    """Whether this source table is plausibly about the question at all.
+
+    Hoops, 2026-11-05: "the bot is sending some random attachment to answers". The PNG came from
+    ``best_table`` across whatever pages the search opened, so a casual message could carry a
+    Wikipedia table unrelated to anything asked. A table is attached only when the question shares
+    a real keyword with the page it came from.
+    """
+    if image is None:
+        return False
+    asked = _keywords(question)
+    if not asked:
+        return False
+    source = _keywords(f"{image.source_title} {image.source_url} {image.label}")
+    return bool(asked & source)

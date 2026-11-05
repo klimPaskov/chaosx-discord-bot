@@ -233,6 +233,43 @@ class Settings(BaseSettings):
         default=10,
         description="Hidden hourly cap on casual/banter replies per member outside banter channels. 0 disables it.",
     )
+    chat_gate_enabled: bool = Field(
+        default=True,
+        description=(
+            "Deterministic casual-reply gates: repeat coalescing, one model call per identical line, a "
+            "minimum gap between replies, one reply per N member messages, and a silent troll cooldown."
+        ),
+    )
+    chat_reply_gap_seconds: int = Field(
+        default=25,
+        ge=0,
+        le=3600,
+        description="Minimum gap between two casual ChaosX replies in the same channel",
+    )
+    chat_reply_one_in: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Casual chat: answer at most one message in every N sent by the same member",
+    )
+    chat_repeat_window_seconds: int = Field(
+        default=180,
+        ge=10,
+        le=3600,
+        description="How long the same normalised message from a member counts as already answered",
+    )
+    chat_troll_cooldown_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=86400,
+        description="Silent cooldown applied to a member who is only repeating, flooding or insulting",
+    )
+    chat_flood_messages: int = Field(
+        default=6,
+        ge=2,
+        le=60,
+        description="Messages inside one minute that count as a flood for the troll cooldown",
+    )
     community_notes_enabled: bool = Field(default=True, description="Write approved public suggestions/event ideas to the Chaos Redux vault")
     community_event_specs_folder: str = Field(default="Events/Event Specs", description="Vault-relative folder for approved community event idea specs")
     community_suggestions_folder: str = Field(default="Planning/Community Suggestions", description="Vault-relative folder for approved community suggestion notes")

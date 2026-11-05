@@ -359,7 +359,7 @@ from . import ask_api
 from . import answer_panel
 from . import banter_budget
 from . import engagement
-from . import bot_spam_banter, knowledge_gaps, member_memory, moderation_cases, moderation_guard
+from . import bot_spam_banter, chat_gate, knowledge_gaps, member_memory, moderation_cases, moderation_guard, output_guard
 from . import tooling_sync
 from . import server_live
 from . import server_ops
@@ -1183,12 +1183,13 @@ async def generate_auto_scan_model_response(
         channel_id=getattr(message.channel, "id", 0),
         exclude_message_id=message.id,
     )
-    # Web grounding: always available (public asks AND banter) so the model
-    # can reach the web when it needs it. Never for catalog lookups
-    # (event/scenario/cluster/mechanic): a miss there must be a plain
-    # "not found", never a web-search dump.
+    # Web grounding: always available so the model can reach the web when it needs it — but a source
+    # table PNG is only fetched for a real answer, never for banter (Hoops, 2026-11-05: the bot was
+    # attaching random tables to casual replies). Never for catalog lookups either: a miss there must
+    # be a plain "not found", never a web-search dump.
     web_context = ""
     evidence: EvidenceImage | None = None
+    wants_evidence = decision.action == "answer"
     if (
         bot.settings.web_search_enabled
         and decision.action in {"answer", "banter"}
@@ -1200,8 +1201,9 @@ async def generate_auto_scan_model_response(
         web_context, evidence = await bot.web.search_evidence(
             user_message,
             max_pages=bot.settings.web_evidence_max_pages,
-            evidence_enabled=bot.settings.web_evidence_enabled,
+            evidence_enabled=bool(bot.settings.web_evidence_enabled) and wants_evidence,
         )
+        evidence = evidence_for_reply(evidence, user_message, casual=not wants_evidence)
     if decision.action == "answer":
         prompt = build_auto_scan_answer_prompt(
             user_message=user_message,
@@ -1325,6 +1327,43 @@ def _member_answer_context(bot: ChaosXBot, user_id: int) -> str:
     except Exception as exc:
         print(f"[engage] member context failed: {type(exc).__name__}: {exc}", flush=True)
         return ""
+
+
+def is_skip_reply(text: str) -> bool:
+    """The model said nothing worth sending (the banter prompt allows an exact SKIP)."""
+    head = (text or "").strip().strip("*`.").upper()
+    return head in {"SKIP", "SKIP."} or head.startswith("SKIP ")
+
+
+def finalize_outbound(
+    bot: "ChaosXBot", text: str, *, channel_id: int | None = None, casual: bool = False
+) -> str:
+    """Last stop before text leaves the bot: leak fixes, then the emoji discipline.
+
+    ``casual`` marks banter/chat, where a single trailing icon is allowed now and then. Factual
+    answers keep at most one inline icon and are never signed.
+    """
+    cleaned = output_guard.sanitize_outbound(text or "")
+    policy = getattr(bot, "emoji_policy", None)
+    if policy is not None:
+        cleaned = policy.finalize(cleaned, channel_id=channel_id or 0, casual=casual)
+    return cleaned
+
+
+def evidence_for_reply(image: EvidenceImage | None, question: str, *, casual: bool = False) -> EvidenceImage | None:
+    """Only attach a source table when it is actually about the question.
+
+    Hoops, 2026-11-05: "the bot is sending some random attachment to answers". The PNG is the best
+    table of whatever page the search opened; without this check a casual line could carry an
+    unrelated Wikipedia table.
+    """
+    if casual or image is None:
+        return None
+    try:
+        from .web_sources import evidence_matches_question
+    except Exception:
+        return None
+    return image if evidence_matches_question(image, question) else None
 
 
 async def reply_with_chunks(
@@ -1472,6 +1511,26 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
     if not decision.acted or decision.confidence < bot.settings.auto_scan_min_confidence:
         return False
 
+    # A troll in cooldown gets no answer on any surface, including auto-scan (Hoops, 2026-11-05).
+    muted = bot.chat.trolls.muted(message.author.id, now=getattr(message, "created_at", None))
+    if muted:
+        await bot.store.audit(
+            actor_id=message.author.id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            command="chat gate silence",
+            summary=f"troll cooldown: {muted.reason}",
+        )
+        return False
+    # The same line answered twice is the duplicate-spam failure; one answer per window is enough.
+    if bot.chat.repeat.is_repeat(
+        channel_id=channel_id or 0,
+        author_id=message.author.id,
+        text=content,
+        now=getattr(message, "created_at", None),
+    ):
+        return False
+
     if decision.action == "answer":
         # A member can switch unprompted answers off (or on for a while) from the panel under any answer;
         # that choice outranks the server-wide setting for them alone.
@@ -1505,7 +1564,17 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan answer model failure", summary=reason)
             return False
-        first_sent = await reply_with_chunks(message, model_output, evidence=evidence)
+        first_sent = await reply_with_chunks(
+            message,
+            finalize_outbound(bot, model_output, channel_id=channel_id, casual=False),
+            evidence=evidence_for_reply(evidence, decision.question or content),
+        )
+        bot.chat.note_answered(
+            channel_id=channel_id or 0,
+            author_id=message.author.id,
+            text=content,
+            now=getattr(message, "created_at", None),
+        )
         if first_sent is not None:
             asyncio.create_task(
                 _attach_answer_panel(
@@ -1559,7 +1628,20 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=reason), message, bot_message_id=None, response=result.stderr or result.stdout)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan banter model failure", summary=reason)
             return False
-        sent = await reply_with_chunks(message, model_output, evidence=evidence)
+        if is_skip_reply(model_output):
+            sent = None
+        else:
+            sent = await reply_with_chunks(
+                message,
+                finalize_outbound(bot, model_output, channel_id=channel_id, casual=True),
+                evidence=None,
+            )
+        bot.chat.note_answered(
+            channel_id=channel_id or 0,
+            author_id=message.author.id,
+            text=content,
+            now=getattr(message, "created_at", None),
+        )
         await record_auto_scan_event(
             bot,
             decision,
@@ -2130,6 +2212,27 @@ class ChaosXBot(discord.Client):
         self.channel_reader = ChannelReader(bot_token=settings.discord_token)
         # Server-side web-search grounding for public asks/banter.
         self.web = WebGrounder()
+        # Casual-reply gates (Hoops, 2026-11-05): repeat coalescing, one model call per identical
+        # line, a minimum gap between replies, one reply per N member messages, and a silent troll
+        # cooldown. All deterministic; no model decides whether the bot stays quiet.
+        self.chat = chat_gate.ChatGate(
+            enabled=bool(getattr(settings, "chat_gate_enabled", True)),
+            repeat_window_seconds=float(getattr(settings, "chat_repeat_window_seconds", 180)),
+            reply_gap_seconds=float(getattr(settings, "chat_reply_gap_seconds", 25)),
+            one_in=int(getattr(settings, "chat_reply_one_in", 3)),
+            troll_cooldown_seconds=float(getattr(settings, "chat_troll_cooldown_seconds", 900)),
+            flood_messages=int(getattr(settings, "chat_flood_messages", 6)),
+        )
+        # Outbound text discipline: one icon at most, no signature ending, no repeated icon.
+        self.emoji_policy = output_guard.EmojiPolicy()
+        # "I can only answer Chaos Redux and modding questions" at most once per member per hour.
+        self.canned = output_guard.CannedSuppressor()
+        # Where the bot last joined a conversation, so the address gate can allow an active chain.
+        self._last_reply_at = {}
+        self._last_reply_author = {}
+        self._troll_cases = {}
+        # Gate-silence audit throttle: (channel, member, reason) -> last logged moment.
+        self._gate_log = {}
 
     async def _refresh_rules_background(self) -> None:
         try:
@@ -4931,6 +5034,7 @@ class ChaosXBot(discord.Client):
         if not line or line.upper().startswith("SKIP") or len(line) > 600:
             print(f"[banter] skipped ({decision.reason}): nothing usable from the model", flush=True)
             return
+        line = finalize_outbound(self, line, channel_id=channel_id, casual=True)
         sent = await channel.send(line, allowed_mentions=targeted_mentions([target.user_id]))
         days = state.get("post_days") if isinstance(state.get("post_days"), dict) else {}
         for key in [k for k in days if k < (now - timedelta(days=7)).date().isoformat()]:
@@ -5727,9 +5831,63 @@ class ChaosXBot(discord.Client):
         # count gate; runs via the public model.
         if not (self.user is not None and message.author.id == self.user.id):
             schedule_user_profile_compaction(self.settings, message.author.id)
+        # Casual-reply gates (Hoops, 2026-11-05): count this message, and file the evidence the first
+        # time a member crosses a troll threshold (repeating, flooding, insult-only). Silent in the
+        # channel — the moderation ladder is a separate decision, made from the same evidence.
+        if message.author is not None and not message.author.bot:
+            verdict = self.chat.observe(
+                channel_id=getattr(message.channel, "id", 0),
+                author_id=message.author.id,
+                text=message.content or "",
+                now=message.created_at,
+            )
+            if verdict:
+                await self._record_troll_case(message, verdict)
         if await handle_message_ask(self, message):
             return
         await handle_auto_scan(self, message)
+
+    async def _record_troll_case(self, message: discord.Message, verdict: chat_gate.TrollVerdict) -> None:
+        """Write a moderation case once per cooldown, so the pattern is visible in #moderator-only."""
+        author = message.author
+        if author is None or author.id == self.settings.owner_id:
+            return
+        perms = getattr(author, "guild_permissions", None)
+        if perms and (perms.manage_messages or perms.kick_members or perms.ban_members):
+            return
+        moment = message.created_at or discord.utils.utcnow()
+        last = self._troll_cases.get(author.id)
+        if last is not None and (moment - last).total_seconds() < max(600, verdict.cooldown_seconds // 2):
+            return
+        self._troll_cases[author.id] = moment
+        try:
+            moderation_cases.save_case(
+                self.settings.db_path,
+                actor_id=author.id,
+                guild_id=message.guild.id if message.guild else None,
+                channel_id=getattr(message.channel, "id", None),
+                action="disengage",
+                summary=f"troll signals — {verdict.reason}; replies paused {verdict.cooldown_seconds // 60} min",
+                messages=[
+                    {
+                        "id": sample_id,
+                        "content": text[:500],
+                        "author": author.display_name,
+                    }
+                    for sample_id, text in zip(
+                        [message.id] * len(verdict.evidence), verdict.evidence
+                    )
+                ],
+            )
+            await self.store.audit(
+                actor_id=author.id,
+                guild_id=message.guild.id if message.guild else None,
+                channel_id=getattr(message.channel, "id", None),
+                command="chat gate disengage",
+                summary=verdict.reason,
+            )
+        except Exception as exc:
+            print(f"[chat-gate] case filing failed: {type(exc).__name__}: {exc}", flush=True)
 
     async def _handle_restricted_persona(self, message: discord.Message) -> bool:
         """Internal silent scan rule (code-level, never in prompt context or
@@ -7392,6 +7550,61 @@ async def try_server_ops_message(bot: ChaosXBot, message: discord.Message, reque
     return True
 
 
+def _in_active_chain(bot: "ChaosXBot", message: discord.Message, channel_id: int | None, *, window_seconds: float = 300.0) -> bool:
+    """The bot is mid-conversation with this member in this channel (its last reply was to them, recently)."""
+    if not channel_id:
+        return False
+    last_at = getattr(bot, "_last_reply_at", {}).get(int(channel_id))
+    if last_at is None:
+        return False
+    if getattr(bot, "_last_reply_author", {}).get(int(channel_id)) != message.author.id:
+        return False
+    now = message.created_at or discord.utils.utcnow()
+    return (now - last_at).total_seconds() <= window_seconds
+
+
+async def _send_casual_reply(
+    bot: "ChaosXBot", message: discord.Message, text: str, decision: AutoScanDecision
+) -> None:
+    """Casual reply through the gates: repeat, in-flight, budget, troll cooldown.
+
+    Either the reply goes out or a gate keeps it quiet; both end the caller's handling. A gate
+    refusal is logged at most once per two minutes per (channel, member, reason), because the whole
+    point is that a flood produces silence, not a flood of log lines.
+    """
+    channel_id = getattr(message.channel, "id", 0) or 0
+    author_id = message.author.id
+    allowed, reason = bot.chat.casual_allowed(
+        channel_id=channel_id, author_id=author_id, text=text, now=message.created_at
+    )
+    if not allowed:
+        log_key = (channel_id, author_id, reason)
+        last_logged = bot._gate_log.get(log_key)
+        now = message.created_at or discord.utils.utcnow()
+        if last_logged is None or (now - last_logged).total_seconds() >= 120:
+            bot._gate_log[log_key] = now
+            try:
+                await bot.store.audit(
+                    actor_id=author_id,
+                    guild_id=message.guild.id if message.guild else None,
+                    channel_id=channel_id,
+                    command="chat gate silence",
+                    summary=reason,
+                )
+            except Exception:
+                pass
+        return
+    if not bot.chat.inflight.acquire(channel_id=channel_id, text=text):
+        return
+    try:
+        await run_mention_banter(bot, message, text, decision)
+    finally:
+        bot.chat.inflight.release(channel_id=channel_id, text=text)
+    bot.chat.note_answered(
+        channel_id=channel_id, author_id=author_id, text=text, now=getattr(message, "created_at", None)
+    )
+
+
 async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
     if not bot.settings.mention_ask_enabled or bot.user is None:
         return False
@@ -7433,8 +7646,19 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
                 and not looks_like_catalog_lookup(casual)
                 and not has_domain_signal(casual)
             ):
+                # Address gate (Hoops, 2026-11-05): being in #bot-spam is not the same as talking to
+                # the bot. It answers a chain it is already in, never a human answering another human.
+                if not chat_gate.addresses_bot(
+                    content=casual,
+                    mentioned=mentioned,
+                    replies_to_bot=replies_to_bot,
+                    name_addressed=name_addressed,
+                    in_chain=_in_active_chain(bot, message, channel_id),
+                ):
+                    return False
                 decision = AutoScanDecision("banter", confidence=80, reason="casual chat in a banter channel")
-                await run_mention_banter(bot, message, casual, decision)
+                # _send_casual_reply either answers or stays silent — both end this handler.
+                await _send_casual_reply(bot, message, casual, decision)
                 return True
         return False
 
@@ -7462,7 +7686,7 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
             ):
                 # Budget spent: stay quiet. No refusal, no counter, nothing the member can see.
                 return True
-            await run_mention_banter(bot, message, casual, decision)
+            await _send_casual_reply(bot, message, casual, decision)
             banter_budget.note(message.author.id)
             return True
     if not request:
@@ -7476,6 +7700,10 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
                 bot.settings.banter_hour_limit,
                 exempt=message.author.id == bot.settings.owner_id,
             ):
+                return True
+            if not bot.canned.allow(message.author.id):
+                # The identical canned line three times in five minutes is noise, not guidance
+                # (Hoops, 2026-11-05). Once per member per hour is plenty.
                 return True
             banter_budget.note(message.author.id)
             guidance = "Ask me a Chaos Redux question after the mention or in your reply, like `@ChaosX how does Zombie Outbreak work?`"
@@ -8141,9 +8369,18 @@ async def run_mention_banter(bot: ChaosXBot, message: discord.Message, request: 
         reason = auto_scan_model_failure_reason(decision, result, model_output)
         await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention banter model failure", summary=reason)
         return
+    model_output = finalize_outbound(bot, model_output, channel_id=channel_id, casual=True)
+    if is_skip_reply(model_output):
+        # The same bit answered twice is the failure this gate exists for; silence is the reply.
+        await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention bot-topic banter", summary="skipped: repeated bit")
+        return
     sent = await reply_with_chunks(message, model_output, evidence=evidence)
     await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="mention bot-topic banter", summary=decision.reason)
     if sent is not None:
+        # A live chain: the next message from this member in this channel is addressed to the bot
+        # rather than a cold open (the address gate reads these two maps).
+        bot._last_reply_at[int(channel_id or 0)] = message.created_at or discord.utils.utcnow()
+        bot._last_reply_author[int(channel_id or 0)] = message.author.id
         try:
             await bot.store.record_message_ask_turn(
                 mode="mention banter",
@@ -8799,6 +9036,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
     if result.timed_out:
         output = f"Hermes run timed out after {bot.settings.hermes_timeout_seconds}s. Try a narrower Chaos Redux question."
     output = sanitize_public_ask_output(output, question=request, channel_id=channel_id)
+    output = finalize_outbound(bot, output, channel_id=channel_id, casual=False)
     memory_output = output
     if rate is not None:
         output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
@@ -8825,7 +9063,7 @@ async def run_public_ask_message(bot: ChaosXBot, message: discord.Message, reque
                 "mention_author": False,
                 "allowed_mentions": safe_allowed_mentions(),
             }
-            attachment = evidence_file(evidence)
+            attachment = evidence_file(evidence_for_reply(evidence, request))
             if attachment is not None:
                 first_kwargs["file"] = attachment
             first_sent = await message.reply(content, **first_kwargs)
@@ -9962,6 +10200,7 @@ async def run_hermes_command(
         )
     if not owner_only and rate_bucket == "ask":
         output = sanitize_public_ask_output(output, question=request, channel_id=interaction.channel_id)
+        output = finalize_outbound(bot, output, channel_id=interaction.channel_id, casual=False)
         memory_output = output
         if rate:
             output += f"\n\n---\nAsks left: `{rate.remaining}` · Reset in: `{_format_duration(rate.reset_after_seconds)}`"
@@ -10012,7 +10251,7 @@ async def run_hermes_command(
     if send_output or not result.ok:
         for i, part in enumerate(_chunk(output)):
             prefix = f"{header}\n" if i == 0 and header else ""
-            attachment = evidence_file(evidence) if i == 0 else None
+            attachment = evidence_file(evidence_for_reply(evidence, request)) if i == 0 else None
             if feed_active and public:
                 # The interaction deferred ephemeral for the thinking feed, so
                 # followups would stay ephemeral. The final answer is posted

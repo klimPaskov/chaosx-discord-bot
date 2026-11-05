@@ -29,6 +29,14 @@ LADDER: tuple[tuple[int, str, str], ...] = (
 
 IMMEDIATE_BAN_RULES = ("2.2", "4.1", "5.1", "4.3", "5.4")  # slurs, NSFW, doxxing, malware, ban evasion
 
+# Flood limits (Hoops, 2026-11-05: "flooding one channel also counts as spam"). The raid detector
+# above needs three channels, so a member who posts the same line 169 times in #bot-spam never
+# tripped anything at all.
+FLOOD_REPEAT_COUNT = 3
+FLOOD_REPEAT_WINDOW_MINUTES = 10
+FLOOD_BURST_COUNT = 8
+FLOOD_BURST_WINDOW_SECONDS = 60
+
 _LINK_RE = re.compile(r"(?:https?://|www\.)\S+", re.I)
 _INVITE_RE = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/\S+", re.I)
 _SHORTENER_RE = re.compile(r"(?:bit\.ly|tinyurl\.com|t\.co|goo\.gl|is\.gd|cutt\.ly|shorturl\.at)/\S+", re.I)
@@ -114,6 +122,37 @@ def _link_spam(messages: list[Message], *, window_minutes: int = 10, channels: i
         if len({m.channel_id for m in recent}) >= channels:
             return True
     return False
+
+
+def _flood(messages: list[Message]) -> tuple[int, list[int]] | None:
+    """Same line repeated, or a burst in one channel. Returns (count, ids of the extra copies)."""
+    from .chat_gate import normalize
+
+    ordered = sorted(messages, key=lambda m: m.created_at)
+    # Repeated identical text inside the window.
+    window = timedelta(minutes=FLOOD_REPEAT_WINDOW_MINUTES)
+    for start in ordered:
+        recent = [m for m in ordered if start.created_at <= m.created_at <= start.created_at + window]
+        groups: dict[str, list[Message]] = {}
+        for entry in recent:
+            key = normalize(entry.content)
+            if len(key) < 6:  # "hi", "gg" and "lol" are conversation, not a flood
+                continue
+            groups.setdefault(key, []).append(entry)
+        for _key, group in groups.items():
+            if len(group) >= FLOOD_REPEAT_COUNT:
+                return len(group), [m.id for m in group[1:]]
+    # A burst of any text inside one minute, one channel.
+    burst_window = timedelta(seconds=FLOOD_BURST_WINDOW_SECONDS)
+    per_channel: dict[int, list[Message]] = {}
+    for entry in ordered:
+        per_channel.setdefault(entry.channel_id, []).append(entry)
+    for rows in per_channel.values():
+        for start in rows:
+            recent = [m for m in rows if start.created_at <= m.created_at <= start.created_at + burst_window]
+            if len(recent) >= FLOOD_BURST_COUNT:
+                return len(recent), [m.id for m in recent[1:]]
+    return None
 
 
 def analyse(
@@ -202,6 +241,17 @@ def analyse(
             reason=f"insulting another member ({insults[0]})",
             confidence=0.75 if targeted else 0.55,
             unsure=(not targeted) and len(insults) < 2 and len(latest.content) < 120,
+        )
+
+    flood = _flood(messages)
+    if flood is not None:
+        count, extra_ids = flood
+        return Verdict(
+            action="warn",
+            rule="7.1",
+            reason=f"flooding one channel with the same message ({count} times)",
+            confidence=0.9,
+            delete_message_ids=extra_ids,
         )
 
     return Verdict(action="none", confidence=1.0, reason="nothing actionable")

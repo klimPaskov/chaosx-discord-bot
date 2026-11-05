@@ -10,6 +10,8 @@ import pytest
 
 from chaosx_bot.auto_scan import AutoScanDecision, classify_auto_answer, classify_bot_topic_banter, classify_mention_banter, classify_message, classify_soft_warning, has_domain_signal, is_question_like
 from chaosx_bot.bot import auto_scan_channel_excluded, format_auto_scan_events, format_auto_scan_notice, handle_auto_scan, parse_channel_id_set
+from chaosx_bot.chat_gate import ChatGate
+from chaosx_bot.output_guard import EmojiPolicy
 from chaosx_bot.config import Settings
 from chaosx_bot.hermes_bridge import HermesResult
 from chaosx_bot.indexer import connect, rebuild_index
@@ -667,6 +669,16 @@ class _FakeBot:
         self.rate_limiter = FixedWindowRateLimiter()
         self.store = _FakeStore()
         self._auto_scan_classify_lock = asyncio.Lock()
+        # The real client always carries the casual-reply gates and the emoji policy; the
+        # auto-scan path reads both (Hoops, 2026-11-05).
+        self.chat = ChatGate(
+            repeat_window_seconds=settings.chat_repeat_window_seconds,
+            reply_gap_seconds=settings.chat_reply_gap_seconds,
+            one_in=settings.chat_reply_one_in,
+            troll_cooldown_seconds=settings.chat_troll_cooldown_seconds,
+            flood_messages=settings.chat_flood_messages,
+        )
+        self.emoji_policy = EmojiPolicy()
 
     def get_channel(self, channel_id: int) -> None:
         return None

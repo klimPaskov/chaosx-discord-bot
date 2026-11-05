@@ -54,8 +54,15 @@ def test_phone_or_email_is_flagged_but_not_punished_blind():
     assert verdict.action == "delete" and verdict.rule == "5.1" and verdict.unsure
 
 
-def test_plain_insult_warns_and_admits_it_might_be_banter():
+def test_insult_aimed_at_someone_is_a_decision_the_bot_can_take():
+    # "you idiot" is aimed at a member, which the guard treats as actionable on its own.
     verdict = guard.analyse([msg(1, 10, content="you idiot")])
+    assert verdict.action == "warn" and verdict.rule == "2.1"
+    assert verdict.unsure is False
+
+
+def test_stray_insult_with_no_target_admits_it_might_be_banter():
+    verdict = guard.analyse([msg(1, 10, content="what an idiot")])
     assert verdict.action == "warn" and verdict.rule == "2.1"
     assert verdict.unsure is True
 
@@ -95,3 +102,30 @@ def test_unsure_cases_ask_a_human_instead_of_acting():
     verdict = guard.analyse([msg(1, 10, content="call me on +1 555 123 4567 tonight")])
     text = guard.unsure_request(verdict, author="member", author_id=42, sample="call me...")
     assert "Unsure" in text and "no action taken" in text
+
+
+def test_same_line_flooded_in_one_channel_is_spam():
+    """The 2026-11-03 failure: 169 identical lines in #bot-spam, no case filed."""
+    messages = [msg(i, 99, content="Kill all clankers", minutes=i * 0.1) for i in range(5)]
+    verdict = guard.analyse(messages)
+    assert verdict.action == "warn" and verdict.rule == "7.1"
+    assert "flooding one channel" in verdict.reason
+    # The first copy stays, the repeats are the evidence to remove.
+    assert verdict.delete_message_ids == [1, 2, 3, 4]
+
+
+def test_a_burst_in_one_channel_is_spam():
+    messages = [msg(i, 99, content=f"line {i}", minutes=i * 0.005) for i in range(9)]
+    verdict = guard.analyse(messages)
+    assert verdict.action == "warn" and verdict.rule == "7.1"
+
+
+def test_short_chatter_is_not_a_flood():
+    messages = [msg(i, 99, content=text, minutes=i) for i, text in enumerate(["hi", "gg", "hi", "lol"])]
+    assert guard.analyse(messages).action == "none"
+
+
+def test_conversation_in_one_channel_is_not_a_flood():
+    lines = ["how does zombie outbreak work", "thanks", "and the focus tree?", "ok cool", "bye"]
+    messages = [msg(i, 99, content=text, minutes=i) for i, text in enumerate(lines)]
+    assert guard.analyse(messages).action == "none"
