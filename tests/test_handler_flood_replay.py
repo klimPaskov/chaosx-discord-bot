@@ -100,12 +100,23 @@ NOW = datetime(2026, 11, 3, 21, 12, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
-async def test_unaddressed_flood_gets_no_reply_at_all(bot: _FakeBot) -> None:
-    """169 copies of a line nobody aimed at the bot: the handler must not answer one of them."""
+async def test_unaddressed_flood_in_the_banter_channel_gets_exactly_one_reply(bot: _FakeBot) -> None:
+    """169 copies of one line in #bot-spam: one answer, because the channel is for talking to the bot."""
     for index in range(169):
         message = _Message("Kill all clankers", author=SIEGFRIED, when=NOW + timedelta(seconds=index * 2))
         await handle_message_ask(cast(Any, bot), cast(Any, message))
-        assert message.replies == []
+    assert len(bot.replies) == 1, f"answered {len(bot.replies)} times"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_line_aimed_at_another_member_gets_no_reply(bot: _FakeBot) -> None:
+    """Two humans talking in #bot-spam is not an invitation."""
+    message = _Message(
+        "<@1125795621782159432> hi", author=SIEGFRIED, when=NOW,
+        mentions=[SimpleNamespace(id=SUSSY)],
+    )
+    await handle_message_ask(cast(Any, bot), cast(Any, message))
+    assert message.replies == []
     assert bot.replies == []  # type: ignore[attr-defined]
 
 

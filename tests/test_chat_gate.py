@@ -32,8 +32,25 @@ def test_address_gate_requires_an_actual_address():
     assert addresses_bot(content="chaosx hi", mentioned=False, replies_to_bot=False, name_addressed=True)
     assert addresses_bot(content="hi", mentioned=False, replies_to_bot=True, name_addressed=False)
     assert addresses_bot(content="hi again", mentioned=False, replies_to_bot=False, name_addressed=False, in_chain=True)
-    # A human answering a human in #bot-spam is not addressed to the bot.
+    # A human answering a human outside a banter channel is not addressed to the bot.
     assert not addresses_bot(content="<@1125> hi", mentioned=False, replies_to_bot=False, name_addressed=False)
+
+
+def test_banter_channel_chat_counts_as_addressed():
+    """#bot-spam exists for talking to the bot: plain chat gets an answer there."""
+    assert addresses_bot(
+        content="Kill all clankers", mentioned=False, replies_to_bot=False, name_addressed=False,
+        banter_channel=True,
+    )
+    # But two humans talking are still left alone.
+    assert not addresses_bot(
+        content="<@1125> hi", mentioned=False, replies_to_bot=False, name_addressed=False,
+        banter_channel=True, mentions_other=True,
+    )
+    assert not addresses_bot(
+        content="yeah agreed", mentioned=False, replies_to_bot=False, name_addressed=False,
+        banter_channel=True, replies_to_other=True,
+    )
 
 
 def test_repeat_window_answers_one_of_many_identical_lines():

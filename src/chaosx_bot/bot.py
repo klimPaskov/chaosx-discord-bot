@@ -7741,14 +7741,20 @@ async def handle_message_ask(bot: ChaosXBot, message: discord.Message) -> bool:
                 and not looks_like_catalog_lookup(casual)
                 and not has_domain_signal(casual)
             ):
-                # Address gate (Hoops, 2026-11-05): being in #bot-spam is not the same as talking to
-                # the bot. It answers a chain it is already in, never a human answering another human.
+                # Address gate (Hoops, 2026-11-05): #bot-spam is a channel for talking to the bot, so
+                # plain chat still gets an answer there — but a line aimed at another member does not,
+                # and the repeat/budget/troll gates are what stop it answering every copy.
+                mentions_other = any(user.id != bot.user.id for user in getattr(message, "mentions", []) or [])
+                replies_to_other = parent_bot_message_id is not None and not replies_to_bot
                 if not chat_gate.addresses_bot(
                     content=casual,
                     mentioned=mentioned,
                     replies_to_bot=replies_to_bot,
                     name_addressed=name_addressed,
                     in_chain=_in_active_chain(bot, message, channel_id),
+                    banter_channel=True,
+                    mentions_other=mentions_other,
+                    replies_to_other=replies_to_other,
                 ):
                     return False
                 decision = AutoScanDecision("banter", confidence=80, reason="casual chat in a banter channel")

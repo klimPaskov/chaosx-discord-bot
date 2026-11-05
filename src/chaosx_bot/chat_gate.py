@@ -105,14 +105,24 @@ def addresses_bot(
     replies_to_bot: bool,
     name_addressed: bool,
     in_chain: bool = False,
+    banter_channel: bool = False,
+    mentions_other: bool = False,
+    replies_to_other: bool = False,
 ) -> bool:
     """Whether a channel message is for the bot at all.
 
     A human answering another human ("<@1125…> hi") is not, and used to get a reply anyway because
     the banter-channel branch answered everything. ``in_chain`` covers a conversation the bot is
     already part of: its own answer is the parent, or the message directly follows its reply.
+
+    ``banter_channel`` inverts the default there: #bot-spam exists so people can talk to the bot
+    without addressing it (Hoops, 2026-11-05: "the bot should respond even when not referred to
+    there"). Ordinary chat counts as addressed; a line aimed at another member still does not,
+    because that is two humans talking and the repeat/budget gates are what keep it to one reply.
     """
     if mentioned or replies_to_bot or name_addressed or in_chain:
+        return True
+    if banter_channel and not mentions_other and not replies_to_other:
         return True
     return False
 
