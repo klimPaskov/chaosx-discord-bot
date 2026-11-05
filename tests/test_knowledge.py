@@ -246,3 +246,17 @@ def test_fts_query_builders_never_produce_column_filter_syntax():
     # Plain queries unchanged in shape (quoted terms, no hyphens needed).
     assert _fts_and_query("zombie outbreak") == '"zombie" AND "outbreak"'
     assert _fts_query("zombie outbreak") == '"zombie" OR "outbreak"'
+
+
+def test_frozen_knowledge_can_cache_the_commit_sha_and_paths(tmp_path, monkeypatch):
+    """A frozen dataclass still needs its caches: assigning them raised inside /ask."""
+    db = tmp_path / "k.db"
+    monkeypatch.setattr("chaosx_bot.knowledge.connect", lambda path: sqlite3.connect(str(path)))
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO index_meta (key, value) VALUES ('commit_sha', 'abc123')")
+    conn.commit()
+    conn.close()
+    knowledge = Knowledge(tmp_path, db)
+    assert knowledge.commit_sha() == "abc123"
+    assert knowledge.commit_sha() == "abc123"  # cached second read

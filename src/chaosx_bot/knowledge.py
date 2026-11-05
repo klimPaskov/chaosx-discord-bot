@@ -762,7 +762,10 @@ class Knowledge:
         finally:
             conn.close()
         value = str(row[0]) if row else ""
-        self._commit_sha_cache = value
+        # Knowledge is a frozen dataclass (its config must not drift mid-run), so a cache goes in
+        # through object.__setattr__. Assigning the field normally raised FrozenInstanceError inside
+        # /ask, which surfaced to members as "the command failed".
+        object.__setattr__(self, "_commit_sha_cache", value)
         return value
 
     def known_paths(self, *, ttl_seconds: float = 600.0) -> set[str]:
@@ -779,7 +782,7 @@ class Knowledge:
             paths = {row[0] for row in conn.execute("SELECT path FROM source_docs")}
         finally:
             conn.close()
-        self._known_paths_cache = (now, paths)
+        object.__setattr__(self, "_known_paths_cache", (now, paths))
         return paths
 
     def public_ask_rows(self, query: str, limit: int = 8) -> list[tuple]:
