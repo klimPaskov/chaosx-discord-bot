@@ -129,6 +129,14 @@ class EmojiPolicy:
     def recent(self, channel_id: int) -> list[str]:
         return list(self._recent[int(channel_id)])
 
+    def seed(self, channel_id: int, text: str) -> None:
+        """Remember a message the bot already sent, e.g. replayed from the archive at startup.
+
+        Without seeding, a restart wipes the window and the first replies can reuse the icon the
+        channel just saw — the exact "forced" feel this policy removes.
+        """
+        self._remember(int(channel_id or 0), text or "")
+
     def finalize(self, text: str, *, channel_id: int | None = None, casual: bool = False) -> str:
         """Return the text with the icon rules applied, and remember what was actually sent."""
         channel = int(channel_id or 0)

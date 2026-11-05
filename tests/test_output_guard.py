@@ -103,3 +103,11 @@ def test_canned_suppressor_allows_one_line_per_hour():
     assert not suppressor.allow(5, now=NOW + timedelta(minutes=5))
     assert suppressor.allow(5, now=NOW + timedelta(hours=2))
     assert suppressor.allow(6, now=NOW + timedelta(minutes=5))
+
+
+def test_startup_seeding_keeps_the_last_icon_off_the_next_reply():
+    """A restart must not let the first reply repeat the icon the channel just saw."""
+    policy = EmojiPolicy()
+    policy.seed(42, "GG indeed <:factory_gg:123456789012345678>")
+    out = policy.finalize("Nice one <:factory_gg:123456789012345678>", channel_id=42, casual=True)
+    assert "<:factory_gg:" not in out

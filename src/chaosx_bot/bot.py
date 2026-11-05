@@ -3050,7 +3050,53 @@ class ChaosXBot(discord.Client):
             self._bot_spam_banter_task = asyncio.create_task(
                 self._bot_spam_banter_worker(90), name="chaosx-bot-spam-banter"
             )
+        if getattr(self, "_emoji_seed_task", None) is None or self._emoji_seed_task.done():
+            self._emoji_seed_task = asyncio.create_task(
+                self._seed_emoji_policy(), name="chaosx-emoji-seed"
+            )
         print(f"ChaosX logged in as {self.user} owner_id={self.settings.owner_id}")
+
+    async def _seed_emoji_policy(self) -> None:
+        """Replay the bot's last icons per banter channel into the emoji policy.
+
+        The window lives in memory, so a restart would otherwise let the first replies repeat the
+        icon the channel just saw (Hoops, 2026-11-05: "it feels forced").
+        """
+        channels = [int(c) for c in (getattr(self.settings, "banter_channel_ids", None) or [])]
+        if not channels or self.user is None:
+            return
+        db_path = str(self.settings.db_path)
+        limit = self.emoji_policy.recent_window
+
+        def read(channel_id: int) -> list[str]:
+            try:
+                conn = sqlite3.connect(db_path)
+                try:
+                    rows = conn.execute(
+                        "SELECT content FROM message_archive WHERE channel_id = ? AND author_id = ? "
+                        "ORDER BY id DESC LIMIT ?",
+                        (channel_id, self.user.id, limit),
+                    ).fetchall()
+                finally:
+                    conn.close()
+            except Exception as exc:
+                print(f"[emoji] seed failed for {channel_id}: {type(exc).__name__}", flush=True)
+                return []
+            return [str(row[0] or "") for row in rows]
+
+        for channel_id in channels:
+            try:
+                seeded = await asyncio.to_thread(read, channel_id)
+            except Exception:
+                continue
+            for content in reversed(seeded):
+                self.emoji_policy.seed(channel_id, content)
+            if seeded:
+                print(
+                    f"[emoji] seeded {len(seeded)} recent message(s) for channel {channel_id}: "
+                    f"{', '.join(self.emoji_policy.recent(channel_id)) or 'no icons'}",
+                    flush=True,
+                )
 
     async def _warm_mcp_session(self) -> None:
         try:
