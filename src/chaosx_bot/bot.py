@@ -3062,7 +3062,8 @@ class ChaosXBot(discord.Client):
         The window lives in memory, so a restart would otherwise let the first replies repeat the
         icon the channel just saw (Hoops, 2026-11-05: "it feels forced").
         """
-        channels = [int(c) for c in (getattr(self.settings, "banter_channel_ids", None) or [])]
+        # banter_channel_ids is a comma-separated Settings string, not a list.
+        channels = sorted(parse_channel_id_set(getattr(self.settings, "banter_channel_ids", "") or ""))
         if not channels or self.user is None:
             return
         db_path = str(self.settings.db_path)
