@@ -908,6 +908,54 @@ async def test_handle_auto_scan_bot_topic_banter_is_rate_limited(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_scan_banter_asks_the_gates_before_calling_the_model(monkeypatch):
+    """A repeat in a banter channel must cost no model call at all."""
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
+    bot = _FakeBot(settings)
+    calls: list[str] = []
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        return AutoScanDecision("banter", confidence=100, reason="bot-topic conversation", question="lol", source="bot_topic")
+
+    def counting_model(*args: Any, **kwargs: Any) -> tuple[Any, str, None]:
+        calls.append("model")
+        return _fake_model_output(*args, **kwargs)
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    monkeypatch.setattr("chaosx_bot.bot.generate_auto_scan_model_response", counting_model)
+
+    first = _FakeMessage("lol")
+    second = _FakeMessage("LOL")
+    assert await handle_auto_scan(cast(Any, bot), cast(Any, first)) is True
+    assert await handle_auto_scan(cast(Any, bot), cast(Any, second)) is False
+    assert len(calls) == 1, "the repeat was answered again"
+    assert second.replies == []
+    assert "repeat" in bot.store.events[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_auto_scan_banter_respects_the_reply_budget(monkeypatch):
+    """Three fresh lines from one member in a row: the budget lets one through, not three."""
+    settings = Settings(discord_token="dummy", automation_reminder_channel_id=None, chat_reply_one_in=3)
+    bot = _FakeBot(settings)
+    calls: list[str] = []
+
+    def fake_classify(*args: Any, **kwargs: Any) -> AutoScanDecision:
+        return AutoScanDecision("banter", confidence=100, reason="bot-topic conversation", question="x", source="bot_topic")
+
+    def counting_model(*args: Any, **kwargs: Any) -> tuple[Any, str, None]:
+        calls.append("model")
+        return _fake_model_output(*args, **kwargs)
+
+    monkeypatch.setattr("chaosx_bot.bot.classify_message", fake_classify)
+    monkeypatch.setattr("chaosx_bot.bot.generate_auto_scan_model_response", counting_model)
+
+    for text in ("nice", "cool", "wild"):
+        await handle_auto_scan(cast(Any, bot), cast(Any, _FakeMessage(text)))
+    assert len(calls) == 1, f"budget let {len(calls)} replies through"
+
+
+@pytest.mark.asyncio
 async def test_handle_auto_scan_soft_warning_uses_model_output(monkeypatch):
     settings = Settings(discord_token="dummy", automation_reminder_channel_id=None)
     bot = _FakeBot(settings)

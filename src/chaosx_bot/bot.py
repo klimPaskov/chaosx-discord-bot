@@ -1529,6 +1529,21 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         text=content,
         now=getattr(message, "created_at", None),
     ):
+        # Visible in auto_scan_events, but at most once per two minutes per member: a flood of 169
+        # copies must not write 169 rows of the same reason.
+        key = ("repeat", channel_id, message.author.id)
+        now = getattr(message, "created_at", None) or discord.utils.utcnow()
+        log = _gate_log_for(bot)
+        last = log.get(key)
+        if last is None or (now - last).total_seconds() >= 120:
+            log[key] = now
+            await record_auto_scan_event(
+                bot,
+                AutoScanDecision("shadow", confidence=decision.confidence, reason="repeat of a message already answered"),
+                message,
+                bot_message_id=None,
+                response="",
+            )
         return False
 
     if decision.action == "answer":
@@ -1622,6 +1637,23 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
         if bot.settings.auto_scan_shadow_mode:
             await record_auto_scan_event(bot, AutoScanDecision("shadow", confidence=decision.confidence, reason=f"shadow bot-topic banter: {decision.reason}"), message, bot_message_id=None, response="")
             return True
+        # Same gates as a reactive casual reply, and before the model call: an unanswered line in a
+        # banter channel costs nothing, while a wasted call still bills tokens and can land late.
+        allowed, gate_reason = bot.chat.casual_allowed(
+            channel_id=channel_id or 0,
+            author_id=message.author.id,
+            text=message.content or "",
+            now=getattr(message, "created_at", None),
+        )
+        if not allowed:
+            await record_auto_scan_event(
+                bot,
+                AutoScanDecision("shadow", confidence=decision.confidence, reason=f"banter gate: {gate_reason}"),
+                message,
+                bot_message_id=None,
+                response="",
+            )
+            return True
         result, model_output, evidence = await generate_auto_scan_model_response(bot, decision, message)
         if not result.ok or not model_output.strip():
             reason = auto_scan_model_failure_reason(decision, result, model_output)
@@ -1684,7 +1716,13 @@ async def handle_auto_scan(bot: ChaosXBot, message: discord.Message) -> bool:
             await send_auto_scan_notice(bot, failed, message, bot_message_id=None)
             await bot.store.audit(actor_id=message.author.id, guild_id=guild_id, channel_id=channel_id, command="auto scan soft warning model failure", summary=reason)
             return False
-        sent = await reply_with_chunks(message, model_output, evidence=evidence)
+        # A warning is a factual message: no signature icon, no leaked source tag, and no
+        # document table attached to a rule reminder (it reads as a random image).
+        sent = await reply_with_chunks(
+            message,
+            finalize_outbound(bot, model_output, channel_id=channel_id, casual=False),
+            evidence=None,
+        )
         await record_auto_scan_event(
             bot,
             decision,
@@ -7550,6 +7588,15 @@ async def try_server_ops_message(bot: ChaosXBot, message: discord.Message, reque
     return True
 
 
+def _gate_log_for(bot: "ChaosXBot") -> dict[tuple, datetime]:
+    """Per-process record of what was logged when, so a flood logs once instead of 169 times."""
+    log = bot.__dict__.get("_gate_log")
+    if log is None:
+        log = {}
+        setattr(bot, "_gate_log", log)
+    return log
+
+
 def _in_active_chain(bot: "ChaosXBot", message: discord.Message, channel_id: int | None, *, window_seconds: float = 300.0) -> bool:
     """The bot is mid-conversation with this member in this channel (its last reply was to them, recently)."""
     if not channel_id:
@@ -7579,10 +7626,11 @@ async def _send_casual_reply(
     )
     if not allowed:
         log_key = (channel_id, author_id, reason)
-        last_logged = bot._gate_log.get(log_key)
+        log = _gate_log_for(bot)
+        last_logged = log.get(log_key)
         now = message.created_at or discord.utils.utcnow()
         if last_logged is None or (now - last_logged).total_seconds() >= 120:
-            bot._gate_log[log_key] = now
+            log[log_key] = now
             try:
                 await bot.store.audit(
                     actor_id=author_id,
