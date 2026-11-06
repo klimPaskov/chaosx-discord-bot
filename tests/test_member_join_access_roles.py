@@ -70,6 +70,7 @@ def _bot(*, enabled=True, roles_enabled=True):
     )
     bot = SimpleNamespace(settings=settings, store=FakeStore())
     bot._send_welcome = lambda member: _coro(None)
+    bot._grant_default_access_roles = lambda member: botmod.ChaosXBot._grant_default_access_roles(bot, member)
     return bot
 
 
