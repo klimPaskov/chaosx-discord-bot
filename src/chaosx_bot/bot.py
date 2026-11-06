@@ -635,6 +635,23 @@ def access_reaction_emoji(key: str, settings: Settings) -> discord.PartialEmoji 
     return settings.access_reaction_mod_emoji
 
 
+def default_access_role_ids(settings: Settings) -> list[int]:
+    """The access roles every member gets automatically (Hoops 2026-11-06).
+
+    Community access and mod-development access are no longer a choice: the onboarding question and the
+    reaction-role panel that awarded them are gone, so both roles are granted on join instead.
+    """
+
+    if not getattr(settings, "default_access_roles_enabled", True):
+        return []
+    ids: list[int] = []
+    for attr in ("access_reaction_member_role_id", "access_reaction_modder_role_id"):
+        value = getattr(settings, attr, None)
+        if value:
+            ids.append(int(value))
+    return ids
+
+
 def _guild_channel(interaction: discord.Interaction) -> tuple[str | None, str | None]:
     guild_name = interaction.guild.name if interaction.guild else None
     channel = interaction.channel
@@ -4286,6 +4303,10 @@ class ChaosXBot(discord.Client):
             await self._send_welcome(member)
         except Exception as exc:  # a failed greeting must never break the join handling
             tier_logger.warning("welcome failed for %s: %s", member.id, exc)
+        try:
+            await self._grant_default_access_roles(member)
+        except Exception as exc:  # access is default now; a failure here must not skip the ladder step
+            tier_logger.warning("default access roles failed for %s: %s", member.id, exc)
         if not self.settings.tier_roles_enabled:
             return
         try:
@@ -4298,6 +4319,33 @@ class ChaosXBot(discord.Client):
             tier_logger.info("new member %s -> %s", member.display_name, TIERS[0][0])
         except (discord.Forbidden, discord.HTTPException) as exc:
             tier_logger.warning("new member tier role failed for %s: %s", member.id, exc)
+
+    async def _grant_default_access_roles(self, member: discord.Member) -> None:
+        """Both access roles are default (Hoops 2026-11-06): nobody chooses community-only vs modder any more.
+
+        The onboarding question that used to award these is gone, and the reaction-role panel with it, so the
+        join itself grants them. Existing members who picked one option are covered by the one-time backfill.
+        """
+        role_ids = default_access_role_ids(self.settings)
+        if not role_ids or getattr(member, "bot", False):
+            return
+        guild = getattr(member, "guild", None)
+        get_role = getattr(guild, "get_role", None)
+        if get_role is None:  # no role cache available, nothing safe to grant
+            return
+        current = list(getattr(member, "roles", []) or [])
+        missing = []
+        for role_id in role_ids:
+            role = get_role(role_id)
+            if role is not None and role not in current:
+                missing.append(role)
+        if not missing:
+            return
+        await member.add_roles(*missing, reason="ChaosX: default community + modding access")
+        print(
+            f"ChaosX default access roles -> {member.id}: {', '.join(role.name for role in missing)}",
+            flush=True,
+        )
 
     async def _welcome_personal(self, member: discord.Member) -> None:
         """Greet them for what they actually answered in onboarding, and remember it.

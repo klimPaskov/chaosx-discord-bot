@@ -394,6 +394,10 @@ class Settings(BaseSettings):
     access_reaction_mod_emoji: str = Field(default="💻", description="Unicode computer emoji for mod-development access")
     access_reaction_member_role_id: Optional[int] = Field(default=1526507892310675539, description="Role granted for Chaos Redux community access")
     access_reaction_modder_role_id: Optional[int] = Field(default=1526507893837529138, description="Role granted for mod-development access")
+    default_access_roles_enabled: bool = Field(
+        default=True,
+        description="Grant the community (Member) and mod-development (Modder) roles to every new member automatically",
+    )
 
     @model_validator(mode="after")
     def default_allowed_guild_to_command_guild(self):

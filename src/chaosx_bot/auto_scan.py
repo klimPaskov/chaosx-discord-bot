@@ -909,7 +909,9 @@ def _community_server_answer(question: str, *, settings: Settings) -> AutoScanDe
 
 def _server_reference_context(settings: Settings) -> str:
     event_ideas_channel = f"<#{settings.community_event_ideas_channel_id}>" if settings.community_event_ideas_channel_id else "the event-ideas forum"
-    if settings.access_reaction_channel_id and settings.access_reaction_message_id:
+    if getattr(settings, "default_access_roles_enabled", True):
+        access = "Access is default: every member gets the community and modding roles on join, so every channel is visible without choosing anything."
+    elif settings.access_reaction_channel_id and settings.access_reaction_message_id:
         access = f"Access uses the reaction-role message in <#{settings.access_reaction_channel_id}>. The community access reaction is the Chaos Redux logo; the mod-development access reaction is `{settings.access_reaction_mod_emoji}`."
     else:
         access = "Access uses the server's reaction-role message for Chaos Redux community/mod-development access."
