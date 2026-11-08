@@ -64,7 +64,7 @@ uv run chaosx-bot
 
 Event-chain rendering also requires Graphviz (`dot`; on Debian/Ubuntu: `sudo apt install graphviz`).
 
-Focus-tree, event-chain, and scripted-GUI rendering also need the HOI4 Agent Tools MCP server configured with the parent directory that contains the Chaos Redux mod. For the current 2.0 development source:
+Focus-tree, event-chain, technology, interface and scripted-GUI rendering, and `/docs`, all run through the HOI4 Agent Tools MCP server (4.x, Node.js 22.19 or newer, or 24). The default launcher is `npx -y hoi4-agent-tools@4.12.0`. The mod is one workspace: the bot passes its name (`CHAOSX_FOCUS_MCP_WORKSPACE_NAME`, default `chaos_redux`) to every tool call, and 4.x resolves it by itself (there is no workspace listing tool any more). For a local checkout of the server instead:
 
 ```bash
 cd /path/to/hoi4-agent-tools
@@ -74,7 +74,11 @@ node dist/bin/setup.js --init --mod-root "/path/to/Hearts of Iron IV/mod"
 node dist/bin/setup.js --diagnose
 ```
 
-Point `CHAOSX_FOCUS_MCP_COMMAND` at `node` and `CHAOSX_FOCUS_MCP_ARGS` at that checkout's `dist/bin/stdio.js`. The npm registry package can be used as a fallback, but may lag the current repository release.
+Point `CHAOSX_FOCUS_MCP_COMMAND` at `node` and `CHAOSX_FOCUS_MCP_ARGS` at that checkout's `dist/bin/stdio.js`. Without a config file at `CHAOSX_FOCUS_MCP_CONFIG_PATH` the bot writes a minimal one itself (the mod checkout is the only workspace). A config file written for 1.x is not valid for 4.x: regenerate it with `hoi4-agent-tools-setup --init`.
+
+The private ChaosX tools (`chaosx.visual_revision`, `chaosx.focus_country_assets`) are not in the public package. They live in the Chaos Redux vault as `hoi4-agent-tools-plugin/chaosx-plugin.mjs` and load through the `plugins` key of the server config, which the bot adds to the isolated config it writes for every session (`CHAOSX_FOCUS_MCP_PLUGINS`, default: the file inside `OBSIDIAN_VAULT_PATH`). The old `HOI4_AGENT_TOOLS_CHAOSX` environment flag is gone.
+
+`/docs query:<text>` searches the game docs and the Paradox wiki through `hoi4.reference_search` and `hoi4.reference_read` (never the host's script-doc dump), and `/ui-preview query:<window>` renders any `interface/*.gui` window with `hoi4.gui_render`.
 
 ChaosX launches that MCP server over stdio only when a visual is needed. Each read-only render session uses disposable MCP state/artifact storage, preventing bot previews from filling the server's persistent artifact-retention budget. Event-chain PNGs collapse option/helper nodes into compact event-to-event flows. Scripted-GUI previews force the matched window visible, crop away empty canvas, and suppress renders with no useful visible interface. The command, config path, workspace name/ID, timeout, graph limits, event-chain bounds, Graphviz command, scripted-GUI preview size, render scale, and Discord attachment cap are configurable in `.env.example`. Scripted-GUI output is an offline MCP approximation, not an in-game screenshot.
 

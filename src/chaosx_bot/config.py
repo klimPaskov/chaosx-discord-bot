@@ -165,6 +165,7 @@ class Settings(BaseSettings):
                 "access_reaction_modder_role_id",
                 "auto_scan_notify_channel_id",
                 "focus_tree_repo",
+                "focus_mcp_state_dir",
             ):
                 if data.get(key) == "":
                     data[key] = None
@@ -174,10 +175,24 @@ class Settings(BaseSettings):
     focus_tree_repo: Path | None = Field(default=None, description="Optional live mod checkout used to discover focus trees; defaults to chaos_redux_repo")
     focus_tree_graphs_enabled: bool = Field(default=True, description="Render public focus-tree graphs through HOI4 Agent Tools MCP")
     focus_mcp_command: str = Field(default="npx", description="Executable used to launch the HOI4 Agent Tools MCP server")
-    focus_mcp_args: str = Field(default="-y hoi4-agent-tools@1.2.0", description="Shell-style arguments for the HOI4 Agent Tools MCP command")
+    focus_mcp_args: str = Field(default="-y hoi4-agent-tools@4.12.0", description="Shell-style arguments for the HOI4 Agent Tools MCP command")
     focus_mcp_config_path: Path = Field(default=Path("/home/klim/.config/hoi4-agent-tools/config.json"))
     focus_mcp_workspace_id: str = Field(default="", description="Optional exact HOI4 Agent Tools workspace ID")
-    focus_mcp_workspace_name: str = Field(default="chaos_redux", description="Workspace name discovered through hoi4.mods when no exact ID is configured")
+    focus_mcp_workspace_name: str = Field(default="chaos_redux", description="Workspace ID or short name passed to every tool call when no exact ID is configured (4.x resolves a mod's folder or workspace name itself)")
+    focus_mcp_state_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Optional persistent folder for the MCP server's analysis cache. Unset keeps every bot start on a "
+            "disposable cache, which makes the first event-chain render after a restart several times slower."
+        ),
+    )
+    focus_mcp_plugins: str = Field(
+        default="",
+        description=(
+            "Comma-separated absolute paths of HOI4 Agent Tools plugin modules for the isolated config. "
+            "Empty means the ChaosX plugin in the Chaos Redux vault (OBSIDIAN_VAULT_PATH/hoi4-agent-tools-plugin/chaosx-plugin.mjs)."
+        ),
+    )
     focus_mcp_timeout_seconds: int = Field(default=300, ge=30, le=900)
     focus_tree_max_graphs: int = Field(default=6, ge=1, le=20)
     focus_tree_review_scale: float = Field(default=1.0, ge=0.25, le=1.0)
@@ -188,6 +203,8 @@ class Settings(BaseSettings):
     event_chain_graphviz_command: str = Field(default="dot", min_length=1, max_length=256)
     event_chain_graphviz_dpi: int = Field(default=192, ge=96, le=300)
     scripted_gui_previews_enabled: bool = Field(default=True, description="Attach MCP-rendered offline scripted-GUI previews")
+    reference_lookup_enabled: bool = Field(default=True, description="Answer /docs from the HOI4 Agent Tools documentation search (game docs and Paradox wiki)")
+    ui_preview_enabled: bool = Field(default=True, description="Answer /ui-preview with an MCP-rendered preview of any interface window")
     scripted_gui_max_previews: int = Field(default=2, ge=1, le=6)
     scripted_gui_preview_width: int = Field(default=1920, ge=320, le=3840)
     scripted_gui_preview_height: int = Field(default=1080, ge=200, le=2160)

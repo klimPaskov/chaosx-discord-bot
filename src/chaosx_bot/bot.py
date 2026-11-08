@@ -129,6 +129,7 @@ from .event_visuals import (
     EventVisualError,
     EventVisualMcpClient,
     ScriptedGuiCatalog,
+    UiWindowCatalog,
 )
 from .event_note_ops import (
     EventNoteError,
@@ -145,6 +146,12 @@ from .focus_trees import (
     FocusTreeMcpClient,
     FocusTreeRecord,
     SharedMcpSession,
+)
+from .reference_lookup import (
+    ReferenceLookupError,
+    ReferenceMcpClient,
+    clean_query as clean_reference_query,
+    format_reference_answer,
 )
 from .guild_channels import GuildChannels
 from .guild_members import GuildMembers, colliding_display_ids, user_reference_name
@@ -2088,6 +2095,9 @@ Use ChaosX for Chaos Redux event info, scenario info, issue reports, testing not
 - `/focus-tree query:<event, country tag, country, or tree name>` — find and view implemented Chaos Redux focus-tree graphs.
 - `/event-chain query:<event id, name, or internal event id>` — view an MCP-rendered event-chain diagram.
 - `/scripted-gui query:<event, window, or scripted-GUI name>` — view offline MCP previews of Chaos Redux scripted GUIs.
+- `/ui-preview query:<window name or file>` — view an offline MCP preview of any Chaos Redux interface window.
+- `/tech-tree view:<view> [target]` — view an MCP-rendered Chaos Redux technology tree, folder, doctrine or single technology.
+- `/docs query:<script token or a few words>` — search the HOI4 modding documentation (game docs and the Paradox wiki) and quote the best section.
 - `/scenario scenario:<SCN id or name>` — triggerable/manual scenario entry.
 - `/cluster cluster:<id or name>` — event cluster summary with member event names.
 - `/status` — project catalog totals and event breakdowns.
@@ -2231,7 +2241,9 @@ class ChaosXBot(discord.Client):
         self.focus_tree_mcp = FocusTreeMcpClient(settings, self.mcp_session)
         self.event_chain_catalog = EventChainCatalog(visual_repo)
         self.scripted_gui_catalog = ScriptedGuiCatalog(visual_repo)
+        self.ui_window_catalog = UiWindowCatalog(visual_repo)
         self.event_visual_mcp = EventVisualMcpClient(settings, self.mcp_session)
+        self.reference_mcp = ReferenceMcpClient(settings, self.mcp_session)
         self.webhook_server = GitHubWebhookServer(
             store=self.store,
             secret=settings.github_webhook_secret,
@@ -9574,6 +9586,66 @@ async def send_tech_lookup(
     )
 
 
+async def send_docs_lookup(bot: ChaosXBot, interaction: discord.Interaction, query: str) -> None:
+    """Search the HOI4 game docs and Paradox wiki through the mod tools and quote the best section."""
+    if not await public_gate(interaction, bot.settings):
+        return
+    limit = bot.settings.public_scripted_limit_per_hour
+    rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
+    if not rate.allowed:
+        minutes = max(1, rate.retry_after_seconds // 60)
+        await interaction.response.send_message(
+            f"Rate limit hit for ChaosX scripted commands. Try again in about {minutes} minute(s).",
+            ephemeral=True,
+        )
+        return
+    cleaned = clean_reference_query(query)
+    if not bot.settings.reference_lookup_enabled:
+        await interaction.response.send_message("Documentation search is turned off right now.", ephemeral=True)
+        return
+    if not cleaned:
+        await interaction.response.send_message(
+            "Give me a script token or a few words to look up, for example `ai_will_do` or `scripted gui visible`.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=False, thinking=True)
+    await bot.store.audit(
+        actor_id=interaction.user.id,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        command="chaosx docs",
+        summary=cleaned,
+    )
+    try:
+        hits = await bot.reference_mcp.search(cleaned, limit=4)
+        section = ""
+        if hits:
+            try:
+                section = await bot.reference_mcp.read(hits[0])
+            except ReferenceLookupError:
+                section = ""  # the search excerpt still answers
+    except ReferenceLookupError as exc:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="docs lookup error",
+            summary=type(exc.__cause__ or exc).__name__,
+        )
+        await interaction.followup.send(
+            "Documentation search is unavailable right now.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    await interaction.followup.send(
+        format_reference_answer(cleaned, hits, section),
+        ephemeral=False,
+        allowed_mentions=safe_allowed_mentions(),
+    )
+
+
 async def send_scripted_gui_lookup(bot: ChaosXBot, interaction: discord.Interaction, query: str) -> None:
     if not await public_gate(interaction, bot.settings):
         return
@@ -9640,6 +9712,76 @@ async def send_scripted_gui_lookup(bot: ChaosXBot, interaction: discord.Interact
         )
     if failed:
         await interaction.followup.send(f"`{failed}` scripted-GUI preview(s) could not be rendered.", ephemeral=False, allowed_mentions=safe_allowed_mentions())
+
+
+async def send_ui_preview_lookup(bot: ChaosXBot, interaction: discord.Interaction, query: str) -> None:
+    """Preview any interface window of the mod, not only the ones a scripted GUI drives."""
+    if not await public_gate(interaction, bot.settings):
+        return
+    limit = bot.settings.public_scripted_limit_per_hour
+    rate = bot.rate_limiter.check(bucket="scripted", user_id=interaction.user.id, limit=limit, window_seconds=3600)
+    if not rate.allowed:
+        minutes = max(1, rate.retry_after_seconds // 60)
+        await interaction.response.send_message(
+            f"Rate limit hit for ChaosX scripted commands. Try again in about {minutes} minute(s).",
+            ephemeral=True,
+        )
+        return
+    if not bot.settings.ui_preview_enabled:
+        await interaction.response.send_message("Interface previews are turned off right now.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=False, thinking=True)
+    records = bot.ui_window_catalog.search(query)
+    await bot.store.audit(
+        actor_id=interaction.user.id,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        command="chaosx ui-preview",
+        summary=query,
+    )
+    safe_query = query.replace("`", "'").replace("\n", " ")[:120]
+    if not records:
+        await interaction.followup.send(
+            f"No interface window matched `{safe_query}`. Use a window name or the name of its `.gui` file.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+        return
+    selected = records[: bot.settings.scripted_gui_max_previews]
+    try:
+        previews, failed = await bot.event_visual_mcp.render_ui_windows(selected)
+    except EventVisualError as exc:
+        await bot.store.audit(
+            actor_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            command="ui preview render error",
+            summary=type(exc.__cause__ or exc).__name__,
+        )
+        await interaction.followup.send("Interface previews are unavailable right now.", ephemeral=False, allowed_mentions=safe_allowed_mentions())
+        return
+    if not previews and not failed:
+        await interaction.followup.send(
+            "The matched window has no useful visible offline preview. It likely depends on in-game context or a hardcoded parent window.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    for preview in previews:
+        await interaction.followup.send(
+            f"### Interface window — {preview.record.label}\n`{preview.record.window_name}` · offline preview, not an in-game screenshot",
+            file=discord.File(io.BytesIO(preview.png), filename=preview.record.filename),
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    hidden = max(0, len(records) - len(selected))
+    if hidden:
+        await interaction.followup.send(
+            f"Showing `{len(selected)}` of `{len(records)}` matches. Use the exact window name to narrow it down.",
+            ephemeral=False,
+            allowed_mentions=safe_allowed_mentions(),
+        )
+    if failed:
+        await interaction.followup.send(f"`{failed}` interface preview(s) could not be rendered.", ephemeral=False, allowed_mentions=safe_allowed_mentions())
 
 
 SECRETISH_PATTERN = re.compile(r"(?i)(token|password|secret|api[_-]?key|authorization|cookie)\s*[:=]\s*\S+")
@@ -11567,6 +11709,16 @@ def register_commands(bot: ChaosXBot) -> None:
         target: str = "",
     ) -> None:
         await send_tech_lookup(bot, interaction, view.value, target)
+
+    @bot.tree.command(name="ui-preview", description="View an offline MCP preview of any Chaos Redux interface window.")
+    @app_commands.describe(query="A window name, or the name of its .gui file")
+    async def chaosx_ui_preview(interaction: discord.Interaction, query: str) -> None:
+        await send_ui_preview_lookup(bot, interaction, query)
+
+    @bot.tree.command(name="docs", description="Search the HOI4 modding documentation (game docs and the Paradox wiki).")
+    @app_commands.describe(query="A script token or a few words, for example ai_will_do or scripted gui visible")
+    async def chaosx_docs(interaction: discord.Interaction, query: str) -> None:
+        await send_docs_lookup(bot, interaction, query)
 
     @bot.tree.command(name="scripted-gui", description="View an offline MCP preview of a Chaos Redux scripted GUI.")
     async def chaosx_scripted_gui(interaction: discord.Interaction, query: str) -> None:

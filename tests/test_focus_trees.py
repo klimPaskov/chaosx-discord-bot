@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import re
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from chaosx_bot.focus_trees import (
     _scale_country_asset_for_discord,
     _validate_mcp_node_runtime,
     isolated_mcp_server_parameters,
+    mcp_plugin_paths,
     read_resource_bytes,
 )
 
@@ -172,7 +174,7 @@ def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
         discord_token="dummy",
         chaos_redux_repo=tmp_path,
         focus_tree_repo=tmp_path,
-        focus_mcp_args=f"server --config {config_path}",
+        focus_mcp_args=f"server --config {config_path.as_posix()}",
         focus_mcp_config_path=config_path,
     )
 
@@ -185,7 +187,7 @@ def test_mcp_render_config_uses_disposable_storage(tmp_path: Path) -> None:
         assert Path(isolated["workspaceStorageRoot"]).is_relative_to(temporary_root)
         assert parameters.cwd == str(tmp_path)
         assert parameters.env is not None
-        assert parameters.env["HOI4_AGENT_TOOLS_CHAOSX"] == "1"
+        assert "HOI4_AGENT_TOOLS_CHAOSX" not in parameters.env
 
     assert not temporary_root.exists()
 
@@ -197,7 +199,7 @@ def test_local_mcp_rejects_obsolete_node_runtime(monkeypatch: pytest.MonkeyPatch
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="v18.19.1\n"),
     )
 
-    with pytest.raises(FocusTreeError, match="Node.js 22 or newer"):
+    with pytest.raises(FocusTreeError, match=r"Node.js 22\.19 or newer"):
         _validate_mcp_node_runtime("node")
 
     _validate_mcp_node_runtime.cache_clear()
@@ -387,12 +389,13 @@ async def test_focus_png_uses_dedicated_raster_tool() -> None:
     assert rendered == png
     assert session.calls == [
         (
-            "hoi4.focus_raster",
+            "hoi4.focus_render",
             {
                 "workspaceId": "current",
                 "relativePath": "common/national_focus/test.txt",
                 "treeId": "test_tree",
                 "reviewScale": 0.5,
+                "inline": False,
             },
         )
     ]
@@ -595,40 +598,116 @@ async def test_focus_render_refreshes_country_assets_while_reusing_focus_png() -
 
 
 @pytest.mark.asyncio
-async def test_mcp_workspace_is_discovered_by_exact_name() -> None:
-    result = _DumpResult(
-        {
-            "isError": False,
-            "structuredContent": {
-                "status": "ok",
-                "data": {
-                    "mods": [
-                        {"id": "mod_other", "name": "other"},
-                        {"id": "mod_chaos", "name": "chaos_redux"},
-                    ]
-                },
-            },
-        }
-    )
-    session = SimpleNamespace(call_tool=lambda *_args, **_kwargs: None)
+async def test_mcp_workspace_is_the_configured_short_name_without_any_discovery_call() -> None:
+    """4.x removed hoi4.mods: the server resolves a workspace ID or short name itself."""
 
-    async def call_tool(*_args, **_kwargs):
-        return result
+    calls: list[str] = []
+
+    async def call_tool(name, *_args, **_kwargs):
+        calls.append(name)
+        raise AssertionError("workspace resolution must not call the server")
 
     async def list_tools():
-        return SimpleNamespace(tools=[SimpleNamespace(name="hoi4.mods")])
+        calls.append("list_tools")
+        raise AssertionError("workspace resolution must not list tools")
 
-    session.call_tool = call_tool
-    session.list_tools = list_tools
+    session = SimpleNamespace(call_tool=call_tool, list_tools=list_tools)
     client = FocusTreeMcpClient(Settings(discord_token="dummy"))
-    assert await client._workspace_id(cast(Any, session)) == "mod_chaos"
+    assert await client._workspace_id(cast(Any, session)) == "chaos_redux"
+    assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_mcp_workspace_uses_current_for_inventory_free_server() -> None:
-    async def list_tools():
-        return SimpleNamespace(tools=[SimpleNamespace(name="hoi4.gui_render")])
+async def test_mcp_workspace_prefers_the_exact_configured_id() -> None:
+    client = FocusTreeMcpClient(
+        Settings(discord_token="dummy", focus_mcp_workspace_id="mod_chaos_redux_0123456789ab")
+    )
+    assert (
+        await client._workspace_id(cast(Any, SimpleNamespace()))
+        == "mod_chaos_redux_0123456789ab"
+    )
 
-    session = SimpleNamespace(list_tools=list_tools)
-    client = FocusTreeMcpClient(Settings(discord_token="dummy"))
-    assert await client._workspace_id(cast(Any, session)) == "current"
+
+def test_mcp_launcher_pins_the_4x_release_and_drops_the_chaosx_flag() -> None:
+    settings = Settings(discord_token="dummy")
+    assert settings.focus_mcp_command == "npx"
+    assert re.fullmatch(r"-y hoi4-agent-tools@4\.\d+\.\d+", settings.focus_mcp_args)
+
+
+def test_mcp_plugins_default_to_the_vault_chaosx_plugin(tmp_path: Path) -> None:
+    plugin = tmp_path / "hoi4-agent-tools-plugin" / "chaosx-plugin.mjs"
+    plugin.parent.mkdir()
+    plugin.write_text("export default () => () => []\n", encoding="utf-8")
+    settings = Settings(discord_token="dummy", obsidian_vault_path=tmp_path)
+    assert mcp_plugin_paths(settings) == [str(plugin)]
+
+
+def test_mcp_plugins_skip_missing_and_relative_paths(tmp_path: Path) -> None:
+    present = tmp_path / "present.mjs"
+    present.write_text("export default () => () => []\n", encoding="utf-8")
+    settings = Settings(
+        discord_token="dummy",
+        obsidian_vault_path=tmp_path / "no-vault",
+        focus_mcp_plugins=f"{present}, {tmp_path / 'missing.mjs'}, relative/plugin.mjs",
+    )
+    assert mcp_plugin_paths(settings) == [str(present)]
+    assert mcp_plugin_paths(Settings(discord_token="dummy", obsidian_vault_path=tmp_path / "none")) == []
+
+
+def test_mcp_render_config_lists_plugins_and_keeps_the_machines_own(tmp_path: Path) -> None:
+    ours = tmp_path / "ours.mjs"
+    ours.write_text("export default () => () => []\n", encoding="utf-8")
+    theirs = tmp_path / "theirs.mjs"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"version": 1, "plugins": [str(theirs)], "serverStateRoot": "/old"}),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        discord_token="dummy",
+        chaos_redux_repo=tmp_path,
+        focus_mcp_args=f"server --config {config_path.as_posix()}",
+        focus_mcp_config_path=config_path,
+        focus_mcp_plugins=str(ours),
+    )
+    with isolated_mcp_server_parameters(settings) as parameters:
+        isolated = json.loads(
+            Path(parameters.args[parameters.args.index("--config") + 1]).read_text(encoding="utf-8")
+        )
+    assert isolated["plugins"] == [str(theirs), str(ours)]
+
+
+def test_mcp_render_config_is_synthesized_when_the_machine_has_none(tmp_path: Path) -> None:
+    mod = tmp_path / "chaos_redux"
+    mod.mkdir()
+    plugin = tmp_path / "chaosx-plugin.mjs"
+    plugin.write_text("export default () => () => []\n", encoding="utf-8")
+    settings = Settings(
+        discord_token="dummy",
+        chaos_redux_repo=mod,
+        focus_mcp_args="server",
+        focus_mcp_config_path=tmp_path / "absent.json",
+        focus_mcp_plugins=str(plugin),
+    )
+    with isolated_mcp_server_parameters(settings) as parameters:
+        isolated_path = Path(parameters.args[parameters.args.index("--config") + 1])
+        isolated = json.loads(isolated_path.read_text(encoding="utf-8"))
+        assert isolated["version"] == 1
+        assert isolated["workspaces"] == [
+            {"id": "chaos_redux", "name": "chaos_redux", "root": str(mod.resolve())}
+        ]
+        assert Path(isolated["serverStateRoot"]).is_relative_to(isolated_path.parent)
+        assert isolated["plugins"] == [str(plugin)]
+        assert "HOI4_AGENT_TOOLS_CHAOSX" not in (parameters.env or {})
+
+
+def test_new_lookup_commands_are_registered_and_listed_in_help() -> None:
+    from chaosx_bot.bot import community_help_text
+
+    bot = ChaosXBot(Settings(discord_token="dummy", command_guild_id=None, allowed_guild_id=None))
+    register_commands(bot)
+    names = {command.name for command in bot.tree.get_commands()}
+    assert {"docs", "ui-preview", "tech-tree"} <= names
+    help_text = community_help_text()
+    for command in ("/docs", "/ui-preview", "/tech-tree"):
+        assert command in help_text
