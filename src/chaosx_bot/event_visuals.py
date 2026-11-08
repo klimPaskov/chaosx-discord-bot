@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
+import logging
 import os
 import re
 import subprocess
+import time
 from xml.etree import ElementTree
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Mapping, Sequence
 
 import cairosvg
 from mcp import ClientSession
-from mcp.client.stdio import stdio_client
 from PIL import Image, ImageChops
 
 from .config import Settings
@@ -23,7 +24,8 @@ from .focus_trees import (
     SharedMcpSession,
     _RefreshableCatalog,
     _structured_content,
-    isolated_mcp_server_parameters,
+    mcp_session,
+    mcp_workspace_id,
     read_resource_bytes,
 )
 from .visual_cache import VisualArtifactCache, mcp_launcher_fingerprint
@@ -35,6 +37,11 @@ EVENT_ID_RE = re.compile(r"(?m)^\s*id\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_.:-]+))"
 ASSIGNMENT_RE = re.compile(r"([A-Za-z0-9_.:-]+)\s*=\s*\{")
 WINDOW_NAME_RE = re.compile(r"\bwindow_name\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_.:-]+))")
 CONTEXT_TYPE_RE = re.compile(r"\bcontext_type\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_.:-]+))")
+NAME_RE = re.compile(r"\bname\s*=\s*(?:\"([^\"]+)\"|([A-Za-z0-9_.:-]+))")
+INTERFACE_ROOT = Path("interface")
+UI_WINDOW_KINDS = frozenset({"containerWindowType", "windowType"})
+UI_PREVIEW_CACHE_HOURS = 6
+logger = logging.getLogger("chaosx.event_visuals")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -95,6 +102,32 @@ class ScriptedGuiRecord:
         return " ".join(
             (self.label, self.relative_path, self.gui_id, self.window_name, self.context_type)
         ).casefold()
+
+
+@dataclass(frozen=True)
+class UiWindowRecord:
+    """A top-level interface window of the mod, whether or not a scripted GUI drives it."""
+
+    relative_path: str
+    window_name: str
+    label: str
+    event_id: int | None
+    source_mtime_ns: int
+    source_size: int
+
+    @property
+    def filename(self) -> str:
+        return f"ui_window_{_safe_slug(self.window_name)}.png"
+
+    @property
+    def searchable_text(self) -> str:
+        return " ".join((self.label, self.relative_path, self.window_name)).casefold()
+
+
+@dataclass(frozen=True)
+class UiWindowPreview:
+    record: UiWindowRecord
+    png: bytes
 
 
 @dataclass(frozen=True)
@@ -250,6 +283,66 @@ class ScriptedGuiCatalog:
         return [record for record in records if all(token in record.searchable_text for token in tokens)]
 
 
+class UiWindowCatalog:
+    """Top-level windows of ``interface/*.gui``: the previews ``/scripted-gui`` cannot reach."""
+
+    def __init__(self, repo: Path) -> None:
+        self.repo = repo
+        self._cache = _RefreshableCatalog(self._scan)
+
+    def _scan(self) -> list[UiWindowRecord]:
+        root = self.repo / INTERFACE_ROOT
+        records: dict[str, UiWindowRecord] = {}
+        if not root.is_dir():
+            return []
+        for source in sorted(root.rglob("*.gui")):
+            try:
+                text = source.read_text(encoding="utf-8-sig", errors="replace")
+                stat = source.stat()
+            except OSError:
+                continue
+            relative = source.relative_to(self.repo).as_posix()
+            label = _source_label(source.stem)
+            event_id = _source_event_id(source.name)
+            for outer in _named_blocks(text, "guiTypes"):
+                for kind, body in _top_level_blocks(outer):
+                    if kind not in UI_WINDOW_KINDS:
+                        continue
+                    window_name = _assignment_value(NAME_RE, body)
+                    if window_name:
+                        records.setdefault(
+                            window_name,
+                            UiWindowRecord(
+                                relative_path=relative,
+                                window_name=window_name,
+                                label=label,
+                                event_id=event_id,
+                                source_mtime_ns=stat.st_mtime_ns,
+                                source_size=stat.st_size,
+                            ),
+                        )
+        return sorted(records.values(), key=lambda record: (record.relative_path, record.window_name))
+
+    def discover(self) -> list[UiWindowRecord]:
+        return self._cache.records()
+
+    def search(self, query: str) -> list[UiWindowRecord]:
+        records = self.discover()
+        normalized = " ".join(query.casefold().strip().split())
+        if not normalized:
+            return []
+        exact = [record for record in records if normalized == record.window_name.casefold()]
+        if exact:
+            return exact
+        numeric = _query_event_id(normalized)
+        if numeric is not None:
+            matches = [record for record in records if record.event_id == numeric]
+            if matches:
+                return matches
+        tokens = normalized.split()
+        return [record for record in records if all(token in record.searchable_text for token in tokens)]
+
+
 class EventVisualMcpClient:
     def __init__(
         self, settings: Settings, session_pool: SharedMcpSession | None = None
@@ -321,13 +414,25 @@ class EventVisualMcpClient:
     ) -> bytes:
         async with self._session() as (session, workspace_id):
             args: dict[str, Any] = {"workspaceId": workspace_id, "view": view}
-            if folder_id:
-                args["folderId"] = folder_id
             if technology_id:
                 args["technologyId"] = technology_id
             if category_id:
                 args["categoryId"] = category_id
-            payload = _structured_content(await session.call_tool("hoi4.tech_render", args))
+            # Folder IDs are exact (`biowarfare_folder`); members type `biowarfare`, so try both.
+            folder_candidates = [folder_id] if folder_id else [""]
+            if folder_id and not folder_id.endswith("_folder"):
+                folder_candidates.append(f"{folder_id}_folder")
+            payload: dict[str, Any] | None = None
+            failure: Exception | None = None
+            for candidate in folder_candidates:
+                call_args = {**args, **({"folderId": candidate} if candidate else {})}
+                try:
+                    payload = _structured_content(await session.call_tool("hoi4.tech_render", call_args))
+                    break
+                except Exception as exc:
+                    failure = exc
+            if payload is None:
+                raise EventVisualError("Technology render failed") from failure
             png = await _tech_png_from_payload(
                 session, payload, max_bytes=self.settings.focus_tree_max_attachment_bytes
             )
@@ -411,42 +516,12 @@ class EventVisualMcpClient:
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[tuple[ClientSession, str]]:
-        timeout = self.settings.focus_mcp_timeout_seconds
-        total_timeout = min(timeout * 2, 900)
-        async with asyncio.timeout(total_timeout):
-            if self.session_pool is not None:
-                async with self.session_pool.session() as session:
-                    yield session, await self._workspace_id(session)
-                return
-            with isolated_mcp_server_parameters(self.settings) as params:
-                with open(os.devnull, "w", encoding="utf-8") as errlog:
-                    async with stdio_client(params, errlog=errlog) as (read, write):
-                        async with ClientSession(
-                            read,
-                            write,
-                            read_timeout_seconds=timedelta(seconds=timeout),
-                        ) as session:
-                            await session.initialize()
-                            yield session, await self._workspace_id(session)
+        async with mcp_session(self.settings, self.session_pool) as opened:
+            yield opened
 
     async def _workspace_id(self, session: ClientSession) -> str:
-        configured = self.settings.focus_mcp_workspace_id.strip()
-        if configured:
-            return configured
-        tools = await session.list_tools()
-        if not any(tool.name == "hoi4.mods" for tool in tools.tools):
-            return "current"
-        payload = _structured_content(await session.call_tool("hoi4.mods", {}))
-        expected = self.settings.focus_mcp_workspace_name.casefold().strip()
-        workspaces = (payload.get("data") or {}).get("mods") or payload.get("workspaces") or []
-        for workspace in workspaces:
-            if not isinstance(workspace, dict):
-                continue
-            workspace_id = str(workspace.get("id") or "")
-            name = str(workspace.get("name") or "").casefold()
-            if workspace_id and (name == expected or workspace_id.casefold() == expected):
-                return workspace_id
-        raise EventVisualError("Chaos Redux MCP workspace was not found")
+        # 4.x has no workspace listing: the server resolves the configured ID or short name itself.
+        return mcp_workspace_id(self.settings)
 
     async def _render_event_chain(
         self,
@@ -544,18 +619,24 @@ class EventVisualMcpClient:
         if not records:
             return {}
         requested = {(record.window_name, record.gui_id) for record in records}
-        payload = _structured_content(
-            await session.call_tool(
-                "chaosx.visual_revision",
-                {
-                    "workspaceId": workspace_id,
-                    "guiWindows": [
-                        {"windowName": window_name, "guiId": gui_id}
-                        for window_name, gui_id in sorted(requested)
-                    ],
-                },
+        try:
+            payload = _structured_content(
+                await session.call_tool(
+                    "chaosx.visual_revision",
+                    {
+                        "workspaceId": workspace_id,
+                        "guiWindows": [
+                            {"windowName": window_name, "guiId": gui_id}
+                            for window_name, gui_id in sorted(requested)
+                        ],
+                    },
+                )
             )
-        )
+        except Exception:
+            # The private ChaosX plugin is not loaded on this host (see mcp_plugin_paths). Previews still
+            # render; their cache key falls back to the source file's stat and a short expiry.
+            logger.warning("chaosx.visual_revision unavailable; scripted-GUI cache uses file stats")
+            return _stat_revisions(records)
         data = payload.get("data")
         if not isinstance(data, dict):
             raise EventVisualError("MCP scripted-GUI revision response is invalid")
@@ -574,26 +655,72 @@ class EventVisualMcpClient:
             raise EventVisualError("MCP scripted-GUI revisions are incomplete")
         return revisions
 
+    async def render_ui_windows(
+        self, records: Sequence[UiWindowRecord]
+    ) -> tuple[tuple[UiWindowPreview, ...], int]:
+        """Preview interface windows that no scripted GUI drives, one MCP render per window."""
+
+        selected = list(records[: self.settings.scripted_gui_max_previews])
+        if not selected:
+            return (), 0
+        try:
+            async with self._session() as (session, workspace_id):
+
+                async def render_one(record: UiWindowRecord) -> tuple[UiWindowPreview | None, bool]:
+                    key = self._ui_key(record)
+                    png = self._cached_gui(key)
+                    if png is None:
+                        try:
+                            png = await self._render_window(session, workspace_id, record.window_name, "")
+                        except EmptyGuiPreviewError:
+                            return None, False
+                        except Exception:
+                            return None, True
+                        self._store_gui(key, png)
+                    return UiWindowPreview(record, png), False
+
+                results = await asyncio.gather(*(render_one(record) for record in selected))
+        except EventVisualError:
+            raise
+        except Exception as exc:
+            raise EventVisualError("Interface previews are unavailable") from exc
+        previews = tuple(preview for preview, _failed in results if preview is not None)
+        return previews, sum(1 for _preview, did_fail in results if did_fail)
+
     async def _render_gui(
         self,
         session: ClientSession,
         workspace_id: str,
         record: ScriptedGuiRecord,
     ) -> bytes:
+        return await self._render_window(session, workspace_id, record.window_name, record.gui_id)
+
+    async def _render_window(
+        self,
+        session: ClientSession,
+        workspace_id: str,
+        window_name: str,
+        gui_id: str,
+    ) -> bytes:
         width = self.settings.scripted_gui_preview_width
         height = self.settings.scripted_gui_preview_height
+        visibility = {window_name: True}
+        scripted_gui: dict[str, bool] = {}
+        if gui_id:
+            scripted_gui[gui_id] = True
+            visibility[gui_id] = True
         payload = _structured_content(
             await session.call_tool(
                 "hoi4.gui_render",
                 {
                     "workspaceId": workspace_id,
-                    "windowName": record.window_name,
+                    "windowName": window_name,
                     "scenario": {
                         "id": "discord-preview",
                         "resolution": {"width": width, "height": height},
                         "state": "active",
-                        "scriptedGui": {record.gui_id: True},
-                        "visibility": {record.window_name: True, record.gui_id: True},
+                        "scriptedGui": scripted_gui,
+                        "visibility": visibility,
                     },
                     "states": ["active"],
                     "resolutions": [{"width": width, "height": height, "uiScale": 1.0}],
@@ -636,6 +763,21 @@ class EventVisualMcpClient:
             self.settings.event_chain_max_depth,
             self.settings.event_chain_max_nodes,
             self.settings.event_chain_graphviz_dpi,
+            self._launcher_fingerprint,
+        )
+
+    def _ui_key(self, record: UiWindowRecord) -> tuple[Any, ...]:
+        # A window pulls sprites and text from files beside its own .gui, which the key cannot see,
+        # so a cached preview also expires after a few hours.
+        return (
+            "ui-window",
+            record.relative_path,
+            record.window_name,
+            record.source_mtime_ns,
+            record.source_size,
+            int(time.time() // (UI_PREVIEW_CACHE_HOURS * 3600)),
+            self.settings.scripted_gui_preview_width,
+            self.settings.scripted_gui_preview_height,
             self._launcher_fingerprint,
         )
 
@@ -750,6 +892,18 @@ def _render_compact_event_chain(
     if len(png) > max_bytes:
         raise EventVisualError("Compact event-chain image exceeds the Discord upload limit")
     return png
+
+
+def _stat_revisions(records: Sequence[ScriptedGuiRecord]) -> dict[tuple[str, str], str]:
+    """A cache revision per scripted GUI from its source file's stat, expiring after a few hours."""
+
+    bucket = int(time.time() // (UI_PREVIEW_CACHE_HOURS * 3600))
+    return {
+        (record.window_name, record.gui_id): hashlib.sha256(
+            f"{record.relative_path}|{record.gui_id}|{record.source_mtime_ns}|{record.source_size}|{bucket}".encode()
+        ).hexdigest()
+        for record in records
+    }
 
 
 def _event_sort_key(node_id: str) -> tuple[Any, ...]:

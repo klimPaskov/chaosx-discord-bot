@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -26,10 +27,14 @@ from pydantic import AnyUrl
 from .config import Settings
 from .visual_cache import VisualArtifactCache, mcp_launcher_fingerprint
 
+logger = logging.getLogger("chaosx.focus_trees")
 FOCUS_ROOT = Path("common/national_focus")
 COUNTRY_TAGS_ROOT = Path("common/country_tags")
-FOCUS_RASTER_TOOL = "hoi4.focus_raster"
+FOCUS_RASTER_TOOL = "hoi4.focus_render"
 COUNTRY_ASSET_TOOL = "chaosx.focus_country_assets"
+PLUGIN_RELATIVE_PATH = Path("hoi4-agent-tools-plugin") / "chaosx-plugin.mjs"
+MAX_MCP_PLUGINS = 8
+WORKSPACE_ID_RE = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 COUNTRY_ASSET_DISPLAY_WIDTH = {"flag": 656, "leader": 624}
 EVENT_PREFIX_RE = re.compile(r"^(\d{3})(?:_|$)")
 ASSIGNMENT_VALUE_RE = r'(?:"([^"\n]+)"|([A-Za-z0-9_.:\-]+))'
@@ -131,9 +136,87 @@ def _validate_mcp_node_runtime(command: str) -> str:
         raise FocusTreeError("The configured Node.js runtime version could not be determined")
     if int(match.group(1)) < 22:
         raise FocusTreeError(
-            "HOI4 Agent Tools 2.x requires Node.js 22 or newer; configure an absolute compatible Node path"
+            "HOI4 Agent Tools 4.x requires Node.js 22.19 or newer (or 24); configure an absolute compatible Node path"
         )
     return expanded
+
+
+def mcp_workspace_id(settings: Settings) -> str:
+    """The workspace argument for every tool call.
+
+    HOI4 Agent Tools 4.x has no workspace listing tool: it resolves a configured workspace ID, or a
+    mod's folder or workspace name in any letter case, by itself, so the bot passes its own name.
+    """
+
+    configured = settings.focus_mcp_workspace_id.strip()
+    if configured:
+        return configured
+    return settings.focus_mcp_workspace_name.strip() or "current"
+
+
+def mcp_plugin_paths(settings: Settings) -> list[str]:
+    """Absolute plugin modules the isolated server config lists.
+
+    The private ChaosX tools (``chaosx.visual_revision``, ``chaosx.focus_country_assets``) live in the
+    Chaos Redux vault, not in the public npm package. A listed file that is missing is left out here
+    (the server would only warn), so one setting works on every host.
+    """
+
+    raw = settings.focus_mcp_plugins.strip()
+    if raw:
+        candidates = [Path(item.strip()).expanduser() for item in raw.split(",") if item.strip()]
+    else:
+        candidates = [settings.obsidian_vault_path.expanduser() / PLUGIN_RELATIVE_PATH]
+    found: list[str] = []
+    for candidate in candidates:
+        if candidate.is_absolute() and candidate.is_file() and str(candidate) not in found:
+            found.append(str(candidate))
+        elif str(candidate) not in found:
+            logger.warning(
+                "HOI4 Agent Tools plugin not found at %s: the private ChaosX tools are unavailable "
+                "(country flags beside focus trees are skipped, scripted-GUI cache keys use file stats)",
+                candidate,
+            )
+    return found
+
+
+def _isolated_config(base: dict[str, Any], root: Path, settings: Settings) -> dict[str, Any]:
+    """The server config for one disposable session: private state and artifact folders, plus plugins."""
+
+    # Rendered artifacts always go to the disposable folder, so previews never fill the server's
+    # retention budget. The analysis cache may live in a persistent folder to survive restarts.
+    state_root = root / "state"
+    if settings.focus_mcp_state_dir is not None:
+        state_root = settings.focus_mcp_state_dir.expanduser()
+        state_root.mkdir(parents=True, exist_ok=True)
+    isolated = {
+        **base,
+        "serverStateRoot": str(state_root),
+        "workspaceStorageRoot": str(root / "workspaces"),
+    }
+    plugins = [str(item) for item in base.get("plugins") or [] if isinstance(item, str)]
+    for path in mcp_plugin_paths(settings):
+        if path not in plugins:
+            plugins.append(path)
+    if plugins:
+        isolated["plugins"] = plugins[:MAX_MCP_PLUGINS]
+    return isolated
+
+
+def _synthesized_config(settings: Settings, workspace_cwd: Path) -> dict[str, Any] | None:
+    """A minimal 4.x config when no config file exists: the bot's own mod checkout is the one workspace."""
+
+    if not workspace_cwd.is_dir():
+        return None
+    workspace_id = mcp_workspace_id(settings).casefold()
+    if not WORKSPACE_ID_RE.fullmatch(workspace_id) or workspace_id == "current":
+        workspace_id = "chaos_redux"
+    return {
+        "version": 1,
+        "workspaces": [
+            {"id": workspace_id, "name": workspace_id, "root": str(workspace_cwd.resolve())}
+        ],
+    }
 
 
 @contextmanager
@@ -145,7 +228,7 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
     workspace_cwd = (settings.focus_tree_repo or settings.chaos_redux_repo).expanduser()
     cwd = str(workspace_cwd) if workspace_cwd.is_dir() else None
     configured_path = settings.focus_mcp_config_path.expanduser()
-    server_env = {**os.environ, "HOI4_AGENT_TOOLS_CHAOSX": "1"}
+    server_env = dict(os.environ)
     config_argument_found = False
     for index, argument in enumerate(args):
         if argument == "--config":
@@ -158,24 +241,22 @@ def isolated_mcp_server_parameters(settings: Settings) -> Iterator[StdioServerPa
             configured_path = Path(argument.split("=", 1)[1]).expanduser()
             config_argument_found = True
             break
-    if not configured_path.is_file():
-        if not config_argument_found:
-            args.extend(("--config", str(configured_path)))
-        yield StdioServerParameters(command=command, args=args, cwd=cwd, env=server_env)
-        return
-    try:
-        config = json.loads(configured_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise FocusTreeError("HOI4 Agent Tools MCP config could not be isolated") from exc
-    if not isinstance(config, dict):
-        raise FocusTreeError("HOI4 Agent Tools MCP config is invalid")
+    if configured_path.is_file():
+        try:
+            config = json.loads(configured_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise FocusTreeError("HOI4 Agent Tools MCP config could not be isolated") from exc
+        if not isinstance(config, dict):
+            raise FocusTreeError("HOI4 Agent Tools MCP config is invalid")
+    else:
+        config = _synthesized_config(settings, workspace_cwd)
+        if config is None:
+            # No config file and no mod checkout: let the server try its own automatic configuration.
+            yield StdioServerParameters(command=command, args=args, cwd=cwd, env=server_env)
+            return
     with tempfile.TemporaryDirectory(prefix="chaosx-hoi4-mcp-") as temporary:
         root = Path(temporary)
-        isolated = {
-            **config,
-            "serverStateRoot": str(root / "state"),
-            "workspaceStorageRoot": str(root / "workspaces"),
-        }
+        isolated = _isolated_config(config, root, settings)
         isolated_path = root / "config.json"
         isolated_path.write_text(json.dumps(isolated), encoding="utf-8")
         replaced = False
@@ -261,6 +342,20 @@ class SharedMcpSession:
                 raise FocusTreeError("HOI4 Agent Tools MCP session is unavailable")
             yield self._session
 
+    @asynccontextmanager
+    async def shared_session(self) -> AsyncIterator[ClientSession]:
+        """The same MCP process without waiting for the render lock.
+
+        For quick read-only lookups (documentation search): the server answers them in about a second,
+        and the protocol allows concurrent requests, so they need not queue behind a render that takes minutes.
+        """
+
+        await self.start()
+        session = self._session
+        if session is None:
+            raise FocusTreeError("HOI4 Agent Tools MCP session is unavailable")
+        yield session
+
     async def close(self) -> None:
         async with self._start_lock:
             async with self._usage_lock:
@@ -274,6 +369,35 @@ class SharedMcpSession:
                 self._worker_task = None
                 self._session = None
                 self._start_error = None
+
+
+@asynccontextmanager
+async def mcp_session(
+    settings: Settings, session_pool: SharedMcpSession | None, *, exclusive: bool = True
+) -> AsyncIterator[tuple[ClientSession, str]]:
+    """A ready MCP session and the workspace argument, from the shared pool or a one-off process.
+
+    ``exclusive=False`` skips the pool's render lock, for quick read-only lookups.
+    """
+
+    timeout = settings.focus_mcp_timeout_seconds
+    total_timeout = min(timeout * 2, 900)
+    async with asyncio.timeout(total_timeout):
+        if session_pool is not None:
+            opener = session_pool.session() if exclusive else session_pool.shared_session()
+            async with opener as session:
+                yield session, mcp_workspace_id(settings)
+            return
+        with isolated_mcp_server_parameters(settings) as params:
+            with open(os.devnull, "w", encoding="utf-8") as errlog:
+                async with stdio_client(params, errlog=errlog) as (read, write):
+                    async with ClientSession(
+                        read,
+                        write,
+                        read_timeout_seconds=timedelta(seconds=timeout),
+                    ) as session:
+                        await session.initialize()
+                        yield session, mcp_workspace_id(settings)
 
 
 @dataclass(frozen=True)
@@ -593,22 +717,8 @@ class FocusTreeMcpClient:
         return rendered, failed
 
     async def _workspace_id(self, session: ClientSession) -> str:
-        configured = self.settings.focus_mcp_workspace_id.strip()
-        if configured:
-            return configured
-        tools = await session.list_tools()
-        if not any(tool.name == "hoi4.mods" for tool in tools.tools):
-            return "current"
-        result = await session.call_tool("hoi4.mods", {})
-        structured = _structured_content(result)
-        mods = (structured.get("data") or {}).get("mods") or []
-        wanted = self.settings.focus_mcp_workspace_name.casefold().strip()
-        for mod in mods:
-            if isinstance(mod, dict) and str(mod.get("name") or "").casefold() == wanted:
-                workspace_id = str(mod.get("id") or "")
-                if workspace_id:
-                    return workspace_id
-        raise FocusTreeError("Chaos Redux MCP workspace was not found")
+        # 4.x has no workspace listing: the server resolves the configured ID or short name itself.
+        return mcp_workspace_id(self.settings)
 
     async def _render_one(self, session: ClientSession, workspace_id: str, record: FocusTreeRecord) -> bytes:
         result = await session.call_tool(
@@ -618,6 +728,8 @@ class FocusTreeMcpClient:
                 "relativePath": record.relative_path,
                 "treeId": record.tree_id,
                 "reviewScale": self.settings.focus_tree_review_scale,
+                # The PNG artifact is what Discord gets; the inline close-ups would only add payload.
+                "inline": False,
             },
         )
         structured = _structured_content(result)
@@ -627,7 +739,7 @@ class FocusTreeMcpClient:
             None,
         )
         if not png_artifact or not png_artifact.get("uri"):
-            raise FocusTreeError("MCP focus raster returned no PNG artifact")
+            raise FocusTreeError("MCP focus render returned no PNG artifact")
         declared_size = int(png_artifact.get("size") or 0)
         if declared_size > self.settings.focus_tree_max_attachment_bytes:
             raise FocusTreeError("MCP focus graph is too large for Discord")

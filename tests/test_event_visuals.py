@@ -18,6 +18,8 @@ from chaosx_bot.event_visuals import (
     EventVisualMcpClient,
     ScriptedGuiCatalog,
     ScriptedGuiRecord,
+    UiWindowCatalog,
+    UiWindowRecord,
     _crop_and_scale_gui_preview,
     _remove_offline_banner,
 )
@@ -434,3 +436,193 @@ def test_offline_disclaimer_is_removed_from_gui_svg() -> None:
 
     assert b"OFFLINE APPROXIMATION" not in cleaned
     assert b"#111923" in cleaned
+
+
+GUI_FILE = """
+guiTypes = {
+	containerWindowType = {
+		name = "chaos_meter_popup_window"
+		size = { width = 527 height = 534 }
+		containerWindowType = {
+			name = "chaos_meter_status_content"
+		}
+	}
+	instantTextBoxType = { name = "stray_text" }
+	windowType = { name = "old_style_window" }
+}
+"""
+
+
+def test_ui_window_catalog_lists_top_level_windows_and_resolves_queries(tmp_path: Path) -> None:
+    interface = tmp_path / "interface"
+    interface.mkdir()
+    (interface / "chaosx_chaos_meter_popup.gui").write_text(GUI_FILE, encoding="utf-8")
+    (interface / "007_fury_leader_overlay.gui").write_text(
+        'guiTypes = { containerWindowType = { name = "fury_overlay" } }', encoding="utf-8"
+    )
+
+    catalog = UiWindowCatalog(tmp_path)
+
+    names = [record.window_name for record in catalog.discover()]
+    assert names == ["fury_overlay", "chaos_meter_popup_window", "old_style_window"]
+    assert [record.window_name for record in catalog.search("chaos_meter_popup_window")] == ["chaos_meter_popup_window"]
+    # A file-name query matches every window the file defines.
+    assert [record.window_name for record in catalog.search("meter popup")] == [
+        "chaos_meter_popup_window",
+        "old_style_window",
+    ]
+    assert [record.window_name for record in catalog.search("7")] == ["fury_overlay"]
+    assert catalog.search("nothing like this") == []
+
+
+@pytest.mark.asyncio
+async def test_ui_window_render_has_no_scripted_gui_flag() -> None:
+    svg = b'''<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200">
+      <rect width="320" height="200" fill="#111923"/>
+      <rect x="20" y="50" width="220" height="100" fill="#345678" stroke="#d9a928" stroke-width="4"/>
+    </svg>'''
+    session = FakeSession(mime_type="image/svg+xml", data=svg, text=True)
+    settings = Settings(discord_token="dummy", scripted_gui_preview_width=320, scripted_gui_preview_height=200)
+    client = EventVisualMcpClient(settings)
+
+    png = await client._render_window(cast(Any, session), "chaos_redux", "chaos_meter_popup_window", "")
+
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    name, arguments = session.calls[0]
+    assert name == "hoi4.gui_render"
+    assert arguments["workspaceId"] == "chaos_redux"
+    assert arguments["windowName"] == "chaos_meter_popup_window"
+    scenario = cast(dict[str, Any], arguments["scenario"])
+    assert scenario["scriptedGui"] == {}
+    assert scenario["visibility"] == {"chaos_meter_popup_window": True}
+
+
+@pytest.mark.asyncio
+async def test_ui_window_previews_are_cached_and_failures_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    client = EventVisualMcpClient(Settings(discord_token="dummy", scripted_gui_max_previews=3))
+    good = UiWindowRecord("interface/a.gui", "good_window", "A", None, 1, 2)
+    empty = UiWindowRecord("interface/b.gui", "empty_window", "B", None, 1, 2)
+    bad = UiWindowRecord("interface/c.gui", "bad_window", "C", None, 1, 2)
+    renders: list[str] = []
+
+    @asynccontextmanager
+    async def fake_session():
+        yield cast(Any, object()), "workspace"
+
+    async def render(_session: object, _workspace: str, window_name: str, gui_id: str) -> bytes:
+        assert gui_id == ""
+        renders.append(window_name)
+        if window_name == "empty_window":
+            raise EmptyGuiPreviewError("blank")
+        if window_name == "bad_window":
+            raise RuntimeError("boom")
+        return b"\x89PNG\r\n\x1a\nui"
+
+    monkeypatch.setattr(client, "_session", fake_session)
+    monkeypatch.setattr(client, "_render_window", render)
+
+    previews, failed = await client.render_ui_windows((good, empty, bad))
+    again, _ = await client.render_ui_windows((good,))
+
+    assert [preview.record.window_name for preview in previews] == ["good_window"]
+    assert failed == 1
+    assert [preview.png for preview in again] == [b"\x89PNG\r\n\x1a\nui"]
+    assert renders.count("good_window") == 1
+
+
+@pytest.mark.asyncio
+async def test_gui_revisions_fall_back_to_file_stats_without_the_plugin() -> None:
+    """A host without the private ChaosX plugin still previews scripted GUIs."""
+
+    class NoPluginSession:
+        async def call_tool(self, name: str, _arguments: dict[str, object]) -> object:
+            raise RuntimeError(f"unknown tool {name}")
+
+    client = EventVisualMcpClient(Settings(discord_token="dummy"))
+    record = ScriptedGuiRecord("common/scripted_guis/a.txt", "A", "a_gui", "a_window", "ctx", 1, 10, 20)
+    changed = ScriptedGuiRecord("common/scripted_guis/a.txt", "A", "a_gui", "a_window", "ctx", 1, 11, 20)
+
+    first = await client._gui_revisions(cast(Any, NoPluginSession()), "workspace", [record])
+    second = await client._gui_revisions(cast(Any, NoPluginSession()), "workspace", [changed])
+
+    key = ("a_window", "a_gui")
+    assert set(first) == {key}
+    assert len(first[key]) == 64 and first[key] != second[key]
+
+
+class _TechSession:
+    """Answers hoi4.tech_render for the folder IDs in ``known`` and fails for any other."""
+
+    def __init__(self, known: set[str]) -> None:
+        self.known = known
+        self.calls: list[dict[str, object]] = []
+        self.png = b"\x89PNG\r\n\x1a\ntech"
+
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
+        assert name == "hoi4.tech_render"
+        self.calls.append(arguments)
+        ok = arguments.get("folderId") in self.known
+        structured: dict[str, object] = (
+            {
+                "status": "ok",
+                "artifacts": [
+                    {"mimeType": "image/png", "uri": "hoi4-agent://workspace/test/artifact/tech", "size": len(self.png)}
+                ],
+            }
+            if ok
+            else {"status": "error", "code": "TECH_RENDER_FOLDER_EMPTY"}
+        )
+
+        class Result:
+            def model_dump(self, **_: object) -> dict[str, object]:
+                return {"isError": not ok, "structuredContent": structured}
+
+        return Result()
+
+    async def read_resource(self, _: object) -> FakeResourceResult:
+        return FakeResourceResult(mime_type="image/png", data=self.png)
+
+
+def _tech_client(session: _TechSession, monkeypatch: pytest.MonkeyPatch) -> EventVisualMcpClient:
+    client = EventVisualMcpClient(Settings(discord_token="dummy"))
+
+    @asynccontextmanager
+    async def fake_session():
+        yield cast(Any, session), "chaos_redux"
+
+    monkeypatch.setattr(client, "_session", fake_session)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_tech_folder_view_retries_with_the_folder_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _TechSession({"biowarfare_folder"})
+    client = _tech_client(session, monkeypatch)
+
+    png = await client.render_tech_view(view="folder", folder_id="biowarfare")
+
+    assert png == session.png
+    assert [call["folderId"] for call in session.calls] == ["biowarfare", "biowarfare_folder"]
+
+
+@pytest.mark.asyncio
+async def test_tech_folder_view_uses_an_exact_id_without_retrying(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _TechSession({"naval_folder"})
+    client = _tech_client(session, monkeypatch)
+
+    await client.render_tech_view(view="folder", folder_id="naval_folder")
+
+    assert [call["folderId"] for call in session.calls] == ["naval_folder"]
+
+
+@pytest.mark.asyncio
+async def test_tech_view_failure_is_a_visual_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from chaosx_bot.event_visuals import EventVisualError
+
+    client = _tech_client(_TechSession(set()), monkeypatch)
+
+    with pytest.raises(EventVisualError):
+        await client.render_tech_view(view="folder", folder_id="nothing")
